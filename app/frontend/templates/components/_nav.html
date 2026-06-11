@@ -1,0 +1,27 @@
+{# Shared navigation partial — included by layouts/base.html
+   Expects context: user (regular User or AdminUser) or admin (AdminUser).
+   Both have .is_admin and .username. Falls back to unauthenticated state. #}
+
+{% set nav_user = user if user is defined else (admin if admin is defined else none) %}
+{% set current = request.url.path %}
+
+<nav class="main-nav" role="navigation" aria-label="Main navigation">
+    {% if nav_user %}
+        <a href="/docs" target="_blank" class="nav-link" title="API Docs">
+            <i class="fas fa-book nav-icon"></i>
+            <span class="nav-label">Docs</span>
+        </a>
+    {% else %}
+        {# Unauthenticated #}
+        <a href="/login"
+           class="nav-link {% if current == '/login' %}active{% endif %}">
+            <i class="fas fa-sign-in-alt nav-icon"></i>
+            <span class="nav-label">Login</span>
+        </a>
+        <a href="/signup"
+           class="nav-link {% if current == '/signup' %}active{% endif %}">
+            <i class="fas fa-user-plus nav-icon"></i>
+            <span class="nav-label">Sign Up</span>
+        </a>
+    {% endif %}
+</nav>

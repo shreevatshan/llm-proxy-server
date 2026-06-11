@@ -1,0 +1,46 @@
+{% extends "layouts/base.html" %}
+
+{% block content %}
+<div class="main-content">
+{% if not user %}
+<!-- Not logged in - show welcome page -->
+<div class="hero">
+    <div class="hero-grid" aria-hidden="true"></div>
+    <h1>Welcome to LLM Proxy Server</h1>
+    <p class="lead">A unified API gateway for multiple LLM providers</p>
+    <hr>
+    <p>Get started by creating an account and generating your API keys</p>
+    <a class="btn btn-primary btn-lg" href="/login">
+        <i class="fas fa-rocket me-2"></i>Get Started
+    </a>
+</div>
+
+<div class="row">
+    <div class="col-md-4 mb-4">
+        <div class="feature-card">
+            <i class="fas fa-key text-accent"></i>
+            <h5>API Key Management</h5>
+            <p>Generate and manage secure API keys for accessing LLM services</p>
+        </div>
+    </div>
+    <div class="col-md-4 mb-4">
+        <div class="feature-card">
+            <i class="fas fa-network-wired text-success"></i>
+            <h5>Multiple Providers</h5>
+            <p>Support for OpenAI, Azure, Google, AWS Bedrock, Ollama etc</p>
+        </div>
+    </div>
+    <div class="col-md-4 mb-4">
+        <div class="feature-card">
+            <i class="fas fa-code text-info"></i>
+            <h5>Multi-API Compatible</h5>
+            <p>Drop-in replacement for multiple LLM provider APIs</p>
+        </div>
+    </div>
+</div>
+
+{% endif %}
+</div> <!-- Close main-content -->
+{% endblock %}
+
+{% block extra_js %}{% endblock %}

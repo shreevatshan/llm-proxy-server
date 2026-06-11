@@ -1,0 +1,482 @@
+/* LLM Proxy Server - Bootstrap Overrides & Global Dark Enforcement */
+/* Load last. Contains ONLY rules that must override Bootstrap defaults.
+   Global * blanket rules removed — fonts/shadows/transitions now in typography.css + animations.css. */
+
+/* ================================
+   GLOBAL DARK BASE
+   ================================ */
+
+body {
+    background-color: var(--dark-bg-primary);
+    color: var(--dark-text-secondary);
+    font-family: var(--font-family-body);
+}
+
+/* Headings + emphasis — repin to bright primary text against Bootstrap's resets */
+h1, h2, h3, h4, h5, h6,
+.h1, .h2, .h3, .h4, .h5, .h6,
+.modal-title,
+.card-title,
+.page-title,
+strong,
+b,
+label,
+.form-label {
+    color: var(--mono-text-primary) !important;
+}
+
+/* Body text & links — inside cards, sections, lists */
+.card-body,
+.card-body p,
+.card-body div,
+.card-body span:not(.text-muted):not(.badge),
+.card-body small:not(.text-muted),
+.section,
+.section p,
+main {
+    color: var(--mono-text-secondary);
+}
+
+/* Common Bootstrap text utilities that frontend templates use */
+.text-muted {
+    color: var(--mono-text-secondary) !important;
+}
+
+.text-white {
+    color: var(--mono-text-primary) !important;
+}
+
+.text-dark {
+    color: var(--mono-text-primary) !important;
+}
+
+.text-primary {
+    color: var(--mono-text-primary) !important;
+}
+
+.text-secondary {
+    color: var(--mono-text-secondary) !important;
+}
+
+.text-success,
+.text-danger,
+.text-warning,
+.text-info {
+    color: var(--mono-text-primary) !important;
+}
+
+/* Page header welcome / lead text gets readable secondary, not muted-near-bg */
+.welcome-text,
+#welcomeMessage,
+.app-header .header-content,
+.lead {
+    color: var(--mono-text-secondary) !important;
+}
+
+/* ================================
+   BOOTSTRAP COMPONENT REPAINTS
+   ================================ */
+
+.card,
+.modal-content,
+.popover,
+.tooltip-inner,
+.admin-panel,
+.dashboard-card,
+.stats-card,
+.provider-models-section,
+.model-item,
+.login-container,
+.signup-container {
+    background-color: var(--dark-surface) !important;
+    border-color: var(--dark-border) !important;
+}
+
+/* Dropdown */
+.dropdown-menu {
+    background-color: var(--dark-bg-secondary) !important;
+    border: 1px solid var(--dark-border) !important;
+    box-shadow: var(--shadow-lg) !important;
+}
+
+.dropdown-item {
+    color: var(--dark-text-secondary) !important;
+}
+
+.dropdown-item:hover,
+.dropdown-item:focus {
+    background-color: var(--dark-bg-tertiary) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+.dropdown-divider {
+    border-color: var(--dark-border) !important;
+}
+
+/* Badge bg utilities */
+.bg-primary, .badge.bg-primary { background-color: var(--mono-text-primary) !important; color: var(--mono-0) !important; }
+.bg-success, .badge.bg-success { background-color: var(--mono-text-primary) !important; color: var(--mono-0) !important; }
+.bg-danger,  .badge.bg-danger  { background-color: transparent !important; color: var(--mono-text-secondary) !important; border: 1px solid var(--mono-5) !important; }
+.bg-warning, .badge.bg-warning { background-color: transparent !important; color: var(--mono-text-secondary) !important; border: 1px dashed var(--mono-5) !important; }
+.bg-info,    .badge.bg-info    { background-color: var(--mono-3) !important; color: var(--mono-text-secondary) !important; border: 1px solid var(--mono-5) !important; }
+.bg-secondary, .badge.bg-secondary { background-color: var(--mono-3) !important; color: var(--dark-text-secondary) !important; border: 1px solid var(--dark-border) !important; }
+
+/* ================================
+   FORM CONTROLS
+   ================================ */
+
+.form-control,
+.form-select,
+input:not([type="checkbox"]):not([type="radio"]),
+textarea,
+select {
+    background-color: var(--dark-bg-secondary) !important;
+    border: 1px solid var(--dark-border) !important;
+    color: var(--dark-text-primary) !important;
+    -webkit-text-fill-color: var(--dark-text-primary) !important;
+}
+
+.form-control:focus,
+.form-select:focus,
+input:not([type="checkbox"]):not([type="radio"]):focus,
+textarea:focus,
+select:focus {
+    border-color: var(--accent-500) !important;
+    border-width: 2px !important;
+    background-color: var(--dark-bg-secondary) !important;
+    outline: none !important;
+    box-shadow: var(--glow-accent) !important;
+    caret-color: var(--accent-500) !important;
+}
+
+.form-control::placeholder,
+.form-select::placeholder,
+input::placeholder,
+textarea::placeholder {
+    color: var(--dark-text-muted) !important;
+    opacity: 0.7 !important;
+    -webkit-text-fill-color: var(--dark-text-muted) !important;
+}
+
+/* ================================
+   AUTOFILL (browser override)
+   ================================ */
+
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+input:-webkit-autofill:active,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus,
+select:-webkit-autofill,
+select:-webkit-autofill:hover,
+select:-webkit-autofill:focus {
+    -webkit-box-shadow: 0 0 0 1000px var(--dark-bg-secondary) inset !important;
+    -webkit-text-fill-color: var(--dark-text-primary) !important;
+    background-color: var(--dark-bg-secondary) !important;
+    border-color: var(--dark-border) !important;
+    transition: background-color 5000s ease-in-out 0s !important;
+}
+
+/* ================================
+   TABLES
+   ================================ */
+
+.table,
+.table thead,
+.table tbody,
+.table tr,
+.table td,
+.table th {
+    background-color: var(--dark-surface) !important;
+    border-color: var(--dark-border) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+.table-hover tbody tr:hover > td,
+.table-hover tbody tr:hover > th {
+    background-color: var(--dark-bg-tertiary) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+/* ================================
+   BUTTON ACTIVE/FOCUS STATES
+   Bootstrap overrides active colors — repin to design system
+   ================================ */
+
+/* Primary — the ONLY solid-white button; everything else is an outlined variant */
+.btn-primary {
+    background-color: var(--mono-text-primary) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-0) !important;
+}
+
+.btn-primary:hover {
+    background-color: var(--mono-white) !important;
+    border-color: var(--mono-white) !important;
+    color: var(--mono-0) !important;
+}
+
+.btn-primary:active,
+.btn-primary:focus,
+.btn-primary.active {
+    background-color: var(--mono-white) !important;
+    border-color: var(--mono-white) !important;
+    color: var(--mono-0) !important;
+    box-shadow: 0 0 0 2px var(--mono-5) !important;
+}
+
+.btn-primary i,
+.btn-primary .fa,
+.btn-primary .fas,
+.btn-primary .far,
+.btn-primary .material-icons {
+    color: var(--mono-0) !important;
+}
+
+/* Danger / Success / Warning / Info — outlined chrome variants in the mono system */
+.btn-danger {
+    background-color: transparent !important;
+    border: 1px solid var(--mono-5) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-danger:hover {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-danger:active,
+.btn-danger:focus,
+.btn-danger.active {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-text-primary) !important;
+    box-shadow: var(--glow-accent) !important;
+}
+
+.btn-success {
+    background-color: var(--mono-3) !important;
+    border: 1px solid var(--mono-5) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-success:hover {
+    background-color: var(--mono-4) !important;
+    border-color: var(--mono-6) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-success:active,
+.btn-success:focus,
+.btn-success.active {
+    background-color: var(--mono-text-primary) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-0) !important;
+}
+
+.btn-warning {
+    background-color: transparent !important;
+    border: 1px dashed var(--mono-5) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-warning:hover {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-6) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-warning:active,
+.btn-warning:focus,
+.btn-warning.active {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-info {
+    background-color: var(--mono-2) !important;
+    border: 1px solid var(--mono-5) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-info:hover {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-6) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-info:active,
+.btn-info:focus,
+.btn-info.active {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-secondary,
+.btn-secondary:hover {
+    background-color: var(--dark-surface) !important;
+    border-color: var(--dark-border) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+.btn-secondary:active,
+.btn-secondary:focus,
+.btn-secondary.active {
+    background-color: var(--dark-bg-tertiary) !important;
+    border-color: var(--dark-border-light) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+.btn-light,
+.btn-light:hover {
+    background-color: var(--dark-bg-tertiary) !important;
+    border-color: var(--dark-border) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+.btn-light:active,
+.btn-light:focus,
+.btn-light.active {
+    background-color: var(--dark-surface) !important;
+    border-color: var(--dark-border-light) !important;
+}
+
+/* Outline buttons — neutral chrome, white outline on active */
+.btn-outline-primary,
+.btn-outline-danger,
+.btn-outline-success,
+.btn-outline-warning,
+.btn-outline-info {
+    background-color: transparent !important;
+    border: 1px solid var(--mono-5) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-outline-primary:hover,
+.btn-outline-danger:hover,
+.btn-outline-success:hover,
+.btn-outline-warning:hover,
+.btn-outline-info:hover {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.btn-outline-primary:active,
+.btn-outline-primary:focus,
+.btn-outline-primary.active,
+.btn-outline-danger:active,
+.btn-outline-danger:focus,
+.btn-outline-danger.active,
+.btn-outline-success:active,
+.btn-outline-success:focus,
+.btn-outline-success.active,
+.btn-outline-warning:active,
+.btn-outline-warning:focus,
+.btn-outline-warning.active,
+.btn-outline-info:active,
+.btn-outline-info:focus,
+.btn-outline-info.active {
+    background-color: var(--mono-3) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-text-primary) !important;
+    box-shadow: var(--glow-accent) !important;
+}
+
+/* ================================
+   TOGGLE SWITCHES (preserved motion)
+   ================================ */
+
+.model-toggle-slider,
+.toggle-slider {
+    transition: background-color 0.2s ease !important;
+}
+
+.model-toggle-slider::before,
+.toggle-slider::before {
+    transition: transform 0.2s ease !important;
+    transform: translateX(0) !important;
+}
+
+input:checked + .model-toggle-slider,
+input:checked + .toggle-slider {
+    background-color: var(--mono-text-primary) !important;
+}
+
+input:checked + .model-toggle-slider::before,
+input:checked + .toggle-slider::before {
+    background-color: var(--mono-0) !important;
+}
+
+input:checked + .model-toggle-slider::before,
+input:checked + .toggle-slider::before {
+    transform: translateX(24px) !important;
+}
+
+/* ================================
+   SEARCH HIGHLIGHT (single definition)
+   ================================ */
+
+.search-highlight {
+    background-color: var(--mono-text-primary) !important;
+    color: var(--mono-0) !important;
+    padding: 0.1rem 0.25rem;
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+}
+
+/* ================================
+   TOASTS
+   ================================ */
+
+.toast {
+    background-color: var(--dark-surface) !important;
+    border: 1px solid var(--dark-border) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+.toast-header {
+    background-color: var(--dark-bg-secondary) !important;
+    border-bottom: 1px solid var(--dark-border) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+.toast-body {
+    color: var(--dark-text-secondary) !important;
+}
+
+/* ================================
+   SCROLLBAR
+   ================================ */
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--dark-bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--dark-border-light); border-radius: var(--radius-full); }
+::-webkit-scrollbar-thumb:hover { background: var(--dark-border-strong); }
+
+/* ================================
+   ICON FONT OVERRIDES
+   Must come last to survive any inherited font-family from body/typography rules
+   ================================ */
+
+.fa, .fas, .far, .fal, .fab,
+.fa-solid, .fa-regular, .fa-light, .fa-brands,
+i.fa, i.fas, i.far, i.fal, i.fab,
+[class*="fa-"] {
+    font-family: "Font Awesome 6 Free", "Font Awesome 6 Brands", "Font Awesome 5 Free", "Font Awesome 5 Brands", "FontAwesome" !important;
+}
+
+.material-icons,
+i.material-icons,
+.brand-icon {
+    font-family: "Material Icons" !important;
+}
+
+.brand-icon {
+    color: var(--dark-text-primary) !important;
+}

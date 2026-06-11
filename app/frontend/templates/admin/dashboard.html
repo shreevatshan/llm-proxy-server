@@ -1,0 +1,562 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block extra_css %}{% endblock %}
+
+{% block content %}
+<!-- Admin Dashboard Header -->
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+        <h1 class="h2 mb-0">Admin Dashboard</h1>
+        <p class="text-muted mb-0">Welcome, {{ admin.username }}</p>
+    </div>
+</div>
+
+
+<!-- Tab Navigation -->
+<div class="tab-navigation">
+    <button class="tab-button active" onclick="showTab('users')">
+        <i class="fas fa-users"></i> User Management
+    </button>
+    <button class="tab-button" onclick="showTab('providers')">
+        <i class="fas fa-server"></i> Provider & Model Management
+    </button>
+    <button class="tab-button" onclick="showTab('requests')">
+        <i class="fas fa-satellite-dish"></i> Active Requests
+    </button>
+    <button class="tab-button" onclick="showTab('usage')">
+        <i class="fas fa-chart-bar"></i> Usage
+    </button>
+    <button class="tab-button" onclick="showTab('rate-limits')">
+        <i class="fas fa-tachometer-alt"></i> Rate Limits
+    </button>
+</div>
+
+<!-- Users Management Section -->
+<div class="section tab-content" id="users-tab">
+    <!-- User Stats -->
+    <div class="dashboard-stats mb-4">
+        <div class="stat-card">
+            <div class="stat-number">{{ users|length }}</div>
+            <div class="stat-label">Total Users</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ users|selectattr("is_active")|list|length }}</div>
+            <div class="stat-label">Active Users</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number">{{ users|selectattr("is_pending_approval")|list|length }}</div>
+            <div class="stat-label">Pending Approval</div>
+        </div>
+    </div>
+    
+    <div class="section-header">
+        <h2 class="section-title">User Management</h2>
+    </div>
+    
+    {% if users %}
+    <div class="table-responsive">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>Username</th>
+                    <th>Email</th>
+                    <th>Auth Type</th>
+                    <th>Created</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for user in users %}
+                <tr>
+                    <td>{{ user.id }}</td>
+                    <td>{{ user.username }}</td>
+                    <td>{{ user.email }}</td>
+                    <td>
+                        {% if user.oauth_provider %}
+                            <span class="badge bg-secondary">OAuth</span>
+                        {% else %}
+                            <span class="badge bg-secondary">Password</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ user.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>
+                        {% if user.is_pending_approval %}
+                            <span class="status-badge status-pending">Pending</span>
+                        {% elif user.is_active %}
+                            <span class="status-badge status-active">Active</span>
+                        {% else %}
+                            <span class="status-badge status-inactive">Inactive</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <div class="actions">
+                            {% if user.is_pending_approval %}
+                                <button class="btn btn-primary btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="approveUser(this)">Approve</button>
+                            {% elif user.is_active %}
+                                <button class="btn btn-danger btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="deactivateUser(this)">Deactivate</button>
+                            {% else %}
+                                <button class="btn btn-success btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="activateUser(this)">Activate</button>
+                            {% endif %}
+                            <button class="btn btn-danger btn-sm btn-remove" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="removeUser(this)">Remove</button>
+                            {% if not user.oauth_provider %}
+                                <button class="btn btn-warning btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="resetPassword(this)">Reset Password</button>
+                            {% endif %}
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty-state">
+        <div class="empty-state-icon">👥</div>
+        <h3>No Users Found</h3>
+        <p>No users have been created yet.</p>
+    </div>
+    {% endif %}
+</div>
+
+<!-- Unified Provider & Model Management Section -->
+<div class="section tab-content" id="providers-tab" style="display: none;">
+    <!-- Provider/Model Stats -->
+    <div class="dashboard-stats mb-4">
+        <div class="stat-card" id="provider-stats">
+            <div class="stat-number" id="enabled-providers">-</div>
+            <div class="stat-label">Active Providers</div>
+        </div>
+        <div class="stat-card" id="model-stats">
+            <div class="stat-number" id="enabled-models">-</div>
+            <div class="stat-label">Enabled Models</div>
+        </div>
+    </div>
+    
+    <div class="section-header">
+        <div class="d-flex align-items-center gap-2">
+            <h2 class="section-title mb-0">Provider & Model Management</h2>
+            <a href="/admin/models/search" class="btn btn-outline-primary btn-sm" title="Search Providers & Models">
+                <i class="fas fa-search"></i>
+            </a>
+        </div>
+        <div class="section-actions">
+            <button class="btn btn-primary btn-sm tip" aria-label="Add Provider" onclick="showAddProviderForm()">
+                <i class="fas fa-plus"></i>
+            </button>
+            <button class="btn btn-outline-secondary btn-sm tip" aria-label="Sync Models" onclick="syncModels()">
+                <i class="fas fa-sync"></i>
+            </button>
+            <button class="btn btn-outline-secondary btn-sm tip" aria-label="Export Config" onclick="exportProviderConfig()">
+                <i class="fas fa-download"></i>
+            </button>
+            <button class="btn btn-outline-secondary btn-sm tip" aria-label="Import Config" onclick="document.getElementById('import-file-input').click()">
+                <i class="fas fa-upload"></i>
+            </button>
+            <input type="file" id="import-file-input" accept=".json" style="display:none" onchange="importProviderConfig(this)">
+            <button class="btn btn-danger btn-sm tip" aria-label="Reinit System" onclick="reinitSystem()">
+                <i class="fas fa-power-off"></i>
+            </button>
+            <button class="btn btn-secondary btn-sm tip" aria-label="Enable All" onclick="bulkToggle('enable_all')">
+                <i class="fas fa-check-circle"></i>
+            </button>
+            <button class="btn btn-danger btn-sm tip" aria-label="Disable All" onclick="bulkToggle('disable_all')">
+                <i class="fas fa-times-circle"></i>
+            </button>
+        </div>
+    </div>
+
+    <!-- Loading State -->
+    <div id="providers-loading" class="loading-state" aria-busy="true" aria-label="Loading providers">
+        <div class="skeleton-stack">
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+        </div>
+    </div>
+
+    <!-- Provider Form -->
+    <div id="provider-form-container" class="mb-4" style="display: none;">
+        <div class="card">
+            <div class="card-header">
+                <div class="d-flex justify-content-between align-items-center">
+                    <div class="d-flex align-items-center">
+                        <i class="fas fa-plus-circle text-primary me-2"></i>
+                        <h3 id="form-title" class="card-title mb-0">Add Provider</h3>
+                    </div>
+                    <button class="btn btn-sm btn-outline-secondary" onclick="cancelProviderForm()" title="Cancel">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+            </div>
+            
+            <form id="provider-form">
+                <div class="card-body">
+                    <!-- Form Alerts -->
+                    <div id="form-alerts" class="form-alerts"></div>
+                    
+                    <!-- Basic Information Section -->
+                    <div class="mb-4">
+                        <h5><i class="fas fa-info-circle text-primary"></i> Basic Information</h5>
+                        <p class="text-muted small">Configure the basic provider settings</p>
+                        
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label for="provider_type" class="form-label">
+                                        <i class="fas fa-server"></i> 
+                                        Provider Type
+                                        <span class="text-danger">*</span>
+                                    </label>
+                                    <select id="provider_type" class="form-select" onchange="updateProviderForm()" required>
+                                        <option value="">Choose a provider type...</option>
+                                        <option value="azure">Azure</option>
+                                        <option value="google">Google AI</option>
+                                        <option value="bedrock">AWS Bedrock</option>
+                                        <option value="custom">Custom</option>
+                                    </select>
+                                    <div class="form-text">Select the AI provider you want to configure</div>
+                                </div>
+                            </div>
+                            
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label for="instance_name" class="form-label">
+                                        <i class="fas fa-tag"></i> 
+                                        Instance Name
+                                        <span class="text-danger">*</span>
+                                    </label>
+                                    <input type="text" id="instance_name" class="form-control" 
+                                           placeholder="e.g., primary, backup, production" 
+                                           required autocomplete="off">
+                                    <div class="form-text">A unique name to identify this provider instance</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Provider-specific Configuration -->
+                    <div id="provider-config-section" class="mb-4" style="display: none;">
+                        <h5><i class="fas fa-cogs text-primary"></i> Provider Configuration</h5>
+                        <p class="text-muted small">Configure provider-specific settings</p>
+                        <div id="provider-specific-fields" class="provider-fields">
+                            <!-- Provider-specific fields will be populated here -->
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="card-footer">
+                    <div class="d-flex justify-content-end gap-2">
+                        <button type="button" class="btn btn-secondary" onclick="cancelProviderForm()">
+                            <i class="fas fa-times"></i> Cancel
+                        </button>
+                        <button type="submit" class="btn btn-primary" id="submit-btn">
+                            <span class="btn-content">
+                                <i class="fas fa-save"></i> 
+                                <span id="submit-text">Create Provider</span>
+                            </span>
+                            <div class="btn-loading d-none">
+                                <i class="fas fa-spinner fa-spin"></i>
+                                <span>Saving...</span>
+                            </div>
+                        </button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Unified Provider & Model List -->
+    <div id="providers-list" style="display: none;">
+        <!-- Will be populated by JavaScript with unified provider cards -->
+    </div>
+
+    <!-- Search Results -->
+    <div id="search-results" style="display: none;">
+        <!-- Will be populated by JavaScript -->
+    </div>
+
+    <!-- Empty State -->
+    <div id="providers-empty" class="empty-state" style="display: none;">
+        <div class="empty-state-icon">🔌</div>
+        <h3>No Providers Configured</h3>
+        <p>Click "Add Provider" to configure your first provider.</p>
+    </div>
+</div>
+
+<!-- Active Requests Section -->
+<div class="section tab-content" id="requests-tab" style="display: none;">
+    <div class="dashboard-stats mb-4">
+        <div class="stat-card">
+            <div class="stat-number" id="total-active-requests">0</div>
+            <div class="stat-label">Total Active</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="openai-active-requests">0</div>
+            <div class="stat-label">OpenAI Server</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="anthropic-active-requests">0</div>
+            <div class="stat-label">Anthropic Server</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="azure-active-requests">0</div>
+            <div class="stat-label">Azure Server</div>
+        </div>
+    </div>
+
+    <div class="section-header">
+        <h2 class="section-title">Active Requests</h2>
+        <div class="d-flex align-items-center gap-2">
+            <span id="sse-connection-status" class="status-badge status-inactive">
+                <i class="fas fa-circle"></i> Disconnected
+            </span>
+        </div>
+    </div>
+
+    <div class="table-responsive">
+        <table class="table table-hover mb-0" id="active-requests-table" style="display: none;">
+            <thead>
+                <tr>
+                    <th>Server</th>
+                    <th>Endpoint</th>
+                    <th>Model</th>
+                    <th>User</th>
+                    <th>Type</th>
+                    <th>Duration</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody id="active-requests-body">
+            </tbody>
+        </table>
+    </div>
+
+    <div id="requests-empty" class="empty-state">
+        <div class="empty-state-icon"><i class="fas fa-check-circle"></i></div>
+        <h3>No Active Requests</h3>
+        <p>All quiet. Requests will appear here in real-time as they come in.</p>
+    </div>
+</div>
+
+<!-- Usage Section -->
+<div class="section tab-content" id="usage-tab" style="display: none;">
+    <div class="dashboard-stats mb-4">
+        <div class="stat-card">
+            <div class="stat-number" id="usage-total-requests">-</div>
+            <div class="stat-label">Total Requests</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="usage-unique-users">-</div>
+            <div class="stat-label">Unique Users</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="usage-unique-models">-</div>
+            <div class="stat-label">Models Used</div>
+        </div>
+    </div>
+
+    <div class="section-header">
+        <div class="d-flex align-items-center gap-3 flex-wrap w-100">
+            <div id="usage-toggle" class="btn-group" role="group" aria-label="View toggle">
+                <button type="button" class="btn btn-secondary btn-sm" id="usage-toggle-user" onclick="window.UsageManager?.setView('user')">By User</button>
+                <button type="button" class="btn btn-secondary btn-sm" id="usage-toggle-model" onclick="window.UsageManager?.setView('model')">By Model</button>
+            </div>
+            <button type="button" class="btn btn-outline-secondary btn-sm" id="usage-back" style="display:none;" onclick="window.UsageManager?.back()">
+                <i class="fas fa-arrow-left"></i> Back
+            </button>
+            <span class="text-muted small ms-auto">Data shown since <span id="usage-since">—</span></span>
+        </div>
+    </div>
+
+    <div id="usage-table-container">
+        <div class="empty-state" id="usage-empty">
+            <div class="empty-state-icon"><i class="fas fa-chart-bar"></i></div>
+            <h3>No Usage Data</h3>
+            <p>Usage data will appear here once requests are made.</p>
+        </div>
+    </div>
+</div>
+
+<!-- Rate Limits Section -->
+<div class="section tab-content" id="rate-limits-tab" style="display: none;">
+    <!-- Global Defaults Card -->
+    <div class="card mb-4">
+        <div class="card-header d-flex align-items-center justify-content-between">
+            <h5 class="mb-0"><i class="fas fa-globe me-2"></i>Global Defaults</h5>
+            <button class="btn btn-primary btn-sm" onclick="window.RateLimitManager?.saveDefaults()">
+                <i class="fas fa-save me-1"></i>Save
+            </button>
+        </div>
+        <div class="card-body">
+            <p class="text-muted small mb-3">Applies to all users without a per-user override. Leave empty for no limit.</p>
+            <div class="row g-3">
+                <div class="col-md-4">
+                    <label class="form-label">Requests per Minute (RPM)</label>
+                    <input type="number" id="rl-default-rpm" class="form-control" min="0" placeholder="Unlimited">
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Requests per Day (RPD)</label>
+                    <input type="number" id="rl-default-rpd" class="form-control" min="0" placeholder="Unlimited">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Per-User Limits Card -->
+    <div class="card">
+        <div class="card-header d-flex align-items-center justify-content-between">
+            <h5 class="mb-0"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
+            <button class="btn btn-outline-secondary btn-sm" onclick="window.RateLimitManager?.load()">
+                <i class="fas fa-sync-alt me-1"></i>Refresh
+            </button>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>User</th>
+                            <th>RPM Limit</th>
+                            <th>RPD Limit</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="rate-limits-tbody">
+                        <tr><td colspan="4" class="text-center text-muted py-4">Loading…</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Toast Notification Container -->
+<div id="toast-container" class="toast-container">
+    <!-- Toast notifications will be inserted here -->
+</div>
+
+<!-- Confirmation Modal -->
+<div class="modal fade" id="confirmModal" tabindex="-1" aria-labelledby="confirmModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="confirmModalLabel">
+                    <i class="fas fa-exclamation-triangle text-warning me-2"></i>
+                    <span id="confirmModalTitle">Confirm Action</span>
+                </h5>
+            </div>
+            <div class="modal-body">
+                <p id="confirmModalMessage">Are you sure you want to proceed?</p>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="confirmCancelBtn">
+                    <i class="fas fa-times me-1"></i>
+                    Cancel
+                </button>
+                <button type="button" class="btn btn-danger" id="confirmActionBtn">
+                    <i class="fas fa-check me-1"></i>
+                    Confirm
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Password Reset Modal -->
+<div class="modal fade" id="passwordResetModal" tabindex="-1" aria-labelledby="passwordResetModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="passwordResetModalLabel">
+                    <i class="fas fa-key text-warning me-2"></i>
+                    Reset Password
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-3">Enter new password for user: <strong id="passwordResetUsername"></strong></p>
+                <div class="mb-3">
+                    <label for="newPasswordInput" class="form-label">New Password</label>
+                    <input type="password" class="form-control" id="newPasswordInput" placeholder="Minimum 6 characters" autocomplete="new-password">
+                    <div class="form-text">Password must be at least 6 characters long</div>
+                </div>
+                <div class="mb-3">
+                    <label for="confirmPasswordInput" class="form-label">Confirm Password</label>
+                    <input type="password" class="form-control" id="confirmPasswordInput" placeholder="Re-enter password" autocomplete="new-password">
+                </div>
+                <div id="passwordResetError" class="alert alert-danger d-none" role="alert"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="fas fa-times me-1"></i>
+                    Cancel
+                </button>
+                <button type="button" class="btn btn-warning" id="passwordResetConfirmBtn">
+                    <i class="fas fa-key me-1"></i>
+                    Reset Password
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+<!-- Import Config Modal -->
+<div class="modal fade" id="importConfigModal" tabindex="-1" aria-labelledby="importConfigModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="importConfigModalLabel">
+                    <i class="fas fa-upload text-primary me-2"></i>
+                    Import Provider Config
+                </h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p class="mb-3">File: <strong id="importFileName"></strong></p>
+                <div class="form-check mb-2">
+                    <input class="form-check-input" type="checkbox" id="importOverwrite">
+                    <label class="form-check-label" for="importOverwrite">
+                        Overwrite existing providers
+                    </label>
+                    <div class="form-text">When unchecked, providers that already exist will be skipped.</div>
+                </div>
+                <div class="form-check mb-3">
+                    <input class="form-check-input" type="checkbox" id="importSyncModels" checked>
+                    <label class="form-check-label" for="importSyncModels">
+                        Sync models after import
+                    </label>
+                    <div class="form-text">Fetch available models from each imported provider.</div>
+                </div>
+                <div id="importResultAlert" class="alert d-none" role="alert"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="fas fa-times me-1"></i> Cancel
+                </button>
+                <button type="button" class="btn btn-primary" id="importConfirmBtn" onclick="confirmImport()">
+                    <span class="btn-content"><i class="fas fa-upload me-1"></i> Import</span>
+                    <span class="btn-loading d-none"><i class="fas fa-spinner fa-spin me-1"></i> Importing...</span>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% block extra_js %}
+<!-- Modular JavaScript files -->
+<script src="/static/js/core/ui-utils.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/provider-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/provider-forms.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/model-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/search-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/azure-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/tracking/user-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/tracking/request-tracker.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/tracking/usage-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/rate-limit-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/admin-dashboard.js?v={{ cache_version }}"></script>
+{% endblock %}

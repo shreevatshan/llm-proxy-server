@@ -1,0 +1,210 @@
+/* LLM Proxy Server - Accessibility Features */
+/* Accessibility-focused styles and enhancements */
+
+/* ================================
+   FOCUS MANAGEMENT
+   ================================ */
+
+/* Enhanced focus styles for better accessibility */
+.btn:focus-visible,
+.form-control:focus-visible,
+.form-select:focus-visible {
+    outline: 2px solid var(--primary-500);
+    outline-offset: 2px;
+    box-shadow: var(--glow-accent);
+}
+
+/* General focus-visible for interactive elements */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+    outline: 2px solid var(--primary-500);
+    outline-offset: 2px;
+}
+
+/* ================================
+   SKIP NAVIGATION
+   ================================ */
+
+/* Skip to content link for screen readers and keyboard navigation */
+.skip-link {
+    position: absolute;
+    top: -40px;
+    left: 6px;
+    background: var(--primary-500);
+    color: var(--text-white);
+    padding: 8px;
+    text-decoration: none;
+    z-index: 100;
+    border-radius: var(--radius-md);
+    font-weight: var(--font-medium);
+    transition: var(--transition-all);
+}
+
+.skip-link:focus {
+    top: 6px;
+    outline: 2px solid var(--text-white);
+    outline-offset: 2px;
+}
+
+/* ================================
+   HIGH CONTRAST MODE SUPPORT
+   ================================ */
+
+@media (prefers-contrast: high) {
+    :root {
+        --border-color: var(--gray-800);
+        --border-light: var(--gray-700);
+    }
+    
+    .card,
+    .form-control,
+    .form-select,
+    .btn {
+        border-width: 2px;
+        border-color: var(--text-primary);
+    }
+    
+    .btn:hover {
+        border-width: 3px;
+    }
+    
+    /* Increase contrast for text elements */
+    .text-muted {
+        color: var(--text-secondary) !important;
+    }
+}
+
+/* ================================
+   REDUCED MOTION SUPPORT
+   ================================ */
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* ================================
+   SCREEN READER UTILITIES
+   ================================ */
+
+/* Visually hidden but accessible to screen readers */
+.sr-only {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    padding: 0 !important;
+    margin: -1px !important;
+    overflow: hidden !important;
+    clip: rect(0, 0, 0, 0) !important;
+    white-space: nowrap !important;
+    border: 0 !important;
+}
+
+/* Make focusable when navigated to via keyboard */
+.sr-only-focusable:focus {
+    position: static !important;
+    width: auto !important;
+    height: auto !important;
+    padding: inherit !important;
+    margin: inherit !important;
+    overflow: visible !important;
+    clip: auto !important;
+    white-space: normal !important;
+}
+
+/* ================================
+   ARIA ENHANCEMENTS
+   ================================ */
+
+/* Style elements based on ARIA states */
+[aria-disabled="true"] {
+    opacity: 0.6;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+/* Removed collapse icon rotation for flat design */
+
+[aria-hidden="true"] {
+    display: none !important;
+}
+
+/* Style invalid form elements */
+[aria-invalid="true"],
+.form-control:invalid {
+    border-color: var(--mono-text-primary);
+    box-shadow: 0 0 0 2px var(--accent-500-alpha);
+}
+
+/* ================================
+   COLOR ACCESSIBILITY
+   ================================ */
+
+/* Ensure adequate color contrast */
+.text-contrast-low {
+    color: var(--text-secondary);
+}
+
+.text-contrast-high {
+    color: var(--text-primary);
+    font-weight: var(--font-medium);
+}
+
+/* ================================
+   KEYBOARD NAVIGATION ENHANCEMENTS
+   ================================ */
+
+/* Enhance keyboard navigation visibility */
+.keyboard-navigation *:focus-visible {
+    outline: 2px solid var(--primary-500);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 4px var(--accent-500-alpha);
+}
+
+/* Style for elements that should be keyboard accessible */
+.keyboard-accessible {
+    cursor: pointer;
+    user-select: none;
+}
+
+.keyboard-accessible:focus-visible {
+    outline: 2px solid var(--primary-500);
+    outline-offset: 2px;
+}
+
+/* ================================
+   PRINT ACCESSIBILITY
+   ================================ */
+
+@media print {
+    /* Ensure good contrast and readability when printed */
+    * {
+        background: transparent !important;
+        color: black !important;
+        box-shadow: none !important;
+        text-shadow: none !important;
+    }
+    
+    a,
+    a:visited {
+        text-decoration: underline;
+    }
+    
+    a[href]:after {
+        content: " (" attr(href) ")";
+    }
+    
+    .btn {
+        border: 1px solid black;
+        padding: 0.25rem 0.5rem;
+    }
+}

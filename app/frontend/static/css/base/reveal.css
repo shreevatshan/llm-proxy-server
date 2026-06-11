@@ -1,0 +1,92 @@
+/* LLM Proxy Server - Page-load reveal + skeleton shimmer */
+
+/* ================================
+   STAGGERED PAGE-LOAD REVEAL
+   Apply .reveal-on-load to a container; its direct children fade up in sequence.
+   Set --i index per child via inline style if explicit ordering is needed.
+   ================================ */
+@keyframes revealUp {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.reveal-on-load > * {
+    opacity: 0;
+    animation: revealUp 0.5s ease forwards;
+    animation-delay: calc(var(--i, 0) * 60ms);
+}
+
+.reveal-on-load > *:nth-child(1)  { --i: 0; }
+.reveal-on-load > *:nth-child(2)  { --i: 1; }
+.reveal-on-load > *:nth-child(3)  { --i: 2; }
+.reveal-on-load > *:nth-child(4)  { --i: 3; }
+.reveal-on-load > *:nth-child(5)  { --i: 4; }
+.reveal-on-load > *:nth-child(6)  { --i: 5; }
+.reveal-on-load > *:nth-child(7)  { --i: 6; }
+.reveal-on-load > *:nth-child(8)  { --i: 7; }
+.reveal-on-load > *:nth-child(n+9){ --i: 8; }
+
+/* ================================
+   SKELETON SHIMMER
+   ================================ */
+@keyframes shimmerSweep {
+    0%   { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+}
+
+.skeleton {
+    display: block;
+    background-color: var(--mono-2);
+    background-image: linear-gradient(
+        90deg,
+        transparent 0,
+        rgba(255, 255, 255, 0.04) 50%,
+        transparent 100%
+    );
+    background-size: 200% 100%;
+    background-repeat: no-repeat;
+    border-radius: var(--radius-sm);
+    animation: shimmerSweep 1.4s linear infinite;
+}
+
+.skeleton-row {
+    height: 56px;
+    margin-bottom: var(--space-2);
+    border: 1px solid var(--mono-4);
+}
+
+.skeleton-line {
+    height: 12px;
+    margin-bottom: var(--space-2);
+}
+
+.skeleton-line--sm  { width: 30%; }
+.skeleton-line--md  { width: 60%; }
+.skeleton-line--lg  { width: 85%; }
+.skeleton-line--xl  { width: 100%; }
+
+.skeleton-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-3);
+    padding: var(--space-4) 0;
+}
+
+/* ================================
+   REDUCED MOTION
+   ================================ */
+@media (prefers-reduced-motion: reduce) {
+    .reveal-on-load > * {
+        opacity: 1;
+        animation: none;
+    }
+    .skeleton {
+        animation: none;
+    }
+}

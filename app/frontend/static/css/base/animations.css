@@ -1,0 +1,105 @@
+/* LLM Proxy Server - Animations & Transitions */
+/* Refined dark terminal — purposeful motion, respects prefers-reduced-motion */
+
+/* ================================
+   KEYFRAME DEFINITIONS
+   ================================ */
+
+@keyframes slideInDown {
+    from { opacity: 0; transform: translateY(-8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideInUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeIn {
+    from { opacity: 0; }
+    to   { opacity: 1; }
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.5; }
+}
+
+/* Toast slide-in */
+@keyframes toastSlideIn {
+    from { opacity: 0; transform: translateX(100%); }
+    to   { opacity: 1; transform: translateX(0); }
+}
+
+/* ================================
+   TRANSITION UTILITIES
+   ================================ */
+
+.transition-fast   { transition: var(--transition-fast); }
+.transition-base   { transition: var(--transition-base); }
+.transition-slow   { transition: var(--transition-slow); }
+.transition-colors { transition: var(--transition-colors); }
+.transition-all    { transition: var(--transition-all); }
+.transition-none   { transition: none; }
+
+/* ================================
+   HOVER UTILITIES (restored for refined terminal aesthetic)
+   ================================ */
+
+.hover-lift {
+    transition: var(--transition-transform);
+}
+.hover-lift:hover {
+    transform: translateY(-2px);
+}
+
+.hover-scale {
+    transition: transform 0.15s ease;
+}
+.hover-scale:hover {
+    transform: scale(1.02);
+}
+
+/* ================================
+   ANIMATION UTILITIES
+   ================================ */
+
+.animate-spin {
+    animation: spin 1s linear infinite;
+}
+.animate-pulse {
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+.animate-fade-in {
+    animation: fadeIn 0.2s ease forwards;
+}
+.animate-slide-in-up {
+    animation: slideInUp 0.2s ease forwards;
+}
+.animate-slide-in-down {
+    animation: slideInDown 0.2s ease forwards;
+}
+
+/* ================================
+   ACCESSIBILITY: Reduce Motion
+   ================================ */
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+
+    .hover-lift:hover,
+    .hover-scale:hover {
+        transform: none !important;
+    }
+}

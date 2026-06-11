@@ -1,0 +1,424 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Endpoints - {{ title }}{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/main.css?v={{ cache_version }}">
+<style>
+    .endpoint-section {
+        margin-bottom: 16px;
+    }
+    .base-url-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 16px;
+        background-color: var(--dark-surface);
+        border: 1px solid var(--dark-border);
+        border-radius: 6px;
+        transition: border-color 0.2s;
+    }
+    .base-url-card.expanded {
+        border-radius: 6px 6px 0 0;
+        border-bottom-color: transparent;
+    }
+    .base-url-left {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex: 1;
+        min-width: 0;
+    }
+    .base-url-right {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-shrink: 0;
+    }
+    .api-badge {
+        display: inline-block;
+        padding: 3px 10px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+        flex-shrink: 0;
+    }
+    .api-badge.openai,
+    .api-badge.anthropic,
+    .api-badge.azure_openai {
+        background-color: var(--mono-3);
+        color: var(--mono-text-primary);
+        border: 1px solid var(--mono-5);
+    }
+    .base-url-text {
+        font-family: var(--font-family-mono);
+        font-size: 14px;
+        color: var(--mono-text-primary);
+        word-break: break-all;
+    }
+    .copy-btn {
+        padding: 6px 14px;
+        background-color: transparent;
+        color: var(--mono-text-primary);
+        border: 1px solid var(--mono-5);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-size: 13px;
+        transition: all 0.2s;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        white-space: nowrap;
+        font-family: var(--font-family-mono);
+    }
+    .copy-btn:hover {
+        border-color: var(--mono-text-primary);
+        background-color: var(--mono-3);
+    }
+    .copy-btn.copied {
+        border-color: var(--mono-text-primary);
+        color: var(--mono-0);
+        background-color: var(--mono-text-primary);
+    }
+    .toggle-btn {
+        padding: 6px 10px;
+        background-color: transparent;
+        color: var(--mono-text-secondary);
+        border: 1px solid var(--mono-5);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-size: 13px;
+        transition: all 0.2s;
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        white-space: nowrap;
+    }
+    .toggle-btn:hover {
+        border-color: var(--mono-text-primary);
+        color: var(--mono-text-primary);
+        background-color: var(--mono-3);
+    }
+    .toggle-btn .chevron {
+        transition: transform 0.25s ease;
+        font-size: 11px;
+    }
+    .toggle-btn.open .chevron {
+        transform: rotate(180deg);
+    }
+    .endpoints-collapse {
+        max-height: 0;
+        overflow: hidden;
+        transition: max-height 0.3s ease;
+        border: 1px solid var(--dark-border);
+        border-top: none;
+        border-radius: 0 0 6px 6px;
+    }
+    .endpoints-collapse.show {
+        max-height: none;
+    }
+    .endpoints-collapse:not(.show) {
+        border-color: transparent;
+    }
+    .endpoint-list-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 16px;
+        background-color: var(--dark-surface);
+        border-top: 1px solid var(--dark-border);
+        transition: background-color 0.2s;
+        gap: 12px;
+    }
+    .endpoint-list-item:last-child {
+        border-radius: 0 0 6px 6px;
+    }
+    .endpoint-list-item:hover {
+        background-color: var(--mono-2);
+    }
+    .endpoint-info {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex: 1;
+        min-width: 0;
+    }
+    .endpoint-method {
+        display: inline-block;
+        padding: 2px 7px;
+        border-radius: 3px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+        flex-shrink: 0;
+        min-width: 46px;
+        text-align: center;
+    }
+    .endpoint-method,
+    .endpoint-method.get,
+    .endpoint-method.post,
+    .endpoint-method.put,
+    .endpoint-method.delete,
+    .endpoint-method.patch {
+        font-family: var(--font-family-mono);
+        letter-spacing: var(--tracking-wider);
+        background-color: transparent;
+        color: var(--mono-text-primary);
+        border: 1px solid var(--mono-5);
+    }
+    .endpoint-path {
+        font-size: 13px;
+        color: var(--mono-text-primary);
+        font-family: var(--font-family-mono);
+    }
+    .endpoint-desc {
+        font-size: 12px;
+        color: var(--mono-text-muted);
+        margin-left: auto;
+        flex-shrink: 0;
+        font-family: var(--font-family-mono);
+    }
+    .toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 9999;
+    }
+    .toast {
+        background-color: var(--mono-1);
+        color: var(--mono-text-primary);
+        padding: 12px 20px;
+        border-radius: var(--radius-sm);
+        margin-bottom: 10px;
+        border: 1px solid var(--mono-5);
+        border-left: 2px solid var(--mono-text-primary);
+        box-shadow: var(--shadow-lg);
+        animation: slideIn 0.3s ease-out;
+        font-family: var(--font-family-mono);
+    }
+    @keyframes slideIn {
+        from { transform: translateX(100%); opacity: 0; }
+        to { transform: translateX(0); opacity: 1; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Page Header -->
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+        <h1 class="h2 mb-0">Available Endpoints</h1>
+        <p class="text-muted mb-0">Copy a base URL to get started</p>
+    </div>
+    <div>
+        <a href="/dashboard" class="btn btn-secondary">
+            <i class="fas fa-arrow-left"></i> Back to Dashboard
+        </a>
+    </div>
+</div>
+
+<div class="section" style="background-color: transparent !important;">
+    <!-- OpenAI -->
+    <div class="endpoint-section">
+        <div class="base-url-card" id="openai-card">
+            <div class="base-url-left">
+                <span class="api-badge openai">OpenAI</span>
+                <span class="base-url-text" id="openai-base-url"></span>
+            </div>
+            <div class="base-url-right">
+                <button class="copy-btn" onclick="copyText(document.getElementById('openai-base-url').textContent, this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+                <button class="toggle-btn" onclick="toggleEndpoints('openai')" id="openai-toggle">
+                    <span class="chevron"><i class="fas fa-chevron-down"></i></span>
+                </button>
+            </div>
+        </div>
+        <div class="endpoints-collapse" id="openai-endpoints"></div>
+    </div>
+
+    <!-- Anthropic -->
+    <div class="endpoint-section">
+        <div class="base-url-card" id="anthropic-card">
+            <div class="base-url-left">
+                <span class="api-badge anthropic">Anthropic</span>
+                <span class="base-url-text" id="anthropic-base-url"></span>
+            </div>
+            <div class="base-url-right">
+                <button class="copy-btn" onclick="copyText(document.getElementById('anthropic-base-url').textContent, this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+                <button class="toggle-btn" onclick="toggleEndpoints('anthropic')" id="anthropic-toggle">
+                    <span class="chevron"><i class="fas fa-chevron-down"></i></span>
+                </button>
+            </div>
+        </div>
+        <div class="endpoints-collapse" id="anthropic-endpoints"></div>
+    </div>
+
+    <!-- Azure OpenAI -->
+    <div class="endpoint-section">
+        <div class="base-url-card" id="azure-openai-card">
+            <div class="base-url-left">
+                <span class="api-badge azure_openai">Azure OpenAI</span>
+                <span class="base-url-text" id="azure-openai-base-url"></span>
+            </div>
+            <div class="base-url-right">
+                <button class="copy-btn" onclick="copyText(document.getElementById('azure-openai-base-url').textContent, this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+                <button class="toggle-btn" onclick="toggleEndpoints('azure-openai')" id="azure-openai-toggle">
+                    <span class="chevron"><i class="fas fa-chevron-down"></i></span>
+                </button>
+            </div>
+        </div>
+        <div class="endpoints-collapse" id="azure-openai-endpoints"></div>
+    </div>
+</div>
+
+<!-- Toast Notification Container -->
+<div id="toast-container" class="toast-container"></div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    const domain = "{{ domain }}";
+    const openaiPort = "{{ openai_port }}";
+    const anthropicPort = "{{ anthropic_port }}";
+    const azureOpenaiPort = "{{ azure_openai_port }}";
+
+    const openaiBaseUrl = `http://${domain}:${openaiPort}/v1`;
+    const anthropicBaseUrl = `http://${domain}:${anthropicPort}`;
+    const azureOpenaiBaseUrl = `http://${domain}:${azureOpenaiPort}`;
+
+    const openaiEndpoints = {{ openai_endpoints_json | safe }};
+
+    const anthropicEndpoints = {{ anthropic_endpoints_json | safe }};
+
+    const azureOpenaiEndpoints = {{ azure_openai_endpoints_json | safe }};
+
+    function renderEndpoints(endpoints, containerId, baseUrl) {
+        const container = document.getElementById(containerId);
+        let html = '';
+        endpoints.forEach(ep => {
+            const fullUrl = baseUrl + ep.path;
+            html += `
+                <div class="endpoint-list-item">
+                    <div class="endpoint-info">
+                        <span class="endpoint-method ${ep.method.toLowerCase()}">${ep.method}</span>
+                        <span class="endpoint-path">${escapeHtml(ep.path)}</span>
+                        <span class="endpoint-desc">${escapeHtml(ep.desc)}</span>
+                    </div>
+                    <button class="copy-btn" data-url="${escapeHtml(fullUrl)}" onclick="copyText(this.getAttribute('data-url'), this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+            `;
+        });
+        container.innerHTML = html;
+    }
+
+    function toggleEndpoints(section) {
+        const container = document.getElementById(section + '-endpoints');
+        const toggle = document.getElementById(section + '-toggle');
+        const card = document.getElementById(section + '-card');
+        const isOpen = container.classList.contains('show');
+
+        if (isOpen) {
+            // Collapse: set explicit height first so transition works, then set to 0
+            container.style.maxHeight = container.scrollHeight + 'px';
+            requestAnimationFrame(() => {
+                container.style.maxHeight = '0';
+            });
+            container.classList.remove('show');
+            toggle.classList.remove('open');
+            card.classList.remove('expanded');
+        } else {
+            // Expand: animate to scrollHeight, then remove inline style so it adapts
+            container.classList.add('show');
+            container.style.maxHeight = container.scrollHeight + 'px';
+            toggle.classList.add('open');
+            card.classList.add('expanded');
+            container.addEventListener('transitionend', function handler() {
+                if (container.classList.contains('show')) {
+                    container.style.maxHeight = 'none';
+                }
+                container.removeEventListener('transitionend', handler);
+            });
+        }
+    }
+
+    function copyText(text, button) {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(text).then(() => {
+                showCopied(button, text);
+            }).catch(() => {
+                fallbackCopy(text, button);
+            });
+        } else {
+            fallbackCopy(text, button);
+        }
+    }
+
+    function fallbackCopy(text, button) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        if (ok) {
+            showCopied(button, text);
+        } else {
+            showToast('Failed to copy to clipboard', 'error');
+        }
+    }
+
+    function showCopied(button, text) {
+        const orig = button.innerHTML;
+        button.innerHTML = '<i class="fas fa-check"></i> Copied!';
+        button.classList.add('copied');
+        showToast(`Copied: ${text}`, 'success');
+        setTimeout(() => {
+            button.innerHTML = orig;
+            button.classList.remove('copied');
+        }, 2000);
+    }
+
+    function showToast(message, type = 'success') {
+        const container = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = 'toast';
+        if (type === 'error') {
+            toast.style.borderLeftColor = 'var(--mono-text-secondary)';
+            toast.style.borderLeftStyle = 'dashed';
+        }
+        toast.innerHTML = `<i class="fas fa-${type === 'error' ? 'exclamation-circle' : 'check-circle'}"></i> ${message}`;
+        container.appendChild(toast);
+        setTimeout(() => {
+            toast.style.animation = 'slideIn 0.3s ease-out reverse';
+            setTimeout(() => toast.remove(), 300);
+        }, 3000);
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        document.getElementById('openai-base-url').textContent = openaiBaseUrl;
+        document.getElementById('anthropic-base-url').textContent = anthropicBaseUrl;
+        document.getElementById('azure-openai-base-url').textContent = azureOpenaiBaseUrl;
+        renderEndpoints(openaiEndpoints, 'openai-endpoints', openaiBaseUrl);
+        renderEndpoints(anthropicEndpoints, 'anthropic-endpoints', anthropicBaseUrl);
+        renderEndpoints(azureOpenaiEndpoints, 'azure-openai-endpoints', azureOpenaiBaseUrl);
+    });
+</script>
+{% endblock %}

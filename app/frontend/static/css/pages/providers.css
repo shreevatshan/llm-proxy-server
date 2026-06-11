@@ -1,0 +1,384 @@
+/* Provider Tree Styles - Dark Flat Design */
+.provider-type-section {
+    margin-bottom: 1rem;
+}
+
+.provider-type-header {
+    background: var(--dark-surface);
+    padding: 1rem;
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    transition: none;
+    border: 1px solid var(--dark-border);
+}
+
+.provider-type-header:hover {
+    background: var(--dark-bg-secondary);
+}
+
+.provider-type-icon {
+    transition: none;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.provider-type-header h3 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.provider-count {
+    margin-left: auto;
+    background: var(--mono-4);
+    color: var(--mono-text-secondary);
+    border: 1px solid var(--mono-5);
+    padding: 0.25rem 0.5rem;
+    border-radius: 12px;
+    font-size: 0.8rem;
+    font-family: var(--font-family-mono);
+}
+
+.provider-type-content {
+    margin-top: 0.5rem;
+    margin-left: 1rem;
+}
+
+.provider-item {
+    background: var(--dark-surface);
+    border: 1px solid var(--dark-border);
+    border-radius: var(--border-radius);
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+}
+
+.provider-item.disabled {
+    opacity: 0.6;
+}
+
+.provider-header {
+    padding: 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    transition: none;
+}
+
+.provider-header:hover {
+    background: var(--dark-bg-secondary);
+}
+
+.provider-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 100%;
+}
+
+.provider-info .provider-title {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0;
+    line-height: 1.2;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.provider-info .provider-status {
+    font-size: 0.9rem;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+    line-height: 1.2;
+    color: var(--dark-text-secondary);
+    font-family: var(--font-family-mono);
+}
+
+.provider-info .provider-stats {
+    font-size: 0.85rem;
+    color: var(--dark-text-muted);
+    font-family: var(--font-family-mono);
+    margin: 0;
+    line-height: 1.2;
+}
+
+/* Removed provider-icon transition for flat design */
+
+.provider-status {
+    font-size: 1.2rem;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.model-count {
+    color: var(--dark-text-muted);
+    font-size: 0.9rem;
+    margin-left: 0.5rem;
+    font-family: var(--font-family-mono);
+}
+
+.provider-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-shrink: 0;
+    height: fit-content;
+    align-self: center;
+}
+
+/* Provider Models Styles */
+.provider-models {
+    border-top: 1px solid var(--dark-border);
+    background: var(--dark-surface);
+}
+
+.loading-models {
+    padding: 1rem;
+    text-align: center;
+    color: var(--dark-text-muted);
+    font-family: var(--font-family-mono);
+}
+
+.model-item {
+    padding: 0.75rem 1rem;
+    background: var(--dark-surface);
+    border-bottom: 1px solid var(--dark-border);
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.model-item:last-child {
+    border-bottom: none;
+}
+
+.model-item.disabled {
+    opacity: 0.6;
+    background: var(--dark-tertiary);
+}
+
+.model-info {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.model-status {
+    font-size: 1rem;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.model-name {
+    font-weight: 500;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.provider-key {
+    color: var(--dark-text-muted);
+    font-size: 0.85rem;
+    margin-left: 0.5rem;
+    font-family: var(--font-family-mono);
+}
+
+.model-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+/* Provider Cards Styles */
+.provider-card {
+    background: var(--dark-surface);
+    border-radius: 0;
+    margin-bottom: 1rem;
+    border: 1px solid var(--dark-border);
+    overflow: hidden;
+}
+
+.provider-card.disabled {
+    opacity: 0.7;
+    background: var(--dark-tertiary);
+}
+
+.provider-card-header {
+    padding: 1.5rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: stretch;
+    border-bottom: 1px solid var(--dark-border);
+    min-height: 5rem;
+    background: var(--dark-surface);
+}
+
+.provider-info .provider-title h4 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+    line-height: 1.3;
+}
+
+.provider-type-badge {
+    background: var(--dark-secondary);
+    color: var(--dark-text-primary);
+    padding: 0.25rem 0.5rem;
+    border-radius: 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-family: var(--font-family-mono);
+}
+
+.provider-details {
+    padding: 1rem 1.5rem;
+    background: var(--dark-surface);
+    border-top: 1px solid var(--dark-border);
+}
+
+.provider-details p {
+    margin: 0.5rem 0;
+    font-size: 0.9rem;
+    color: var(--dark-text-secondary);
+    font-family: var(--font-family-mono);
+}
+
+.provider-details strong {
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+/* Unified Provider Card Styles */
+.unified-provider-card {
+    background: var(--dark-surface);
+    border-radius: 0;
+    margin-bottom: 1rem;
+    border: 1px solid var(--dark-border);
+    overflow: hidden;
+}
+
+.unified-provider-card.disabled {
+    opacity: 0.7;
+    background: var(--dark-tertiary);
+}
+
+/* Provider Card Header - Fixed alignment and structure */
+.unified-provider-card .provider-card-header {
+    padding: 1.5rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: stretch;
+    border-bottom: 1px solid var(--dark-border);
+    min-height: 5rem;
+    background: var(--dark-surface);
+}
+
+.unified-provider-card .provider-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.4rem;
+    min-height: 100%;
+}
+
+.unified-provider-card .provider-title {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0;
+    line-height: 1.2;
+}
+
+.unified-provider-card .provider-title h4 {
+    margin: 0;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+    line-height: 1.3;
+}
+
+.unified-provider-card .provider-type-badge {
+    background: var(--dark-secondary);
+    color: var(--dark-text-primary);
+    padding: 0.25rem 0.5rem;
+    border-radius: 12px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    white-space: nowrap;
+    flex-shrink: 0;
+    font-family: var(--font-family-mono);
+}
+
+.unified-provider-card .provider-status {
+    font-size: 0.9rem;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0;
+    line-height: 1.2;
+    color: var(--dark-text-secondary);
+    font-family: var(--font-family-mono);
+}
+
+.unified-provider-card .provider-stats {
+    font-size: 0.85rem;
+    color: var(--dark-text-muted);
+    margin: 0;
+    line-height: 1.2;
+    font-family: var(--font-family-mono);
+}
+
+.unified-provider-card .provider-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-shrink: 0;
+    height: fit-content;
+    align-self: center;
+}
+
+.unified-provider-card .model-stats {
+    font-weight: 500;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.unified-provider-card .provider-expand {
+    padding: 0.75rem 1.5rem;
+    background: var(--dark-surface);
+    border-top: 1px solid var(--dark-border);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    color: var(--dark-text-secondary);
+    font-family: var(--font-family-mono);
+}
+
+.unified-provider-card .provider-expand:hover {
+    background: var(--dark-tertiary);
+    color: var(--dark-text-primary);
+}

@@ -1,0 +1,196 @@
+/* LLM Proxy Server - Design Tokens */
+/* Refined dark monochrome — pure grayscale, single source of truth */
+:root {
+    /* ================================
+       MONOCHROME SURFACE STACK
+       ================================ */
+    --mono-0: #0d0d0d;   /* page bg */
+    --mono-1: #141414;   /* card bg */
+    --mono-2: #1a1a1a;   /* surface bg */
+    --mono-3: #1f1f1f;   /* elevated surface */
+    --mono-4: #2a2a2a;   /* hairline / track */
+    --mono-5: #3a3a3a;   /* strong border */
+    --mono-6: #555555;   /* divider on hover */
+
+    /* Text */
+    --mono-text-primary:   #fafafa;
+    --mono-text-secondary: #b8b8b8;
+    --mono-text-muted:     #876580;
+    --mono-text-inverse:   #0d0d0d;
+
+    /* Pure */
+    --mono-white: #ffffff;
+    --mono-black: #000000;
+
+    /* ================================
+       ACCENT (mono) — primary CTA, active, focus
+       ================================ */
+    --accent-500: #ffffff;
+    --accent-600: #e5e5e5;
+    --accent-500-alpha: rgba(255, 255, 255, 0.12);
+
+    /* Primary scale alias */
+    --primary-500: var(--accent-500);
+    --primary-600: var(--accent-600);
+
+    /* ================================
+       STATUS — neutralized to grayscale
+       (class names preserved; meaning carried by icons + shape)
+       ================================ */
+    --success-500: #fafafa;
+    --success-600: #e5e5e5;
+    --success-700: #cccccc;
+    --danger-500:  #a0a0a0;
+    --danger-600:  #888888;
+    --danger-700:  #6e6e6e;
+    --warning-500: #a0a0a0;
+    --warning-600: #888888;
+    --info-500:    #a0a0a0;
+    --info-600:    #888888;
+    --info-700:    #6e6e6e;
+
+    /* ================================
+       LEGACY ALIASES (repointed to mono stack)
+       ================================ */
+    --dark-bg-primary:   var(--mono-0);
+    --dark-bg-secondary: var(--mono-1);
+    --dark-bg-tertiary:  var(--mono-2);
+    --dark-surface:      var(--mono-1);
+    --dark-border:        var(--mono-4);
+    --dark-border-light:  var(--mono-5);
+    --dark-border-strong: var(--mono-6);
+    --dark-text-primary:   var(--mono-text-primary);
+    --dark-text-secondary: var(--mono-text-secondary);
+    --dark-text-muted:     var(--mono-text-muted);
+    --dark-secondary: var(--mono-1);
+    --dark-tertiary:  var(--mono-2);
+    --border-dark:    var(--mono-5);
+
+    --gray-700: #374151;
+    --gray-800: #1f2937;
+    --text-white: var(--mono-white);
+    --text-light: var(--mono-text-secondary);
+
+    /* ================================
+       THEME MAPPINGS (forced dark)
+       ================================ */
+    --text-primary: var(--mono-text-primary);
+    --text-secondary: var(--mono-text-secondary);
+    --text-muted: var(--mono-text-muted);
+    --bg-primary: var(--mono-0);
+    --bg-secondary: var(--mono-1);
+    --bg-tertiary: var(--mono-2);
+    --bg-white: var(--mono-1);
+    --border-color: var(--mono-4);
+    --border-light: var(--mono-5);
+
+    /* Legacy semantic aliases */
+    --primary-color: var(--accent-500);
+    --success-color: var(--mono-text-primary);
+    --danger-color:  var(--mono-text-secondary);
+    --warning-color: var(--mono-text-secondary);
+    --info-color:    var(--mono-text-secondary);
+
+    /* ================================
+       TYPOGRAPHY
+       ================================ */
+    --font-family-display: 'Space Grotesk', 'Geist', ui-sans-serif, system-ui, sans-serif;
+    --font-family-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, 'SF Mono', Monaco, 'Inconsolata', monospace;
+    --font-family-body: var(--font-family-mono);
+    --font-family: var(--font-family-mono);
+
+    --text-xs: 0.75rem;
+    --text-sm: 0.875rem;
+    --text-base: 1rem;
+    --text-lg: 1.125rem;
+    --text-xl: 1.25rem;
+    --text-2xl: 1.5rem;
+    --text-3xl: 1.875rem;
+    --text-4xl: 2.25rem;
+
+    --font-normal: 400;
+    --font-medium: 500;
+    --font-semibold: 600;
+    --font-bold: 700;
+
+    --leading-none: 1;
+    --leading-tight: 1.25;
+    --leading-snug: 1.375;
+    --leading-normal: 1.5;
+    --leading-relaxed: 1.625;
+    --leading-loose: 2;
+
+    /* Tracking — tight for display, neutral for body */
+    --tracking-tight: -0.02em;
+    --tracking-normal: 0;
+    --tracking-wide: 0.08em;
+    --tracking-wider: 0.16em;
+
+    /* ================================
+       SPACING
+       ================================ */
+    --space-0: 0;
+    --space-1: 0.25rem;
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-5: 1.25rem;
+    --space-6: 1.5rem;
+    --space-7: 1.75rem;
+    --space-8: 2rem;
+    --space-10: 2.5rem;
+    --space-12: 3rem;
+    --space-16: 4rem;
+    --space-20: 5rem;
+
+    /* ================================
+       BORDER RADIUS — tightened for sharp aesthetic
+       ================================ */
+    --radius-none: 0;
+    --radius-sm: 2px;
+    --radius-base: 2px;
+    --radius-md: 3px;
+    --radius-lg: 4px;
+    --radius-xl: 6px;
+    --radius-2xl: 8px;
+    --radius-full: 9999px;
+    --border-radius-pill: var(--radius-full);
+    --border-radius: var(--radius-md);
+    --border-radius-lg: var(--radius-lg);
+
+    /* ================================
+       SHADOWS — deepened for true black surfaces
+       ================================ */
+    --shadow-none: none;
+    --shadow-xs: 0 1px 0 rgba(0, 0, 0, 0.6);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.7);
+    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.7);
+    --shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.8);
+    --shadow-xl: 0 24px 48px rgba(0, 0, 0, 0.85);
+    --shadow-2xl: 0 32px 64px rgba(0, 0, 0, 0.9);
+    --shadow-material-1: var(--shadow-xs);
+    --shadow-material-2: var(--shadow-sm);
+    --shadow-material-3: var(--shadow-md);
+
+    /* Focus ring — solid white outline, no glow */
+    --glow-accent: 0 0 0 2px var(--mono-text-primary);
+
+    /* ================================
+       Z-INDEX
+       ================================ */
+    --z-10: 10;
+    --z-20: 20;
+    --z-50: 50;
+    --z-100: 100;
+    --z-1000: 1000;
+
+    /* ================================
+       TRANSITIONS
+       ================================ */
+    --transition-fast: all 0.15s ease;
+    --transition-base: all 0.2s ease;
+    --transition-slow: all 0.3s ease;
+    --transition-colors: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+    --transition-all: all 0.2s ease;
+    --transition-transform: transform 0.2s ease;
+}

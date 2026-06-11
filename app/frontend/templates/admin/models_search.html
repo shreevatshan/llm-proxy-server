@@ -1,0 +1,326 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Search - {{ title }}{% endblock %}
+
+{% block extra_css %}
+<style>
+    .model-list-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--dark-border);
+        transition: background-color 0.2s;
+        background-color: var(--dark-surface);
+    }
+    .model-list-item:hover {
+        background-color: var(--dark-border);
+    }
+    .model-list-item:last-child {
+        border-bottom: none;
+    }
+    .model-name {
+        font-size: 14px;
+        color: var(--dark-text-secondary);
+        flex: 1;
+        font-family: var(--font-family-mono);
+    }
+    .model-toggle-switch {
+        position: relative;
+        display: inline-block;
+        width: 48px;
+        height: 24px;
+        margin: 0;
+    }
+    .model-toggle-switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+    }
+    .model-toggle-slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: var(--dark-border-light);
+        transition: background-color 0.2s ease;
+        border-radius: 24px;
+    }
+    .model-toggle-slider:before {
+        position: absolute;
+        content: "";
+        height: 18px;
+        width: 18px;
+        left: 3px;
+        bottom: 3px;
+        background-color: var(--mono-white);
+        transition: transform 0.2s ease;
+        border-radius: 50%;
+    }
+    .model-toggle-switch input:checked + .model-toggle-slider {
+        background-color: var(--mono-text-primary);
+    }
+    .model-toggle-switch input:checked + .model-toggle-slider:before {
+        transform: translateX(24px);
+        background-color: var(--mono-0);
+    }
+    .search-stats {
+        padding: 12px 16px;
+        background-color: var(--dark-surface);
+        border-radius: var(--radius-md);
+        margin-bottom: 16px;
+        font-size: 14px;
+        color: var(--dark-text-secondary);
+        border: 1px solid var(--dark-border);
+    }
+    #model-list .card {
+        background-color: var(--dark-surface);
+        border: 1px solid var(--dark-border);
+    }
+    #model-list .card-body {
+        background-color: var(--dark-surface);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Search Page Header -->
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+        <h1 class="h2 mb-0">Model Management</h1>
+        <p class="text-muted mb-0">Search and manage all models</p>
+    </div>
+    <div>
+        <a href="/admin/dashboard" class="btn btn-secondary">
+            <i class="fas fa-arrow-left"></i> Back to Dashboard
+        </a>
+    </div>
+</div>
+
+<!-- Search Section -->
+<div class="section" style="background-color: transparent !important;">
+    <!-- Search Bar -->
+    <div class="search-container mb-4">
+        <input type="text" id="model-search" class="form-control form-control-lg" 
+               placeholder="Search models by name..." 
+               autofocus>
+        <i class="fas fa-search search-icon"></i>
+    </div>
+
+    <!-- Search Stats -->
+    <div id="search-stats" class="search-stats">
+        Loading models...
+    </div>
+
+    <!-- Loading State -->
+    <div id="search-loading" class="loading-state" style="display: none;" aria-busy="true">
+        <div class="skeleton-stack">
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+        </div>
+    </div>
+
+    <!-- Model List -->
+    <div id="model-list" class="card">
+        <div class="card-body" style="padding: 0;">
+            <!-- Models will be listed here -->
+        </div>
+    </div>
+</div>
+
+<!-- Toast Notification Container -->
+<div id="toast-container" class="toast-container">
+    <!-- Toast notifications will be inserted here -->
+</div>
+
+{% include 'components/_confirm_modal.html' %}
+{% endblock %}
+
+
+{% block extra_js %}
+<!-- Modular JavaScript files -->
+<script src="/static/js/core/ui-utils.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/model-manager.js?v={{ cache_version }}"></script>
+<script>
+    // Model Search Page
+    let allModels = [];
+    let filteredModels = [];
+
+    // Load all models on page load
+    async function loadAllModels() {
+        const loadingEl = document.getElementById('search-loading');
+        const statsEl = document.getElementById('search-stats');
+        
+        try {
+            loadingEl.style.display = 'block';
+            
+            // Fetch all providers first
+            const providersResponse = await fetch('/admin/providers', {
+                credentials: 'include'
+            });
+            
+            if (!providersResponse.ok) {
+                throw new Error('Failed to fetch providers');
+            }
+            
+            const providers = await providersResponse.json();
+            
+            // Fetch models for each provider
+            allModels = [];
+            for (const provider of providers) {
+                try {
+                    const modelsResponse = await fetch(`/admin/models/provider?provider_key=${encodeURIComponent(provider.provider_key)}`, {
+                        credentials: 'include'
+                    });
+                    
+                    if (modelsResponse.ok) {
+                        const models = await modelsResponse.json();
+                        allModels.push(...models);
+                    }
+                } catch (error) {
+                    console.warn(`Failed to load models for ${provider.provider_key}:`, error);
+                }
+            }
+            
+            // Sort models alphabetically by model_id (which contains the full name)
+            allModels.sort((a, b) => {
+                return a.model_id.toLowerCase().localeCompare(b.model_id.toLowerCase());
+            });
+            
+            // Display all models initially
+            filteredModels = [...allModels];
+            displayModels();
+            
+        } catch (error) {
+            console.error('Error loading models:', error);
+            if (window.UIUtils) {
+                window.UIUtils.showToast('Error loading models: ' + error.message, 'error');
+            }
+            statsEl.innerHTML = '<span class="text-danger">Error loading models</span>';
+        } finally {
+            loadingEl.style.display = 'none';
+        }
+    }
+
+    // Filter models based on search input
+    function filterModels() {
+        const searchInput = document.getElementById('model-search');
+        const searchTerm = searchInput.value.toLowerCase().trim();
+        
+        if (searchTerm === '') {
+            filteredModels = [...allModels];
+        } else {
+            filteredModels = allModels.filter(model => {
+                // Search in model_id which already contains the full name
+                return model.model_id.toLowerCase().includes(searchTerm);
+            });
+        }
+        
+        displayModels();
+    }
+
+    // Display the filtered models
+    function displayModels() {
+        const modelListEl = document.getElementById('model-list').querySelector('.card-body');
+        const statsEl = document.getElementById('search-stats');
+        
+        const enabledCount = filteredModels.filter(m => m.is_enabled).length;
+        const totalCount = filteredModels.length;
+        
+        statsEl.innerHTML = `Showing ${totalCount} model${totalCount !== 1 ? 's' : ''} | ${enabledCount} enabled | ${totalCount - enabledCount} disabled`;
+        
+        if (filteredModels.length === 0) {
+            modelListEl.innerHTML = `
+                <div class="text-center py-5 text-muted">
+                    <i class="fas fa-search fa-3x mb-3"></i>
+                    <p>No models found</p>
+                </div>
+            `;
+            return;
+        }
+        
+        let html = '';
+        filteredModels.forEach(model => {
+            // Use model_id directly - it already contains the full name (provider_key/model_name)
+            const fullModelName = model.model_id;
+            
+            html += `
+                <div class="model-list-item">
+                    <div class="model-name">${escapeHtml(fullModelName)}</div>
+                    <label class="model-toggle-switch">
+                        <input type="checkbox" 
+                               ${model.is_enabled ? 'checked' : ''} 
+                               onchange="toggleModel('${escapeHtml(model.model_id)}', this.checked, '${escapeHtml(model.provider_key)}')">
+                        <span class="model-toggle-slider"></span>
+                    </label>
+                </div>
+            `;
+        });
+        
+        modelListEl.innerHTML = html;
+    }
+
+    // Toggle model enabled/disabled
+    async function toggleModel(modelId, enabled, providerKey) {
+        try {
+            const response = await fetch(`/admin/models/toggle?model_id=${encodeURIComponent(modelId)}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                credentials: 'include',
+                body: JSON.stringify({
+                    enabled: enabled
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error('Failed to toggle model');
+            }
+
+            // Update the model in our local array
+            const model = allModels.find(m => m.model_id === modelId);
+            if (model) {
+                model.is_enabled = enabled;
+            }
+            
+            // Refresh the display to update counts
+            displayModels();
+
+            if (window.UIUtils) {
+                window.UIUtils.showToast(
+                    `Model ${enabled ? 'enabled' : 'disabled'} successfully`,
+                    'success'
+                );
+            }
+        } catch (error) {
+            console.error('Error toggling model:', error);
+            if (window.UIUtils) {
+                window.UIUtils.showToast('Error toggling model: ' + error.message, 'error');
+            }
+            // Reload models to restore correct state
+            await loadAllModels();
+        }
+    }
+
+    // Escape HTML to prevent XSS
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // Add event listener for search input
+    document.addEventListener('DOMContentLoaded', function() {
+        const searchInput = document.getElementById('model-search');
+        searchInput.addEventListener('input', filterModels);
+        
+        // Load all models on page load
+        loadAllModels();
+    });
+</script>
+{% endblock %}
+

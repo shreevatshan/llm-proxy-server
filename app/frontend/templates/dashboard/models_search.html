@@ -1,0 +1,428 @@
+{% extends "layouts/base.html" %}
+
+{% block title %}Models - {{ title }}{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="/static/css/main.css?v={{ cache_version }}">
+<style>
+    .model-list-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--dark-border);
+        transition: background-color 0.2s;
+        background-color: var(--dark-surface);
+        gap: 12px;
+    }
+    .model-list-item:hover {
+        background-color: var(--dark-border);
+    }
+    .model-list-item:last-child {
+        border-bottom: none;
+    }
+    .model-name {
+        font-size: 14px;
+        color: var(--mono-text-primary);
+        flex: 1;
+        font-family: var(--font-family-mono);
+        word-break: break-all;
+        overflow-wrap: break-word;
+        white-space: normal;
+        line-height: 1.5;
+    }
+    .model-info {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        flex: 1;
+        min-width: 0;
+    }
+    .api-badges {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+    }
+    .api-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 3px;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        text-transform: uppercase;
+    }
+    .api-badge.openai,
+    .api-badge.anthropic,
+    .api-badge.azure_openai {
+        background-color: var(--mono-3);
+        color: var(--mono-text-secondary);
+        border: 1px solid var(--mono-5);
+        font-family: var(--font-family-mono);
+    }
+    .copy-button {
+        padding: 6px 16px;
+        background-color: transparent;
+        color: var(--mono-text-primary);
+        border: 1px solid var(--mono-5);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        font-size: 13px;
+        transition: all 0.2s;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+        white-space: nowrap;
+        font-family: var(--font-family-mono);
+    }
+    .copy-button:hover {
+        border-color: var(--mono-text-primary);
+        background-color: var(--mono-3);
+    }
+    .copy-button.copied {
+        border-color: var(--mono-text-primary);
+        color: var(--mono-0);
+        background-color: var(--mono-text-primary);
+    }
+    .search-stats {
+        padding: 12px 16px;
+        background-color: var(--dark-surface);
+        border-radius: var(--radius-sm);
+        margin-bottom: 16px;
+        font-size: 14px;
+        color: var(--mono-text-primary);
+        border: 1px solid var(--dark-border);
+        font-family: var(--font-family-mono);
+    }
+    #model-list .card {
+        background-color: var(--dark-surface);
+        border: 1px solid var(--dark-border);
+    }
+    #model-list .card-body {
+        background-color: var(--dark-surface);
+    }
+    .toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 9999;
+    }
+    .toast {
+        background-color: var(--mono-1);
+        color: var(--mono-text-primary);
+        padding: 12px 20px;
+        border-radius: var(--radius-sm);
+        margin-bottom: 10px;
+        border: 1px solid var(--mono-5);
+        border-left: 2px solid var(--mono-text-primary);
+        box-shadow: var(--shadow-lg);
+        animation: slideIn 0.3s ease-out;
+        font-family: var(--font-family-mono);
+    }
+    @keyframes slideIn {
+        from {
+            transform: translateX(100%);
+            opacity: 0;
+        }
+        to {
+            transform: translateX(0);
+            opacity: 1;
+        }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Search Page Header -->
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <div>
+        <h1 class="h2 mb-0">Available Models</h1>
+        <p class="text-muted mb-0">Search and copy model names for API usage</p>
+    </div>
+    <div>
+        <a href="/dashboard" class="btn btn-secondary">
+            <i class="fas fa-arrow-left"></i> Back to Dashboard
+        </a>
+    </div>
+</div>
+
+<!-- Search Section -->
+<div class="section" style="background-color: transparent !important;">
+    <!-- Search Bar -->
+    <div class="search-container mb-4">
+        <input type="text" id="model-search" class="form-control form-control-lg" 
+               placeholder="Search models by name..." 
+               autofocus>
+        <i class="fas fa-search search-icon"></i>
+    </div>
+
+    <!-- Search Stats -->
+    <div id="search-stats" class="search-stats">
+        Loading models...
+    </div>
+
+    <!-- Loading State -->
+    <div id="search-loading" class="loading-state" style="display: none;" aria-busy="true">
+        <div class="skeleton-stack">
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+        </div>
+    </div>
+
+    <!-- Model List -->
+    <div id="model-list" class="card">
+        <div class="card-body" style="padding: 0;">
+            <!-- Models will be listed here -->
+        </div>
+    </div>
+</div>
+
+<!-- Toast Notification Container -->
+<div id="toast-container" class="toast-container">
+    <!-- Toast notifications will be inserted here -->
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+    // Model Search Page for Users
+    let allModels = [];
+    let filteredModels = [];
+    let modelApiSupport = {};  // model_id -> ["openai", "anthropic"]
+
+    // Load all enabled models on page load
+    async function loadAllModels() {
+        const loadingEl = document.getElementById('search-loading');
+        const statsEl = document.getElementById('search-stats');
+        
+        try {
+            loadingEl.style.display = 'block';
+            
+            // Fetch models with API support info from management endpoint
+            const modelsResponse = await makeAuthenticatedRequest('/dashboard/api/models');
+            
+            if (!modelsResponse.ok) {
+                throw new Error('Failed to fetch models');
+            }
+            
+            const response = await modelsResponse.json();
+
+            // Build API support map from the response
+            response.data.forEach(model => {
+                if (model.supported_apis) {
+                    modelApiSupport[model.id] = model.supported_apis;
+                }
+            });
+            
+            // The v1/models endpoint returns {data: [{id, object, created, owned_by}, ...]}
+            // Use the id field directly as the full model name
+            allModels = response.data.map(model => {
+                return {
+                    model_id: model.id,  // Use full ID
+                    model_name: model.id,  // Full name is the ID
+                    provider_key: '',  // Not needed for display
+                    is_enabled: true  // All models from v1/models are enabled
+                };
+            });
+            
+            // Sort models alphabetically by full model name
+            allModels.sort((a, b) => {
+                return a.model_name.toLowerCase().localeCompare(b.model_name.toLowerCase());
+            });
+            
+            // Display all models initially
+            filteredModels = [...allModels];
+            displayModels();
+            
+        } catch (error) {
+            console.error('Error loading models:', error);
+            showToast('Error loading models: ' + error.message, 'error');
+            statsEl.innerHTML = '<span class="text-danger">Error loading models</span>';
+        } finally {
+            loadingEl.style.display = 'none';
+        }
+    }
+
+    // Filter models based on search input
+    function filterModels() {
+        const searchInput = document.getElementById('model-search');
+        const searchTerm = searchInput.value.toLowerCase().trim();
+        
+        if (searchTerm === '') {
+            filteredModels = [...allModels];
+        } else {
+            filteredModels = allModels.filter(model => {
+                // Search in full model name
+                return model.model_name.toLowerCase().includes(searchTerm);
+            });
+        }
+        
+        displayModels();
+    }
+
+    // Display the filtered models
+    function displayModels() {
+        const modelListEl = document.getElementById('model-list').querySelector('.card-body');
+        const statsEl = document.getElementById('search-stats');
+        
+        const totalCount = filteredModels.length;
+        
+        statsEl.innerHTML = `Showing ${totalCount} enabled model${totalCount !== 1 ? 's' : ''}`;
+        
+        if (filteredModels.length === 0) {
+            modelListEl.innerHTML = `
+                <div class="text-center py-5 text-muted">
+                    <i class="fas fa-search fa-3x mb-3"></i>
+                    <p>No models found</p>
+                </div>
+            `;
+            return;
+        }
+        
+        let html = '';
+        filteredModels.forEach((model, index) => {
+            // Use the full model name directly
+            const fullModelName = model.model_name;
+
+            // Build API badges from the support map
+            const apis = modelApiSupport[fullModelName] || ['openai'];
+            let badgesHtml = '';
+            apis.forEach(api => {
+                badgesHtml += `<span class="api-badge ${escapeHtml(api)}">${escapeHtml(api)}</span>`;
+            });
+            
+            html += `
+                <div class="model-list-item">
+                    <div class="model-info">
+                        <div class="model-name">${escapeHtml(fullModelName)}</div>
+                        <div class="api-badges">${badgesHtml}</div>
+                    </div>
+                    <button class="copy-button" data-model-name="${escapeHtml(fullModelName)}" onclick="copyModelName(this)">
+                        <i class="fas fa-copy"></i>
+                        Copy
+                    </button>
+                </div>
+            `;
+        });
+        
+        modelListEl.innerHTML = html;
+    }
+
+    // Copy model name to clipboard
+    function copyModelName(button) {
+        try {
+            // Get the model name from data attribute
+            const modelName = button.getAttribute('data-model-name');
+            console.log('Attempting to copy:', modelName);
+            
+            // Try modern clipboard API first (check if it exists and is secure context)
+            if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+                navigator.clipboard.writeText(modelName).then(() => {
+                    // Visual feedback
+                    const originalHTML = button.innerHTML;
+                    button.innerHTML = '<i class="fas fa-check"></i> Copied!';
+                    button.classList.add('copied');
+                    
+                    // Show toast notification
+                    showToast(`Copied: ${modelName}`, 'success');
+                    
+                    // Reset button after 2 seconds
+                    setTimeout(() => {
+                        button.innerHTML = originalHTML;
+                        button.classList.remove('copied');
+                    }, 2000);
+                }).catch(err => {
+                    console.error('Clipboard API failed:', err);
+                    // Fallback to old method
+                    fallbackCopy(modelName, button);
+                });
+            } else {
+                // Use fallback method
+                console.log('Clipboard API not available, using fallback');
+                fallbackCopy(modelName, button);
+            }
+            
+        } catch (error) {
+            console.error('Failed to copy:', error);
+            fallbackCopy(modelName, button);
+        }
+    }
+
+    // Fallback copy method using textarea
+    function fallbackCopy(text, button) {
+        try {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            textarea.setSelectionRange(0, 99999); // For mobile devices
+            
+            const successful = document.execCommand('copy');
+            document.body.removeChild(textarea);
+            
+            if (successful) {
+                // Visual feedback
+                const originalHTML = button.innerHTML;
+                button.innerHTML = '<i class="fas fa-check"></i> Copied!';
+                button.classList.add('copied');
+                
+                // Show toast notification
+                showToast(`Copied: ${text}`, 'success');
+                
+                // Reset button after 2 seconds
+                setTimeout(() => {
+                    button.innerHTML = originalHTML;
+                    button.classList.remove('copied');
+                }, 2000);
+            } else {
+                throw new Error('execCommand failed');
+            }
+        } catch (err) {
+            console.error('Fallback copy failed:', err);
+            showToast('Failed to copy to clipboard', 'error');
+        }
+    }
+
+    // Show toast notification
+    function showToast(message, type = 'success') {
+        const toastContainer = document.getElementById('toast-container');
+        const toast = document.createElement('div');
+        toast.className = 'toast';
+        if (type === 'error') {
+            toast.style.borderLeftColor = 'var(--mono-text-secondary)';
+            toast.style.borderLeftStyle = 'dashed';
+        }
+        toast.innerHTML = `<i class="fas fa-${type === 'error' ? 'exclamation-circle' : 'check-circle'}"></i> ${message}`;
+        
+        toastContainer.appendChild(toast);
+        
+        // Remove toast after 3 seconds
+        setTimeout(() => {
+            toast.style.animation = 'slideIn 0.3s ease-out reverse';
+            setTimeout(() => {
+                toast.remove();
+            }, 300);
+        }, 3000);
+    }
+
+    // Escape HTML to prevent XSS
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    // Add event listener for search input
+    document.addEventListener('DOMContentLoaded', function() {
+        const searchInput = document.getElementById('model-search');
+        searchInput.addEventListener('input', filterModels);
+        
+        // Load all models on page load
+        loadAllModels();
+    });
+</script>
+{% endblock %}

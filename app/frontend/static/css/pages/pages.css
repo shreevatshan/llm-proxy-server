@@ -1,0 +1,514 @@
+/* ================================
+   AUTH PAGES (login / signup / admin_login)
+   Extend layouts/auth_base.html — centered card, no nav
+   ================================ */
+
+.auth-page {
+    background: var(--dark-bg-primary);
+    min-height: 100vh;
+}
+
+.auth-layout {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: var(--space-6) var(--space-4);
+}
+
+.auth-brand {
+    margin-bottom: var(--space-8);
+    align-self: flex-start;
+    width: 100%;
+    max-width: 420px;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+.auth-main {
+    width: 100%;
+    max-width: 420px;
+    margin: 0 auto;
+}
+
+.auth-card {
+    background: var(--dark-surface);
+    border: 1px solid var(--dark-border);
+    border-radius: var(--radius-xl);
+    padding: var(--space-8);
+    box-shadow: var(--shadow-lg);
+}
+
+.auth-card-header {
+    text-align: center;
+    margin-bottom: var(--space-6);
+}
+
+.auth-icon {
+    width: 52px;
+    height: 52px;
+    border-radius: var(--radius-lg);
+    background: var(--mono-3);
+    border: 1px solid var(--mono-5);
+    color: var(--mono-text-primary);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.375rem;
+    margin-bottom: var(--space-4);
+}
+
+.auth-icon-warning {
+    background: var(--mono-2);
+    border: 1px dashed var(--mono-5);
+    color: var(--mono-text-secondary);
+}
+
+.auth-title {
+    font-family: var(--font-family-display);
+    font-size: var(--text-2xl);
+    font-weight: var(--font-bold);
+    color: var(--dark-text-primary);
+    margin-bottom: var(--space-1);
+    letter-spacing: -0.03em;
+}
+
+.auth-subtitle {
+    color: var(--dark-text-muted);
+    font-size: var(--text-sm);
+    margin-bottom: 0;
+}
+
+.auth-divider {
+    position: relative;
+    text-align: center;
+    margin: var(--space-6) 0;
+}
+
+.auth-divider::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: var(--dark-border);
+}
+
+.auth-divider span {
+    position: relative;
+    background: var(--dark-surface);
+    padding: 0 var(--space-3);
+    color: var(--dark-text-muted);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+}
+
+.auth-links {
+    text-align: center;
+    margin-top: var(--space-4);
+    font-size: var(--text-sm);
+}
+
+.oauth-buttons {
+    margin-bottom: var(--space-2);
+}
+
+/* Legacy aliases kept for backwards compatibility */
+.login-page { background: var(--dark-bg-primary); min-height: 100vh; }
+.login-container { max-width: 420px; margin: 0 auto; }
+.back-link { text-align: center; margin-top: var(--space-4); font-size: var(--text-sm); }
+.back-link a { color: var(--accent-500); text-decoration: none; }
+.back-link a:hover { color: var(--accent-600); }
+
+/* Enhanced Provider Form Styles - Dark Flat Design */
+.provider-form-container {
+    margin-bottom: 2rem;
+    animation: none;
+    opacity: 1;
+}
+
+.provider-form-card {
+    background: var(--dark-surface);
+    border-radius: var(--border-radius-lg);
+    box-shadow: none;
+    border: 1px solid var(--dark-border);
+    overflow: hidden;
+    position: relative;
+    transition: none;
+}
+
+.provider-form-card:hover {
+    box-shadow: none;
+    transform: none;
+}
+
+.provider-form-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 4px;
+    background: var(--accent-500);
+    box-shadow: none;
+}
+
+.provider-form-header {
+    background: var(--dark-surface);
+    padding: 1.5rem 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--dark-border);
+}
+
+.form-title-section {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.form-icon {
+    width: 40px;
+    height: 40px;
+    background: var(--dark-secondary);
+    border-radius: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--dark-text-primary);
+    font-size: 1.1rem;
+    font-family: var(--font-family-mono);
+}
+
+.provider-form-header h3 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+/* Provider Form Body */
+.provider-form-body {
+    padding: 2rem;
+    background: var(--dark-surface);
+}
+
+/* Provider Form Actions */
+.provider-form-actions {
+    padding: 2rem;
+    background: var(--dark-bg-secondary);
+    border-top: 1px solid var(--dark-border);
+    display: flex;
+    justify-content: flex-end;
+    gap: 1rem;
+}
+
+.provider-form-actions .btn {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.875rem 1.5rem;
+    font-weight: 600;
+    border-radius: var(--border-radius);
+    transition: none;
+    position: relative;
+    overflow: hidden;
+    font-family: var(--font-family-mono);
+}
+
+.provider-form-actions .btn i {
+    font-size: 0.9rem;
+}
+
+.provider-form-actions .btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
+}
+
+.provider-form-actions .btn:active {
+    transform: translateY(0);
+}
+
+/* OAuth Login Styles */
+.oauth-divider {
+    position: relative;
+    text-align: center;
+    margin: 1.5rem 0;
+}
+
+.oauth-divider hr {
+    border: 0;
+    height: 1px;
+    background: var(--dark-border);
+    margin: 0;
+}
+
+.oauth-divider span {
+    background: var(--dark-surface);
+    padding: 0 1rem;
+    color: var(--dark-text-secondary);
+    font-size: 0.875rem;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-family: var(--font-family-mono);
+}
+
+.oauth-buttons {
+    margin-bottom: 1rem;
+}
+
+.oauth-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.75rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-radius: var(--border-radius);
+    transition: all 0.2s ease;
+    position: relative;
+    overflow: hidden;
+    font-family: var(--font-family-mono);
+    background: var(--dark-surface);
+    border: 1px solid var(--dark-border);
+    color: var(--dark-text-primary);
+}
+
+.oauth-btn:hover {
+    background: var(--dark-bg-secondary);
+    border-color: var(--border-color);
+    color: var(--accent-500);
+    transform: translateY(-1px);
+}
+
+.oauth-btn:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--accent-500-alpha);
+}
+
+.oauth-btn i {
+    font-size: 1rem;
+    margin-right: 0.5rem;
+}
+
+/* ZOHO Brand Color */
+.oauth-btn.zoho:hover {
+    border-color: var(--border-color);
+    color: var(--dark-text-primary);
+}
+
+/* ================================
+   PROFILE PAGE STYLES
+   ================================ */
+
+/* Profile cards - dark theme */
+.card.border-0.shadow-sm {
+    background: var(--dark-surface) !important;
+    border: 1px solid var(--dark-border) !important;
+    box-shadow: none !important;
+}
+
+/* Profile card headers */
+.card-header.bg-white {
+    background: var(--dark-surface) !important;
+    border-bottom: 1px solid var(--dark-border) !important;
+}
+
+/* Input group icons */
+.input-group-text.bg-light {
+    background: var(--dark-bg-tertiary) !important;
+    border-color: var(--dark-border) !important;
+    color: var(--dark-text-secondary) !important;
+}
+
+/* Icon backgrounds in profile */
+.bg-primary.bg-opacity-10,
+.bg-warning.bg-opacity-10,
+.bg-danger.bg-opacity-10 {
+    background-color: var(--dark-bg-tertiary) !important;
+}
+
+/* Icon colors in profile sections - neutral theme colors */
+.bg-primary.bg-opacity-10 i.text-primary,
+.bg-primary.bg-opacity-10 .text-primary,
+.bg-warning.bg-opacity-10 i.text-warning,
+.bg-warning.bg-opacity-10 .text-warning,
+.bg-danger.bg-opacity-10 i.text-danger,
+.bg-danger.bg-opacity-10 .text-danger {
+    color: var(--dark-text-secondary) !important;
+}
+
+/* Section header icons - all neutral */
+.card-header .bg-primary.bg-opacity-10 i.fa-edit,
+.card-header .bg-warning.bg-opacity-10 i.fa-key,
+.card-header .bg-danger.bg-opacity-10 i.fa-exclamation-triangle {
+    color: var(--dark-text-secondary) !important;
+}
+
+/* Icon container alignment */
+.card-header .d-flex.align-items-center {
+    gap: 0 !important;
+}
+
+.card-header .bg-primary.bg-opacity-10.rounded,
+.card-header .bg-warning.bg-opacity-10.rounded,
+.card-header .bg-danger.bg-opacity-10.rounded {
+    width: 40px !important;
+    height: 40px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    flex-shrink: 0 !important;
+}
+
+.card-header .bg-primary.bg-opacity-10.rounded i,
+.card-header .bg-warning.bg-opacity-10.rounded i,
+.card-header .bg-danger.bg-opacity-10.rounded i {
+    font-size: 1rem !important;
+    margin: 0 !important;
+}
+
+/* Light backgrounds for badges/circles */
+.bg-light.rounded-circle {
+    background: var(--dark-bg-tertiary) !important;
+    color: var(--dark-text-secondary) !important;
+}
+
+.bg-light.rounded-circle i {
+    color: var(--dark-text-secondary) !important;
+}
+
+/* Alert styling */
+.alert.alert-danger.border-0.bg-danger.bg-opacity-10 {
+    background: var(--mono-2) !important;
+    border: 1px solid var(--mono-5) !important;
+    border-left: 2px solid var(--mono-text-secondary) !important;
+    color: var(--dark-text-primary) !important;
+}
+
+/* Profile page headings */
+h2.text-dark,
+h4.fw-bold,
+h5.fw-bold,
+h6.fw-bold {
+    color: var(--dark-text-primary) !important;
+}
+
+/* Modal styling for profile */
+.modal-content.border-0.shadow {
+    background: var(--dark-surface) !important;
+    border: 1px solid var(--dark-border) !important;
+}
+
+.modal-header.bg-danger {
+    background: var(--mono-2) !important;
+    border-bottom: 1px solid var(--mono-5) !important;
+    color: var(--mono-text-primary) !important;
+}
+
+.modal-body .bg-light {
+    background: var(--dark-bg-tertiary) !important;
+}
+
+/* Button outlines for dark theme */
+.btn-outline-primary,
+.btn-outline-warning,
+.btn-outline-danger {
+    border-color: var(--dark-border) !important;
+}
+
+.btn-outline-primary:hover,
+.btn-outline-warning:hover,
+.btn-outline-danger:hover {
+    background: transparent !important;
+    border-color: var(--dark-border) !important;
+}
+
+/* ================================
+   HERO REFINEMENTS — monochrome polish
+   ================================ */
+
+.hero {
+    position: relative;
+    overflow: hidden;
+    background: var(--mono-1);
+    border: 1px solid var(--mono-4);
+}
+
+/* Faint hairline grid backdrop */
+.hero-grid {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background-image:
+        linear-gradient(to right, var(--mono-3) 1px, transparent 1px),
+        linear-gradient(to bottom, var(--mono-3) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: radial-gradient(ellipse at center, black 30%, transparent 80%);
+    -webkit-mask-image: radial-gradient(ellipse at center, black 30%, transparent 80%);
+    opacity: 0.5;
+    z-index: 0;
+}
+
+.hero > *:not(.hero-grid) {
+    position: relative;
+    z-index: 1;
+}
+
+.hero-eyebrow {
+    display: inline-block;
+    font-family: var(--font-family-mono);
+    font-size: var(--text-xs);
+    font-weight: var(--font-medium);
+    letter-spacing: var(--tracking-wider);
+    text-transform: uppercase;
+    color: var(--mono-text-muted);
+    padding: 0.25rem 0.625rem;
+    border: 1px solid var(--mono-4);
+    border-radius: var(--radius-sm);
+    margin-bottom: 1.25rem;
+}
+
+.hero h1 {
+    font-family: var(--font-family-display);
+    letter-spacing: var(--tracking-tight);
+}
+
+/* ================================
+   FEATURE CARDS — refined mono
+   ================================ */
+
+.feature-card {
+    background: var(--mono-1) !important;
+    border: 1px solid var(--mono-4) !important;
+    box-shadow: var(--shadow-sm);
+    border-radius: var(--radius-lg);
+    transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.feature-card:hover {
+    border-color: var(--mono-5) !important;
+    transform: translateY(-1px);
+}
+
+.feature-card h5 {
+    font-family: var(--font-family-display);
+    letter-spacing: var(--tracking-tight);
+    color: var(--mono-text-primary);
+}
+
+.feature-card p {
+    color: var(--mono-text-secondary);
+}
+
+.feature-card .text-accent,
+.feature-card .text-success,
+.feature-card .text-info {
+    color: var(--mono-text-primary) !important;
+}

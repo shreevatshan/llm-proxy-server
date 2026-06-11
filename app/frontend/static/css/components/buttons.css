@@ -1,0 +1,515 @@
+/* Button System - Dark Flat Design */
+
+/* ================================
+   BASE BUTTON STYLES
+   ================================ */
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    padding: 0.75rem 1.5rem;
+    font-size: 0.875rem;
+    font-weight: 500;
+    line-height: 1;
+    text-align: center;
+    text-decoration: none;
+    border: 1px solid var(--dark-border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    min-height: 40px;
+    letter-spacing: 0.025em;
+    position: relative;
+    overflow: hidden;
+    font-family: var(--font-family-mono);
+    background: var(--dark-surface);
+    color: var(--dark-text-primary);
+    transition: opacity 0.2s ease;
+}
+
+.btn:hover {
+    background: var(--dark-surface);
+    color: var(--dark-text-primary);
+    border-color: var(--dark-border);
+    opacity: 0.85;
+}
+
+.btn:active,
+.btn:focus {
+    background: var(--dark-surface);
+    color: var(--dark-text-primary);
+    border-color: var(--dark-border);
+    outline: none;
+}
+
+.btn:disabled,
+.btn.disabled {
+    opacity: 0.6;
+    pointer-events: none;
+    cursor: not-allowed;
+    background: var(--dark-bg-tertiary);
+    color: var(--dark-text-muted);
+}
+
+/* ================================
+   BUTTON VARIANTS — semantic colors
+   Active/focus states handled by dark-flat-override.css (Bootstrap repin)
+   ================================ */
+
+.btn {
+    transition: var(--transition-colors), transform 0.1s ease;
+}
+
+.btn:hover {
+    transform: translateY(-1px);
+}
+
+.btn:active {
+    transform: translateY(0);
+}
+
+/* Primary — solid white-on-black (the ONLY filled-white button) */
+.btn-primary,
+.btn-accent {
+    background: var(--mono-text-primary);
+    color: var(--mono-0);
+    border-color: var(--mono-text-primary);
+}
+
+.btn-primary:hover,
+.btn-accent:hover {
+    background: var(--mono-white);
+    border-color: var(--mono-white);
+    color: var(--mono-0);
+    opacity: 1;
+}
+
+/* Secondary / Ghost — muted surface */
+.btn-secondary,
+.btn-ghost {
+    background: var(--dark-bg-tertiary);
+    color: var(--dark-text-secondary);
+    border-color: var(--dark-border);
+}
+
+.btn-secondary:hover,
+.btn-ghost:hover {
+    background: var(--dark-surface);
+    color: var(--dark-text-primary);
+    border-color: var(--dark-border-light);
+    opacity: 1;
+}
+
+/* Danger — outlined chrome (no chromatic fill) */
+.btn-danger {
+    background: transparent;
+    color: var(--mono-text-primary);
+    border: 1px solid var(--mono-5);
+}
+
+.btn-danger:hover {
+    background: var(--mono-3);
+    border-color: var(--mono-text-primary);
+    color: var(--mono-text-primary);
+    opacity: 1;
+}
+
+/* Success — subtle filled gray, white-on-active */
+.btn-success {
+    background: var(--mono-3);
+    color: var(--mono-text-primary);
+    border: 1px solid var(--mono-5);
+}
+
+.btn-success:hover {
+    background: var(--mono-4);
+    border-color: var(--mono-6);
+    color: var(--mono-text-primary);
+    opacity: 1;
+}
+
+/* Warning — dashed outline */
+.btn-warning {
+    background: transparent;
+    color: var(--mono-text-primary);
+    border: 1px dashed var(--mono-5);
+}
+
+.btn-warning:hover {
+    background: var(--mono-3);
+    border-color: var(--mono-6);
+    color: var(--mono-text-primary);
+    opacity: 1;
+}
+
+/* Info — soft surface */
+.btn-info {
+    background: var(--mono-2);
+    color: var(--mono-text-primary);
+    border: 1px solid var(--mono-5);
+}
+
+.btn-info:hover {
+    background: var(--mono-3);
+    border-color: var(--mono-6);
+    color: var(--mono-text-primary);
+    opacity: 1;
+}
+
+/* Light — subtle dark surface */
+.btn-light {
+    background: var(--dark-bg-tertiary);
+    color: var(--dark-text-primary);
+    border-color: var(--dark-border);
+}
+
+.btn-light:hover {
+    background: var(--dark-surface);
+    border-color: var(--dark-border-light);
+    color: var(--dark-text-primary);
+    opacity: 1;
+}
+
+/* ================================
+   OUTLINE VARIANTS
+   ================================ */
+
+.btn-outline-primary {
+    background: transparent;
+    color: var(--accent-500);
+    border-color: var(--accent-500);
+}
+
+.btn-outline-primary:hover {
+    background: var(--accent-500);
+    color: var(--mono-white);
+    border-color: var(--accent-500);
+    opacity: 1;
+}
+
+.btn-outline-danger {
+    background: transparent;
+    color: var(--danger-500);
+    border-color: var(--danger-600);
+}
+
+.btn-outline-danger:hover {
+    background: var(--danger-600);
+    color: var(--mono-white);
+    border-color: var(--danger-600);
+    opacity: 1;
+}
+
+.btn-outline-success {
+    background: transparent;
+    color: var(--success-500);
+    border-color: var(--success-600);
+}
+
+.btn-outline-success:hover {
+    background: var(--success-600);
+    color: var(--mono-white);
+    border-color: var(--success-600);
+    opacity: 1;
+}
+
+.btn-outline-warning {
+    background: transparent;
+    color: var(--warning-500);
+    border-color: var(--warning-500);
+}
+
+.btn-outline-warning:hover {
+    background: var(--warning-500);
+    color: var(--mono-black);
+    border-color: var(--warning-500);
+    opacity: 1;
+}
+
+.btn-outline-info {
+    background: transparent;
+    color: var(--info-500);
+    border-color: var(--info-600);
+}
+
+.btn-outline-info:hover {
+    background: var(--info-600);
+    color: var(--mono-white);
+    border-color: var(--info-600);
+    opacity: 1;
+}
+
+.btn-outline-secondary {
+    background: transparent;
+    color: var(--dark-text-secondary);
+    border-color: var(--dark-border);
+}
+
+.btn-outline-secondary:hover {
+    background: var(--dark-bg-tertiary);
+    color: var(--dark-text-primary);
+    border-color: var(--dark-border-light);
+    opacity: 1;
+}
+
+/* ================================
+   BUTTON SIZES
+   ================================ */
+
+.btn-sm {
+    padding: 0.5rem 1rem;
+    font-size: 0.75rem;
+    min-height: 32px;
+}
+
+.btn-lg {
+    padding: 1rem 2rem;
+    font-size: 1rem;
+    min-height: 48px;
+    font-weight: 600;
+}
+
+.btn-xl {
+    padding: 1.25rem 2.5rem;
+    font-size: 1.125rem;
+    min-height: 56px;
+    font-weight: 600;
+}
+
+/* ================================
+   BUTTON GROUPS
+   ================================ */
+
+.btn-group {
+    display: inline-flex;
+    align-items: center;
+}
+
+.btn-group .btn {
+    border-radius: 0;
+    border-right-width: 0;
+    position: relative;
+}
+
+.btn-group .btn:first-child {
+    border-top-left-radius: var(--radius-md);
+    border-bottom-left-radius: var(--radius-md);
+}
+
+.btn-group .btn:last-child {
+    border-top-right-radius: var(--radius-md);
+    border-bottom-right-radius: var(--radius-md);
+    border-right-width: 1px;
+}
+
+.btn-group .btn:not(:last-child):not(:first-child) {
+    border-radius: 0;
+}
+
+/* ================================
+   ICON BUTTONS
+   ================================ */
+
+.btn-icon {
+    padding: 0.75rem;
+    min-width: 40px;
+    justify-content: center;
+}
+
+.btn-icon .material-icons,
+.btn-icon i {
+    font-size: 1.125rem;
+    color: var(--dark-text-primary);
+}
+
+.btn-icon-sm {
+    padding: 0.5rem;
+    min-width: 32px;
+}
+
+.btn-icon-sm .material-icons,
+.btn-icon-sm i {
+    font-size: 1rem;
+    color: var(--dark-text-primary);
+}
+
+.btn-icon-lg {
+    padding: 1rem;
+    min-width: 48px;
+}
+
+.btn-icon-lg .material-icons,
+.btn-icon-lg i {
+    font-size: 1.25rem;
+    color: var(--dark-text-primary);
+}
+
+/* ================================
+   FLOATING ACTION BUTTON
+   ================================ */
+
+.btn-fab {
+    position: fixed;
+    bottom: 2rem;
+    right: 2rem;
+    width: 56px;
+    height: 56px;
+    border-radius: var(--radius-md);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 0;
+    background: var(--dark-surface);
+    border: 1px solid var(--dark-border);
+}
+
+.btn-fab .material-icons {
+    font-size: 1.5rem;
+    color: var(--dark-text-primary);
+}
+
+/* ================================
+   SPECIAL BUTTON VARIANTS
+   ================================ */
+
+.btn-remove {
+    background-color: var(--dark-surface) !important;
+    border-color: var(--dark-border) !important;
+    color: var(--dark-text-primary);
+    position: relative;
+}
+
+.btn-remove:hover {
+    background-color: var(--dark-surface) !important;
+    border-color: var(--dark-border) !important;
+}
+
+.btn-remove:before {
+    content: "⚠️";
+    margin-right: var(--space-1);
+}
+
+.btn-ghost-close {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    border-radius: 50%;
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-close {
+    background: transparent url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23000'%3e%3cpath d='M.293.293a1 1 0 0 1 1.414 0L8 6.586 14.293.293a1 1 0 1 1 1.414 1.414L9.414 8l6.293 6.293a1 1 0 0 1-1.414 1.414L8 9.414l-6.293 6.293a1 1 0 0 1-1.414-1.414L6.586 8 .293 1.707a1 1 0 0 1 0-1.414z'/%3e%3c/svg%3e") center/1em auto no-repeat;
+    border: none;
+    width: 1.5rem;
+    height: 1.5rem;
+    cursor: pointer;
+    opacity: 0.7;
+    border-radius: 0.25rem;
+    padding: 0.25rem;
+}
+
+.btn-close:hover {
+    opacity: 1;
+}
+
+/* Modal close button specific styling */
+.modal-header .btn-close {
+    margin: -0.5rem -0.5rem -0.5rem auto;
+    padding: 0.5rem;
+    opacity: 0.6;
+}
+
+.modal-header .btn-close:hover {
+    opacity: 1;
+}
+
+.modal-header .btn-close-white,
+.btn-close-white {
+    background: transparent url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%23fff'%3e%3cpath d='M.293.293a1 1 0 0 1 1.414 0L8 6.586 14.293.293a1 1 0 1 1 1.414 1.414L9.414 8l6.293 6.293a1 1 0 0 1-1.414 1.414L8 9.414l-6.293 6.293a1 1 0 0 1-1.414-1.414L6.586 8 .293 1.707a1 1 0 0 1 0-1.414z'/%3e%3c/svg%3e") center/1em auto no-repeat !important;
+    filter: none !important;
+}
+
+/* ================================
+   BUTTON STATES
+   ================================ */
+
+#submit-btn {
+    position: relative;
+    min-width: 180px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.btn-content {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    visibility: visible;
+}
+
+.btn-content[style*="display: none"] {
+    visibility: hidden;
+    height: 0;
+    overflow: hidden;
+    position: absolute;
+}
+
+.btn-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    white-space: nowrap;
+}
+
+.btn-loading.d-none {
+    display: none !important;
+}
+
+.btn-loading i {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* ================================
+   RESPONSIVE DESIGN
+   ================================ */
+
+@media (max-width: 640px) {
+    .btn {
+        font-size: 0.75rem;
+        padding: 0.625rem 1.25rem;
+    }
+    
+    .btn-lg {
+        font-size: 0.875rem;
+        padding: 0.875rem 1.75rem;
+    }
+    
+    .btn-fab {
+        bottom: 1rem;
+        right: 1rem;
+        width: 48px;
+        height: 48px;
+    }
+    
+    .btn-fab .material-icons {
+        font-size: 1.25rem;
+    }
+}

@@ -1,0 +1,358 @@
+/* ================================
+   FORM FOUNDATIONS
+   ================================ */
+
+.form-group {
+    margin-bottom: 1.5rem;
+    position: relative;
+}
+
+.form-label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: 500;
+    color: var(--text-primary);
+    font-size: 0.875rem;
+    letter-spacing: 0.025em;
+}
+
+.form-label.required::after {
+    content: ' *';
+    color: var(--danger-500);
+}
+
+.required {
+    color: var(--danger-color);
+    margin-left: 0.25rem;
+}
+
+/* ================================
+   INPUT CONTROLS
+   ================================ */
+
+.form-control {
+    width: 100%;
+    padding: 0.875rem 1rem;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    font-size: 0.875rem;
+    line-height: 1.5;
+    color: var(--text-primary) !important;
+    background: var(--bg-secondary) !important;
+    font-family: inherit;
+}
+
+.form-control:focus {
+    outline: none;
+    border-color: var(--border-color);
+    background: var(--bg-secondary) !important;
+    color: var(--text-primary) !important;
+}
+
+.form-control:disabled,
+.form-control[readonly] {
+    background-color: var(--bg-tertiary);
+    color: var(--text-muted);
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+.form-control::placeholder {
+    color: var(--text-muted) !important;
+    opacity: 0.6;
+    font-weight: 400;
+}
+
+/* Select Controls */
+.form-select {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23666' stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M2 5l6 6 6-6'/%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 16px 12px;
+    padding-right: 2.5rem;
+}
+
+/* ================================
+   FORM VALIDATION STATES
+   ================================ */
+
+.form-control.is-valid {
+    border-color: var(--success-600);
+}
+
+.form-control.is-invalid {
+    border-color: var(--danger-600);
+}
+
+.valid-feedback {
+    display: block;
+    width: 100%;
+    margin-top: 0.25rem;
+    font-size: 0.75rem;
+    color: var(--success-600);
+}
+
+.invalid-feedback {
+    display: none;
+    width: 100%;
+    margin-top: 0.25rem;
+    font-size: 0.75rem;
+    color: var(--danger-600);
+}
+
+.invalid-feedback.show {
+    display: block !important;
+}
+
+.form-text {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+    line-height: 1.4;
+}
+
+.form-text.hidden {
+    display: none;
+}
+
+/* ================================
+   INPUT GROUPS
+   ================================ */
+
+.input-group {
+    display: flex;
+    position: relative;
+    width: 100%;
+}
+
+.input-group .form-control {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+    margin-bottom: 0;
+}
+
+.input-group .form-control:not(:first-child) {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+    border-left: none;
+}
+
+.input-group .form-control:not(:last-child) {
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+}
+
+.input-group-text {
+    display: flex;
+    align-items: center;
+    padding: 0.875rem 1rem;
+    font-size: 0.875rem;
+    font-weight: 400;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    background-color: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+}
+
+.input-group-text:first-child {
+    border-top-left-radius: var(--radius-lg);
+    border-bottom-left-radius: var(--radius-lg);
+    border-right: none;
+}
+
+.input-group-text:last-child {
+    border-top-right-radius: var(--radius-lg);
+    border-bottom-right-radius: var(--radius-lg);
+    border-left: none;
+}
+
+.input-group .btn {
+    border-top-left-radius: 0;
+    border-bottom-left-radius: 0;
+}
+
+/* ================================
+   SEARCH FORMS
+   ================================ */
+
+.search-container {
+    position: relative;
+    margin-bottom: 1.5rem;
+}
+
+.search-container .form-control {
+    padding-left: 2.5rem;
+}
+
+.search-icon {
+    position: absolute;
+    left: 1rem;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    pointer-events: none;
+}
+
+/* ================================
+   FORM SECTIONS
+   ================================ */
+
+.form-section {
+    margin-bottom: 2.5rem;
+    padding: 2rem;
+    border-bottom: 1px solid var(--border-light);
+    border-radius: var(--radius-lg);
+}
+
+.form-section:last-child {
+    border-bottom: none;
+    margin-bottom: 0;
+}
+
+.form-section .section-header {
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.form-section .section-header h4 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+.section-description {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.5;
+}
+
+/* ================================
+   FORM LAYOUT
+   ================================ */
+
+.form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+}
+
+.provider-fields {
+    display: grid;
+    gap: 1.5rem;
+}
+
+/* ================================
+   FORM ALERTS & MESSAGES
+   ================================ */
+
+.form-alerts {
+    margin-bottom: 2rem;
+}
+
+.form-alert,
+.general-message {
+    padding: 0.875rem 1rem;
+    border-radius: var(--radius-lg);
+    margin-bottom: 1rem;
+    font-size: 0.875rem;
+    line-height: 1.5;
+    border: 1px solid;
+}
+
+.form-alert.success,
+.general-message.alert-success {
+    background: var(--mono-2);
+    border-color: var(--mono-5);
+    border-left: 2px solid var(--mono-text-primary);
+    color: var(--mono-text-primary);
+}
+
+.form-alert.error {
+    background: var(--mono-2);
+    border-color: var(--mono-5);
+    border-left: 2px solid var(--mono-text-secondary);
+    color: var(--mono-text-primary);
+}
+
+.form-alert.warning {
+    background: var(--mono-2);
+    border-color: var(--mono-5);
+    border-left: 2px dashed var(--mono-text-secondary);
+    color: var(--mono-text-primary);
+}
+
+.form-alert i,
+.general-message i {
+    margin-right: 0.5rem;
+}
+
+/* ================================
+   AZURE MANAGEMENT CONFIGURATION
+   ================================ */
+
+#azure-management-config {
+    background: var(--dark-bg-secondary) !important;
+    border: 1px solid var(--dark-border) !important;
+}
+
+#azure-management-config h6 {
+    color: var(--dark-text-primary) !important;
+    font-weight: 600 !important;
+    font-size: 1rem !important;
+}
+
+#azure-management-config .form-label {
+    color: var(--dark-text-primary) !important;
+    font-weight: 500 !important;
+}
+
+#azure-management-config .form-text {
+    color: var(--dark-text-muted) !important;
+    font-size: 0.75rem !important;
+}
+
+#azure-management-config .text-danger {
+    color: var(--danger-600) !important;
+    font-weight: 600 !important;
+}
+
+/* Improve section header visibility */
+.text-secondary {
+    color: var(--dark-text-primary) !important;
+}
+
+/* Override text-primary for form section headers to match theme */
+.provider-fields .text-primary,
+.mb-4 h6.text-primary {
+    color: var(--dark-text-primary) !important;
+    font-weight: 600 !important;
+    font-size: 1rem !important;
+}
+
+/* Form check labels */
+.form-check-label {
+    color: var(--dark-text-primary) !important;
+}
+
+.form-check-label strong {
+    font-weight: 600 !important;
+    color: var(--dark-text-primary) !important;
+}
+
+/* Azure Setup Instructions button - make it more specific to avoid affecting other buttons */
+#azure-management-config .btn-outline-info {
+    color: var(--info-600) !important;
+    border-color: var(--info-600) !important;
+}
+
+#azure-management-config .btn-outline-info:hover {
+    background-color: var(--info-600) !important;
+    color: var(--mono-white) !important;
+}
+
+

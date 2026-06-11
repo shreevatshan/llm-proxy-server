@@ -1,0 +1,21 @@
+/* LLM Proxy Server - Theme stubs */
+/* Single forced-dark theme. All tokens live in base/variables.css.
+   This file is intentionally minimal — theming logic removed (see plan Phase 2). */
+
+/* High-contrast mode adjustments */
+.theme-high-contrast,
+.theme-high-contrast-dark {
+    --border-color: var(--dark-text-primary);
+    --border-light: var(--dark-text-secondary);
+}
+
+.theme-high-contrast .btn,
+.theme-high-contrast-dark .btn {
+    border-width: 2px;
+    font-weight: var(--font-semibold);
+}
+
+.theme-high-contrast .card,
+.theme-high-contrast-dark .card {
+    border-width: 2px;
+}

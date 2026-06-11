@@ -1,0 +1,60 @@
+services:
+  llm-proxy-server:
+    image: shreevatshan/llm-proxy-server:latest
+    container_name: llm-proxy-server
+    ports:
+      - "11440:11440"  # OpenAI API
+      - "11439:11439"  # Azure OpenAI API
+      - "2027:2027"    # Anthropic API
+      - "8765:8765"    # Management panel
+    volumes:
+      # Database persistence - the container will create this directory with proper permissions
+      - ./data:/llm-proxy-server/data
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    environment:
+      # Python Configuration
+      - PYTHONUNBUFFERED=1
+      # Database Configuration
+      - DATABASE_URL=sqlite+aiosqlite:///./data/llm_proxy.db
+      # JWT Authentication
+      - JWT_SECRET_KEY=your-secret-key-change-this-in-production
+      # Server Configuration
+      - LLMPROXY_HOST=0.0.0.0
+      - LLMPROXY_DOMAIN=localhost
+      - OPENAI_SERVER_PORT=11440
+      - AZURE_OPENAI_SERVER_PORT=11439
+      - ANTHROPIC_SERVER_PORT=2027
+      - MANAGEMENT_SERVER_PORT=8765
+      # Admin Configuration
+      - LLMPROXY_ADMIN_ENABLED=true
+      - LLMPROXY_ADMIN_USERNAME=admin
+      - LLMPROXY_ADMIN_EMAIL=admin@localhost.com
+      - LLMPROXY_ADMIN_PASSWORD=admin123
+      # Zoho OAuth Configuration
+      # Base URL is automatically detected from https://accounts.zoho.com/oauth/serverinfo
+      #- ZOHO_CLIENT_ID=your-zoho-client-id
+      #- ZOHO_CLIENT_SECRET=your-zoho-client-secret
+      # OpenTelemetry Tracing Configuration (uncomment to enable)
+      #- OTEL_EXPORTER_OTLP_ENDPOINT=https://localhost:4318
+      #- OTEL_SERVICE_NAME=llm-proxy-server
+      #- OTEL_EXPORTER_OTLP_HEADERS=api-key=*********
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8765/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - llm-proxy-network
+
+volumes:
+  llm-proxy-data:
+    driver: local
+
+networks:
+  llm-proxy-network:
+    driver: bridge

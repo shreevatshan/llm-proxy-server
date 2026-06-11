@@ -1,0 +1,306 @@
+/* Corporate Responsive Design System */
+/* Mobile-first responsive breakpoints with material design principles */
+
+/* ================================
+   MOBILE BREAKPOINT (max-width: 768px)
+   ================================ */
+
+@media (max-width: 768px) {
+    /* Header adjustments */
+    .header-content,
+    .app-header .header-content {
+        padding: 0 1rem;
+        gap: 1rem;
+    }
+    
+    .header-nav {
+        display: none; /* Hide secondary nav on mobile */
+    }
+    
+    .brand-text {
+        display: none; /* Show only icon on very small screens */
+    }
+    
+    /* Main content */
+    .app-main,
+    .main-container {
+        padding: 1rem; /* Comfortable mobile padding */
+        padding-bottom: 1rem;
+    }
+    
+    .content-wrapper {
+        padding: 1rem;
+    }
+    
+    /* Cards and sections */
+    .card,
+    .section {
+        margin-bottom: 1rem;
+        border-radius: var(--radius-lg);
+    }
+    
+    .card-header,
+    .card-body {
+        padding: 1.5rem;
+    }
+    
+    .section-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 1rem;
+    }
+    
+    /* Dashboard stats */
+    .dashboard-stats {
+        grid-template-columns: 1fr;
+        gap: 1rem;
+    }
+    
+    .stat-card {
+        padding: 1rem;
+    }
+    
+    /* Hero section */
+    .hero {
+        padding: 3rem 1.5rem;
+        margin-bottom: 1rem;
+    }
+    
+    .hero h1 {
+        font-size: 2rem;
+    }
+    
+    .hero .lead {
+        font-size: 1.125rem;
+    }
+    
+    /* Forms */
+    .form-control {
+        font-size: 1rem; /* Prevent zoom on iOS */
+    }
+    
+    /* Buttons */
+    .btn {
+        padding: 0.875rem 1.25rem;
+        font-size: 0.875rem;
+    }
+    
+    .btn-lg {
+        padding: 1rem 1.5rem;
+        font-size: 1rem;
+    }
+    
+    /* Footer */
+    .footer-content {
+        padding: 1.5rem;
+        flex-direction: column;
+        gap: 1.5rem;
+        text-align: center;
+    }
+    
+    .footer-section:last-child {
+        align-items: center;
+    }
+    
+    .footer-links {
+        justify-content: center;
+    }
+    
+    .footer-copyright {
+        text-align: center;
+    }
+}
+
+/* ================================
+   SMALL MOBILE BREAKPOINT (max-width: 480px)
+   ================================ */
+
+@media (max-width: 480px) {
+    /* Header */
+    .header-content,
+    .app-header .header-content {
+        padding: 0 0.75rem;
+    }
+    
+    .header-actions {
+        gap: 0.5rem;
+    }
+    
+    .brand-icon {
+        margin-right: 0.5rem;
+    }
+    
+    /* Main content */
+    .app-main,
+    .main-container {
+        padding: 0.75rem;
+        padding-bottom: 0.75rem;
+    }
+    
+    /* Cards */
+    .card-header,
+    .card-body {
+        padding: 1rem;
+    }
+    
+    /* Hero */
+    .hero {
+        padding: 2rem 1rem;
+    }
+    
+    .hero h1 {
+        font-size: 1.75rem;
+    }
+    
+    /* Buttons */
+    .btn {
+        padding: 0.75rem 1rem;
+        font-size: 0.875rem;
+    }
+    
+    .btn-sm {
+        padding: 0.5rem 0.75rem;
+        font-size: 0.75rem;
+    }
+    
+    /* Dashboard */
+    .dashboard-stats {
+        gap: 0.75rem;
+    }
+    
+    .stat-card {
+        padding: 1rem;
+    }
+    
+    .stat-number {
+        font-size: 1.5rem;
+    }
+    
+    /* Tables */
+    .table-responsive {
+        font-size: 0.75rem;
+    }
+}
+
+/* ================================
+   LARGE DESKTOP BREAKPOINT (min-width: 1200px)
+   ================================ */
+
+@media (min-width: 1200px) {
+    .app-main,
+    .main-container {
+        padding: 2rem; /* Comfortable desktop padding */
+        max-width: none; /* Remove max-width */
+    }
+    
+    .dashboard-stats {
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 2rem;
+    }
+    
+    .hero {
+        padding: 5rem 3rem;
+    }
+    
+    .hero h1 {
+        font-size: 4rem;
+    }
+    
+    .section {
+        padding: 2.5rem;
+    }
+}
+
+/* ================================
+   ULTRA-WIDE BREAKPOINT (min-width: 1600px)
+   ================================ */
+
+@media (min-width: 1600px) {
+    .app-main,
+    .main-container {
+        padding: 2.5rem; /* Extra padding for ultra-wide screens */
+        max-width: none; /* Remove max-width constraint for full screen */
+        margin: 0;
+    }
+}
+
+/* ================================
+   ACCESSIBILITY & FOCUS STATES
+   ================================ */
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+    .btn {
+        border-width: 2px;
+    }
+    
+    .form-control {
+        border-width: 2px;
+    }
+    
+    .card,
+    .section {
+        border-width: 2px;
+    }
+}
+
+/* High Contrast Mode Support */
+@media (prefers-contrast: high) {
+    .card {
+        border: 2px solid var(--text-primary);
+    }
+    
+    .form-control {
+        border-width: 2px;
+    }
+}
+
+/* Reduced Motion Support */
+@media (prefers-reduced-motion: reduce) {
+    .btn,
+    .card,
+    .feature-card,
+    .stat-card {
+        transition: none;
+    }
+    
+    .btn:hover,
+    .feature-card:hover,
+    .stat-card:hover {
+        transform: none;
+    }
+    
+    .fade-in,
+    .slide-in-up {
+        animation: none;
+    }
+}
+
+/* ================================
+   ENHANCED RESPONSIVE UTILITIES
+   ================================ */
+
+@media (min-width: 768px) and (max-width: 1023.98px) {
+    /* Tablet specific adjustments */
+    .container {
+        padding: 0 var(--space-6);
+    }
+}
+
+@media (min-width: 1024px) {
+    /* Desktop specific adjustments */
+    .container {
+        padding: 0 var(--space-8);
+    }
+}

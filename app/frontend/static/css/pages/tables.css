@@ -1,0 +1,385 @@
+/* Corporate Flat Design Tables & Navigation */
+
+/* ================================
+   TABLE SYSTEM
+   ================================ */
+
+.table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 0;
+    font-size: 0.875rem;
+    background: var(--dark-surface);
+    font-family: var(--font-family-mono);
+}
+
+.table th,
+.table td {
+    padding: 1rem 1.5rem;
+    text-align: left;
+    border-bottom: 1px solid var(--dark-border);
+    vertical-align: middle;
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.table th {
+    background: var(--dark-bg-secondary);
+    font-weight: 600;
+    color: var(--dark-text-primary);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    font-family: var(--font-family-mono);
+}
+
+.table tbody tr {
+    transition: none;
+}
+
+.table tbody tr:hover {
+    background: var(--dark-bg-secondary);
+}
+
+.table tbody tr:last-child td {
+    border-bottom: none;
+}
+
+/* Table variants */
+.table-striped tbody tr:nth-of-type(odd) {
+    background: var(--dark-bg-secondary);
+}
+
+.table-striped tbody tr:nth-of-type(odd):hover {
+    background: var(--dark-bg-tertiary);
+}
+
+.table-responsive {
+    overflow-x: auto;
+    border-radius: var(--radius-lg);
+    box-shadow: none;
+    border: 1px solid var(--dark-border);
+}
+
+/* ================================
+   FLAT DESIGN TABS
+   ================================ */
+
+.tab-navigation {
+    display: flex;
+    background: var(--dark-surface);
+    border-radius: var(--radius-xl);
+    box-shadow: none;
+    border: 1px solid var(--dark-border);
+    margin-bottom: 2rem;
+    overflow: hidden;
+    position: relative;
+}
+
+.tab-button {
+    flex: 1;
+    padding: 1rem 1.5rem;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--dark-text-secondary);
+    transition: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    position: relative;
+    z-index: 2;
+    font-family: var(--font-family-mono);
+}
+
+.tab-button:hover {
+    background: var(--dark-bg-secondary);
+    color: var(--dark-text-primary);
+}
+
+.tab-button.active {
+    background: var(--mono-text-primary);
+    color: var(--mono-0);
+    font-weight: 600;
+}
+
+.tab-button.active::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--mono-text-primary);
+}
+
+.tab-button i,
+.tab-button .material-icons {
+    font-size: 1.125rem;
+    color: inherit;
+}
+
+/* Specific support for FontAwesome icons in tab buttons */
+.tab-button .fas,
+.tab-button .far,
+.tab-button .fab {
+    color: inherit;
+    font-size: 1.125rem;
+}
+
+.tab-button.active i,
+.tab-button.active .material-icons,
+.tab-button.active .fas,
+.tab-button.active .far,
+.tab-button.active .fab {
+    color: var(--mono-0);
+}
+
+/* Tab content */
+.tab-content {
+    display: none;
+    background: var(--dark-surface);
+    color: var(--dark-text-primary);
+    font-family: var(--font-family-mono);
+}
+
+.tab-content.active {
+    display: block;
+    animation: none; /* Flat design - no animations */
+}
+
+/* Remove fadeIn animation for flat design */
+
+/* ================================
+   BREADCRUMB NAVIGATION
+   ================================ */
+
+.breadcrumb {
+    display: flex;
+    flex-wrap: wrap;
+    padding: 0;
+    margin-bottom: 1rem;
+    list-style: none;
+    background: transparent;
+    border-radius: var(--radius-lg);
+}
+
+.breadcrumb-item {
+    display: flex;
+    align-items: center;
+    font-family: var(--font-family-mono);
+}
+
+.breadcrumb-item + .breadcrumb-item::before {
+    content: '/';
+    padding: 0 0.5rem;
+    color: var(--dark-text-muted);
+}
+
+.breadcrumb-item a {
+    color: var(--accent-500);
+    text-decoration: none;
+    font-weight: 500;
+    transition: none;
+    font-family: var(--font-family-mono);
+}
+
+.breadcrumb-item a:hover {
+    color: var(--accent-600);
+    text-decoration: underline;
+}
+
+.breadcrumb-item.active {
+    color: var(--dark-text-muted);
+    font-family: var(--font-family-mono);
+}
+
+/* ================================
+   PAGINATION
+   ================================ */
+
+.pagination {
+    display: flex;
+    padding-left: 0;
+    list-style: none;
+    gap: 0.5rem;
+}
+
+.page-item {
+    display: flex;
+}
+
+.page-link {
+    position: relative;
+    display: block;
+    padding: 0.5rem 0.75rem;
+    color: var(--accent-500);
+    text-decoration: none;
+    background-color: var(--dark-surface);
+    border: 1px solid var(--dark-border);
+    border-radius: var(--radius-md);
+    transition: none;
+    font-size: 0.875rem;
+    font-weight: 500;
+    font-family: var(--font-family-mono);
+}
+
+.page-link:hover {
+    color: var(--dark-text-primary);
+    background-color: var(--dark-bg-secondary);
+    border-color: var(--border-color);
+    text-decoration: none;
+}
+
+.page-item.active .page-link {
+    background-color: var(--dark-bg-tertiary);
+    border-color: var(--border-color);
+    color: var(--dark-text-primary);
+    box-shadow: none;
+}
+
+.page-item.disabled .page-link {
+    color: var(--dark-text-muted);
+    background-color: var(--dark-bg-tertiary);
+    border-color: var(--dark-border);
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+/* ================================
+   RESPONSIVE TABLES & NAVIGATION
+   ================================ */
+
+@media (max-width: 768px) {
+    .tab-navigation {
+        flex-direction: column;
+    }
+    
+    .tab-button {
+        padding: 0.75rem 1rem;
+        justify-content: flex-start;
+    }
+    
+    .table th,
+    .table td {
+        padding: 0.75rem 1rem;
+        font-size: 0.75rem;
+    }
+    
+    .table-responsive {
+        font-size: 0.75rem;
+    }
+    
+    .pagination {
+        justify-content: center;
+        flex-wrap: wrap;
+    }
+    
+    .page-link {
+        padding: 0.5rem;
+        min-width: 40px;
+        text-align: center;
+    }
+}
+
+@media (max-width: 480px) {
+    .tab-button {
+        padding: 0.625rem 0.75rem;
+    }
+    
+    .tab-button span {
+        display: none;
+    }
+    
+    .table th,
+    .table td {
+        padding: 0.5rem;
+    }
+}
+
+.tab-button i {
+    font-size: 1.1rem;
+}
+
+/* Actions */
+.actions {
+    display: flex;
+    gap: 0.5rem;
+}
+
+/* Toggle Switch Styles */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 24px;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--dark-border-light);
+    transition: background-color 0.2s ease;
+    border-radius: 24px;
+}
+
+.toggle-slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    bottom: 3px;
+    background-color: var(--mono-white);
+    transition: transform 0.2s ease;
+    border-radius: 50%;
+}
+
+input:checked + .toggle-slider {
+    background-color: var(--success-color);
+}
+
+input:checked + .toggle-slider:before {
+    transform: translateX(26px);
+}
+
+/* Search Results Styles */
+.search-results-content {
+    margin-top: 1rem;
+}
+
+.search-section {
+    margin-bottom: 2rem;
+}
+
+.search-section h4 {
+    color: var(--text-primary);
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border-light);
+}
+
+.error {
+    color: var(--danger-color);
+    text-align: center;
+    padding: 1rem;
+    font-style: italic;
+}
