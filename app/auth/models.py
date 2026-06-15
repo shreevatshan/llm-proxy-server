@@ -1,6 +1,6 @@
 """Database models for authentication."""
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
@@ -148,6 +148,44 @@ class RequestUsage(Base):
 
     __table_args__ = (
         UniqueConstraint('date', 'user_identity', 'model', 'server', name='uq_usage_day'),
+    )
+
+
+class RequestUsageHourly(Base):
+    """Per-hour request usage counters; retained for ~48 hours to serve the rolling-24h window."""
+    __tablename__ = "request_usage_hourly"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, index=True, nullable=False)
+    hour = Column(Integer, nullable=False)
+    user_identity = Column(String(200), index=True, nullable=False)
+    user_type = Column(String(20), nullable=False)
+    model = Column(String(200), index=True, nullable=False)
+    server = Column(String(20), nullable=False)
+    request_count = Column(Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('date', 'hour', 'user_identity', 'model', 'server', name='uq_usage_hour'),
+        Index('ix_usage_hourly_date_hour', 'date', 'hour'),
+    )
+
+
+class RequestUsageMonthly(Base):
+    """Per-month rolled-up request usage; retained forever."""
+    __tablename__ = "request_usage_monthly"
+
+    id = Column(Integer, primary_key=True, index=True)
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)
+    user_identity = Column(String(200), index=True, nullable=False)
+    user_type = Column(String(20), nullable=False)
+    model = Column(String(200), index=True, nullable=False)
+    server = Column(String(20), nullable=False)
+    request_count = Column(Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint('year', 'month', 'user_identity', 'model', 'server', name='uq_usage_month'),
+        Index('ix_usage_monthly_year_month', 'year', 'month'),
     )
 
 

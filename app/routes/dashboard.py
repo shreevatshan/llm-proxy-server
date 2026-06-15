@@ -66,8 +66,47 @@ async def dashboard_home(
     # If user is admin, redirect to admin dashboard
     if isinstance(current_user_or_admin, AdminUser):
         return RedirectResponse(url="/admin/dashboard", status_code=status.HTTP_302_FOUND)
-    
+
     import time
+    from app.config import config
+    from app.providers.provider_manager import provider_manager
+
+    # Extract endpoints and models for the user dashboard tabs
+    from app.routes import (
+        models, chat, completions, embeddings, images, audio, responses,
+        anthropic_messages, anthropic_models,
+        azure_openai,
+    )
+    openai_routers = [models, chat, completions, embeddings, images, audio, responses]
+    anthropic_routers = [anthropic_messages, anthropic_models]
+    azure_legacy_routers = [azure_openai]
+
+    openai_endpoints = _extract_endpoints_from_routers(openai_routers)
+    anthropic_endpoints = _extract_endpoints_from_routers(anthropic_routers)
+    azure_endpoints = (
+        _extract_endpoints_from_routers(azure_legacy_routers)
+        + _extract_endpoints_from_routers(openai_routers, prefix="/openai")
+    )
+
+    # Strip /v1 prefix from OpenAI endpoint paths
+    for ep in openai_endpoints:
+        if ep["path"].startswith("/v1"):
+            ep["path"] = ep["path"][3:]
+
+    # Get enabled models with supported_apis for badge rendering
+    enabled_models = provider_manager.model_cache.get_enabled_models()
+    models_list = []
+    for model in enabled_models:
+        provider = provider_manager.providers.get(model.provider)
+        supported_apis = provider.get_supported_apis_for_model(model.id) if provider else ["openai"]
+        models_list.append({
+            "id": model.id,
+            "object": model.object,
+            "created": model.created,
+            "owned_by": model.owned_by,
+            "supported_apis": supported_apis,
+        })
+
     # Regular user - show normal dashboard
     return templates.TemplateResponse(
         "dashboard/authenticated.html",
@@ -75,7 +114,15 @@ async def dashboard_home(
             "request": request,
             "user": current_user_or_admin,
             "title": "LLM Proxy Server Dashboard",
-            "cache_version": str(int(time.time()))
+            "cache_version": str(int(time.time())),
+            "domain": config.server.domain,
+            "openai_port": config.server.openai_port,
+            "anthropic_port": config.server.anthropic_port,
+            "azure_openai_port": config.server.azure_openai_port,
+            "openai_endpoints_json": json.dumps(openai_endpoints),
+            "anthropic_endpoints_json": json.dumps(anthropic_endpoints),
+            "azure_endpoints_json": json.dumps(azure_endpoints),
+            "models_json": json.dumps(models_list),
         }
     )
 

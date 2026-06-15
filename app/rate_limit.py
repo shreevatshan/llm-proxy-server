@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, Optional
+from app import time_utils
 
 logger = logging.getLogger(__name__)
 
@@ -141,12 +142,7 @@ def _rl_headers(d: RateLimitDecision) -> dict:
 
 
 def _seconds_until_utc_midnight() -> int:
-    now = datetime.now(tz=timezone.utc)
-    from datetime import timedelta
-    next_midnight = (now + timedelta(days=1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return max(1, int((next_midnight - now).total_seconds()))
+    return max(1, int(time_utils.seconds_until_local_midnight()))
 
 
 class RateLimitTracker:

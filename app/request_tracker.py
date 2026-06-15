@@ -11,8 +11,9 @@ import time
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, asdict
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional
+from app import time_utils
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ class RequestTracker:
         self._usage_buffer: dict[tuple, int] = defaultdict(int)
         self._usage_lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
+        self._last_rollup_at: float = 0.0
 
     async def start(self):
         self._running = True
@@ -83,21 +85,48 @@ class RequestTracker:
                 return
             snapshot = dict(self._usage_buffer)
 
-        rows = [
+        # Buffer key: (date, hour, user_identity, user_type, model, server)
+        hourly_rows = [
             {
                 "date": key[0],
-                "user_identity": key[1],
-                "user_type": key[2],
-                "model": key[3],
-                "server": key[4],
+                "hour": key[1],
+                "user_identity": key[2],
+                "user_type": key[3],
+                "model": key[4],
+                "server": key[5],
                 "request_count": count,
             }
             for key, count in snapshot.items()
         ]
+
+        # Collapse hourly rows into daily rows (sum counts for same date/user/model/server)
+        daily_map: dict[tuple, int] = defaultdict(int)
+        for key, count in snapshot.items():
+            daily_key = (key[0], key[2], key[3], key[4], key[5])  # drop hour
+            daily_map[daily_key] += count
+        daily_rows = [
+            {
+                "date": k[0],
+                "user_identity": k[1],
+                "user_type": k[2],
+                "model": k[3],
+                "server": k[4],
+                "request_count": count,
+            }
+            for k, count in daily_map.items()
+        ]
+
         try:
-            from app.auth.database import flush_request_usage, prune_request_usage
-            await flush_request_usage(rows)
-            await prune_request_usage(days=30)
+            from app.auth.database import flush_request_usage, flush_request_usage_hourly, prune_hourly_usage, rollup_to_monthly
+            await flush_request_usage_hourly(hourly_rows)
+            await flush_request_usage(daily_rows)
+            await prune_hourly_usage()
+
+            # Throttle rollup to once per hour
+            if time.time() - self._last_rollup_at >= 3600:
+                await rollup_to_monthly()
+                self._last_rollup_at = time.time()
+
             # Only clear after successful commit so get_today_count never sees a gap
             async with self._usage_lock:
                 for key, count in snapshot.items():
@@ -147,8 +176,10 @@ class RequestTracker:
 
         # Accumulate usage (skip unauthenticated requests)
         if entry.user_type != "unknown":
+            now_local = time_utils.local_now()
             key = (
-                date.today(),
+                now_local.date(),
+                now_local.hour,
                 entry.user_identity,
                 entry.user_type,
                 entry.model or "unknown",
@@ -230,11 +261,11 @@ class RequestTracker:
 
     async def get_today_count(self, user_identity: str) -> int:
         """Return total requests today for user_identity (buffer + DB)."""
-        today = date.today()
+        today = time_utils.local_today()
         buffered = 0
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
-                if key[0] == today and key[1] == user_identity:
+                if key[0] == today and key[2] == user_identity:
                     buffered += count
 
         try:

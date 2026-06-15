@@ -1,44 +1,298 @@
 {% extends "layouts/base.html" %}
 
+{% block extra_css %}
+<style>
+    /* ── Endpoints tab ─────────────────────────────────────────────── */
+    .endpoint-section { margin-bottom: 16px; }
+    .base-url-card {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 14px 16px; background-color: var(--dark-surface);
+        border: 1px solid var(--dark-border); border-radius: 6px; transition: border-color 0.2s;
+    }
+    .base-url-card.expanded { border-radius: 6px 6px 0 0; border-bottom-color: transparent; }
+    .base-url-left { display: flex; align-items: center; gap: 12px; flex: 1; min-width: 0; }
+    .base-url-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .api-badge {
+        display: inline-block; padding: 3px 10px; border-radius: 4px; font-size: 11px;
+        font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase; flex-shrink: 0;
+    }
+    .api-badge.openai, .api-badge.anthropic, .api-badge.azure_openai {
+        background-color: var(--mono-3); color: var(--mono-text-primary); border: 1px solid var(--mono-5);
+    }
+    .base-url-text { font-family: var(--font-family-mono); font-size: 14px; color: var(--mono-text-primary); word-break: break-all; }
+    .copy-btn {
+        padding: 6px 14px; background-color: transparent; color: var(--mono-text-primary);
+        border: 1px solid var(--mono-5); border-radius: var(--radius-sm); cursor: pointer;
+        font-size: 13px; transition: all 0.2s; display: flex; align-items: center; gap: 6px;
+        white-space: nowrap; font-family: var(--font-family-mono);
+    }
+    .copy-btn:hover { border-color: var(--mono-text-primary); background-color: var(--mono-3); }
+    .copy-btn.copied { border-color: var(--mono-text-primary); color: var(--mono-0); background-color: var(--mono-text-primary); }
+    .toggle-btn {
+        padding: 6px 10px; background-color: transparent; color: var(--mono-text-secondary);
+        border: 1px solid var(--mono-5); border-radius: var(--radius-sm); cursor: pointer;
+        font-size: 13px; transition: all 0.2s; display: flex; align-items: center; gap: 5px; white-space: nowrap;
+    }
+    .toggle-btn:hover { border-color: var(--mono-text-primary); color: var(--mono-text-primary); background-color: var(--mono-3); }
+    .toggle-btn .chevron { transition: transform 0.25s ease; font-size: 11px; }
+    .toggle-btn.open .chevron { transform: rotate(180deg); }
+    .endpoints-collapse {
+        max-height: 0; overflow: hidden; transition: max-height 0.3s ease;
+        border: 1px solid var(--dark-border); border-top: none; border-radius: 0 0 6px 6px;
+    }
+    .endpoints-collapse.show { max-height: none; }
+    .endpoints-collapse:not(.show) { border-color: transparent; }
+    .endpoint-list-item {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 10px 16px; background-color: var(--dark-surface);
+        border-top: 1px solid var(--dark-border); transition: background-color 0.2s; gap: 12px;
+    }
+    .endpoint-list-item:last-child { border-radius: 0 0 6px 6px; }
+    .endpoint-list-item:hover { background-color: var(--mono-2); }
+    .endpoint-info { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+    .endpoint-method {
+        display: inline-block; padding: 2px 7px; border-radius: 3px; font-size: 10px;
+        font-weight: 700; letter-spacing: 0.3px; text-transform: uppercase; flex-shrink: 0;
+        min-width: 46px; text-align: center;
+        font-family: var(--font-family-mono); letter-spacing: var(--tracking-wider);
+        background-color: transparent; color: var(--mono-text-primary); border: 1px solid var(--mono-5);
+    }
+    .endpoint-path { font-size: 13px; color: var(--mono-text-primary); font-family: var(--font-family-mono); }
+    .endpoint-desc { font-size: 12px; color: var(--mono-text-muted); margin-left: auto; flex-shrink: 0; font-family: var(--font-family-mono); }
+
+    /* ── Models tab ────────────────────────────────────────────────── */
+    .model-list-item {
+        display: flex; justify-content: space-between; align-items: flex-start;
+        padding: 12px 16px; border-bottom: 1px solid var(--dark-border);
+        transition: background-color 0.2s; background-color: var(--dark-surface); gap: 12px;
+    }
+    .model-list-item:hover { background-color: var(--dark-border); }
+    .model-list-item:last-child { border-bottom: none; }
+    .model-name {
+        font-size: 14px; color: var(--mono-text-primary); flex: 1;
+        font-family: var(--font-family-mono); word-break: break-all; overflow-wrap: break-word;
+        white-space: normal; line-height: 1.5;
+    }
+    .model-info { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 0; }
+    .api-badges { display: flex; gap: 6px; flex-wrap: wrap; }
+    .api-badge.openai, .api-badge.anthropic, .api-badge.azure_openai {
+        background-color: var(--mono-3); color: var(--mono-text-secondary);
+        border: 1px solid var(--mono-5); font-family: var(--font-family-mono);
+    }
+    .copy-button {
+        padding: 6px 16px; background-color: transparent; color: var(--mono-text-primary);
+        border: 1px solid var(--mono-5); border-radius: var(--radius-sm); cursor: pointer;
+        font-size: 13px; transition: all 0.2s; display: flex; align-items: center; gap: 6px;
+        flex-shrink: 0; white-space: nowrap; font-family: var(--font-family-mono);
+    }
+    .copy-button:hover { border-color: var(--mono-text-primary); background-color: var(--mono-3); }
+    .copy-button.copied { border-color: var(--mono-text-primary); color: var(--mono-0); background-color: var(--mono-text-primary); }
+    .search-stats {
+        padding: 12px 16px; background-color: var(--dark-surface); border-radius: var(--radius-sm);
+        margin-bottom: 16px; font-size: 14px; color: var(--mono-text-primary);
+        border: 1px solid var(--dark-border); font-family: var(--font-family-mono);
+    }
+    #model-list .card { background-color: var(--dark-surface); border: 1px solid var(--dark-border); }
+    #model-list .card-body { background-color: var(--dark-surface); }
+
+    /* ── Time-window segmented control (ported from admin.css) ───── */
+    .time-window { display: flex; align-items: center; gap: 6px; position: relative; flex-wrap: wrap; }
+    .time-window__track {
+        position: relative; display: flex; align-items: center;
+        background: var(--mono-1); border: 1px solid var(--mono-4);
+        border-radius: var(--radius-md, 3px); padding: 2px; gap: 0;
+    }
+    .time-window__preset {
+        position: relative; z-index: 1; background: transparent; border: none;
+        color: var(--mono-text-secondary, #b8b8b8);
+        font-family: var(--font-family-display, 'Space Grotesk', sans-serif);
+        font-size: 0.7rem; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase;
+        padding: 4px 10px; border-radius: calc(var(--radius-md, 3px) - 1px);
+        cursor: pointer; transition: color 0.15s ease; white-space: nowrap; line-height: 1.4;
+    }
+    .time-window__preset:hover:not(.is-active) { color: var(--mono-text-primary, #fafafa); }
+    .time-window__preset.is-active { color: var(--mono-0, #0d0d0d); background: var(--mono-text-primary, #fafafa); }
+    .time-window__indicator {
+        position: absolute; top: 2px; bottom: 2px; left: 2px;
+        width: var(--tw-w, 0px); transform: translateX(var(--tw-x, 0px));
+        background: var(--mono-text-primary, #fafafa);
+        border-radius: calc(var(--radius-md, 3px) - 2px);
+        transition: transform 0.25s cubic-bezier(0.4,0,0.2,1), width 0.25s cubic-bezier(0.4,0,0.2,1), opacity 0.15s ease;
+        pointer-events: none; z-index: 0;
+    }
+
+    /* ── Toast (shared) ────────────────────────────────────────────── */
+    .toast {
+        background-color: var(--mono-1); color: var(--mono-text-primary); padding: 12px 20px;
+        border-radius: var(--radius-sm); margin-bottom: 10px; border: 1px solid var(--mono-5);
+        border-left: 2px solid var(--mono-text-primary); box-shadow: var(--shadow-lg);
+        animation: slideIn 0.3s ease-out; font-family: var(--font-family-mono);
+    }
+    @keyframes slideIn {
+        from { transform: translateX(100%); opacity: 0; }
+        to { transform: translateX(0); opacity: 1; }
+    }
+</style>
+{% endblock %}
+
 {% block content %}
-<!-- Logged in - show dashboard -->
 <div class="row">
     <div class="col-12">
-        <div class="mb-3 d-flex justify-content-between align-items-center">
-            <div>
-                <h2 id="welcomeMessage">Welcome back!</h2>
-                <p class="text-muted mb-0">Manage your API keys</p>
-            </div>
-            <div class="d-flex gap-2">
-                <a href="/dashboard/endpoints" class="btn btn-outline-primary">
-                    <i class="fas fa-plug me-2"></i>View Available Endpoints
-                </a>
-                <a href="/dashboard/models" class="btn btn-outline-primary">
-                    <i class="fas fa-list me-2"></i>View Available Models
-                </a>
+        <div class="mb-4">
+            <h1 id="welcomeMessage" class="h2 mb-1">Welcome back!</h1>
+        </div>
+    </div>
+</div>
+
+<!-- Tab Navigation -->
+<div class="tab-navigation mb-4">
+    <button class="tab-button active" onclick="showTab('api-keys')">
+        <i class="fas fa-key"></i> API Key Management
+    </button>
+    <button class="tab-button" onclick="showTab('endpoints')">
+        <i class="fas fa-plug"></i> Endpoints
+    </button>
+    <button class="tab-button" onclick="showTab('models')">
+        <i class="fas fa-list"></i> Models
+    </button>
+    <button class="tab-button" onclick="showTab('usage')">
+        <i class="fas fa-chart-bar"></i> Usage
+    </button>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ API Keys -->
+<div class="section tab-content" id="api-keys-tab">
+    <div class="row">
+        <div class="col-12">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h5 class="mb-0"><i class="fas fa-key me-2"></i>API Keys</h5>
+                    <button class="btn btn-primary btn-sm" id="createApiKeyBtn" onclick="showCreateApiKeyModal()">
+                        <i class="fas fa-plus me-1"></i>Create New
+                    </button>
+                </div>
+                <div class="card-body">
+                    <div id="apiKeysContainer">
+                        <div class="skeleton-stack" aria-busy="true" aria-label="Loading API keys">
+                            <div class="skeleton skeleton-row"></div>
+                            <div class="skeleton skeleton-row"></div>
+                            <div class="skeleton skeleton-row"></div>
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
     </div>
 </div>
 
-<div class="row">
-    <div class="col-12">
-        <div class="card">
-            <div class="card-header d-flex justify-content-between align-items-center">
-                <h5 class="mb-0">
-                    <i class="fas fa-key me-2"></i>API Keys
-                </h5>
-                <button class="btn btn-primary btn-sm" id="createApiKeyBtn" onclick="showCreateApiKeyModal()">
-                    <i class="fas fa-plus me-1"></i>Create New
+<!-- ══════════════════════════════════════════════════════ Endpoints -->
+<div class="section tab-content" id="endpoints-tab">
+    <!-- OpenAI -->
+    <div class="endpoint-section">
+        <div class="base-url-card" id="openai-card">
+            <div class="base-url-left">
+                <span class="api-badge openai">OpenAI</span>
+                <span class="base-url-text" id="openai-base-url"></span>
+            </div>
+            <div class="base-url-right">
+                <button class="copy-btn" onclick="copyText(document.getElementById('openai-base-url').textContent, this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+                <button class="toggle-btn" onclick="toggleEndpoints('openai')" id="openai-toggle">
+                    <span class="chevron"><i class="fas fa-chevron-down"></i></span>
                 </button>
             </div>
-            <div class="card-body">
-                <div id="apiKeysContainer">
-                    <div class="skeleton-stack" aria-busy="true" aria-label="Loading API keys">
-                        <div class="skeleton skeleton-row"></div>
-                        <div class="skeleton skeleton-row"></div>
-                        <div class="skeleton skeleton-row"></div>
+        </div>
+        <div class="endpoints-collapse" id="openai-endpoints"></div>
+    </div>
+
+    <!-- Anthropic -->
+    <div class="endpoint-section">
+        <div class="base-url-card" id="anthropic-card">
+            <div class="base-url-left">
+                <span class="api-badge anthropic">Anthropic</span>
+                <span class="base-url-text" id="anthropic-base-url"></span>
+            </div>
+            <div class="base-url-right">
+                <button class="copy-btn" onclick="copyText(document.getElementById('anthropic-base-url').textContent, this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+                <button class="toggle-btn" onclick="toggleEndpoints('anthropic')" id="anthropic-toggle">
+                    <span class="chevron"><i class="fas fa-chevron-down"></i></span>
+                </button>
+            </div>
+        </div>
+        <div class="endpoints-collapse" id="anthropic-endpoints"></div>
+    </div>
+
+    <!-- Azure OpenAI -->
+    <div class="endpoint-section">
+        <div class="base-url-card" id="azure-openai-card">
+            <div class="base-url-left">
+                <span class="api-badge azure_openai">Azure OpenAI</span>
+                <span class="base-url-text" id="azure-openai-base-url"></span>
+            </div>
+            <div class="base-url-right">
+                <button class="copy-btn" onclick="copyText(document.getElementById('azure-openai-base-url').textContent, this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+                <button class="toggle-btn" onclick="toggleEndpoints('azure-openai')" id="azure-openai-toggle">
+                    <span class="chevron"><i class="fas fa-chevron-down"></i></span>
+                </button>
+            </div>
+        </div>
+        <div class="endpoints-collapse" id="azure-openai-endpoints"></div>
+    </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ Models -->
+<div class="section tab-content" id="models-tab">
+    <div class="search-container mb-4">
+        <input type="text" id="model-search" class="form-control form-control-lg"
+               placeholder="Search models by name...">
+    </div>
+    <div id="search-stats" class="search-stats">Loading models...</div>
+    <div id="model-list" class="card">
+        <div class="card-body" style="padding: 0;"></div>
+    </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ Usage -->
+<div class="section tab-content" id="usage-tab">
+    <div class="dashboard-stats mb-4">
+        <div class="stat-card">
+            <div class="stat-number" id="totalRequests">—</div>
+            <div class="stat-label">Total Requests</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-number" id="uniqueModels">—</div>
+            <div class="stat-label">Models Used</div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header">
+            <div class="d-flex align-items-center gap-3 flex-wrap w-100">
+                <h5 class="mb-0"><i class="fas fa-chart-bar me-2"></i>Usage by Model</h5>
+                <span id="user-usage-earliest-date" style="font-size:0.75rem; color:var(--mono-text-muted); font-family:var(--font-family-mono); margin-left:0.5rem;"></span>
+                <div class="time-window ms-auto" id="usage-window-container" data-window-mode="preset">
+                    <div class="time-window__track" id="usage-window-btns" role="group" aria-label="Time window">
+                        <div class="time-window__indicator" id="usage-window-indicator" aria-hidden="true"></div>
+                        <button type="button" class="time-window__preset" data-window="24h" onclick="window.UserUsageManager?.setWindow('24h')">24h</button>
+                        <button type="button" class="time-window__preset" data-window="today" onclick="window.UserUsageManager?.setWindow('today')">Today</button>
+                        <button type="button" class="time-window__preset" data-window="yesterday" onclick="window.UserUsageManager?.setWindow('yesterday')">Yesterday</button>
+                        <button type="button" class="time-window__preset" data-window="7d" onclick="window.UserUsageManager?.setWindow('7d')">7d</button>
+                        <button type="button" class="time-window__preset is-active" data-window="30d" onclick="window.UserUsageManager?.setWindow('30d')">30d</button>
+                        <button type="button" class="time-window__preset" data-window="all" onclick="window.UserUsageManager?.setWindow('all')">All Time</button>
                     </div>
+                </div>
+            </div>
+        </div>
+        <div class="card-body">
+            <div id="usageContainer">
+                <div class="skeleton-stack" aria-busy="true" aria-label="Loading usage data">
+                    <div class="skeleton skeleton-row"></div>
+                    <div class="skeleton skeleton-row"></div>
+                    <div class="skeleton skeleton-row"></div>
                 </div>
             </div>
         </div>
@@ -59,7 +313,7 @@
                 <div class="modal-body">
                     <div class="mb-3">
                         <label for="apiKeyName" class="form-label">API Key Name</label>
-                        <input type="text" class="form-control" id="apiKeyName" name="name" required 
+                        <input type="text" class="form-control" id="apiKeyName" name="name" required
                                placeholder="e.g., My App, Production, Development">
                         <div class="form-text">Choose a descriptive name to identify this API key</div>
                     </div>
@@ -120,12 +374,10 @@
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal" id="confirmCancelBtn">
-                    <i class="fas fa-times me-1"></i>
-                    Cancel
+                    <i class="fas fa-times me-1"></i>Cancel
                 </button>
                 <button type="button" class="btn btn-danger" id="confirmActionBtn">
-                    <i class="fas fa-check me-1"></i>
-                    Confirm
+                    <i class="fas fa-check me-1"></i>Confirm
                 </button>
             </div>
         </div>
@@ -134,10 +386,21 @@
 
 <!-- Toast Container -->
 <div id="toast-container" class="toast-container"></div>
-
 {% endblock %}
 
 {% block extra_js %}
+<script>
+    // Embed data from server for endpoints + models tabs
+    const _domain         = "{{ domain }}";
+    const _openaiPort     = "{{ openai_port }}";
+    const _anthropicPort  = "{{ anthropic_port }}";
+    const _azurePort      = "{{ azure_openai_port }}";
+    const endpointsData         = {{ openai_endpoints_json|safe }};
+    const anthropicEndpointsData= {{ anthropic_endpoints_json|safe }};
+    const azureEndpointsData    = {{ azure_endpoints_json|safe }};
+    const modelsData            = {{ models_json|safe }};
+</script>
 <script src="/static/js/core/ui-utils.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/authenticated_dashboard.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/dashboard/user-usage-manager.js?v={{ cache_version }}"></script>
 {% endblock %}

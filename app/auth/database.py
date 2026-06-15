@@ -4,14 +4,14 @@ import os
 import secrets
 import logging
 from pathlib import Path
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, String
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, Session, selectinload
 from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, UserRateLimit, GlobalRateLimit
+from .models import Base, User, APIKey, ModelConfiguration, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -232,20 +232,21 @@ async def get_oauth_user_by_provider_id(db: AsyncSession, provider: str, provide
     return result.scalar_one_or_none()
 
 
-async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: str, email: str, name: str, 
-                           first_name: Optional[str] = None, last_name: Optional[str] = None, 
-                           picture: Optional[str] = None, raw_data: Optional[str] = None) -> tuple[User, OAuthUser]:
+async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: str, email: str, name: str,
+                           first_name: Optional[str] = None, last_name: Optional[str] = None,
+                           picture: Optional[str] = None, raw_data: Optional[str] = None,
+                           is_pending: bool = False) -> tuple[User, OAuthUser]:
     """Create a new user with OAuth authentication."""
     # Generate a unique username from email or name
     username = email.split('@')[0] if '@' in email else name.lower().replace(' ', '_')
-    
+
     # Check if username exists and make it unique if needed
     base_username = username
     counter = 1
     while await get_user_by_username(db, username):
         username = f"{base_username}_{counter}"
         counter += 1
-    
+
     # Check if email exists
     existing_user_by_email = await get_user_by_email(db, email)
     if existing_user_by_email:
@@ -262,7 +263,9 @@ async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: s
             email=email,
             hashed_password=None,  # No password for OAuth users
             oauth_provider=provider,
-            oauth_sub=provider_user_id
+            oauth_sub=provider_user_id,
+            is_active=not is_pending,
+            is_pending_approval=is_pending
         )
         db.add(user)
         await db.flush()  # Flush to get the user ID
@@ -1268,7 +1271,7 @@ async def delete_response_provider_mapping(
 
 
 async def flush_request_usage(rows: list[dict]) -> None:
-    """Bulk upsert usage rows, incrementing request_count on conflict."""
+    """Bulk upsert daily usage rows, incrementing request_count on conflict."""
     if not rows:
         return
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -1287,19 +1290,210 @@ async def flush_request_usage(rows: list[dict]) -> None:
             raise
 
 
-async def prune_request_usage(days: int = 30) -> None:
-    """Delete usage rows older than `days` days."""
-    from sqlalchemy import delete
-    from datetime import date, timedelta
-    cutoff = date.today() - timedelta(days=days)
+async def flush_request_usage_hourly(rows: list[dict]) -> None:
+    """Bulk upsert hourly usage rows, incrementing request_count on conflict."""
+    if not rows:
+        return
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
     async with AsyncSessionLocal() as db:
         try:
-            await db.execute(delete(RequestUsage).where(RequestUsage.date < cutoff))
+            stmt = sqlite_insert(RequestUsageHourly).values(rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["date", "hour", "user_identity", "model", "server"],
+                set_={"request_count": RequestUsageHourly.request_count + stmt.excluded.request_count},
+            )
+            await db.execute(stmt)
             await db.commit()
         except Exception as e:
             await db.rollback()
-            logger.error(f"Failed to prune request usage: {e}")
+            logger.error(f"Failed to flush hourly request usage: {e}")
             raise
+
+
+async def prune_hourly_usage() -> None:
+    """Delete hourly rows older than yesterday (~48h retention)."""
+    from sqlalchemy import delete
+    from datetime import timedelta
+    from app import time_utils
+    cutoff = time_utils.local_today() - timedelta(days=1)
+    async with AsyncSessionLocal() as db:
+        try:
+            await db.execute(delete(RequestUsageHourly).where(RequestUsageHourly.date < cutoff))
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Failed to prune hourly usage: {e}")
+            raise
+
+
+async def rollup_to_monthly() -> None:
+    """Roll up fully-aged months from request_usage into request_usage_monthly.
+
+    A month is eligible when its last calendar day is at least 30 days before today,
+    ensuring we never roll up a partially-complete month.
+    """
+    from sqlalchemy import func, delete, text
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+    from datetime import date, timedelta
+    from app import time_utils
+    import calendar
+
+    today = time_utils.local_today()
+
+    async with AsyncSessionLocal() as db:
+        try:
+            # Find distinct (year, month) pairs present in the daily table
+            q = select(
+                func.strftime('%Y', RequestUsage.date).label('yr'),
+                func.strftime('%m', RequestUsage.date).label('mo'),
+            ).group_by(
+                func.strftime('%Y', RequestUsage.date),
+                func.strftime('%m', RequestUsage.date),
+            )
+            ym_rows = (await db.execute(q)).all()
+
+            for ym in ym_rows:
+                year, month = int(ym.yr), int(ym.mo)
+                last_day_of_month = date(year, month, calendar.monthrange(year, month)[1])
+                if last_day_of_month >= today - timedelta(days=30):
+                    continue  # month not fully aged yet
+
+                # Aggregate all daily rows for this month
+                agg_q = select(
+                    RequestUsage.user_identity,
+                    RequestUsage.user_type,
+                    RequestUsage.model,
+                    RequestUsage.server,
+                    func.sum(RequestUsage.request_count).label("request_count"),
+                ).where(
+                    func.strftime('%Y', RequestUsage.date) == str(year),
+                    func.strftime('%m', RequestUsage.date) == f"{month:02d}",
+                ).group_by(
+                    RequestUsage.user_identity,
+                    RequestUsage.user_type,
+                    RequestUsage.model,
+                    RequestUsage.server,
+                )
+                agg_rows = (await db.execute(agg_q)).all()
+
+                if not agg_rows:
+                    continue
+
+                monthly_rows = [
+                    {
+                        "year": year,
+                        "month": month,
+                        "user_identity": r.user_identity,
+                        "user_type": r.user_type,
+                        "model": r.model,
+                        "server": r.server,
+                        "request_count": r.request_count,
+                    }
+                    for r in agg_rows
+                ]
+
+                # Upsert into monthly table
+                stmt = sqlite_insert(RequestUsageMonthly).values(monthly_rows)
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=["year", "month", "user_identity", "model", "server"],
+                    set_={"request_count": RequestUsageMonthly.request_count + stmt.excluded.request_count},
+                )
+                await db.execute(stmt)
+
+                # Delete the source daily rows for this month
+                await db.execute(
+                    delete(RequestUsage).where(
+                        func.strftime('%Y', RequestUsage.date) == str(year),
+                        func.strftime('%m', RequestUsage.date) == f"{month:02d}",
+                    )
+                )
+                await db.commit()
+                logger.info(f"Rolled up {len(monthly_rows)} groups for {year}-{month:02d} into monthly table")
+
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Failed to roll up monthly usage: {e}")
+            raise
+
+
+def _build_usage_where(window: str, year: Optional[int], month: Optional[int]):
+    """Return (table, where_clauses) for the given window over the daily table.
+
+    Returns None for table when the window should use the monthly table directly.
+    For 'month' window with year/month, returns clauses for both daily and monthly tables
+    so the caller can UNION them.
+    """
+    from datetime import timedelta
+    from sqlalchemy import func
+    from app import time_utils
+    today = time_utils.local_today()
+
+    if window == "all":
+        return None, []  # handled inline in get_usage_aggregates (UNION daily + monthly, no date filter)
+    if window == "24h":
+        # Handled separately via RequestUsageHourly
+        return None, []
+    if window == "today":
+        return RequestUsage, [RequestUsage.date == today]
+    if window == "yesterday":
+        return RequestUsage, [RequestUsage.date == today - timedelta(days=1)]
+    if window == "7d":
+        return RequestUsage, [RequestUsage.date >= today - timedelta(days=6)]
+    if window == "30d":
+        return RequestUsage, [RequestUsage.date >= today - timedelta(days=29)]
+    if window == "month" and year and month:
+        return None, []  # handled inline in get_usage_aggregates
+    return RequestUsage, [RequestUsage.date >= today - timedelta(days=29)]
+
+
+async def get_usage_earliest_date(db: AsyncSession, filter_user: Optional[str] = None) -> Optional[str]:
+    """Return the earliest date for which any usage data exists, as an ISO string (YYYY-MM-DD).
+
+    Checks the daily table first (exact dates), then falls back to the monthly rollup
+    (returns the first day of the earliest year/month found there).
+    When filter_user is given, scopes to that user only.
+    """
+    from sqlalchemy import func
+    from datetime import date
+
+    daily_q = select(func.min(RequestUsage.date))
+    monthly_q = select(func.min(RequestUsageMonthly.year), func.min(RequestUsageMonthly.month))
+
+    if filter_user:
+        daily_q = daily_q.where(RequestUsage.user_identity == filter_user)
+        monthly_q = select(
+            func.min(RequestUsageMonthly.year),
+            func.min(RequestUsageMonthly.month),
+        ).where(RequestUsageMonthly.user_identity == filter_user)
+
+    daily_min = (await db.execute(daily_q)).scalar()
+    if daily_min:
+        return daily_min.isoformat() if hasattr(daily_min, 'isoformat') else str(daily_min)
+
+    monthly_row = (await db.execute(monthly_q)).first()
+    if monthly_row and monthly_row[0] is not None:
+        return date(int(monthly_row[0]), int(monthly_row[1]), 1).isoformat()
+
+    return None
+
+
+async def get_usage_years(db: AsyncSession) -> list[int]:
+    """Return sorted list of years with any usage data (daily or monthly tables)."""
+    from sqlalchemy import func, union_all, literal_column
+    from datetime import date
+
+    q_daily = select(
+        func.strftime('%Y', RequestUsage.date).label('yr')
+    ).group_by(func.strftime('%Y', RequestUsage.date))
+
+    q_monthly = select(
+        RequestUsageMonthly.year.cast(String).label('yr')
+    ).group_by(RequestUsageMonthly.year)
+
+    # Execute both and merge in Python (SQLite async union is awkward with labels)
+    daily_years = {int(r.yr) for r in (await db.execute(q_daily)).all()}
+    monthly_years = {int(r.yr) for r in (await db.execute(q_monthly)).all()}
+    return sorted(daily_years | monthly_years)
 
 
 async def get_usage_aggregates(
@@ -1307,124 +1501,343 @@ async def get_usage_aggregates(
     group_by: str = "user",
     filter_user: Optional[str] = None,
     filter_model: Optional[str] = None,
+    window: str = "30d",
+    year: Optional[int] = None,
+    month: Optional[int] = None,
 ) -> dict:
-    """Return aggregated usage data for the last 30 days.
+    """Return aggregated usage data for the requested time window.
 
-    group_by: 'user' or 'model'
-    filter_user: when set, group by model for this user (drill-down)
-    filter_model: when set, group by user for this model (drill-down)
+    window: '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'month'
+    year, month: required when window='month'
+    group_by: 'user' | 'model' (top-level only)
+    filter_user / filter_model: drill-down
     """
-    from sqlalchemy import func, text
+    from sqlalchemy import func, union_all
     from datetime import date, timedelta
+    from app import time_utils
 
-    cutoff = date.today() - timedelta(days=29)
+    today = time_utils.local_today()
 
-    base_q = select(RequestUsage).where(RequestUsage.date >= cutoff)
+    # ------------------------------------------------------------------ #
+    # Build the base query (or queries for month UNION) depending on window
+    # ------------------------------------------------------------------ #
 
-    if filter_user is not None:
-        # Drill-down: split by model for a specific user
-        q = (
-            select(
-                RequestUsage.model,
-                func.sum(RequestUsage.request_count).label("request_count"),
+    def _daily_where():
+        if window == "today":
+            return [RequestUsage.date == today]
+        if window == "yesterday":
+            return [RequestUsage.date == today - timedelta(days=1)]
+        if window == "7d":
+            return [RequestUsage.date >= today - timedelta(days=6)]
+        return [RequestUsage.date >= today - timedelta(days=29)]  # default 30d
+
+    async def _query_24h(extra_where):
+        now_utc = time_utils.local_now()
+        cutoff_dt = now_utc - timedelta(hours=24)
+        cutoff_date = cutoff_dt.date()
+        cutoff_hour = cutoff_dt.hour
+
+        where = [
+            (RequestUsageHourly.date > cutoff_date) |
+            ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
+        ] + extra_where
+        return where
+
+    async def _exec_top_level_query(where_clauses, use_hourly=False, use_monthly=False):
+        """Run user + model top-level queries and return (per_user, per_model)."""
+        tbl_u = RequestUsageHourly if use_hourly else (RequestUsageMonthly if use_monthly else RequestUsage)
+        tbl_m = tbl_u
+
+        def _user_q(tbl, where):
+            return (
+                select(
+                    tbl.user_identity,
+                    tbl.user_type,
+                    func.sum(tbl.request_count).label("request_count"),
+                )
+                .where(*where)
+                .group_by(tbl.user_identity, tbl.user_type)
+                .order_by(func.sum(tbl.request_count).desc(), tbl.user_identity)
             )
-            .where(RequestUsage.date >= cutoff)
-            .where(RequestUsage.user_identity == filter_user)
-            .group_by(RequestUsage.model)
-            .order_by(func.sum(RequestUsage.request_count).desc(), RequestUsage.model)
-        )
-        rows = (await db.execute(q)).all()
-        result = [{"model": r.model, "request_count": r.request_count} for r in rows]
-        shown_since = await _usage_shown_since(db, cutoff)
-        return {"shown_since": shown_since, "breakdown": result}
 
-    if filter_model is not None:
-        # Drill-down: split by user for a specific model
-        q = (
-            select(
-                RequestUsage.user_identity,
-                RequestUsage.user_type,
-                func.sum(RequestUsage.request_count).label("request_count"),
+        def _model_q(tbl, where):
+            return (
+                select(
+                    tbl.model,
+                    func.sum(tbl.request_count).label("request_count"),
+                )
+                .where(*where)
+                .group_by(tbl.model)
+                .order_by(func.sum(tbl.request_count).desc(), tbl.model)
             )
-            .where(RequestUsage.date >= cutoff)
-            .where(RequestUsage.model == filter_model)
-            .group_by(RequestUsage.user_identity, RequestUsage.user_type)
-            .order_by(func.sum(RequestUsage.request_count).desc(), RequestUsage.user_identity)
+
+        user_rows = (await db.execute(_user_q(tbl_u, where_clauses))).all()
+        model_rows = (await db.execute(_model_q(tbl_m, where_clauses))).all()
+        return (
+            [{"user_identity": r.user_identity, "user_type": r.user_type, "request_count": r.request_count} for r in user_rows],
+            [{"model": r.model, "request_count": r.request_count} for r in model_rows],
         )
-        rows = (await db.execute(q)).all()
-        result = [
-            {"user_identity": r.user_identity, "user_type": r.user_type, "request_count": r.request_count}
-            for r in rows
+
+    async def _exec_drilldown_query(where_clauses, use_hourly=False, use_monthly=False):
+        tbl = RequestUsageHourly if use_hourly else (RequestUsageMonthly if use_monthly else RequestUsage)
+        if filter_user is not None:
+            q = (
+                select(tbl.model, func.sum(tbl.request_count).label("request_count"))
+                .where(*where_clauses, tbl.user_identity == filter_user)
+                .group_by(tbl.model)
+                .order_by(func.sum(tbl.request_count).desc(), tbl.model)
+            )
+            rows = (await db.execute(q)).all()
+            return [{"model": r.model, "request_count": r.request_count} for r in rows]
+        else:
+            q = (
+                select(tbl.user_identity, tbl.user_type, func.sum(tbl.request_count).label("request_count"))
+                .where(*where_clauses, tbl.model == filter_model)
+                .group_by(tbl.user_identity, tbl.user_type)
+                .order_by(func.sum(tbl.request_count).desc(), tbl.user_identity)
+            )
+            rows = (await db.execute(q)).all()
+            return [{"user_identity": r.user_identity, "user_type": r.user_type, "request_count": r.request_count} for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # 24h window — strict rolling 24h using the hourly table only.
+    # Requests made before request_usage_hourly was introduced will not
+    # appear; this resolves naturally within 24h of first deploy.
+    # ------------------------------------------------------------------ #
+    if window == "24h":
+        now_utc = time_utils.local_now()
+        cutoff_dt = now_utc - timedelta(hours=24)
+        cutoff_date = cutoff_dt.date()
+        cutoff_hour = cutoff_dt.hour
+        base_where = [
+            (RequestUsageHourly.date > cutoff_date) |
+            ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
         ]
-        shown_since = await _usage_shown_since(db, cutoff)
-        return {"shown_since": shown_since, "breakdown": result}
 
-    # Top-level: group by user or model
-    if group_by == "model":
-        q = (
-            select(
-                RequestUsage.model,
-                func.sum(RequestUsage.request_count).label("request_count"),
+        if filter_user is not None or filter_model is not None:
+            breakdown = await _exec_drilldown_query(base_where, use_hourly=True)
+            return {"window": window, "breakdown": breakdown}
+
+        per_user, per_model = await _exec_top_level_query(base_where, use_hourly=True)
+        total_requests = sum(r["request_count"] for r in per_user)
+        return {
+            "window": window,
+            "per_user": per_user,
+            "per_model": per_model,
+            "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
+        }
+
+    # ------------------------------------------------------------------ #
+    # Month window — UNION daily rows (not yet rolled up) + monthly rows
+    # ------------------------------------------------------------------ #
+    if window == "month" and year and month:
+        yr_str = str(year)
+        mo_str = f"{month:02d}"
+
+        daily_where = [
+            func.strftime('%Y', RequestUsage.date) == yr_str,
+            func.strftime('%m', RequestUsage.date) == mo_str,
+        ]
+        monthly_where = [
+            RequestUsageMonthly.year == year,
+            RequestUsageMonthly.month == month,
+        ]
+
+        async def _month_query_user():
+            d_rows = (await db.execute(
+                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
+                .where(*daily_where).group_by(RequestUsage.user_identity, RequestUsage.user_type)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(*monthly_where).group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                k = (r.user_identity, r.user_type)
+                combined[k] = combined.get(k, 0) + r.rc
+            return sorted(
+                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
+                key=lambda x: -x["request_count"]
             )
-            .where(RequestUsage.date >= cutoff)
-            .group_by(RequestUsage.model)
-            .order_by(func.sum(RequestUsage.request_count).desc(), RequestUsage.model)
-        )
-        rows = (await db.execute(q)).all()
-        per_model = [{"model": r.model, "request_count": r.request_count} for r in rows]
-    else:
-        per_model = None
 
-    q_user = (
-        select(
-            RequestUsage.user_identity,
-            RequestUsage.user_type,
-            func.sum(RequestUsage.request_count).label("request_count"),
-        )
-        .where(RequestUsage.date >= cutoff)
-        .group_by(RequestUsage.user_identity, RequestUsage.user_type)
-        .order_by(func.sum(RequestUsage.request_count).desc(), RequestUsage.user_identity)
-    )
-    user_rows = (await db.execute(q_user)).all()
-    per_user = [
-        {"user_identity": r.user_identity, "user_type": r.user_type, "request_count": r.request_count}
-        for r in user_rows
-    ]
-
-    if per_model is None:
-        q_model = (
-            select(
-                RequestUsage.model,
-                func.sum(RequestUsage.request_count).label("request_count"),
+        async def _month_query_model():
+            d_rows = (await db.execute(
+                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
+                .where(*daily_where).group_by(RequestUsage.model)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(*monthly_where).group_by(RequestUsageMonthly.model)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                combined[r.model] = combined.get(r.model, 0) + r.rc
+            return sorted(
+                [{"model": m, "request_count": c} for m, c in combined.items()],
+                key=lambda x: -x["request_count"]
             )
-            .where(RequestUsage.date >= cutoff)
-            .group_by(RequestUsage.model)
-            .order_by(func.sum(RequestUsage.request_count).desc(), RequestUsage.model)
-        )
-        model_rows = (await db.execute(q_model)).all()
-        per_model = [{"model": r.model, "request_count": r.request_count} for r in model_rows]
 
+        if filter_user is not None:
+            d_rows = (await db.execute(
+                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
+                .where(*daily_where, RequestUsage.user_identity == filter_user)
+                .group_by(RequestUsage.model)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(*monthly_where, RequestUsageMonthly.user_identity == filter_user)
+                .group_by(RequestUsageMonthly.model)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                combined[r.model] = combined.get(r.model, 0) + r.rc
+            breakdown = sorted(
+                [{"model": m, "request_count": c} for m, c in combined.items()],
+                key=lambda x: -x["request_count"]
+            )
+            return {"window": window, "year": year, "month": month, "breakdown": breakdown}
+
+        if filter_model is not None:
+            d_rows = (await db.execute(
+                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
+                .where(*daily_where, RequestUsage.model == filter_model)
+                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(*monthly_where, RequestUsageMonthly.model == filter_model)
+                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                k = (r.user_identity, r.user_type)
+                combined[k] = combined.get(k, 0) + r.rc
+            breakdown = sorted(
+                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
+                key=lambda x: -x["request_count"]
+            )
+            return {"window": window, "year": year, "month": month, "breakdown": breakdown}
+
+        per_user = await _month_query_user()
+        per_model = await _month_query_model()
+        total_requests = sum(r["request_count"] for r in per_user)
+        return {
+            "window": window,
+            "year": year,
+            "month": month,
+            "per_user": per_user,
+            "per_model": per_model,
+            "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
+        }
+
+    # ------------------------------------------------------------------ #
+    # All-time window — UNION daily rows + monthly rollups, no date filter
+    # ------------------------------------------------------------------ #
+    if window == "all":
+        async def _all_query_user():
+            d_rows = (await db.execute(
+                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
+                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                k = (r.user_identity, r.user_type)
+                combined[k] = combined.get(k, 0) + r.rc
+            return sorted(
+                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
+                key=lambda x: -x["request_count"]
+            )
+
+        async def _all_query_model():
+            d_rows = (await db.execute(
+                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
+                .group_by(RequestUsage.model)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .group_by(RequestUsageMonthly.model)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                combined[r.model] = combined.get(r.model, 0) + r.rc
+            return sorted(
+                [{"model": m, "request_count": c} for m, c in combined.items()],
+                key=lambda x: -x["request_count"]
+            )
+
+        if filter_user is not None:
+            d_rows = (await db.execute(
+                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
+                .where(RequestUsage.user_identity == filter_user)
+                .group_by(RequestUsage.model)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(RequestUsageMonthly.user_identity == filter_user)
+                .group_by(RequestUsageMonthly.model)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                combined[r.model] = combined.get(r.model, 0) + r.rc
+            breakdown = sorted(
+                [{"model": m, "request_count": c} for m, c in combined.items()],
+                key=lambda x: -x["request_count"]
+            )
+            return {"window": window, "breakdown": breakdown}
+
+        if filter_model is not None:
+            d_rows = (await db.execute(
+                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
+                .where(RequestUsage.model == filter_model)
+                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(RequestUsageMonthly.model == filter_model)
+                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
+            )).all()
+            combined: dict = {}
+            for r in list(d_rows) + list(m_rows):
+                k = (r.user_identity, r.user_type)
+                combined[k] = combined.get(k, 0) + r.rc
+            breakdown = sorted(
+                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
+                key=lambda x: -x["request_count"]
+            )
+            return {"window": window, "breakdown": breakdown}
+
+        per_user = await _all_query_user()
+        per_model = await _all_query_model()
+        total_requests = sum(r["request_count"] for r in per_user)
+        return {
+            "window": window,
+            "per_user": per_user,
+            "per_model": per_model,
+            "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
+        }
+
+    # ------------------------------------------------------------------ #
+    # Daily-table windows: today, yesterday, 7d, 30d
+    # ------------------------------------------------------------------ #
+    base_where = _daily_where()
+
+    if filter_user is not None or filter_model is not None:
+        breakdown = await _exec_drilldown_query(base_where)
+        return {"window": window, "breakdown": breakdown}
+
+    per_user, per_model = await _exec_top_level_query(base_where)
     total_requests = sum(r["request_count"] for r in per_user)
-    shown_since = await _usage_shown_since(db, cutoff)
-
     return {
-        "shown_since": shown_since,
+        "window": window,
         "per_user": per_user,
         "per_model": per_model,
-        "totals": {
-            "requests": total_requests,
-            "unique_users": len(per_user),
-            "unique_models": len(per_model),
-        },
+        "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
     }
-
-
-async def _usage_shown_since(db: AsyncSession, cutoff) -> Optional[str]:
-    from sqlalchemy import func
-    q = select(func.min(RequestUsage.date)).where(RequestUsage.date >= cutoff)
-    result = await db.execute(q)
-    min_date = result.scalar_one_or_none()
-    return str(min_date) if min_date else str(cutoff)
 
 
 async def init_database():

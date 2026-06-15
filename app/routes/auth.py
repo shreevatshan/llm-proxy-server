@@ -5,7 +5,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import timedelta
-from typing import List
+from typing import List, Optional
 import json
 import secrets
 
@@ -434,33 +434,72 @@ async def delete_account(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin users cannot delete account through this endpoint"
         )
-    
+
     # Verify confirmation text before deletion
     if delete_data.confirmation != "DELETE":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Confirmation text is incorrect. Please type 'DELETE' exactly."
         )
-    
+
     try:
         success = await permanently_delete_user(db, current_user.id)
-        
+
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
-        
+
         # Clear authentication cookie
         if response:
             response.delete_cookie(key="access_token")
-        
+
         return {"message": "Account deleted successfully"}
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete account"
         )
+
+
+@router.get("/usage")
+async def get_user_usage(
+    view: Optional[str] = Query(None, description="'model' for drill-down by model"),
+    id: Optional[str] = Query(None, description="Model name to drill into"),
+    window: str = Query("30d", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
+    year: Optional[int] = Query(None, description="Year (required when window=month)"),
+    month: Optional[int] = Query(None, description="Month 1-12 (required when window=month)"),
+    current_user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return usage data for the authenticated user.
+
+    - No view/id: top-level per_model + totals.
+    - ?view=model&id=gpt-4: breakdown by model context (optional MVP+).
+    - window=24h|today|yesterday|7d|30d|month|all
+    - window=month requires year and month params.
+    """
+    from app.auth.database import get_usage_aggregates, get_usage_earliest_date
+    from app.request_tracker import request_tracker
+
+    await request_tracker.flush_pending()
+
+    filter_model: Optional[str] = None
+    if view == "model" and id is not None:
+        filter_model = id
+
+    result = await get_usage_aggregates(
+        db,
+        group_by="model",
+        filter_user=current_user.username,
+        filter_model=filter_model,
+        window=window,
+        year=year,
+        month=month,
+    )
+    result["earliest_date"] = await get_usage_earliest_date(db, filter_user=current_user.username)
+    return result
 
 
 # ZOHO OAuth Routes
@@ -533,6 +572,8 @@ async def zoho_callback(code: str, state: str = None, location: str = None,
         else:
             # New OAuth user - create user and OAuth record
             is_new_user = True
+            email_domain = user_info.email.split('@')[-1].lower() if '@' in user_info.email else ''
+            is_pending = email_domain != 'zohocorp.com'
             user, oauth_user = await create_oauth_user(
                 db,
                 provider="zoho",
@@ -542,7 +583,8 @@ async def zoho_callback(code: str, state: str = None, location: str = None,
                 first_name=user_info.first_name,
                 last_name=user_info.last_name,
                 picture=user_info.picture,
-                raw_data=json.dumps(user_info.model_dump())
+                raw_data=json.dumps(user_info.model_dump()),
+                is_pending=is_pending
             )
 
             # Send signup webhook notification for new OAuth users
@@ -551,20 +593,27 @@ async def zoho_callback(code: str, state: str = None, location: str = None,
                 email=user.email,
                 signup_mode="oauth",
                 user_id=user.id,
-                is_pending=False,
+                is_pending=is_pending,
                 oauth_provider="zoho"
             )
-        
+
+        # Block pending users before issuing a token
+        if not user.is_active:
+            admin_email = get_admin_email()
+            from urllib.parse import quote
+            msg = f"Your account is pending admin approval. Please contact {admin_email} for access."
+            return RedirectResponse(url=f"/login?error={quote(msg)}", status_code=302)
+
         # Create access token
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
-            data={"sub": user.username}, 
+            data={"sub": user.username},
             expires_delta=access_token_expires
         )
-        
+
         # Create redirect response
         redirect_response = RedirectResponse(url="/dashboard/", status_code=302)
-        
+
         # Set HTTP-only cookie for web interface
         redirect_response.set_cookie(
             key="access_token",
@@ -574,7 +623,7 @@ async def zoho_callback(code: str, state: str = None, location: str = None,
             secure=False,  # Set to True in production with HTTPS
             samesite="lax"
         )
-        
+
         return redirect_response
         
     except Exception as e:

@@ -5,8 +5,16 @@ document.addEventListener('DOMContentLoaded', function () {
     createApiKeyModal = new bootstrap.Modal(document.getElementById('createApiKeyModal'));
     apiKeyDisplayModal = new bootstrap.Modal(document.getElementById('apiKeyDisplayModal'));
 
+    // tables.css hides all .tab-content by default; activate the first tab explicitly
+    // so the API keys panel is visible without needing a tab switch first.
+    showTab('api-keys');
+
     // Check authentication and load user data
     checkAuthAndLoadData();
+
+    // Populate endpoints and models from embedded server-rendered data
+    initEndpointsTab();
+    initModelsTab();
 });
 
 async function checkAuthAndLoadData() {
@@ -293,4 +301,220 @@ async function deleteApiKey(keyId, keyName) {
     } catch (error) {
         window.UIUtils.showToast('Network error. Please try again.', 'error');
     }
+}
+
+// ================================================================ //
+// Endpoints Tab — base-URL cards + collapsible endpoint lists
+// Ported from app/frontend/templates/dashboard/endpoints.html
+// ================================================================ //
+
+function initEndpointsTab() {
+    if (typeof _domain === 'undefined') return;
+
+    const openaiBaseUrl    = `http://${_domain}:${_openaiPort}/v1`;
+    const anthropicBaseUrl = `http://${_domain}:${_anthropicPort}`;
+    const azureBaseUrl     = `http://${_domain}:${_azurePort}`;
+
+    const el = id => document.getElementById(id);
+    el('openai-base-url').textContent    = openaiBaseUrl;
+    el('anthropic-base-url').textContent = anthropicBaseUrl;
+    el('azure-openai-base-url').textContent = azureBaseUrl;
+
+    _renderEndpoints(endpointsData,          'openai-endpoints',    openaiBaseUrl);
+    _renderEndpoints(anthropicEndpointsData,  'anthropic-endpoints', anthropicBaseUrl);
+    _renderEndpoints(azureEndpointsData,      'azure-openai-endpoints', azureBaseUrl);
+}
+
+function _renderEndpoints(endpoints, containerId, baseUrl) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+    let html = '';
+    (endpoints || []).forEach(ep => {
+        const fullUrl = baseUrl + ep.path;
+        html += `
+            <div class="endpoint-list-item">
+                <div class="endpoint-info">
+                    <span class="endpoint-method ${escapeHtml(ep.method.toLowerCase())}">${escapeHtml(ep.method)}</span>
+                    <span class="endpoint-path">${escapeHtml(ep.path)}</span>
+                    <span class="endpoint-desc">${escapeHtml(ep.desc || '')}</span>
+                </div>
+                <button class="copy-btn" data-url="${escapeHtml(fullUrl)}" onclick="copyText(this.getAttribute('data-url'), this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+            </div>`;
+    });
+    container.innerHTML = html;
+}
+
+function toggleEndpoints(section) {
+    const container = document.getElementById(section + '-endpoints');
+    const toggle    = document.getElementById(section + '-toggle');
+    const card      = document.getElementById(section + '-card');
+    if (!container) return;
+    const isOpen = container.classList.contains('show');
+    if (isOpen) {
+        container.style.maxHeight = container.scrollHeight + 'px';
+        requestAnimationFrame(() => { container.style.maxHeight = '0'; });
+        container.classList.remove('show');
+        toggle.classList.remove('open');
+        card.classList.remove('expanded');
+    } else {
+        container.classList.add('show');
+        container.style.maxHeight = container.scrollHeight + 'px';
+        toggle.classList.add('open');
+        card.classList.add('expanded');
+        container.addEventListener('transitionend', function handler() {
+            if (container.classList.contains('show')) container.style.maxHeight = 'none';
+            container.removeEventListener('transitionend', handler);
+        });
+    }
+}
+
+function copyText(text, button) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(text).then(() => showCopied(button, text)).catch(() => _fallbackCopyText(text, button));
+    } else {
+        _fallbackCopyText(text, button);
+    }
+}
+
+function _fallbackCopyText(text, button) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (ok) showCopied(button, text);
+    else showDashboardToast('Failed to copy to clipboard', 'error');
+}
+
+function showCopied(button, text) {
+    const orig = button.innerHTML;
+    button.innerHTML = '<i class="fas fa-check"></i> Copied!';
+    button.classList.add('copied');
+    showDashboardToast(`Copied: ${text}`, 'success');
+    setTimeout(() => { button.innerHTML = orig; button.classList.remove('copied'); }, 2000);
+}
+
+// ================================================================ //
+// Models Tab — search input + live filtering
+// Ported from app/frontend/templates/dashboard/models_search.html
+// ================================================================ //
+
+let _allModels = [];
+let _filteredModels = [];
+let _modelApiSupport = {};
+
+function initModelsTab() {
+    if (typeof modelsData === 'undefined') return;
+
+    // Build support map and model list from embedded data
+    _modelApiSupport = {};
+    modelsData.forEach(m => { if (m.supported_apis) _modelApiSupport[m.id] = m.supported_apis; });
+
+    _allModels = modelsData
+        .map(m => ({ model_id: m.id, model_name: m.id }))
+        .sort((a, b) => a.model_name.toLowerCase().localeCompare(b.model_name.toLowerCase()));
+
+    _filteredModels = [..._allModels];
+    _displayModels();
+
+    const search = document.getElementById('model-search');
+    if (search) search.addEventListener('input', _filterModels);
+}
+
+function _filterModels() {
+    const term = (document.getElementById('model-search').value || '').toLowerCase().trim();
+    _filteredModels = term
+        ? _allModels.filter(m => m.model_name.toLowerCase().includes(term))
+        : [..._allModels];
+    _displayModels();
+}
+
+function _displayModels() {
+    const listBody = document.querySelector('#model-list .card-body');
+    const stats    = document.getElementById('search-stats');
+    if (!listBody) return;
+
+    const n = _filteredModels.length;
+    if (stats) stats.textContent = `Showing ${n} enabled model${n !== 1 ? 's' : ''}`;
+
+    if (n === 0) {
+        listBody.innerHTML = `<div class="text-center py-5 text-muted"><i class="fas fa-search fa-3x mb-3"></i><p>No models found</p></div>`;
+        return;
+    }
+
+    let html = '';
+    _filteredModels.forEach(model => {
+        const name = model.model_name;
+        const apis = _modelApiSupport[name] || ['openai'];
+        const badges = apis.map(a => `<span class="api-badge ${escapeHtml(a)}">${escapeHtml(a)}</span>`).join('');
+        html += `
+            <div class="model-list-item">
+                <div class="model-info">
+                    <div class="model-name">${escapeHtml(name)}</div>
+                    <div class="api-badges">${badges}</div>
+                </div>
+                <button class="copy-button" data-model-name="${escapeHtml(name)}" onclick="copyModelName(this)">
+                    <i class="fas fa-copy"></i> Copy
+                </button>
+            </div>`;
+    });
+    listBody.innerHTML = html;
+}
+
+function copyModelName(button) {
+    const name = button.getAttribute('data-model-name');
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(name).then(() => _modelCopied(button, name)).catch(() => _modelFallbackCopy(name, button));
+    } else {
+        _modelFallbackCopy(name, button);
+    }
+}
+
+function _modelCopied(button, text) {
+    const orig = button.innerHTML;
+    button.innerHTML = '<i class="fas fa-check"></i> Copied!';
+    button.classList.add('copied');
+    showDashboardToast(`Copied: ${text}`, 'success');
+    setTimeout(() => { button.innerHTML = orig; button.classList.remove('copied'); }, 2000);
+}
+
+function _modelFallbackCopy(text, button) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, 99999);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    if (ok) _modelCopied(button, text);
+    else showDashboardToast('Failed to copy to clipboard', 'error');
+}
+
+// ================================================================ //
+// Shared toast (used by endpoints + models tabs)
+// Uses the same #toast-container already on the page
+// ================================================================ //
+
+function showDashboardToast(message, type) {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+    const toast = document.createElement('div');
+    toast.className = 'toast';
+    if (type === 'error') { toast.style.borderLeftColor = 'var(--mono-text-secondary)'; toast.style.borderLeftStyle = 'dashed'; }
+    toast.innerHTML = `<i class="fas fa-${type === 'error' ? 'exclamation-circle' : 'check-circle'}"></i> ${message}`;
+    container.appendChild(toast);
+    setTimeout(() => {
+        toast.style.animation = 'slideIn 0.3s ease-out reverse';
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
+}
+
+// ================================================================ //
+// Shared helpers
+// ================================================================ //
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = String(text);
+    return div.innerHTML;
 }

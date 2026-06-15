@@ -10,6 +10,7 @@ class ServerConfig(BaseModel):
     anthropic_port: int = 2027  # Anthropic API server port
     azure_openai_port: int = 11439  # Azure OpenAI API server port
     management_port: int = 8765  # Management (admin + user login) server port
+    timezone: str = "UTC"  # IANA timezone name, e.g. "Asia/Kolkata"
 
 
 class DebugConfig(BaseModel):
@@ -64,7 +65,14 @@ class Config(BaseModel):
 
 def load_config_from_env() -> Config:
     """Load configuration from environment variables with defaults."""
-    
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    tz_name = os.getenv("TIMEZONE", "UTC")
+    try:
+        ZoneInfo(tz_name)  # validate early — fail fast on bad names
+    except (ZoneInfoNotFoundError, KeyError) as e:
+        raise ValueError(f"Invalid TIMEZONE '{tz_name}': {e}") from e
+
     # Server configuration from environment
     server_config = ServerConfig(
         host=os.getenv("LLMPROXY_HOST", "0.0.0.0"),
@@ -73,6 +81,7 @@ def load_config_from_env() -> Config:
         anthropic_port=int(os.getenv("ANTHROPIC_SERVER_PORT", "2027")),
         azure_openai_port=int(os.getenv("AZURE_OPENAI_SERVER_PORT", "11439")),
         management_port=int(os.getenv("MANAGEMENT_SERVER_PORT", "8765")),
+        timezone=tz_name,
     )
     
     # Model configuration from environment  

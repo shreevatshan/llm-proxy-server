@@ -18,7 +18,7 @@ from app.auth.database import (
     toggle_provider_configuration, toggle_model_configuration, bulk_toggle_all_models,
     search_models_and_providers, get_all_provider_credentials, get_provider_credentials,
     create_provider_credentials, update_provider_credentials, delete_provider_credentials,
-    clear_all_model_configurations, admin_reset_user_password, get_usage_aggregates,
+    clear_all_model_configurations, admin_reset_user_password, get_usage_aggregates, get_usage_years,
     get_global_rate_limit, upsert_global_rate_limit,
     get_user_rate_limit, upsert_user_rate_limit, delete_user_rate_limit,
 )
@@ -1774,20 +1774,36 @@ async def stream_active_requests(
 # ==================== Usage ====================
 
 
+@router.get("/usage/years")
+async def get_usage_years_endpoint(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return list of years that have any usage data."""
+    years = await get_usage_years(db)
+    return {"years": years}
+
+
 @router.get("/usage")
 async def get_usage(
     view: Optional[str] = Query(None, description="'user' or 'model' for drill-down"),
     id: Optional[str] = Query(None, description="Identity value to drill into"),
+    window: str = Query("30d", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
+    year: Optional[int] = Query(None, description="Year (required when window=month)"),
+    month: Optional[int] = Query(None, description="Month 1-12 (required when window=month)"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return aggregated usage for the last 30 days.
+    """Return aggregated usage for the requested time window.
 
-    - No params: top-level per_user + per_model + totals.
+    - No view/id: top-level per_user + per_model + totals.
     - ?view=user&id=alice: breakdown by model for alice.
     - ?view=model&id=gpt-4: breakdown by user for gpt-4.
+    - window=24h|today|yesterday|7d|30d|month
+    - window=month requires year and month params.
     """
     from app.request_tracker import request_tracker
+    from app.auth.database import get_usage_earliest_date
     await request_tracker.flush_pending()
 
     filter_user: Optional[str] = None
@@ -1798,9 +1814,14 @@ async def get_usage(
     elif view == "model" and id is not None:
         filter_model = id
 
-    return await get_usage_aggregates(
+    result = await get_usage_aggregates(
         db,
         group_by="user",
         filter_user=filter_user,
         filter_model=filter_model,
+        window=window,
+        year=year,
+        month=month,
     )
+    result["earliest_date"] = await get_usage_earliest_date(db)
+    return result

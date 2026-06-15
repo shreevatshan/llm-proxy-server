@@ -357,7 +357,6 @@
             <div class="stat-label">Models Used</div>
         </div>
     </div>
-
     <div class="section-header">
         <div class="d-flex align-items-center gap-3 flex-wrap w-100">
             <div id="usage-toggle" class="btn-group" role="group" aria-label="View toggle">
@@ -367,7 +366,43 @@
             <button type="button" class="btn btn-outline-secondary btn-sm" id="usage-back" style="display:none;" onclick="window.UsageManager?.back()">
                 <i class="fas fa-arrow-left"></i> Back
             </button>
-            <span class="text-muted small ms-auto">Data shown since <span id="usage-since">—</span></span>
+            <span id="usage-earliest-date" style="font-size:0.75rem; color:var(--mono-text-muted); font-family:var(--font-family-mono);"></span>
+            <!-- Window selector -->
+            <div class="time-window ms-auto" id="usage-window-container" data-window-mode="preset">
+                <div class="time-window__track" id="usage-window-btns" role="group" aria-label="Time window">
+                    <div class="time-window__indicator" id="usage-window-indicator" aria-hidden="true"></div>
+                    <button type="button" class="time-window__preset" data-window="24h" onclick="window.UsageManager?.setWindow('24h')">24h</button>
+                    <button type="button" class="time-window__preset" data-window="today" onclick="window.UsageManager?.setWindow('today')">Today</button>
+                    <button type="button" class="time-window__preset" data-window="yesterday" onclick="window.UsageManager?.setWindow('yesterday')">Yesterday</button>
+                    <button type="button" class="time-window__preset" data-window="7d" onclick="window.UsageManager?.setWindow('7d')">7d</button>
+                    <button type="button" class="time-window__preset is-active" data-window="30d" onclick="window.UsageManager?.setWindow('30d')">30d</button>
+                    <button type="button" class="time-window__preset" data-window="all" onclick="window.UsageManager?.setWindow('all')">All Time</button>
+                </div>
+                <button type="button" class="time-window__older" id="usage-window-older-btn" onclick="window.UsageManager?.toggleOlderPopover()" aria-haspopup="true" aria-expanded="false">
+                    <span id="usage-older-label">Older</span>
+                    <svg class="time-window__older-caret" viewBox="0 0 10 6" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M1 1l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                </button>
+                <!-- Older popover — year + month picker -->
+                <div class="time-window__popover" id="usage-older-popover" role="dialog" aria-label="Select historical month">
+                    <div class="tw-popover__years" id="tw-years-list" role="listbox" aria-label="Year">
+                        <!-- populated by JS -->
+                    </div>
+                    <div class="tw-popover__months" id="tw-months-grid" role="listbox" aria-label="Month" data-disabled="true">
+                        <button class="tw-month-chip" data-month="1">Jan</button>
+                        <button class="tw-month-chip" data-month="2">Feb</button>
+                        <button class="tw-month-chip" data-month="3">Mar</button>
+                        <button class="tw-month-chip" data-month="4">Apr</button>
+                        <button class="tw-month-chip" data-month="5">May</button>
+                        <button class="tw-month-chip" data-month="6">Jun</button>
+                        <button class="tw-month-chip" data-month="7">Jul</button>
+                        <button class="tw-month-chip" data-month="8">Aug</button>
+                        <button class="tw-month-chip" data-month="9">Sep</button>
+                        <button class="tw-month-chip" data-month="10">Oct</button>
+                        <button class="tw-month-chip" data-month="11">Nov</button>
+                        <button class="tw-month-chip" data-month="12">Dec</button>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -375,7 +410,7 @@
         <div class="empty-state" id="usage-empty">
             <div class="empty-state-icon"><i class="fas fa-chart-bar"></i></div>
             <h3>No Usage Data</h3>
-            <p>Usage data will appear here once requests are made.</p>
+            <p>Usage data will appear here for the selected time window.</p>
         </div>
     </div>
 </div>

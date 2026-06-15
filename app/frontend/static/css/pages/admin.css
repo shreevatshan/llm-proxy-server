@@ -578,3 +578,238 @@ input:checked + .model-toggle-slider:before {
 .tip:hover::after {
     opacity: 1;
 }
+
+/* ================================
+   TIME WINDOW SELECTOR
+   ================================ */
+
+.time-window {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    position: relative;
+    flex-wrap: wrap;
+}
+
+/* ---- Preset track ---- */
+.time-window__track {
+    position: relative;
+    display: flex;
+    align-items: center;
+    background: var(--mono-1);
+    border: 1px solid var(--mono-4);
+    border-radius: var(--radius-md, 3px);
+    padding: 2px;
+    gap: 0;
+}
+
+.time-window__preset {
+    position: relative;
+    z-index: 1;
+    background: transparent;
+    border: none;
+    color: var(--mono-text-secondary, #b8b8b8);
+    font-family: var(--font-family-display, 'Space Grotesk', sans-serif);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 4px 10px;
+    border-radius: calc(var(--radius-md, 3px) - 1px);
+    cursor: pointer;
+    transition: color 0.15s ease;
+    white-space: nowrap;
+    line-height: 1.4;
+}
+
+.time-window__preset:hover:not(.is-active) {
+    color: var(--mono-text-primary, #fafafa);
+}
+
+.time-window__preset.is-active {
+    color: var(--mono-0, #0d0d0d);
+    /* Fallback background in case JS hasn't measured yet; indicator overpaints this */
+    background: var(--mono-text-primary, #fafafa);
+}
+
+/* Sliding active indicator */
+.time-window__indicator {
+    position: absolute;
+    top: 2px;
+    bottom: 2px;
+    left: 2px;
+    width: var(--tw-w, 0px);
+    transform: translateX(var(--tw-x, 0px));
+    background: var(--mono-text-primary, #fafafa);
+    border-radius: calc(var(--radius-md, 3px) - 2px);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+                width 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0.15s ease;
+    pointer-events: none;
+    z-index: 0;
+}
+
+/* Hide indicator when in "older/month" mode */
+[data-window-mode="older"] .time-window__indicator {
+    opacity: 0;
+}
+
+/* ---- Older trigger ---- */
+.time-window__older {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--mono-1);
+    border: 1px solid var(--mono-4);
+    border-radius: var(--radius-md, 3px);
+    color: var(--mono-text-secondary, #b8b8b8);
+    font-family: var(--font-family-display, 'Space Grotesk', sans-serif);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+    white-space: nowrap;
+    line-height: 1.4;
+}
+
+.time-window__older:hover,
+.time-window__older[aria-expanded="true"] {
+    color: var(--mono-text-primary, #fafafa);
+    border-color: var(--mono-text-primary, #fafafa);
+}
+
+.time-window__older.is-active {
+    background: var(--mono-text-primary, #fafafa);
+    border-color: var(--mono-text-primary, #fafafa);
+    color: var(--mono-0, #0d0d0d);
+}
+
+.time-window__older-caret {
+    width: 10px;
+    height: 6px;
+    flex-shrink: 0;
+    transition: transform 0.18s ease;
+}
+
+.time-window__older[aria-expanded="true"] .time-window__older-caret {
+    transform: rotate(180deg);
+}
+
+/* ---- Popover ---- */
+.time-window__popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 1050;
+    display: flex;
+    gap: 0;
+    min-width: 260px;
+    background: var(--mono-2, #1f1f1f);
+    border: 1px solid var(--mono-4, #333);
+    border-radius: var(--radius-md, 3px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.7);
+    opacity: 0;
+    transform: translateY(-4px);
+    pointer-events: none;
+    transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.time-window__popover.is-open {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+}
+
+/* Year column */
+.tw-popover__years {
+    width: 72px;
+    flex-shrink: 0;
+    border-right: 1px solid var(--mono-4, #333);
+    max-height: 200px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--mono-4) transparent;
+    padding: 4px 0;
+}
+
+.tw-popover__years::-webkit-scrollbar {
+    width: 4px;
+}
+
+.tw-popover__years::-webkit-scrollbar-thumb {
+    background: var(--mono-4, #333);
+    border-radius: 2px;
+}
+
+.tw-year-item {
+    display: block;
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--mono-text-secondary, #b8b8b8);
+    font-family: var(--font-family-mono, 'JetBrains Mono', monospace);
+    font-size: 0.72rem;
+    text-align: center;
+    padding: 7px 8px;
+    cursor: pointer;
+    transition: background 0.1s ease, color 0.1s ease;
+}
+
+.tw-year-item:hover {
+    background: var(--mono-3, #2a2a2a);
+    color: var(--mono-text-primary, #fafafa);
+}
+
+.tw-year-item.is-active {
+    background: var(--mono-text-primary, #fafafa);
+    color: var(--mono-0, #0d0d0d);
+    font-weight: 700;
+}
+
+/* Month grid */
+.tw-popover__months {
+    flex: 1;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 3px;
+    padding: 6px;
+    align-content: start;
+}
+
+.tw-month-chip {
+    background: transparent;
+    border: 1px solid var(--mono-4, #333);
+    border-radius: calc(var(--radius-md, 3px) - 1px);
+    color: var(--mono-text-secondary, #b8b8b8);
+    font-family: var(--font-family-display, 'Space Grotesk', sans-serif);
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 5px 4px;
+    cursor: pointer;
+    transition: background 0.1s ease, color 0.1s ease, border-color 0.1s ease;
+    text-align: center;
+}
+
+.tw-month-chip:hover:not(:disabled) {
+    background: var(--mono-3, #2a2a2a);
+    color: var(--mono-text-primary, #fafafa);
+    border-color: var(--mono-text-secondary, #b8b8b8);
+}
+
+.tw-month-chip.is-active {
+    background: var(--mono-text-primary, #fafafa);
+    border-color: var(--mono-text-primary, #fafafa);
+    color: var(--mono-0, #0d0d0d);
+}
+
+.tw-month-chip:disabled,
+[data-disabled="true"] .tw-month-chip {
+    opacity: 0.3;
+    cursor: not-allowed;
+    pointer-events: none;
+}
