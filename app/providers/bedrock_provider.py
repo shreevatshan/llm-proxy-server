@@ -37,9 +37,21 @@ from pydantic import BaseModel
 #  Module-level concurrency primitives for the InvokeModel (native) path.
 #  Shared across BedrockProvider instances.  Thread-pool workers run the
 #  synchronous boto3 calls; the semaphore prevents stampede overload.
+#
+#  Two separate pool/semaphore pairs are used:
+#    • "native stream"  — InvokeModelWithResponseStream (Claude streaming).
+#      Workers are long-lived (hold a thread for the full response duration).
+#    • "native"         — InvokeModel (Claude non-stream / embeddings).
+#      Workers are short-lived (return as soon as the response body is read).
+#
+#  Keeping them separate prevents a burst of long-running streams from
+#  starving synchronous calls and vice versa.  Pool sizes are tunable via
+#  env vars so operators can right-size them for their workload.
 # ---------------------------------------------------------------------------
 _NATIVE_POOL_SIZE = 15
 _NATIVE_SEMAPHORE_LIMIT = 15
+_NATIVE_STREAM_POOL_SIZE = 15   # dedicated to InvokeModelWithResponseStream workers
+_NATIVE_STREAM_SEMAPHORE_LIMIT = 15
 _BEDROCK_NATIVE_WARNING_THRESHOLD_RATIO = 0.6
 _BEDROCK_NATIVE_FUTURE_DONE_EMPTY_CHECKS = 2
 _BEDROCK_NATIVE_FUTURE_DONE_GRACE_SECONDS = 0.1
@@ -59,6 +71,11 @@ _BEDROCK_NATIVE_PROGRESS_EVENT_TYPES = frozenset(
 _native_executor: Optional[ThreadPoolExecutor] = None
 _native_semaphore: Optional[asyncio.Semaphore] = None
 _native_executor_lock = threading.Lock()
+
+# Dedicated to the native streaming (InvokeModelWithResponseStream) path.
+_native_stream_executor: Optional[ThreadPoolExecutor] = None
+_native_stream_semaphore: Optional[asyncio.Semaphore] = None
+_native_stream_executor_lock = threading.Lock()
 
 
 def _get_positive_int_env(name: str, default: int) -> int:
@@ -131,7 +148,7 @@ def _get_native_executor() -> ThreadPoolExecutor:
 
 
 def _get_native_semaphore() -> asyncio.Semaphore:
-    """Get or create the global semaphore for InvokeModel concurrency."""
+    """Get or create the global semaphore for InvokeModel (non-stream) concurrency."""
     global _native_semaphore
     if _native_semaphore is None:
         _native_semaphore = asyncio.Semaphore(_NATIVE_SEMAPHORE_LIMIT)
@@ -140,6 +157,75 @@ def _get_native_semaphore() -> asyncio.Semaphore:
             _NATIVE_SEMAPHORE_LIMIT,
         )
     return _native_semaphore
+
+
+def _get_native_stream_executor() -> ThreadPoolExecutor:
+    """Get or create the dedicated thread-pool for InvokeModelWithResponseStream workers.
+
+    Kept separate from the non-stream executor so long-running stream workers
+    cannot starve short synchronous InvokeModel calls, and vice versa.
+    Pool size is configurable via BEDROCK_NATIVE_STREAM_POOL_SIZE env var.
+    """
+    global _native_stream_executor
+    if _native_stream_executor is None:
+        with _native_stream_executor_lock:
+            if _native_stream_executor is None:
+                pool_size = _get_positive_int_env(
+                    "BEDROCK_NATIVE_STREAM_POOL_SIZE", _NATIVE_STREAM_POOL_SIZE
+                )
+                _native_stream_executor = ThreadPoolExecutor(
+                    max_workers=pool_size,
+                    thread_name_prefix="bedrock-native-stream-",
+                )
+                logger.info(
+                    "[BEDROCK] Created native-stream thread pool with %d workers",
+                    pool_size,
+                )
+    return _native_stream_executor
+
+
+def _get_native_stream_semaphore() -> asyncio.Semaphore:
+    """Get or create the dedicated semaphore for InvokeModelWithResponseStream concurrency.
+
+    Kept separate from the non-stream semaphore so streaming and synchronous
+    native calls cannot deplete each other's permit budgets.
+    Limit is configurable via BEDROCK_NATIVE_STREAM_SEMAPHORE_LIMIT env var.
+    """
+    global _native_stream_semaphore
+    if _native_stream_semaphore is None:
+        limit = _get_positive_int_env(
+            "BEDROCK_NATIVE_STREAM_SEMAPHORE_LIMIT", _NATIVE_STREAM_SEMAPHORE_LIMIT
+        )
+        _native_stream_semaphore = asyncio.Semaphore(limit)
+        logger.info(
+            "[BEDROCK] Created native-stream semaphore with limit %d",
+            limit,
+        )
+    return _native_stream_semaphore
+
+
+def _close_stream_box(stream_box: Optional[list]) -> None:
+    """Close the boto3 event-stream held in *stream_box[0]* if present.
+
+    Called from the async consumer when it exits early so the worker thread
+    blocked in ``next(stream)`` is unblocked immediately rather than waiting
+    for the ~940 s socket read_timeout.  Safe to call from any thread/coroutine;
+    idempotent (no-op when stream_box is None or already cleared).
+    """
+    if stream_box is None:
+        return
+    stream = stream_box[0]
+    if stream is None:
+        return
+    close_fn = getattr(stream, "close", None)
+    if callable(close_fn):
+        try:
+            close_fn()
+        except Exception:
+            logger.debug(
+                "[BEDROCK STREAM NATIVE] _close_stream_box: ignoring close error",
+                exc_info=True,
+            )
 
 
 def _classify_native_stream_exception(exc: Exception) -> str:
@@ -441,7 +527,11 @@ class BedrockProvider(BaseProvider):
         native_stream_client_kwargs["config"] = Config(
             connect_timeout=60,
             read_timeout=self.native_stream_socket_read_timeout,
-            retries={'max_attempts': 8, 'mode': 'adaptive'},
+            # 3 attempts (initial + 2 retries) is sufficient for transient
+            # connection errors; the idle watchdog handles genuine slow starts.
+            # The original value of 8 adaptive retries prolonged thread holding
+            # on Bedrock throttling, contributing to pool exhaustion.
+            retries={'max_attempts': 3, 'mode': 'adaptive'},
             max_pool_connections=50,
         )
         self.bedrock_runtime_native_stream = boto3.client(**native_stream_client_kwargs)
@@ -2361,25 +2451,34 @@ class BedrockProvider(BaseProvider):
         self,
         model_id: str,
         native_request: Dict[str, Any],
-    ) -> tuple["queue.Queue", asyncio.Future, threading.Event]:
+    ) -> tuple["queue.Queue", asyncio.Future, threading.Event, list]:
         """Launch a fresh worker for the native Claude streaming path.
 
-        Returns the (event_queue, future, stop_event) triple driving one
-        invocation of ``_stream_worker_native``. Used both at stream entry
-        and on the pre-output retry path.
+        Returns the (event_queue, future, stop_event, stream_box) 4-tuple
+        driving one invocation of ``_stream_worker_native``. Used both at
+        stream entry and on the pre-output retry path.
+
+        ``stream_box`` is a single-element list that the worker populates with
+        the boto3 event-stream object once it has been opened.  The consumer
+        can call ``stream_box[0].close()`` from the async side to immediately
+        unblock a worker thread parked inside ``next(stream)`` — this prevents
+        zombie threads from exhausting the thread pool when the consumer exits
+        early (client disconnect, idle timeout, outer stream wrapper timeout).
         """
         event_queue: queue.Queue = queue.Queue()
         stop_event = threading.Event()
+        stream_box: list = [None]  # filled by worker after stream is opened
         loop = asyncio.get_event_loop()
         future = loop.run_in_executor(
-            _get_native_executor(),
+            _get_native_stream_executor(),
             self._stream_worker_native,
             model_id,
             native_request,
             event_queue,
             stop_event,
+            stream_box,
         )
-        return event_queue, future, stop_event
+        return event_queue, future, stop_event, stream_box
 
     def _stream_worker_native(
         self,
@@ -2387,6 +2486,7 @@ class BedrockProvider(BaseProvider):
         native_request: Dict[str, Any],
         event_queue: "queue.Queue[tuple]",
         stop_event: Optional[threading.Event] = None,
+        stream_box: Optional[list] = None,
     ) -> None:
         """Thread-pool worker: call ``invoke_model_with_response_stream`` and
         push native Anthropic SSE events into *event_queue*.
@@ -2395,6 +2495,11 @@ class BedrockProvider(BaseProvider):
             ("upstream_event", {"sse": str, "event_type": str})
             ("done", {...})         — worker finished and reports terminal state
             ("error", {...})        — an error occurred
+
+        ``stream_box`` is a single-element list shared with the consumer.  The
+        worker stores the open boto3 event-stream in ``stream_box[0]`` as soon
+        as it is available so the async consumer can close it from the event
+        loop thread, unblocking this thread if it is parked in ``next(stream)``.
         """
         stream = None
         terminal_event_type = None
@@ -2455,6 +2560,12 @@ class BedrockProvider(BaseProvider):
                     )
                 )
                 return
+            # Publish the stream object so the async consumer can close it
+            # from the event loop if it needs to exit early, which unblocks
+            # this thread parked in next(stream) without waiting for the
+            # ~940s socket read_timeout.
+            if stream_box is not None:
+                stream_box[0] = stream
 
             for event in stream:
                 if stop_event is not None and stop_event.is_set():
@@ -2584,6 +2695,9 @@ class BedrockProvider(BaseProvider):
                         transport_eof_observed,
                         exc_info=True,
                     )
+            # Clear stream_box so a stale reference cannot be used after the worker exits.
+            if stream_box is not None:
+                stream_box[0] = None
 
     def _synthesize_native_finalization_events(
         self,
@@ -2628,8 +2742,17 @@ class BedrockProvider(BaseProvider):
         future: asyncio.Future,
         stop_event: Optional[threading.Event] = None,
         restart_worker: Optional[Any] = None,
+        stream_box: Optional[list] = None,
     ) -> AsyncGenerator[str, None]:
-        """Consume worker events for Bedrock native Claude streaming."""
+        """Consume worker events for Bedrock native Claude streaming.
+
+        ``stream_box`` is a single-element list populated by the worker with
+        the open boto3 event-stream object.  On early consumer exit (client
+        disconnect, idle timeout, outer stream-wrapper timeout) the ``finally``
+        block calls ``stream_box[0].close()`` to immediately unblock a worker
+        thread parked inside ``next(stream)``, preventing zombie threads that
+        would otherwise hold thread-pool slots for up to ~940 s.
+        """
         stream_started_at = time.monotonic()
         last_progress_event_at = stream_started_at
         last_progress_event_type: Optional[str] = None
@@ -2933,7 +3056,10 @@ class BedrockProvider(BaseProvider):
                         )
                         if stop_event is not None and not stop_event.is_set():
                             stop_event.set()
-                        event_queue, future, stop_event = restart_worker()
+                        # Close any still-open stream on the old worker so its
+                        # thread exits without waiting for the socket timeout.
+                        _close_stream_box(stream_box)
+                        event_queue, future, stop_event, stream_box = restart_worker()
                         # Reset per-attempt diagnostic state; client has seen
                         # at most proxy pings, so any synthesis state is moot.
                         stream_started_at = time.monotonic()
@@ -3043,6 +3169,12 @@ class BedrockProvider(BaseProvider):
                     model_id,
                     future.done(),
                 )
+            # Close the boto3 event-stream (if still open) so the worker thread
+            # unblocks out of next(stream) immediately instead of waiting up to
+            # ~940 s for the socket read_timeout.  Safe to call from the async
+            # side because boto3's EventStream.close() acquires no Python-side
+            # lock that the worker holds; it only closes the underlying socket.
+            _close_stream_box(stream_box)
 
     def _cache_control_to_cache_point_block(self, cache_control: Any) -> Optional[Dict[str, Any]]:
         if cache_control is None:
@@ -3506,7 +3638,10 @@ class BedrockProvider(BaseProvider):
                     bool(native_request.get("thinking")),
                 )
 
-            semaphore = _get_native_semaphore()
+            # Use the dedicated streaming semaphore (separate from the non-stream
+            # InvokeModel semaphore) so long-running stream workers cannot starve
+            # synchronous calls and vice versa.
+            semaphore = _get_native_stream_semaphore()
             semaphore_wait_started_at = time.monotonic()
             acquired_semaphore = False
 
@@ -3516,18 +3651,18 @@ class BedrockProvider(BaseProvider):
                 semaphore_wait_seconds = time.monotonic() - semaphore_wait_started_at
                 if semaphore_wait_seconds >= _BEDROCK_NATIVE_SEMAPHORE_WAIT_WARNING_SECONDS:
                     logger.warning(
-                        "[BEDROCK STREAM NATIVE] Waited %.2fs for native semaphore: model=%s",
+                        "[BEDROCK STREAM NATIVE] Waited %.2fs for native stream semaphore: model=%s",
                         semaphore_wait_seconds,
                         model_id,
                     )
                 else:
                     logger.debug(
-                        "[BEDROCK STREAM NATIVE] Acquired native semaphore in %.2fs: model=%s",
+                        "[BEDROCK STREAM NATIVE] Acquired native stream semaphore in %.2fs: model=%s",
                         semaphore_wait_seconds,
                         model_id,
                     )
 
-                event_queue, future, stop_event = self._start_native_stream_worker(
+                event_queue, future, stop_event, stream_box = self._start_native_stream_worker(
                     model_id, native_request,
                 )
 
@@ -3538,6 +3673,7 @@ class BedrockProvider(BaseProvider):
                     future,
                     stop_event,
                     restart_worker=lambda: self._start_native_stream_worker(model_id, native_request),
+                    stream_box=stream_box,
                 ):
                     yield sse_chunk
             finally:

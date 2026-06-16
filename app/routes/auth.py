@@ -17,9 +17,10 @@ from app.auth.database import (
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.models import (
-    UserCreate, UserLogin, UserResponse, Token, APIKeyCreate, 
+    UserCreate, UserLogin, UserResponse, Token, APIKeyCreate,
     APIKeyResponse, APIKeyListResponse, UserUpdate, PasswordUpdate, AccountDelete,
-    ZohoOAuthCallback
+    ZohoOAuthCallback,
+    MyQuotasResponse, QuotaOverallResponse, QuotaGroupResponse,
 )
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin
@@ -500,6 +501,56 @@ async def get_user_usage(
     )
     result["earliest_date"] = await get_usage_earliest_date(db, filter_user=current_user.username)
     return result
+
+
+@router.get("/quotas", response_model=MyQuotasResponse)
+async def get_my_quotas(
+    current_user: Union[User, AdminUser] = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the authenticated user's read-only quota information.
+
+    - overall: effective RPM/RPD limits + current usage counts
+    - groups:  each model group's effective RPM/RPD limits (override or group default) + member models
+    - Admins are exempt from rate limits and receive is_admin=True with no quota data.
+    """
+    from app.auth.models import ModelGroup
+    from app.auth.database import list_model_groups, get_user_group_rate_limit
+    from app.rate_limit import rate_limit_tracker
+
+    # Admins bypass all rate limits; AdminUser has no integer DB id
+    if isinstance(current_user, AdminUser):
+        return MyQuotasResponse(is_admin=True, overall=None, groups=[])
+
+    # --- Overall request-level quota (read-only, no increment) ---
+    status_obj = await rate_limit_tracker.get_user_status(current_user.id, current_user.username)
+    overall = QuotaOverallResponse(
+        rpm_limit=status_obj.rpm_limit,
+        rpm_count=status_obj.rpm_count,
+        rpm_remaining=status_obj.rpm_remaining,
+        rpd_limit=status_obj.rpd_limit,
+        rpd_count=status_obj.rpd_count,
+        rpd_remaining=status_obj.rpd_remaining,
+    )
+
+    # --- Per-model-group quotas ---
+    group_rows = await list_model_groups(db)  # eager-loads .members
+    quota_groups: list[QuotaGroupResponse] = []
+    for group in group_rows:
+        # Resolve effective limit: per-user override if set, else group default
+        ov = await get_user_group_rate_limit(db, current_user.id, group.id)
+        eff_rpm = ov.rpm_limit if (ov and ov.rpm_limit is not None) else group.rpm_default
+        eff_rpd = ov.rpd_limit if (ov and ov.rpd_limit is not None) else group.rpd_default
+        models = [m.model_id for m in group.members]
+        quota_groups.append(QuotaGroupResponse(
+            name=group.name,
+            description=group.description,
+            rpm_limit=eff_rpm,
+            rpd_limit=eff_rpd,
+            models=models,
+        ))
+
+    return MyQuotasResponse(is_admin=False, overall=overall, groups=quota_groups)
 
 
 # ZOHO OAuth Routes

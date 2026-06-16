@@ -21,6 +21,7 @@ from app.providers.anthropic_compatible import (
     # bounded post-terminal drain policy as direct Anthropic-compatible
     # providers so cleanup semantics stay aligned.
     get_anthropic_post_terminal_drain_stop_reason,
+    _translate_anthropic_sdk_error,
 )
 from app.anthropic_models import (
     build_anthropic_sdk_kwargs,
@@ -583,7 +584,10 @@ class AzureProvider(OpenAICompatibleProvider):
                     "anthropic-beta": filtered_beta,
                 }
 
-            response = await self._anthropic_client.messages.create(**kwargs)
+            try:
+                response = await self._anthropic_client.messages.create(**kwargs)
+            except Exception as e:
+                raise _translate_anthropic_sdk_error(e, "azure-foundry") from e
             response_data = json.loads(response.model_dump_json(warnings="none"))
             response_data["model"] = request.model
             return response_data
@@ -619,59 +623,64 @@ class AzureProvider(OpenAICompatibleProvider):
                     "anthropic-beta": filtered_beta,
                 }
 
-            async with self._anthropic_client.messages.stream(**kwargs) as stream:
-                terminal_event_type = None
-                terminal_seen_at: Optional[float] = None
-                drained_event_count = 0
-                async for event in stream:
-                    if terminal_event_type is not None:
-                        drained_event_count += 1
-                        drain_stop_reason = get_anthropic_post_terminal_drain_stop_reason(
-                            terminal_seen_at=terminal_seen_at,
-                            drained_event_count=drained_event_count,
-                        )
-                        if drain_stop_reason is not None:
-                            logger.warning(
-                                "Anthropic post-terminal drain budget reached for provider=azure-foundry model=%s terminal_event=%s drained_event_count=%s stop_reason=%s",
-                                request.model,
-                                terminal_event_type,
-                                drained_event_count,
-                                drain_stop_reason,
+            try:
+                async with self._anthropic_client.messages.stream(**kwargs) as stream:
+                    terminal_event_type = None
+                    terminal_seen_at: Optional[float] = None
+                    drained_event_count = 0
+                    async for event in stream:
+                        if terminal_event_type is not None:
+                            drained_event_count += 1
+                            drain_stop_reason = get_anthropic_post_terminal_drain_stop_reason(
+                                terminal_seen_at=terminal_seen_at,
+                                drained_event_count=drained_event_count,
                             )
-                            break
-                        continue
-                    if hasattr(event, "model_dump_json"):
-                        json_str = event.model_dump_json(exclude_none=True, warnings="none")
-                        event_data = json.loads(json_str)
-                    else:
-                        event_data = event
-                        json_str = json.dumps(event_data, ensure_ascii=False, separators=(",", ":"))
-                    event_type = (
-                        event_data.get("type", "unknown") if isinstance(event_data, dict) else "unknown"
-                    )
-                    sse = f"event: {event_type}\ndata: {json_str}\n\n"
-                    yield sse
-
-                    if is_anthropic_terminal_stream_event(event_type=event_type, event_data=event_data):
-                        terminal_event_type = event_type
-                        terminal_seen_at = time.monotonic()
-                        logger.info(
-                            "Anthropic upstream stream reached terminal event for provider=azure-foundry model=%s event_type=%s",
-                            request.model,
-                            event_type,
+                            if drain_stop_reason is not None:
+                                logger.warning(
+                                    "Anthropic post-terminal drain budget reached for provider=azure-foundry model=%s terminal_event=%s drained_event_count=%s stop_reason=%s",
+                                    request.model,
+                                    terminal_event_type,
+                                    drained_event_count,
+                                    drain_stop_reason,
+                                )
+                                break
+                            continue
+                        if hasattr(event, "model_dump_json"):
+                            json_str = event.model_dump_json(exclude_none=True, warnings="none")
+                            event_data = json.loads(json_str)
+                        else:
+                            event_data = event
+                            json_str = json.dumps(event_data, ensure_ascii=False, separators=(",", ":"))
+                        event_type = (
+                            event_data.get("type", "unknown") if isinstance(event_data, dict) else "unknown"
                         )
+                        sse = f"event: {event_type}\ndata: {json_str}\n\n"
+                        yield sse
 
-            if terminal_event_type is not None:
-                drain_ms = 0.0
-                if terminal_seen_at is not None:
-                    drain_ms = (time.monotonic() - terminal_seen_at) * 1000
-                logger.info(
-                    "Anthropic stream completed after terminal event for provider=azure-foundry model=%s event_type=%s drained_event_count=%s post_terminal_drain_ms=%.1f",
-                    request.model,
-                    terminal_event_type,
-                    drained_event_count,
-                    drain_ms,
-                )
+                        if is_anthropic_terminal_stream_event(event_type=event_type, event_data=event_data):
+                            terminal_event_type = event_type
+                            terminal_seen_at = time.monotonic()
+                            logger.info(
+                                "Anthropic upstream stream reached terminal event for provider=azure-foundry model=%s event_type=%s",
+                                request.model,
+                                event_type,
+                            )
+
+                    if terminal_event_type is not None:
+                        drain_ms = 0.0
+                        if terminal_seen_at is not None:
+                            drain_ms = (time.monotonic() - terminal_seen_at) * 1000
+                        logger.info(
+                            "Anthropic stream completed after terminal event for provider=azure-foundry model=%s event_type=%s drained_event_count=%s post_terminal_drain_ms=%.1f",
+                            request.model,
+                            terminal_event_type,
+                            drained_event_count,
+                            drain_ms,
+                        )
+            except ProviderHTTPError:
+                raise
+            except Exception as e:
+                raise _translate_anthropic_sdk_error(e, "azure-foundry") from e
 
             return
 

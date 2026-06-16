@@ -526,6 +526,33 @@ class UserModelGroupRateLimitResponse(BaseModel):
         from_attributes = True
 
 
+# ---------------------------------------------------------------------------
+# User-facing quota response models (GET /auth/quotas)
+# ---------------------------------------------------------------------------
+
+class QuotaOverallResponse(BaseModel):
+    rpm_limit: Optional[int] = None      # null = unlimited
+    rpm_count: int = 0                   # requests used this minute
+    rpm_remaining: Optional[int] = None  # null = unlimited
+    rpd_limit: Optional[int] = None      # null = unlimited
+    rpd_count: int = 0                   # requests used today (UTC)
+    rpd_remaining: Optional[int] = None  # null = unlimited
+
+
+class QuotaGroupResponse(BaseModel):
+    name: str
+    description: Optional[str] = None
+    rpm_limit: Optional[int] = None      # effective: override if set, else group default; null = unlimited
+    rpd_limit: Optional[int] = None      # effective; null = unlimited
+    models: List[str] = []               # member model_ids in this group
+
+
+class MyQuotasResponse(BaseModel):
+    is_admin: bool = False                             # true ⇒ exempt from all limits
+    overall: Optional[QuotaOverallResponse] = None    # null when is_admin
+    groups: List[QuotaGroupResponse] = []
+
+
 class UserModelGroupRateLimitUpdate(BaseModel):
     rpm_limit: Optional[int] = None
     rpd_limit: Optional[int] = None

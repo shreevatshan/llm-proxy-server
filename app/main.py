@@ -201,6 +201,15 @@ def _add_request_tracking(app: FastAPI, server_name: str):
             except Exception:
                 body_bytes = b""
 
+            # For Azure-style deployment paths the deployment name lives in the URL,
+            # not the body (the Azure SDK omits the "model" field).  Fall back to
+            # reconstructing it from the path so usage isn't recorded as "unknown".
+            # Path shape: /openai/deployments/{provider}/{deployment}/...
+            if not model and path.startswith("/openai/deployments/"):
+                parts = path.split("/")
+                if len(parts) >= 5 and parts[3] and parts[4]:
+                    model = f"{parts[3]}/{parts[4]}"
+
             # No need to replace request._receive here.
             # Starlette's BaseHTTPMiddleware wraps the request in a
             # _CachedRequest whose wrapped_receive() automatically

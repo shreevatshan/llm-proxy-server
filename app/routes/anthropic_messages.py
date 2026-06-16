@@ -45,6 +45,7 @@ from app.routes.stream_utils import (
     set_request_tracking_outcome,
 )
 from app.rate_limit_dep import enforce_group_rate_limit
+from app.rate_limit import RateLimitExceeded
 from opentelemetry import trace
 from opentelemetry.context import get_current
 
@@ -481,7 +482,7 @@ async def create_message(
                         str(e)
                     )
 
-        except HTTPException:
+        except (HTTPException, RateLimitExceeded):
             raise
         except ValueError as e:
             logger.warning(f"Anthropic request validation error: {e}")

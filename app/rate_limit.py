@@ -161,23 +161,27 @@ def _limit_message(d: RateLimitDecision) -> str:
     if d.limited_by == "group_rpm":
         return (
             f"Rate limit exceeded for model group '{d.group_name}': {d.group_rpm_limit} requests per minute. "
-            f"Retry after {_human_duration(d.retry_after_seconds)}."
+            f"Retry after {_human_duration(d.retry_after_seconds)}, or use a model outside this group. "
+            f"View your allowed quota in the console."
         )
     if d.limited_by == "group_rpd":
         return (
             f"Rate limit exceeded for model group '{d.group_name}': {d.group_rpd_limit} requests per day. "
-            f"Retry after {_human_duration(d.retry_after_seconds)}."
+            f"Retry after {_human_duration(d.retry_after_seconds)}, or use a model outside this group. "
+            f"View your allowed quota in the console."
         )
     if d.limited_by == "rpm":
         limit = d.rpm_limit
         return (
             f"Rate limit exceeded: {limit} requests per minute. "
-            f"Retry after {_human_duration(d.retry_after_seconds)}."
+            f"Retry after {_human_duration(d.retry_after_seconds)}. "
+            f"View your allowed quota in the console."
         )
     limit = d.rpd_limit
     return (
         f"Rate limit exceeded: {limit} requests per day. "
-        f"Retry after {_human_duration(d.retry_after_seconds)}."
+        f"Retry after {_human_duration(d.retry_after_seconds)}. "
+        f"View your allowed quota in the console."
     )
 
 

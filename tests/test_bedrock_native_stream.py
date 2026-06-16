@@ -433,7 +433,8 @@ class BedrockNativeStreamConsumerTests(unittest.IsolatedAsyncioTestCase):
 
         def restart_worker():
             restart_calls.append(1)
-            return second_queue, second_future, None
+            # _start_native_stream_worker now returns a 4-tuple: (queue, future, stop_event, stream_box)
+            return second_queue, second_future, None, [None]
 
         chunks = []
         exc = None
@@ -577,6 +578,126 @@ class BedrockNativeStreamConsumerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(chunks, [])
         self.assertIsNone(exc)
+
+
+    async def test_early_exit_closes_stream_box(self):
+        """Consumer finally must close stream_box[0] on early exit (idle timeout).
+
+        This is the regression test for the zombie-thread starvation bug: when the
+        consumer exits before the worker finishes, it must close the underlying boto3
+        event-stream so the worker thread unblocks out of next(stream) immediately
+        instead of waiting for the ~940 s socket read_timeout.
+        """
+        request = SimpleNamespace(model="bedrock:test/claude-sonnet", thinking=None, tools=None)
+        clock = _FakeClock()
+        # Empty queue → consumer will idle-timeout and exit early.
+        event_queue = _ScheduledEventQueue(clock, [])
+        future = _ScheduledFuture(clock, done_at=None)  # worker appears still running
+
+        close_calls = []
+
+        class _FakeStream:
+            def close(self):
+                close_calls.append(1)
+
+        stream_box = [_FakeStream()]
+
+        with patch.multiple(
+            "app.providers.bedrock_provider",
+            BEDROCK_NATIVE_INITIAL_IDLE_TIMEOUT_SECONDS=3,
+            BEDROCK_NATIVE_THINKING_INITIAL_IDLE_TIMEOUT_SECONDS=5,
+            BEDROCK_NATIVE_MIDSTREAM_IDLE_TIMEOUT_SECONDS=2,
+            BEDROCK_NATIVE_EXTENDED_MIDSTREAM_IDLE_TIMEOUT_SECONDS=4,
+        ), patch("app.providers.bedrock_provider.time.monotonic", side_effect=clock.monotonic), patch(
+            "app.providers.bedrock_provider.asyncio.sleep",
+            side_effect=clock.sleep,
+        ):
+            generator = self.provider._consume_native_stream_events(
+                request,
+                request.model,
+                event_queue,
+                future,
+                stream_box=stream_box,
+            )
+            chunks = []
+            exc = None
+            try:
+                async for chunk in generator:
+                    chunks.append(chunk)
+            except Exception as caught:
+                exc = caught
+
+        # Consumer should have timed out
+        self.assertIsInstance(exc, BedrockNativeIdleTimeout)
+        # The stream box must have been closed so the worker thread is unblocked.
+        self.assertEqual(close_calls, [1], "stream_box[0].close() must be called on early exit")
+
+    async def test_early_exit_closes_stream_box_on_provider_error(self):
+        """Consumer finally must close stream_box[0] even when a provider error exits the loop."""
+        request = SimpleNamespace(model="bedrock:test/claude-sonnet", thinking=None, tools=None)
+        clock = _FakeClock()
+        event_queue = _ScheduledEventQueue(
+            clock,
+            [
+                (0.0, ("error", {
+                    "code": "internal_error",
+                    "message": "stream ended",
+                    "error_class": "protocol_error",
+                    "aws_request_id": "REQ-ERR",
+                    "output_bytes_received": 0,
+                })),
+            ],
+        )
+        future = _ScheduledFuture(clock, done_at=None)
+
+        close_calls = []
+
+        class _FakeStream:
+            def close(self):
+                close_calls.append(1)
+
+        stream_box = [_FakeStream()]
+
+        with patch.multiple(
+            "app.providers.bedrock_provider",
+            BEDROCK_NATIVE_INITIAL_IDLE_TIMEOUT_SECONDS=3,
+            BEDROCK_NATIVE_THINKING_INITIAL_IDLE_TIMEOUT_SECONDS=5,
+            BEDROCK_NATIVE_MIDSTREAM_IDLE_TIMEOUT_SECONDS=2,
+            BEDROCK_NATIVE_EXTENDED_MIDSTREAM_IDLE_TIMEOUT_SECONDS=4,
+            BEDROCK_NATIVE_RETRY_ON_PRE_OUTPUT_DROP=False,
+        ), patch("app.providers.bedrock_provider.time.monotonic", side_effect=clock.monotonic), patch(
+            "app.providers.bedrock_provider.asyncio.sleep",
+            side_effect=clock.sleep,
+        ):
+            generator = self.provider._consume_native_stream_events(
+                request,
+                request.model,
+                event_queue,
+                future,
+                stream_box=stream_box,
+            )
+            exc = None
+            try:
+                async for _ in generator:
+                    pass
+            except Exception as caught:
+                exc = caught
+
+        self.assertIsInstance(exc, BedrockNativeProviderError)
+        self.assertEqual(close_calls, [1], "stream_box[0].close() must be called on provider error exit")
+
+    async def test_stream_box_none_is_safe(self):
+        """Consumer must not crash when stream_box is omitted (backward compat)."""
+        request = SimpleNamespace(model="bedrock:test/claude-sonnet", thinking=None, tools=None)
+        scheduled_items = [
+            (0.0, ("upstream_event", {"sse": _sse("message_start"), "event_type": "message_start"})),
+            (0.1, ("upstream_event", {"sse": _sse("message_stop"), "event_type": "message_stop"})),
+            (0.1, ("done", {"terminal_event_seen": True, "terminal_event_type": "message_stop", "transport_eof_observed": False})),
+        ]
+        # stream_box omitted → defaults to None
+        chunks, exc = await self._collect(request, scheduled_items)
+        self.assertIsNone(exc)
+        self.assertIn(_sse("message_stop"), chunks)
 
 
 class BedrockConverseStreamTests(unittest.IsolatedAsyncioTestCase):
