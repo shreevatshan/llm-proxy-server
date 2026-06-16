@@ -286,6 +286,38 @@ class RequestTracker:
 
         return buffered + db_count
 
+    async def get_today_group_count(self, user_identity: str, model_ids: list) -> int:
+        """Return total requests today across all model_ids in a group (buffer + DB)."""
+        if not model_ids:
+            return 0
+        today = time_utils.local_today()
+        model_set = set(model_ids)
+        buffered = 0
+        async with self._usage_lock:
+            for key, count in self._usage_buffer.items():
+                # key = (date, hour, user_identity, user_type, model, server)
+                if key[0] == today and key[2] == user_identity and key[4] in model_set:
+                    buffered += count
+
+        try:
+            from sqlalchemy.future import select
+            from sqlalchemy import func
+            from app.auth.database import AsyncSessionLocal
+            from app.auth.models import RequestUsage
+            async with AsyncSessionLocal() as db:
+                result = await db.execute(
+                    select(func.sum(RequestUsage.request_count)).where(
+                        RequestUsage.date == today,
+                        RequestUsage.user_identity == user_identity,
+                        RequestUsage.model.in_(model_ids),
+                    )
+                )
+                db_count = result.scalar() or 0
+        except Exception:
+            db_count = 0
+
+        return buffered + db_count
+
     async def _broadcast(self, event_type: str, entry: ActiveRequest) -> None:
         await self._broadcast_raw(event_type, self._serialize(entry))
 

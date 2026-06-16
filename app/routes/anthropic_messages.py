@@ -44,6 +44,7 @@ from app.routes.stream_utils import (
     format_anthropic_sse_event,
     set_request_tracking_outcome,
 )
+from app.rate_limit_dep import enforce_group_rate_limit
 from opentelemetry import trace
 from opentelemetry.context import get_current
 
@@ -239,6 +240,9 @@ async def create_message(
                     "not_found_error",
                     f"Model '{model_name}' not found or not available via Anthropic API"
                 )
+
+            # Group rate limit check (request-level limits already handled in middleware)
+            await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="anthropic")
 
             # Pre-flight: confirm the specific model exists in the cached model list.
             preflight_result = await _check_model_exists(provider, model_name)

@@ -189,6 +189,58 @@ class RequestUsageMonthly(Base):
     )
 
 
+class ModelGroup(Base):
+    """Named group of models sharing a rate-limit bucket."""
+    __tablename__ = "model_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), unique=True, nullable=False)
+    description = Column(String(256), nullable=True)
+    rpm_default = Column(Integer, nullable=True)  # null = unlimited
+    rpd_default = Column(Integer, nullable=True)  # null = unlimited
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    members = relationship("ModelGroupMember", back_populates="group", cascade="all, delete-orphan")
+    user_limits = relationship("UserModelGroupRateLimit", back_populates="group", cascade="all, delete-orphan")
+
+
+class ModelGroupMember(Base):
+    """Maps a model_id to exactly one ModelGroup (unique on model_id)."""
+    __tablename__ = "model_group_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("model_groups.id", ondelete="CASCADE"), nullable=False)
+    model_id = Column(String(200), unique=True, nullable=False)  # unique enforces single-group membership
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    group = relationship("ModelGroup", back_populates="members")
+
+    __table_args__ = (
+        Index("ix_model_group_members_group_id", "group_id"),
+    )
+
+
+class UserModelGroupRateLimit(Base):
+    """Per-user override for a model group's rate limits. Absent row = inherit group default."""
+    __tablename__ = "user_model_group_rate_limits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    group_id = Column(Integer, ForeignKey("model_groups.id", ondelete="CASCADE"), nullable=False)
+    rpm_limit = Column(Integer, nullable=True)  # null = inherit group default
+    rpd_limit = Column(Integer, nullable=True)  # null = inherit group default
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    group = relationship("ModelGroup", back_populates="user_limits")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "group_id", name="uq_user_model_group_rate_limit"),
+    )
+
+
 class ProviderCredentials(Base):
     """Provider credentials model for storing provider configurations."""
     __tablename__ = "provider_credentials"
@@ -359,6 +411,132 @@ class UserRateLimitUpdate(BaseModel):
 
 class AccountDelete(BaseModel):
     confirmation: str
+
+
+# ---------------------------------------------------------------------------
+# Model-group Pydantic models
+# ---------------------------------------------------------------------------
+
+class ModelGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    rpm_default: Optional[int] = None
+    rpd_default: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        import re
+        self.name = self.name.strip()
+        if not self.name or len(self.name) > 64:
+            raise ValueError("name must be 1–64 characters")
+        if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
+            raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+        if self.description is not None:
+            self.description = self.description.strip()[:256]
+        if self.rpm_default is not None and self.rpm_default < 0:
+            raise ValueError("rpm_default must be >= 0")
+        if self.rpd_default is not None and self.rpd_default < 0:
+            raise ValueError("rpd_default must be >= 0")
+        return self
+
+
+class ModelGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        import re
+        if self.name is not None:
+            self.name = self.name.strip()
+            if not self.name or len(self.name) > 64:
+                raise ValueError("name must be 1–64 characters")
+            if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
+                raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+        if self.description is not None:
+            self.description = self.description.strip()[:256]
+        return self
+
+
+class ModelGroupLimitsUpdate(BaseModel):
+    rpm_default: Optional[int] = None
+    rpd_default: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_non_negative(self):
+        if self.rpm_default is not None and self.rpm_default < 0:
+            raise ValueError("rpm_default must be >= 0")
+        if self.rpd_default is not None and self.rpd_default < 0:
+            raise ValueError("rpd_default must be >= 0")
+        return self
+
+
+class ModelGroupMembersUpdate(BaseModel):
+    model_ids: List[str]
+
+    @model_validator(mode="after")
+    def validate_model_ids(self):
+        seen = set()
+        clean = []
+        for mid in self.model_ids:
+            mid = mid.strip()
+            if not mid or len(mid) > 200:
+                raise ValueError(f"model_id '{mid}' is invalid (must be 1–200 chars)")
+            if mid not in seen:
+                seen.add(mid)
+                clean.append(mid)
+        self.model_ids = clean
+        return self
+
+
+class ModelGroupMemberResponse(BaseModel):
+    model_id: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ModelGroupResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    rpm_default: Optional[int] = None
+    rpd_default: Optional[int] = None
+    member_count: int = 0
+    members: List[str] = []
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserModelGroupRateLimitResponse(BaseModel):
+    user_id: int
+    username: str
+    email: str
+    group_id: int
+    rpm_limit: Optional[int] = None
+    rpd_limit: Optional[int] = None
+    effective_rpm: Optional[int] = None
+    effective_rpd: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserModelGroupRateLimitUpdate(BaseModel):
+    rpm_limit: Optional[int] = None
+    rpd_limit: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_non_negative(self):
+        if self.rpm_limit is not None and self.rpm_limit < 0:
+            raise ValueError("rpm_limit must be >= 0")
+        if self.rpd_limit is not None and self.rpd_limit < 0:
+            raise ValueError("rpd_limit must be >= 0")
+        return self
 
 
 # Model Management Pydantic models (updated to use ProviderCredentials)

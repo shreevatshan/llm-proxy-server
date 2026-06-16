@@ -30,6 +30,7 @@ from app.routes.stream_utils import (
     STREAM_CHUNK_TIMEOUT_SECONDS,
     DISCONNECT_CHECK_INTERVAL
 )
+from app.rate_limit_dep import enforce_group_rate_limit
 from opentelemetry import trace
 from opentelemetry.context import attach
 
@@ -61,6 +62,9 @@ async def chat_completions(
         kind=trace.SpanKind.INTERNAL
     ) as span:
         try:
+            # Group rate limit check (request-level limits already handled in middleware)
+            await enforce_group_rate_limit(request_obj, auth, request.model)
+
             # Apply request transformations
             transformation_manager = get_transformation_manager()
             if transformation_manager:

@@ -156,6 +156,20 @@ function showTab(tabName) {
     }
 }
 
+// Sub-tab switcher inside the Rate Limits tab
+function showRateLimitSubTab(name) {
+    const panes = ['request', 'model-groups'];
+    panes.forEach(p => {
+        const el = document.getElementById(`rl-subtab-${p}`);
+        if (el) el.style.display = p === name ? '' : 'none';
+        const btn = document.getElementById(`rl-subtab-${p}-btn`);
+        if (btn) btn.classList.toggle('active', p === name);
+    });
+    if (name === 'model-groups') {
+        window.ModelGroupManager?.load();
+    }
+}
+
 // Utility Functions
 function escapeHtml(text) {
     const div = document.createElement('div');
@@ -170,5 +184,8 @@ window.UIUtils = {
     closeToast,
     showConfirmModal,
     showTab,
+    showRateLimitSubTab,
     escapeHtml
 };
+
+window.showRateLimitSubTab = showRateLimitSubTab;

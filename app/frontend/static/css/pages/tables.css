@@ -36,6 +36,11 @@
     font-family: var(--font-family-mono);
 }
 
+.table th.text-end,
+.table td.text-end {
+    text-align: right;
+}
+
 .table tbody tr {
     transition: none;
 }

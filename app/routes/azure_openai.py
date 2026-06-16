@@ -54,6 +54,7 @@ from app.routes.stream_utils import (
     stream_with_context_and_timeout,
     STREAM_TIMEOUT_SECONDS,
 )
+from app.rate_limit_dep import enforce_group_rate_limit
 from app.tracing import (
     get_w3c_traceparent,
     create_span,
@@ -223,6 +224,7 @@ async def azure_chat_completions(
     provider = _get_azure_provider(provider_name)
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
+    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_chat_completion", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -273,6 +275,7 @@ async def azure_chat_completions(
     tags=["azure_openai"],
 )
 async def azure_completions(
+    request_obj: Request,
     provider_name: str,
     deployment: str,
     request: CompletionRequest,
@@ -283,6 +286,7 @@ async def azure_completions(
     provider = _get_azure_provider(provider_name)
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
+    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_completion", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -325,6 +329,7 @@ async def azure_completions(
     tags=["azure_openai"],
 )
 async def azure_embeddings(
+    request_obj: Request,
     provider_name: str,
     deployment: str,
     request: EmbeddingRequest,
@@ -335,6 +340,7 @@ async def azure_embeddings(
     provider = _get_azure_provider(provider_name)
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
+    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_embeddings", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -359,6 +365,7 @@ async def azure_embeddings(
     tags=["azure_openai"],
 )
 async def azure_image_generation(
+    request_obj: Request,
     provider_name: str,
     deployment: str,
     request: ImageGenerationRequest,
@@ -369,6 +376,7 @@ async def azure_image_generation(
     provider = _get_azure_provider(provider_name)
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
+    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_image_generation", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
