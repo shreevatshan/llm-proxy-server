@@ -27,16 +27,10 @@ class ProviderRoutingTests(unittest.TestCase):
             provider_name="azure",
             endpoint="https://example.openai.azure.com",
             api_key="secret",
-            api_version="2024-12-01-preview",
+            discovery_api_version="2023-05-01",
             azure_backend=None,
             deployments_json='["gpt-4o"]',
             dynamic_discovery=False,
-            subscription_id=None,
-            resource_group=None,
-            account_name=None,
-            client_id=None,
-            client_secret=None,
-            tenant_id=None,
         )
 
         config = manager._create_provider_config(cred)
@@ -52,16 +46,10 @@ class ProviderRoutingTests(unittest.TestCase):
             provider_name="azure",
             endpoint="https://example.services.ai.azure.com",
             api_key="secret",
-            api_version="2024-12-01-preview",
+            discovery_api_version="2023-05-01",
             azure_backend="foundry",
             deployments_json='["claude-3-7-sonnet"]',
             dynamic_discovery=False,
-            subscription_id=None,
-            resource_group=None,
-            account_name=None,
-            client_id=None,
-            client_secret=None,
-            tenant_id=None,
         )
 
         config = manager._create_provider_config(cred)
@@ -77,16 +65,10 @@ class ProviderRoutingTests(unittest.TestCase):
             provider_name="azure",
             endpoint="https://example.services.ai.azure.com",
             api_key="secret",
-            api_version="2024-12-01-preview",
+            discovery_api_version="2023-05-01",
             azure_backend="foundry",
             deployments_json='{"openai":["gpt-4.1"],"anthropic":["claude-3-7-sonnet"]}',
             dynamic_discovery=False,
-            subscription_id=None,
-            resource_group=None,
-            account_name=None,
-            client_id=None,
-            client_secret=None,
-            tenant_id=None,
         )
 
         config = manager._create_provider_config(cred)
@@ -138,7 +120,7 @@ class ProviderRoutingTests(unittest.TestCase):
                 "enabled": True,
                 "endpoint": "https://example.services.ai.azure.com",
                 "api_key": "secret",
-                "api_version": "2024-12-01-preview",
+                "discovery_api_version": "2023-05-01",
                 "azure_backend": "foundry",
                 "dynamic_discovery": False,
                 "openai_deployments": ["gpt-4.1"],
@@ -159,7 +141,7 @@ class ProviderRoutingTests(unittest.TestCase):
                 "enabled": True,
                 "endpoint": "https://example.services.ai.azure.com",
                 "api_key": "secret",
-                "api_version": "2024-12-01-preview",
+                "discovery_api_version": "2023-05-01",
                 "azure_backend": "foundry",
                 "dynamic_discovery": False,
                 "openai_deployments": ["gpt-4.1"],

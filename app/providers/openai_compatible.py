@@ -77,12 +77,21 @@ class OpenAICompatibleProvider(BaseProvider):
     
     def _get_responses_client(self) -> AsyncOpenAI:
         """Return the client to use for Responses API calls.
-        
+
         By default returns self.client. Subclasses (e.g. AzureProvider) can set
         self._responses_client to use a different client for the Responses API
         which may require a different base URL or auth configuration.
         """
         return self._responses_client if self._responses_client is not None else self.client
+
+    def _get_inference_client(self) -> AsyncOpenAI:
+        """Return the client to use for chat/completions/embeddings/audio/images.
+
+        Default is self.client. AzureProvider overrides this to select between
+        the v1 client and the legacy deployment-based client based on the
+        azure_call_style ContextVar set by the inbound route handler.
+        """
+        return self.client
 
     # ==================== Initialization helpers ====================
 
@@ -212,8 +221,8 @@ class OpenAICompatibleProvider(BaseProvider):
             # Some providers like Ollama don't support this parameter
             request_dict.pop("options", None)
             
-            response = await self.client.chat.completions.create(**request_dict)
-            
+            response = await self._get_inference_client().chat.completions.create(**request_dict)
+
             # Convert OpenAI SDK response to our Pydantic model to ensure proper serialization
             # Use exclude_unset=True to only include fields actually returned by upstream,
             # preserving response fidelity (e.g. annotations, refusal) and avoiding
@@ -243,8 +252,8 @@ class OpenAICompatibleProvider(BaseProvider):
             # Some providers like Ollama don't support this parameter
             request_dict.pop("options", None)
             
-            stream = await self.client.chat.completions.create(**request_dict)
-            
+            stream = await self._get_inference_client().chat.completions.create(**request_dict)
+
             async for chunk in stream:
                 # Skip if chunk is a string or None
                 if isinstance(chunk, str) or chunk is None:
@@ -292,13 +301,13 @@ class OpenAICompatibleProvider(BaseProvider):
             # Some providers like Ollama don't support this parameter
             request_dict.pop("options", None)
             
-            response = await self.client.completions.create(**request_dict)
-            
+            response = await self._get_inference_client().completions.create(**request_dict)
+
             # Convert OpenAI SDK response to our Pydantic model to ensure proper serialization
             response_dict = response.model_dump(exclude_unset=True) if hasattr(response, 'model_dump') else response.dict()
             if not preserve_upstream_model.get(False):
                 response_dict["model"] = request.model  # Preserve original model name
-            
+
             return CompletionResponse(**response_dict)
         except Exception as e:
             raise Exception(f"{self.provider_type} completion error: {str(e)}")
@@ -320,8 +329,8 @@ class OpenAICompatibleProvider(BaseProvider):
             # Some providers like Ollama don't support this parameter
             request_dict.pop("options", None)
             
-            stream = await self.client.completions.create(**request_dict)
-            
+            stream = await self._get_inference_client().completions.create(**request_dict)
+
             async for chunk in stream:
                 # Skip if chunk is a string or None
                 if isinstance(chunk, str) or chunk is None:
@@ -369,8 +378,8 @@ class OpenAICompatibleProvider(BaseProvider):
             # Some providers like Ollama don't support this parameter
             request_dict.pop("options", None)
             
-            response = await self.client.embeddings.create(**request_dict)
-            
+            response = await self._get_inference_client().embeddings.create(**request_dict)
+
             # Convert response and preserve model name
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
             if not preserve_upstream_model.get(False):
@@ -388,7 +397,7 @@ class OpenAICompatibleProvider(BaseProvider):
         request_dict = self._prepare_request_dict(request, model_id)
         
         try:
-            response = await self.client.audio.speech.create(**request_dict)
+            response = await self._get_inference_client().audio.speech.create(**request_dict)
             return response.content
         except Exception as e:
             raise Exception(f"{self.provider_type} audio speech error: {str(e)}")
@@ -399,7 +408,7 @@ class OpenAICompatibleProvider(BaseProvider):
         request_dict = self._prepare_request_dict(request, model_id)
         
         try:
-            response = await self.client.audio.transcriptions.create(**request_dict)
+            response = await self._get_inference_client().audio.transcriptions.create(**request_dict)
             
             # Handle different response formats
             if request.response_format in ["srt", "vtt", "text"]:
@@ -418,7 +427,7 @@ class OpenAICompatibleProvider(BaseProvider):
         request_dict = self._prepare_request_dict(request, model_id)
         
         try:
-            response = await self.client.audio.translations.create(**request_dict)
+            response = await self._get_inference_client().audio.translations.create(**request_dict)
             
             # Handle different response formats
             if request.response_format in ["srt", "vtt", "text"]:
@@ -439,7 +448,7 @@ class OpenAICompatibleProvider(BaseProvider):
         request_dict = self._prepare_request_dict(request, model_id)
         
         try:
-            response = await self.client.images.generate(**request_dict)
+            response = await self._get_inference_client().images.generate(**request_dict)
             
             # Convert OpenAI response to our format
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
@@ -453,7 +462,7 @@ class OpenAICompatibleProvider(BaseProvider):
         request_dict = self._prepare_request_dict(request, model_id)
         
         try:
-            response = await self.client.images.edit(**request_dict)
+            response = await self._get_inference_client().images.edit(**request_dict)
             
             # Convert OpenAI response to our format
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
@@ -467,7 +476,7 @@ class OpenAICompatibleProvider(BaseProvider):
         request_dict = self._prepare_request_dict(request, model_id)
         
         try:
-            response = await self.client.images.create_variation(**request_dict)
+            response = await self._get_inference_client().images.create_variation(**request_dict)
             
             # Convert OpenAI response to our format
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()

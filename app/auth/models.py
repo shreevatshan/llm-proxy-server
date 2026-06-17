@@ -254,7 +254,7 @@ class ProviderCredentials(Base):
     # Provider-specific configuration fields (nullable, used based on provider_type)
     endpoint = Column(String(500), nullable=True)          # OpenAI, Azure
     api_key = Column(String(500), nullable=True)           # OpenAI, Azure, Google
-    api_version = Column(String(50), nullable=True)        # Azure
+    discovery_api_version = Column(String(50), nullable=True)  # Azure: Management API version for dynamic discovery
     azure_backend = Column(String(50), nullable=True)      # Azure: "openai" or "foundry"
     region = Column(String(50), nullable=True)             # Bedrock
     access_key_id = Column(String(200), nullable=True)     # Bedrock
@@ -262,15 +262,8 @@ class ProviderCredentials(Base):
     base_url = Column(String(500), nullable=True)          # Ollama, OpenAI-compatible
     deployments_json = Column(Text, nullable=True)         # Azure (JSON array)
     provider_name = Column(String(100), nullable=False)    # Provider name (e.g., "ollama", "azure", "openai", "bedrock", "google")
-    
-    # Azure AD fields for dynamic deployment discovery
-    subscription_id = Column(String(100), nullable=True)   # Azure subscription ID
-    resource_group = Column(String(100), nullable=True)    # Azure resource group name
-    account_name = Column(String(100), nullable=True)      # Azure Cognitive Services account name
-    client_id = Column(String(100), nullable=True)         # Azure AD application client ID
-    client_secret = Column(String(500), nullable=True)     # Azure AD application client secret
-    tenant_id = Column(String(100), nullable=True)         # Azure AD tenant ID
-    dynamic_discovery = Column(Boolean, nullable=True)     # Azure: True to use Management API, False to use manual deployments
+
+    dynamic_discovery = Column(Boolean, nullable=True)     # Azure: True to discover via the models API, False to use manual deployments
     
     # Supported API formats for custom providers (JSON array, e.g., '["openai", "anthropic"]')
     supported_apis = Column(Text, nullable=True, default='["openai"]')
@@ -625,7 +618,7 @@ class ProviderCredentialsCreate(BaseModel):
     # Provider-specific fields (all optional)
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
-    api_version: Optional[str] = None
+    discovery_api_version: Optional[str] = None
     azure_backend: Optional[str] = None
     region: Optional[str] = None
     access_key_id: Optional[str] = None
@@ -634,16 +627,8 @@ class ProviderCredentialsCreate(BaseModel):
     deployments: Optional[List[str]] = None  # Will be converted to JSON
     openai_deployments: Optional[List[str]] = None
     anthropic_deployments: Optional[List[str]] = None
-    
-    # Azure AD fields for dynamic deployment discovery
-    subscription_id: Optional[str] = None
-    resource_group: Optional[str] = None
-    account_name: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    tenant_id: Optional[str] = None
     dynamic_discovery: Optional[bool] = None
-    
+
     # Supported API formats for custom providers
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
 
@@ -680,6 +665,13 @@ class ProviderCredentialsCreate(BaseModel):
                 raise ValueError(
                     "Cannot specify deployments when dynamic_discovery is enabled. "
                     "Either disable dynamic_discovery or remove deployment lists."
+                )
+            # Azure dynamic discovery uses GET {endpoint}/openai/models?api-version=...
+            # for both backends, so an api-version is always required.
+            if self.provider_type == "azure" and not self.discovery_api_version:
+                raise ValueError(
+                    "discovery_api_version is required when dynamic_discovery is enabled "
+                    "for an Azure provider."
                 )
         return self
 
@@ -691,7 +683,7 @@ class ProviderCredentialsUpdate(BaseModel):
     # Provider-specific fields (all optional)
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
-    api_version: Optional[str] = None
+    discovery_api_version: Optional[str] = None
     azure_backend: Optional[str] = None
     region: Optional[str] = None
     access_key_id: Optional[str] = None
@@ -701,16 +693,8 @@ class ProviderCredentialsUpdate(BaseModel):
     openai_deployments: Optional[List[str]] = None
     anthropic_deployments: Optional[List[str]] = None
     provider_name: Optional[str] = None  # OpenAI-compatible provider name (e.g., "ollama", "llamacpp", "openai")
-    
-    # Azure AD fields for dynamic deployment discovery
-    subscription_id: Optional[str] = None
-    resource_group: Optional[str] = None
-    account_name: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    tenant_id: Optional[str] = None
     dynamic_discovery: Optional[bool] = None
-    
+
     # Supported API formats for custom providers
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
 
@@ -747,6 +731,12 @@ class ProviderCredentialsUpdate(BaseModel):
                 raise ValueError(
                     "Cannot specify deployments when dynamic_discovery is enabled. "
                     "Either disable dynamic_discovery or remove deployment lists."
+                )
+            # Update payloads may omit discovery_api_version when it already exists
+            # in the DB, so only reject if it is explicitly set to empty/None here.
+            if self.discovery_api_version is not None and not self.discovery_api_version:
+                raise ValueError(
+                    "discovery_api_version cannot be empty when dynamic_discovery is enabled."
                 )
         return self
 
@@ -763,7 +753,7 @@ class ProviderCredentialsResponse(BaseModel):
     # Provider-specific fields
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
-    api_version: Optional[str] = None
+    discovery_api_version: Optional[str] = None
     azure_backend: Optional[str] = None
     region: Optional[str] = None
     access_key_id: Optional[str] = None
@@ -773,16 +763,6 @@ class ProviderCredentialsResponse(BaseModel):
     openai_deployments: Optional[List[str]] = None
     anthropic_deployments: Optional[List[str]] = None
     provider_name: str  # Provider name (e.g., "ollama", "azure", "openai", "bedrock", "google")
-    
-    # Azure AD fields for dynamic deployment discovery
-    subscription_id: Optional[str] = None
-    resource_group: Optional[str] = None
-    account_name: Optional[str] = None
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    tenant_id: Optional[str] = None
-    
-    # Azure dynamic discovery flag (computed based on whether deployments are set)
     dynamic_discovery: Optional[bool] = None
     
     # Supported API formats for custom providers

@@ -82,17 +82,6 @@ class ProviderFormManager {
                     </div>
                 </div>
             </div>
-            <div class="row">
-                <div class="col-md-6">
-                    <div class="mb-3">
-                        <label for="api_version" class="form-label">
-                            <i class="fas fa-code-branch"></i> API Version
-                        </label>
-                        <input type="text" id="api_version" class="form-control" 
-                               placeholder="2024-12-01-preview" value="2024-12-01-preview">
-                    </div>
-                </div>
-            </div>
             <div class="mb-3">
                 <label for="api_key" class="form-label">
                     <i class="fas fa-key"></i> API Key <span class="text-danger">*</span>
@@ -136,80 +125,20 @@ class ProviderFormManager {
                     </div>
                 </div>
                 
-                <!-- Azure Management API Configuration (shown for Azure OpenAI dynamic discovery) -->
+                <!-- Dynamic Discovery API Version (shown for both backends when dynamic discovery is enabled) -->
                 <div id="azure-management-config" class="border rounded p-3 bg-light" style="display: none;">
                     <h6 class="text-secondary mb-3">
-                        <i class="fas fa-cloud"></i> Azure Management API Configuration
+                        <i class="fas fa-search"></i> Dynamic Discovery Settings
                     </h6>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label for="subscription_id" class="form-label">
-                                    <i class="fas fa-id-card"></i> Subscription ID <span class="text-danger">*</span>
-                                </label>
-                                <input type="text" id="subscription_id" class="form-control" 
-                                       placeholder="12345678-1234-1234-1234-123456789012">
-                                <div class="form-text">Azure subscription ID</div>
-                            </div>
-                        </div>
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label for="resource_group" class="form-label">
-                                    <i class="fas fa-layer-group"></i> Resource Group <span class="text-danger">*</span>
-                                </label>
-                                <input type="text" id="resource_group" class="form-control" 
-                                       placeholder="my-resource-group">
-                                <div class="form-text">Resource group containing the Cognitive Services resource</div>
-                            </div>
-                        </div>
-                    </div>
                     <div class="mb-3">
-                        <label for="account_name" class="form-label">
-                            <i class="fas fa-server"></i> Account Name <span class="text-danger">*</span>
+                        <label for="discovery_api_version" class="form-label">
+                            <i class="fas fa-code-branch"></i> API Version <span class="text-danger">*</span>
                         </label>
-                        <input type="text" id="account_name" class="form-control" 
-                               placeholder="prod-resource">
-                        <div class="form-text">Name of the Cognitive Services resource</div>
-                    </div>
-                    
-                    <h6 class="text-secondary mb-3 mt-4">
-                        <i class="fas fa-shield-alt"></i> Azure AD Service Principal
-                    </h6>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label for="client_id" class="form-label">
-                                    <i class="fas fa-user-cog"></i> Client ID <span class="text-danger">*</span>
-                                </label>
-                                <input type="text" id="client_id" class="form-control" 
-                                       placeholder="87654321-4321-4321-4321-210987654321">
-                                <div class="form-text">Azure AD service principal client ID</div>
-                            </div>
+                        <input type="text" id="discovery_api_version" class="form-control"
+                               placeholder="2024-10-21">
+                        <div class="form-text">
+                            api-version passed to <code>GET {endpoint}/openai/models?api-version=…</code>
                         </div>
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label for="tenant_id" class="form-label">
-                                    <i class="fas fa-building"></i> Tenant ID <span class="text-danger">*</span>
-                                </label>
-                                <input type="text" id="tenant_id" class="form-control" 
-                                       placeholder="11111111-2222-3333-4444-555555555555">
-                                <div class="form-text">Azure AD tenant ID</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="mb-3">
-                        <label for="client_secret" class="form-label">
-                            <i class="fas fa-lock"></i> Client Secret <span class="text-danger">*</span>
-                        </label>
-                        <input type="password" id="client_secret" class="form-control" 
-                               placeholder="Your service principal client secret">
-                        <div class="form-text">Azure AD service principal client secret</div>
-                    </div>
-                    
-                    <div class="text-center mt-3">
-                        <button type="button" class="btn btn-outline-info btn-sm" onclick="window.AzureManager.showAzureSetupInstructions()">
-                            <i class="fas fa-question-circle"></i> Azure Setup Instructions
-                        </button>
                     </div>
                 </div>
             </div>
@@ -407,7 +336,7 @@ class ProviderFormManager {
             };
 
             // Collect provider-specific fields
-            const fields = ['endpoint', 'api_key', 'api_version', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name'];
+            const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name'];
             fields.forEach(field => {
                 const element = document.getElementById(field);
                 if (element && element.value.trim()) {
@@ -434,7 +363,7 @@ class ProviderFormManager {
                 }
 
                 // Handle Azure Management API fields
-                const azureFields = ['subscription_id', 'resource_group', 'account_name', 'client_id', 'client_secret', 'tenant_id'];
+                const azureFields = ['discovery_api_version'];
                 azureFields.forEach(field => {
                     const element = document.getElementById(field);
                     if (element && element.value.trim()) {
@@ -687,7 +616,7 @@ class ProviderFormManager {
 
     populateProviderFields(provider) {
         // Populate common fields
-        const fields = ['endpoint', 'api_key', 'api_version', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name'];
+        const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name'];
         fields.forEach(field => {
             const element = document.getElementById(field);
             if (element && provider[field]) {
@@ -711,7 +640,7 @@ class ProviderFormManager {
             }
 
             // Handle Azure Management API fields
-            const azureFields = ['subscription_id', 'resource_group', 'account_name', 'client_id', 'client_secret', 'tenant_id'];
+            const azureFields = ['discovery_api_version'];
             azureFields.forEach(field => {
                 const element = document.getElementById(field);
                 if (element && provider[field]) {

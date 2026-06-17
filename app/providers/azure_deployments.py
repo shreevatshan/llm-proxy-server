@@ -102,7 +102,7 @@ def build_azure_config_fields(creds) -> Dict[str, Any]:
     return {
         'endpoint': creds.endpoint,
         'api_key': creds.api_key,
-        'api_version': getattr(creds, 'api_version', None) or '2024-12-01-preview',
+        'discovery_api_version': getattr(creds, 'discovery_api_version', None),
         'azure_backend': azure_backend,
         'deployments': merge_azure_deployments(
             deployment_groups,

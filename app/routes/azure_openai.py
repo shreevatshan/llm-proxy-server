@@ -46,6 +46,7 @@ from app.openai_models import (
 )
 from app.providers.provider_manager import provider_manager
 from app.providers.openai_compatible import preserve_upstream_model
+from app.providers.azure_provider import azure_call_style, azure_api_version
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.auth.database import get_api_key, AsyncSessionLocal
@@ -222,6 +223,16 @@ async def azure_chat_completions(
     """Azure OpenAI chat completions endpoint."""
     request_started_at = time.monotonic()
     provider = _get_azure_provider(provider_name)
+
+    # Signal the provider to use the legacy deployment-style upstream call and
+    # forward the inbound api-version.  Pre-validate so streaming responses get
+    # a clean 400 before the StreamingResponse wrapper is returned.
+    if provider._is_foundry_backend() or not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    azure_call_style.set("deployment")
+    azure_api_version.set(api_version)
+
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
@@ -284,6 +295,13 @@ async def azure_completions(
 ):
     """Azure OpenAI text completions endpoint."""
     provider = _get_azure_provider(provider_name)
+
+    if provider._is_foundry_backend() or not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    azure_call_style.set("deployment")
+    azure_api_version.set(api_version)
+
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
@@ -338,6 +356,13 @@ async def azure_embeddings(
 ):
     """Azure OpenAI embeddings endpoint."""
     provider = _get_azure_provider(provider_name)
+
+    if provider._is_foundry_backend() or not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    azure_call_style.set("deployment")
+    azure_api_version.set(api_version)
+
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
@@ -374,6 +399,13 @@ async def azure_image_generation(
 ):
     """Azure OpenAI image generation endpoint."""
     provider = _get_azure_provider(provider_name)
+
+    if provider._is_foundry_backend() or not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    azure_call_style.set("deployment")
+    azure_api_version.set(api_version)
+
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
@@ -409,6 +441,13 @@ async def azure_audio_speech(
 ):
     """Azure OpenAI text-to-speech endpoint."""
     provider = _get_azure_provider(provider_name)
+
+    if provider._is_foundry_backend() or not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    azure_call_style.set("deployment")
+    azure_api_version.set(api_version)
+
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
 
@@ -459,6 +498,13 @@ async def azure_audio_transcription(
 ):
     """Azure OpenAI audio transcription endpoint."""
     provider = _get_azure_provider(provider_name)
+
+    if provider._is_foundry_backend() or not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    azure_call_style.set("deployment")
+    azure_api_version.set(api_version)
+
     model_name = _build_model_name(provider_name, deployment)
 
     with create_span("azure_audio_transcription", kind=trace.SpanKind.INTERNAL) as span:
@@ -515,6 +561,13 @@ async def azure_audio_translation(
 ):
     """Azure OpenAI audio translation endpoint."""
     provider = _get_azure_provider(provider_name)
+
+    if provider._is_foundry_backend() or not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    azure_call_style.set("deployment")
+    azure_api_version.set(api_version)
+
     model_name = _build_model_name(provider_name, deployment)
 
     with create_span("azure_audio_translation", kind=trace.SpanKind.INTERNAL) as span:

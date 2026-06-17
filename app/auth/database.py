@@ -957,19 +957,13 @@ async def _rename_provider_with_models(
             enabled=kwargs.get('enabled', old_credentials.enabled),
             endpoint=kwargs.get('endpoint', old_credentials.endpoint),
             api_key=kwargs.get('api_key', old_credentials.api_key),
-            api_version=kwargs.get('api_version', old_credentials.api_version),
+            discovery_api_version=kwargs.get('discovery_api_version', old_credentials.discovery_api_version),
             azure_backend=kwargs.get('azure_backend', old_credentials.azure_backend),
             region=kwargs.get('region', old_credentials.region),
             access_key_id=kwargs.get('access_key_id', old_credentials.access_key_id),
             secret_access_key=kwargs.get('secret_access_key', old_credentials.secret_access_key),
             base_url=kwargs.get('base_url', old_credentials.base_url),
             deployments_json=kwargs.get('deployments_json', old_credentials.deployments_json),
-            subscription_id=kwargs.get('subscription_id', old_credentials.subscription_id),
-            resource_group=kwargs.get('resource_group', old_credentials.resource_group),
-            account_name=kwargs.get('account_name', old_credentials.account_name),
-            client_id=kwargs.get('client_id', old_credentials.client_id),
-            client_secret=kwargs.get('client_secret', old_credentials.client_secret),
-            tenant_id=kwargs.get('tenant_id', old_credentials.tenant_id),
             provider_name=kwargs.get('provider_name', old_credentials.provider_name),
             dynamic_discovery=kwargs.get('dynamic_discovery', old_credentials.dynamic_discovery),
             supported_apis=kwargs.get('supported_apis', old_credentials.supported_apis),
@@ -1903,7 +1897,39 @@ async def _run_auto_migrations():
                 logger.info("Auto-migration: 'azure_backend' column added successfully")
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add azure_backend column: {e}")
-        
+
+        # Migrate api_version → discovery_api_version and drop legacy Azure AD columns.
+        try:
+            result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))
+            columns = [row[1] for row in result.fetchall()]
+
+            if 'discovery_api_version' not in columns:
+                logger.info("Auto-migration: Adding 'discovery_api_version' column to provider_credentials")
+                await conn.execute(text(
+                    "ALTER TABLE provider_credentials ADD COLUMN discovery_api_version TEXT"
+                ))
+                if 'api_version' in columns:
+                    # Preserve any previously configured api_version as the discovery version.
+                    await conn.execute(text(
+                        "UPDATE provider_credentials SET discovery_api_version = api_version "
+                        "WHERE provider_type = 'azure' AND api_version IS NOT NULL"
+                    ))
+                logger.info("Auto-migration: 'discovery_api_version' column added")
+
+            # Drop the old api_version and Azure AD service-principal columns when present.
+            for old_col in ('api_version', 'subscription_id', 'resource_group',
+                            'account_name', 'client_id', 'client_secret', 'tenant_id'):
+                if old_col in columns:
+                    try:
+                        await conn.execute(text(
+                            f"ALTER TABLE provider_credentials DROP COLUMN {old_col}"
+                        ))
+                        logger.info(f"Auto-migration: Dropped obsolete column '{old_col}'")
+                    except Exception as drop_err:
+                        logger.warning(f"Auto-migration: Could not drop column '{old_col}': {drop_err}")
+        except Exception as e:
+            logger.warning(f"Auto-migration: discovery_api_version migration failed: {e}")
+
         # Rename provider_type 'openai_compatible' to 'custom' and set default supported_apis
         try:
             result = await conn.execute(text(

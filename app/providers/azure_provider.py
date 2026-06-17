@@ -1,9 +1,19 @@
 import time
 import json
 import logging
+from contextvars import ContextVar
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncAzureOpenAI, AsyncOpenAI
-import aiohttp
+
+# Per-request selection of the upstream call style for AzureProvider inference methods.
+#   "v1"         → AsyncOpenAI at {endpoint}/openai/v1/  (no api-version required)
+#   "deployment" → legacy AsyncAzureOpenAI /openai/deployments/{dep}/...?api-version=
+# Default "v1" — standard /v1/... and /openai/v1/... routes never set this.
+azure_call_style: ContextVar[str] = ContextVar("azure_call_style", default="v1")
+
+# The api-version forwarded from the inbound /openai/deployments/... request.
+azure_api_version: ContextVar[Optional[str]] = ContextVar("azure_api_version", default=None)
+
 from app.providers.openai_compatible import OpenAICompatibleProvider
 from app.openai_models import (
     ChatCompletionRequest,
@@ -42,61 +52,22 @@ _AZURE_FOUNDRY_ANTHROPIC_BETA_SUPPORTED = {
 
 class AzureProvider(OpenAICompatibleProvider):
     """
-    Azure OpenAI provider implementation with dynamic deployment discovery using Azure Management API.
+    Azure OpenAI / Azure AI Foundry provider implementation.
 
-    This provider uses the Azure Management API to automatically discover deployments based on:
-    - Azure subscription ID
-    - Resource group name
-    - Cognitive Services account name
-    - Azure AD service principal credentials
+    Dynamic discovery uses GET {endpoint}/openai/models?api-version={discovery_api_version}
+    which is the standard Azure OpenAI models-list endpoint (no Azure AD service principal
+    required — only the resource API key is needed).
 
     Required Configuration Parameters:
-    - endpoint: Azure OpenAI endpoint URL (for API calls)
-    - api_key: Azure OpenAI API key (for API calls)
-    - api_version: Azure OpenAI API version
-    - subscription_id: Azure subscription ID
-    - resource_group: Resource group containing the Cognitive Services resource
-    - account_name: Name of the Cognitive Services resource
-    - client_id: Azure AD service principal client ID
-    - client_secret: Azure AD service principal client secret
-    - tenant_id: Azure AD tenant ID
+    - endpoint: Azure OpenAI endpoint URL
+    - api_key: Azure OpenAI API key
 
-    Setup Instructions:
-
-    1. Create an Azure AD App Registration:
-       - Go to Azure Portal > Azure Active Directory > App registrations
-       - Click "New registration"
-       - Name: "LLM-Proxy-Server" (or your preferred name)
-       - Account types: "Accounts in this organizational directory only"
-       - Click "Register"
-
-    2. Create a Client Secret:
-       - In your app registration, go to "Certificates & secrets"
-       - Click "New client secret"
-       - Description: "LLM Proxy Server Secret"
-       - Expires: Choose appropriate duration
-       - Click "Add" and copy the secret value (client_secret)
-
-    3. Note the Application Details:
-       - Application (client) ID = client_id
-       - Directory (tenant) ID = tenant_id
-
-    4. Assign Permissions:
-       - Go to your Cognitive Services resource in Azure Portal
-       - Click "Access control (IAM)"
-       - Click "Add role assignment"
-       - Role: "Cognitive Services Contributor" or "Reader"
-       - Assign access to: "User, group, or service principal"
-       - Select your app registration
-       - Click "Save"
-
-    5. Configure the Provider:
-       - subscription_id: Your Azure subscription ID
-       - resource_group: Resource group containing your Cognitive Services resource
-       - account_name: Name of your Cognitive Services resource
-       - client_id: Application (client) ID from step 3
-       - client_secret: Client secret value from step 2
-       - tenant_id: Directory (tenant) ID from step 3
+    Optional:
+    - discovery_api_version: api-version string used for the models-list call
+      (required when dynamic_discovery is True, e.g. "2024-10-21")
+    - azure_backend: "openai" (default) or "foundry"
+    - dynamic_discovery: True (default) to discover models at runtime; False to
+      use the manually supplied deployment lists
 
     Configuration Example:
     ```yaml
@@ -105,13 +76,7 @@ class AzureProvider(OpenAICompatibleProvider):
         enabled: true
         endpoint: "https://your-resource.openai.azure.com/"
         api_key: "your-api-key"
-        api_version: "2024-12-01-preview"
-        subscription_id: "12345678-1234-1234-1234-123456789012"
-        resource_group: "my-resource-group"
-        account_name: "my-openai-resource"
-        client_id: "87654321-4321-4321-4321-210987654321"
-        client_secret: "your-client-secret"
-        tenant_id: "11111111-2222-3333-4444-555555555555"
+        discovery_api_version: "2024-10-21"
     ```
     """
 
@@ -119,20 +84,12 @@ class AzureProvider(OpenAICompatibleProvider):
         super().__init__(config)
         self.endpoint = config.get('endpoint', '').rstrip('/')
         self.api_key = config.get('api_key')
-        self.api_version = config.get('api_version')
+        self.discovery_api_version = config.get('discovery_api_version')
         self.azure_backend = (config.get('azure_backend') or 'openai').lower()
-        self.subscription_id = config.get('subscription_id')
-        self.resource_group = config.get('resource_group')
-        self.account_name = config.get('account_name')
-        self.client_id = config.get('client_id')
-        self.client_secret = config.get('client_secret')
-        self.tenant_id = config.get('tenant_id')
         self.deployments = config.get('deployments', [])
         self.openai_deployments = config.get('openai_deployments', [])
         self.anthropic_deployments = config.get('anthropic_deployments', [])
         self.dynamic_discovery = config.get('dynamic_discovery', True)
-        self._access_token: Optional[str] = None
-        self._token_expires_at: Optional[float] = None
         self._anthropic_client = None
 
         # Validate required configuration parameters
@@ -153,31 +110,15 @@ class AzureProvider(OpenAICompatibleProvider):
         # Backward-compat alias used by OpenAICompatibleProvider._get_responses_client()
         self._responses_client = self._v1_client
 
-        # Initialize legacy Azure OpenAI client (for deployment-based endpoints).
-        # api_version is optional — when absent, only v1 endpoints are available.
-        if self.azure_backend == "foundry":
-            self.client = self._v1_client
-            self._responses_client = self._v1_client
-            self._init_foundry_anthropic_client()
-        elif self.api_version:
-            self.client = AsyncAzureOpenAI(
-                azure_endpoint=self.endpoint,
-                api_key=self.api_key,
-                api_version=self.api_version
-            )
-        else:
-            # No api_version: fall back to v1 client for all SDK calls.
-            # Legacy deployment-based routes may not work without api_version,
-            # but v1 routes (/openai/v1/*) will work fine.
-            self.client = self._v1_client
+        # Cache of AsyncAzureOpenAI clients keyed by api-version string.
+        # Populated lazily by _get_deployment_client() per inbound request api-version.
+        self._deployment_clients: Dict[str, AsyncAzureOpenAI] = {}
 
-        # Warn if api_version is set but may be too old for Responses API
-        if self.api_version and self.api_version < "2025-03-01-preview":
-            print(
-                f"Warning: Azure api_version '{self.api_version}' may not support the Responses API. "
-                f"The Responses API requires the v1 endpoint which is used automatically, but "
-                f"consider updating api_version to '2025-03-01-preview' or later for full compatibility."
-            )
+        # All inference goes through the v1 client; deployment-style callers get a
+        # per-request AsyncAzureOpenAI built from the inbound ?api-version= param.
+        self.client = self._v1_client
+        if self.azure_backend == "foundry":
+            self._init_foundry_anthropic_client()
 
     def _init_foundry_anthropic_client(self) -> None:
         try:
@@ -204,6 +145,39 @@ class AzureProvider(OpenAICompatibleProvider):
 
     def _is_foundry_backend(self) -> bool:
         return self.azure_backend == "foundry"
+
+    def _get_inference_client(self):
+        """Return the upstream client to use for chat/completions/embeddings/audio/images.
+
+        Reads the azure_call_style ContextVar set by the route handler:
+          "deployment" → legacy AsyncAzureOpenAI using the deployment URL format
+          "v1" (default) → AsyncOpenAI at /openai/v1/
+        """
+        if azure_call_style.get("v1") == "deployment":
+            return self._get_deployment_client(azure_api_version.get(None))
+        return self._v1_client
+
+    def _get_deployment_client(self, api_version: Optional[str]) -> AsyncAzureOpenAI:
+        """Return (or lazily build) an AsyncAzureOpenAI client for the given api-version.
+
+        Raises ValueError if no usable api-version can be determined or if this
+        is a Foundry backend (which has no legacy deployment URL surface).
+        The deployment route handlers catch ValueError and return a 400 response.
+        """
+        eff = api_version
+        if self._is_foundry_backend() or not eff:
+            raise ValueError(
+                "api-version is required for deployment-style calls to this Azure provider"
+            )
+        client = self._deployment_clients.get(eff)
+        if client is None:
+            client = AsyncAzureOpenAI(
+                azure_endpoint=self.endpoint,
+                api_key=self.api_key,
+                api_version=eff,
+            )
+            self._deployment_clients[eff] = client
+        return client
 
     def _is_claude_model(self, model_name: str) -> bool:
         return "claude" in self.get_model_id(model_name).lower()
@@ -321,135 +295,63 @@ class AzureProvider(OpenAICompatibleProvider):
         return filtered or None
 
     async def _fetch_deployments(self) -> List[str]:
-        """Fetch available deployments from Azure OpenAI using configured method."""
+        """Fetch available model names from Azure.
+
+        When dynamic_discovery is False the manually configured deployment lists
+        are returned as-is.  When enabled, both the ``openai`` and ``foundry``
+        backends are queried via:
+
+            GET {endpoint}/openai/models?api-version={discovery_api_version}
+
+        This endpoint is the standard Azure OpenAI models-list API and returns
+        all deployed models without requiring Azure AD service-principal
+        credentials.
+        """
         try:
-            # If dynamic discovery is disabled, use the configured deployments list
             if not self.dynamic_discovery:
                 manual_models = self._get_manual_model_names()
                 if not manual_models:
-                    raise ValueError("Azure provider requires manual model entries when dynamic_discovery is False")
+                    raise ValueError(
+                        "Azure provider requires manual model entries when dynamic_discovery is False"
+                    )
                 print(f"Azure provider using configured models: {manual_models}")
                 return manual_models
 
-            if self._is_foundry_backend():
-                response = await self._v1_client.models.list()
-                models = [m.id for m in response.data if m.id]
-                print(f"Azure Foundry provider discovered {len(models)} models via SDK: {models}")
-                return models
+            if not self.discovery_api_version:
+                raise ValueError(
+                    "discovery_api_version is required for Azure dynamic discovery"
+                )
 
-            # Use Azure Management API for dynamic discovery (always fetch fresh - no individual caching)
-            if not all([self.subscription_id, self.resource_group, self.account_name]):
-                raise ValueError("Azure provider requires subscription_id, resource_group, and account_name for dynamic deployment discovery")
+            url = f"{self.endpoint}/openai/models"
+            params = {"api-version": self.discovery_api_version}
+            headers = {
+                "api-key": self.api_key,
+            }
 
-            deployments = await self._fetch_deployments_via_management_api()
-            return deployments
+            import aiohttp  # already in requirements; local import keeps the module usable
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        models = [
+                            item["id"]
+                            for item in data.get("data", [])
+                            if item.get("id")
+                        ]
+                        print(
+                            f"Azure provider ({self.azure_backend}) discovered "
+                            f"{len(models)} models via models API: {models}"
+                        )
+                        return models
+                    else:
+                        body = await response.text()
+                        raise Exception(
+                            f"Azure models API returned HTTP {response.status}: {body}"
+                        )
 
         except Exception as e:
             print(f"Azure deployment fetch error: {e}")
             raise Exception(f"Failed to fetch deployments: {e}")
-
-    async def _fetch_deployments_via_management_api(self) -> List[str]:
-        """Fetch deployments using Azure Management API."""
-        try:
-            # Check if we have the required Azure AD credentials
-            if not all([self.client_id, self.client_secret, self.tenant_id]):
-                print("Azure Management API requires client_id, client_secret, and tenant_id - skipping")
-                return []
-
-            # Get Azure AD access token
-            access_token = await self._get_azure_ad_token()
-            if not access_token:
-                print("Failed to acquire Azure AD token - skipping Management API")
-                return []
-
-            # Azure Management API endpoint for listing deployments
-            management_api_url = (
-                f"https://management.azure.com/subscriptions/{self.subscription_id}/"
-                f"resourceGroups/{self.resource_group}/providers/Microsoft.CognitiveServices/"
-                f"accounts/{self.account_name}/deployments"
-            )
-
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json"
-            }
-            params = {"api-version": "2023-05-01"}
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(management_api_url, headers=headers, params=params) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        deployments = []
-
-                        # Extract deployment names from the response
-                        if "value" in data:
-                            for deployment in data["value"]:
-                                if "name" in deployment:
-                                    deployments.append(deployment["name"])
-
-                        print(f"Azure provider discovered {len(deployments)} deployments via Management API: {deployments}")
-                        return deployments
-                    else:
-                        print(f"Azure Management API returned HTTP {response.status}")
-                        response_text = await response.text()
-                        print(f"Response: {response_text}")
-                        return []
-
-        except Exception as e:
-            print(f"Error fetching deployments via Management API: {e}")
-            return []
-
-    async def _get_azure_ad_token(self) -> Optional[str]:
-        """Get Azure AD access token using client credentials flow."""
-        try:
-            # Check if we have a valid cached token
-            if (self._access_token and self._token_expires_at and
-                time.time() < self._token_expires_at - 300):  # 5 minutes buffer
-                return self._access_token
-
-            # Azure AD token endpoint
-            token_url = f"https://login.microsoftonline.com/{self.tenant_id}/oauth2/v2.0/token"
-
-            # Prepare the request data for client credentials flow
-            data = {
-                "grant_type": "client_credentials",
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "scope": "https://management.azure.com/.default"
-            }
-
-            headers = {
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(token_url, data=data, headers=headers) as response:
-                    if response.status == 200:
-                        token_data = await response.json()
-
-                        # Extract access token and expiration
-                        access_token = token_data.get("access_token")
-                        expires_in = token_data.get("expires_in", 3600)  # Default to 1 hour
-
-                        if access_token:
-                            # Cache the token
-                            self._access_token = access_token
-                            self._token_expires_at = time.time() + expires_in
-
-                            print("Successfully acquired Azure AD access token")
-                            return access_token
-                        else:
-                            print("No access token in response")
-                            return None
-                    else:
-                        print(f"Azure AD token request failed with status {response.status}")
-                        response_text = await response.text()
-                        print(f"Response: {response_text}")
-                        return None
-
-        except Exception as e:
-            print(f"Error acquiring Azure AD token: {e}")
-            return None
 
     async def responses_input_tokens(self, request, **kwargs):
         """Azure OpenAI does not currently support the input_tokens endpoint."""

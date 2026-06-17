@@ -184,15 +184,6 @@ class ProviderManager:
         # Add provider-specific fields based on type
         if cred.provider_type == 'azure':
             config_dict.update(build_azure_config_fields(cred))
-            config_dict.update({
-                # Azure AD fields for dynamic deployment discovery
-                'subscription_id': cred.subscription_id,
-                'resource_group': cred.resource_group,
-                'account_name': cred.account_name,
-                'client_id': cred.client_id,
-                'client_secret': cred.client_secret,
-                'tenant_id': cred.tenant_id
-            })
         elif cred.provider_type == 'google':
             config_dict.update({
                 'api_key': cred.api_key,
