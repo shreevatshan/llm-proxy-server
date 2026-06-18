@@ -70,7 +70,10 @@ class UsageManager {
     // Window selector
     // ------------------------------------------------------------------ //
 
-    setWindow(win) {
+    async setWindow(win) {
+        // Preserve any active drill-down so the new window stays scoped to the
+        // selected user/model instead of reverting to overall usage.
+        const prevDrilldown = this._lastDrilldown;
         this._window = win;
         this._year = null;
         this._month = null;
@@ -78,8 +81,11 @@ class UsageManager {
         this._updateWindowButtons(win);
         this.isDrilledIn = false;
         this._lastDrilldown = null;
-        this._setHeaderMode('toggle');
-        this._fetchAndRender({ silent: false });
+        // Keep the header in 'back' mode when a drill-down will be re-applied, so the
+        // Back button doesn't flash to the user/model toggle and back again.
+        if (!prevDrilldown) this._setHeaderMode('toggle');
+        await this._fetchAndRender({ silent: false, deferBody: !!prevDrilldown });
+        if (prevDrilldown) await this.drillDown(prevDrilldown.axis, prevDrilldown.id);
         this._clearTimer('window changed');
         this._startRefreshIfLive();
     }
@@ -168,7 +174,7 @@ class UsageManager {
         return `/admin/usage?${params}`;
     }
 
-    async _fetchAndRender({ silent }) {
+    async _fetchAndRender({ silent, deferBody = false }) {
         try {
             const resp = await fetch(this._buildUrl(), { credentials: 'include', cache: 'no-store' });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -181,13 +187,16 @@ class UsageManager {
         if (!silent) {
             this.isDrilledIn = false;
             this._lastDrilldown = null;
-            this._setHeaderMode('toggle');
+            // deferBody implies a drill-down render follows; leave the header in 'back'
+            // mode so it doesn't flash to the user/model toggle in between.
+            if (!deferBody) this._setHeaderMode('toggle');
         }
         this._renderStats(this._cache.totals);
         this._renderEarliestDate(this._cache.earliest_date);
-        if (!this.isDrilledIn) {
-            // When drilled in, _refreshDrilldown renders the filtered series; rendering
-            // the unfiltered series here first would flash the wrong bars on each refresh.
+        // deferBody: a drill-down render follows immediately (e.g. a window change while
+        // a user/model is selected), so skip the top-level chart+table to avoid flashing
+        // the overall view before the scoped one paints.
+        if (!this.isDrilledIn && !deferBody) {
             this._renderChart(this._cache.timeseries);
             this._updateToggle(this.currentView);
             this._renderTopLevel();
@@ -291,8 +300,10 @@ class UsageManager {
         }
     }
 
-    _selectMonth(m) {
+    async _selectMonth(m) {
         if (!this._year) return;
+        // Preserve any active drill-down across the window change (see setWindow).
+        const prevDrilldown = this._lastDrilldown;
         this._month = m;
         this._window = 'month';
 
@@ -317,8 +328,9 @@ class UsageManager {
         this._closeOlderPopover();
         this.isDrilledIn = false;
         this._lastDrilldown = null;
-        this._setHeaderMode('toggle');
-        this._fetchAndRender({ silent: false });
+        if (!prevDrilldown) this._setHeaderMode('toggle');
+        await this._fetchAndRender({ silent: false, deferBody: !!prevDrilldown });
+        if (prevDrilldown) await this.drillDown(prevDrilldown.axis, prevDrilldown.id);
         this._clearTimer('historical window');
     }
 
