@@ -2,6 +2,15 @@
 
 {% block extra_css %}
 <style>
+    /* ── Quota tooltips ────────────────────────────────────────────── */
+    .quota-tooltip .tooltip-inner {
+        max-width: 360px;
+        text-align: left;
+        padding: 10px 12px;
+        font-size: 0.8rem;
+        line-height: 1.5;
+    }
+
     /* ── Endpoints tab ─────────────────────────────────────────────── */
     .endpoint-section { margin-bottom: 16px; }
     .base-url-card {
@@ -304,22 +313,52 @@
 
 <!-- ══════════════════════════════════════════════════════ Quotas -->
 <div class="section tab-content" id="quotas-tab">
-    <!-- Overall request quota stat cards -->
-    <div class="dashboard-stats mb-4" id="quotaOverallStats">
-        <div class="stat-card">
-            <div class="stat-number" id="quotaRpmLimit">—</div>
-            <div class="stat-label">RPM Limit</div>
+    <!-- Overall request quota -->
+    <div class="card mb-4">
+        <div class="card-header">
+            <h5 class="mb-0">
+                <i class="fas fa-gauge-high me-2"></i>Overall Quota
+                <i class="fas fa-info-circle text-muted ms-1 quota-info" style="font-size:0.8rem;cursor:help;"
+                   data-bs-toggle="tooltip" data-bs-placement="top"
+                   title="Your default request limits. These apply only to requests that are NOT covered by an instance group or a model group — grouped requests count against their group's quota instead, never here. RPM = requests per minute, RPD = requests per day; '(N left)' is your remaining requests today. ∞ means unlimited."></i>
+            </h5>
         </div>
-        <div class="stat-card" style="position:relative;">
-            <div class="stat-number" id="quotaRpdLimit">—</div>
-            <div class="stat-label">RPD Limit</div>
-            <span id="quotaRpdRemaining" style="position:absolute;bottom:0.75rem;right:1rem;font-size:0.75rem;color:var(--mono-text-muted,#888);"></span>
+        <div class="card-body">
+            <div id="quotaOverallContainer">
+                <div class="skeleton-stack" aria-busy="true" aria-label="Loading quota data">
+                    <div class="skeleton skeleton-row"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <!-- Instance group quotas (take precedence over model groups) -->
+    <div class="card mb-4">
+        <div class="card-header">
+            <h5 class="mb-0">
+                <i class="fas fa-server me-2"></i>Instance Group Quotas
+                <i class="fas fa-info-circle text-muted ms-1 quota-info" style="font-size:0.8rem;cursor:help;"
+                   data-bs-toggle="tooltip" data-bs-placement="top"
+                   title="Limits applied per instance group. An 'instance' is an upstream provider. Instance groups have the HIGHEST precedence: any request to an instance in a group is governed by that group's RPM/RPD limit, ignoring model-group and overall limits. RPD '(N left)' is the group's remaining requests today across all its instances. ∞ means unlimited."></i>
+            </h5>
+        </div>
+        <div class="card-body">
+            <div id="quotaInstanceGroupsContainer">
+                <div class="skeleton-stack" aria-busy="true" aria-label="Loading quota data">
+                    <div class="skeleton skeleton-row"></div>
+                    <div class="skeleton skeleton-row"></div>
+                </div>
+            </div>
         </div>
     </div>
     <!-- Model group quotas -->
     <div class="card">
         <div class="card-header">
-            <h5 class="mb-0"><i class="fas fa-layer-group me-2"></i>Model Group Quotas</h5>
+            <h5 class="mb-0">
+                <i class="fas fa-layer-group me-2"></i>Model Group Quotas
+                <i class="fas fa-info-circle text-muted ms-1 quota-info" style="font-size:0.8rem;cursor:help;"
+                   data-bs-toggle="tooltip" data-bs-placement="top"
+                   title="Limits applied per model group — a named set of models sharing one quota. A request to a model in a group is governed by that group's RPM/RPD limit instead of the overall limit, UNLESS the request's instance is in an instance group (which takes precedence). RPD '(N left)' is the group's remaining requests today across all its models. ∞ means unlimited."></i>
+            </h5>
         </div>
         <div class="card-body">
             <div id="quotaGroupsContainer">

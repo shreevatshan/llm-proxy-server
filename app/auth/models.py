@@ -241,6 +241,58 @@ class UserModelGroupRateLimit(Base):
     )
 
 
+class InstanceGroup(Base):
+    """Named group of provider instances sharing a rate-limit bucket."""
+    __tablename__ = "instance_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), unique=True, nullable=False)
+    description = Column(String(256), nullable=True)
+    rpm_default = Column(Integer, nullable=True)  # null = unlimited
+    rpd_default = Column(Integer, nullable=True)  # null = unlimited
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    members = relationship("InstanceGroupMember", back_populates="group", cascade="all, delete-orphan")
+    user_limits = relationship("UserInstanceGroupRateLimit", back_populates="group", cascade="all, delete-orphan")
+
+
+class InstanceGroupMember(Base):
+    """Maps a provider_key (instance) to exactly one InstanceGroup (unique on provider_key)."""
+    __tablename__ = "instance_group_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("instance_groups.id", ondelete="CASCADE"), nullable=False)
+    provider_key = Column(String(100), unique=True, nullable=False)  # unique enforces single-group membership
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    group = relationship("InstanceGroup", back_populates="members")
+
+    __table_args__ = (
+        Index("ix_instance_group_members_group_id", "group_id"),
+    )
+
+
+class UserInstanceGroupRateLimit(Base):
+    """Per-user override for an instance group's rate limits. Absent row = inherit group default."""
+    __tablename__ = "user_instance_group_rate_limits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    group_id = Column(Integer, ForeignKey("instance_groups.id", ondelete="CASCADE"), nullable=False)
+    rpm_limit = Column(Integer, nullable=True)  # null = inherit group default
+    rpd_limit = Column(Integer, nullable=True)  # null = inherit group default
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    group = relationship("InstanceGroup", back_populates="user_limits")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "group_id", name="uq_user_instance_group_rate_limit"),
+    )
+
+
 class ProviderCredentials(Base):
     """Provider credentials model for storing provider configurations."""
     __tablename__ = "provider_credentials"
@@ -537,16 +589,147 @@ class QuotaGroupResponse(BaseModel):
     description: Optional[str] = None
     rpm_limit: Optional[int] = None      # effective: override if set, else group default; null = unlimited
     rpd_limit: Optional[int] = None      # effective; null = unlimited
+    rpd_count: int = 0                   # requests used today (UTC) across this group
+    rpd_remaining: Optional[int] = None  # null = unlimited
     models: List[str] = []               # member model_ids in this group
+
+
+class QuotaInstanceGroupResponse(BaseModel):
+    name: str
+    description: Optional[str] = None
+    rpm_limit: Optional[int] = None      # effective: override if set, else group default; null = unlimited
+    rpd_limit: Optional[int] = None      # effective; null = unlimited
+    rpd_count: int = 0                   # requests used today (UTC) across this group
+    rpd_remaining: Optional[int] = None  # null = unlimited
+    instances: List[str] = []            # member provider_keys in this group
 
 
 class MyQuotasResponse(BaseModel):
     is_admin: bool = False                             # true ⇒ exempt from all limits
     overall: Optional[QuotaOverallResponse] = None    # null when is_admin
     groups: List[QuotaGroupResponse] = []
+    instance_groups: List[QuotaInstanceGroupResponse] = []
 
 
 class UserModelGroupRateLimitUpdate(BaseModel):
+    rpm_limit: Optional[int] = None
+    rpd_limit: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_non_negative(self):
+        if self.rpm_limit is not None and self.rpm_limit < 0:
+            raise ValueError("rpm_limit must be >= 0")
+        if self.rpd_limit is not None and self.rpd_limit < 0:
+            raise ValueError("rpd_limit must be >= 0")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Instance group Pydantic models (mirror the model-group ones)
+# ---------------------------------------------------------------------------
+
+class InstanceGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    rpm_default: Optional[int] = None
+    rpd_default: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        import re
+        self.name = self.name.strip()
+        if not self.name or len(self.name) > 64:
+            raise ValueError("name must be 1–64 characters")
+        if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
+            raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+        if self.description is not None:
+            self.description = self.description.strip()[:256]
+        if self.rpm_default is not None and self.rpm_default < 0:
+            raise ValueError("rpm_default must be >= 0")
+        if self.rpd_default is not None and self.rpd_default < 0:
+            raise ValueError("rpd_default must be >= 0")
+        return self
+
+
+class InstanceGroupUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        import re
+        if self.name is not None:
+            self.name = self.name.strip()
+            if not self.name or len(self.name) > 64:
+                raise ValueError("name must be 1–64 characters")
+            if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
+                raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+        if self.description is not None:
+            self.description = self.description.strip()[:256]
+        return self
+
+
+class InstanceGroupLimitsUpdate(BaseModel):
+    rpm_default: Optional[int] = None
+    rpd_default: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_non_negative(self):
+        if self.rpm_default is not None and self.rpm_default < 0:
+            raise ValueError("rpm_default must be >= 0")
+        if self.rpd_default is not None and self.rpd_default < 0:
+            raise ValueError("rpd_default must be >= 0")
+        return self
+
+
+class InstanceGroupMembersUpdate(BaseModel):
+    provider_keys: List[str]
+
+    @model_validator(mode="after")
+    def validate_provider_keys(self):
+        seen = set()
+        clean = []
+        for pk in self.provider_keys:
+            pk = pk.strip()
+            if not pk or len(pk) > 100:
+                raise ValueError(f"provider_key '{pk}' is invalid (must be 1–100 chars)")
+            if pk not in seen:
+                seen.add(pk)
+                clean.append(pk)
+        self.provider_keys = clean
+        return self
+
+
+class InstanceGroupResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    rpm_default: Optional[int] = None
+    rpd_default: Optional[int] = None
+    member_count: int = 0
+    members: List[str] = []               # member provider_keys
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserInstanceGroupRateLimitResponse(BaseModel):
+    user_id: int
+    username: str
+    email: str
+    group_id: int
+    rpm_limit: Optional[int] = None
+    rpd_limit: Optional[int] = None
+    effective_rpm: Optional[int] = None
+    effective_rpd: Optional[int] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserInstanceGroupRateLimitUpdate(BaseModel):
     rpm_limit: Optional[int] = None
     rpd_limit: Optional[int] = None
 

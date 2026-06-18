@@ -29,7 +29,7 @@ class RateLimitDecision:
     rpd_limit: Optional[int]
     rpd_remaining: Optional[int]
     retry_after_seconds: int
-    limited_by: Optional[str]  # "rpm" | "rpd" | "group_rpm" | "group_rpd" | None
+    limited_by: Optional[str]  # "rpm"|"rpd"|"group_rpm"|"group_rpd"|"instance_group_rpm"|"instance_group_rpd"|None
     # Group context (set when limited_by is group_rpm or group_rpd, or for headers)
     group_id: Optional[int] = None
     group_name: Optional[str] = None
@@ -69,6 +69,23 @@ class _ModelGroupSnapshot:
 
 @dataclass
 class _UserGroupOverride:
+    user_id: int
+    group_id: int
+    rpm_limit: Optional[int]
+    rpd_limit: Optional[int]
+
+
+@dataclass
+class _InstanceGroupSnapshot:
+    group_id: int
+    name: str
+    rpm_default: Optional[int]
+    rpd_default: Optional[int]
+    provider_keys: List[str]
+
+
+@dataclass
+class _UserInstanceGroupOverride:
     user_id: int
     group_id: int
     rpm_limit: Optional[int]
@@ -158,6 +175,18 @@ def _human_duration(seconds: int) -> str:
 
 
 def _limit_message(d: RateLimitDecision) -> str:
+    if d.limited_by == "instance_group_rpm":
+        return (
+            f"Rate limit exceeded for instance group '{d.group_name}': {d.group_rpm_limit} requests per minute. "
+            f"Retry after {_human_duration(d.retry_after_seconds)}, or use an instance outside this group. "
+            f"View your allowed quota in the console."
+        )
+    if d.limited_by == "instance_group_rpd":
+        return (
+            f"Rate limit exceeded for instance group '{d.group_name}': {d.group_rpd_limit} requests per day. "
+            f"Retry after {_human_duration(d.retry_after_seconds)}, or use an instance outside this group. "
+            f"View your allowed quota in the console."
+        )
     if d.limited_by == "group_rpm":
         return (
             f"Rate limit exceeded for model group '{d.group_name}': {d.group_rpm_limit} requests per minute. "
@@ -186,8 +215,8 @@ def _limit_message(d: RateLimitDecision) -> str:
 
 
 def _rl_headers(d: RateLimitDecision) -> dict:
-    if d.limited_by in ("group_rpm", "group_rpd"):
-        limit = d.group_rpm_limit if d.limited_by == "group_rpm" else d.group_rpd_limit
+    if d.limited_by in ("group_rpm", "group_rpd", "instance_group_rpm", "instance_group_rpd"):
+        limit = d.group_rpm_limit if d.limited_by in ("group_rpm", "instance_group_rpm") else d.group_rpd_limit
     else:
         limit = d.rpm_limit if d.limited_by == "rpm" else d.rpd_limit
     return {
@@ -231,6 +260,12 @@ class RateLimitTracker:
         self._groups: Dict[int, _ModelGroupSnapshot] = {}        # group_id → snapshot
         self._model_to_group: Dict[str, int] = {}               # model_id → group_id
         self._user_group_overrides: Dict[Tuple[int, int], _UserGroupOverride] = {}  # (user_id, group_id)
+        # Instance-group state (keyed on provider_key)
+        self._instance_groups: Dict[int, _InstanceGroupSnapshot] = {}    # group_id → snapshot
+        self._provider_to_group: Dict[str, int] = {}                     # provider_key → group_id
+        self._instance_group_minute_buckets: Dict[Tuple[int, int], _MinuteBucket] = {}  # (user_id, group_id)
+        self._instance_group_rpd_cache: Dict[Tuple[str, int], _RpdCacheEntry] = {}      # (user_identity, group_id)
+        self._user_instance_group_overrides: Dict[Tuple[int, int], _UserInstanceGroupOverride] = {}  # (user_id, group_id)
 
     def set_db_session_factory(self, factory: Callable) -> None:
         self._db_session_factory = factory
@@ -273,7 +308,10 @@ class RateLimitTracker:
             return
         try:
             from app.auth.database import get_global_rate_limit, AsyncSessionLocal
-            from app.auth.models import UserRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit
+            from app.auth.models import (
+                UserRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit,
+                InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit,
+            )
             from sqlalchemy.future import select
             from sqlalchemy.orm import selectinload
 
@@ -291,6 +329,16 @@ class RateLimitTracker:
                 # Load per-user group overrides
                 result = await db.execute(select(UserModelGroupRateLimit))
                 user_group_rows = result.scalars().all()
+
+                # Load instance groups with members
+                result = await db.execute(
+                    select(InstanceGroup).options(selectinload(InstanceGroup.members))
+                )
+                instance_group_rows = result.scalars().all()
+
+                # Load per-user instance-group overrides
+                result = await db.execute(select(UserInstanceGroupRateLimit))
+                user_instance_group_rows = result.scalars().all()
 
             lock = await self._get_lock()
             async with lock:
@@ -331,6 +379,30 @@ class RateLimitTracker:
                     )
                     for row in user_group_rows
                 }
+                self._instance_groups = {
+                    g.id: _InstanceGroupSnapshot(
+                        group_id=g.id,
+                        name=g.name,
+                        rpm_default=g.rpm_default,
+                        rpd_default=g.rpd_default,
+                        provider_keys=[m.provider_key for m in g.members],
+                    )
+                    for g in instance_group_rows
+                }
+                self._provider_to_group = {
+                    m.provider_key: g.id
+                    for g in instance_group_rows
+                    for m in g.members
+                }
+                self._user_instance_group_overrides = {
+                    (row.user_id, row.group_id): _UserInstanceGroupOverride(
+                        user_id=row.user_id,
+                        group_id=row.group_id,
+                        rpm_limit=row.rpm_limit,
+                        rpd_limit=row.rpd_limit,
+                    )
+                    for row in user_instance_group_rows
+                }
         except Exception as e:
             logger.warning(f"RateLimitTracker: config reload failed: {e}")
 
@@ -342,6 +414,9 @@ class RateLimitTracker:
         stale_g = [k for k, b in self._group_minute_buckets.items() if b.window < current_window - 1]
         for k in stale_g:
             del self._group_minute_buckets[k]
+        stale_ig = [k for k, b in self._instance_group_minute_buckets.items() if b.window < current_window - 1]
+        for k in stale_ig:
+            del self._instance_group_minute_buckets[k]
 
     def invalidate_user(self, user_id: int) -> None:
         self._overrides.pop(user_id, None)
@@ -370,15 +445,59 @@ class RateLimitTracker:
         self._group_minute_buckets.pop((user_id, group_id), None)
         self._group_rpd_cache.pop((str(user_id), group_id), None)
 
+    def invalidate_instance_group(self, group_id: int) -> None:
+        """Remove cached instance-group snapshot and all related RPM buckets."""
+        snap = self._instance_groups.pop(group_id, None)
+        if snap:
+            for pk in snap.provider_keys:
+                self._provider_to_group.pop(pk, None)
+        stale = [k for k in self._instance_group_minute_buckets if k[1] == group_id]
+        for k in stale:
+            del self._instance_group_minute_buckets[k]
+        stale_rpd = [k for k in self._instance_group_rpd_cache if k[1] == group_id]
+        for k in stale_rpd:
+            del self._instance_group_rpd_cache[k]
+
+    def invalidate_user_instance_group(self, user_id: int, group_id: int) -> None:
+        self._user_instance_group_overrides.pop((user_id, group_id), None)
+        self._instance_group_minute_buckets.pop((user_id, group_id), None)
+        self._instance_group_rpd_cache.pop((str(user_id), group_id), None)
+
     async def refresh_now(self) -> None:
         """Force an immediate config reload from DB (called after admin edits)."""
         await self._load_config()
+
+    def model_belongs_to_group(self, model_id: str) -> bool:
+        """True if the model is mapped to a configured model group."""
+        return bool(model_id) and model_id in self._model_to_group
+
+    def instance_belongs_to_group(self, provider_key: str) -> bool:
+        """True if the provider instance is mapped to a configured instance group."""
+        return bool(provider_key) and provider_key in self._provider_to_group
+
+    def grouped_keys(self) -> Tuple[set, set]:
+        """Return (grouped_model_ids, grouped_provider_keys) currently configured.
+
+        A request is excluded from the overall (ungrouped) quota when its model is
+        in a model group OR its instance is in an instance group — the same predicate
+        the auth middleware uses to skip the overall gate.
+        """
+        return set(self._model_to_group.keys()), set(self._provider_to_group.keys())
 
     def _resolve_group_limits(
         self, user_id: int, group: _ModelGroupSnapshot
     ) -> Tuple[Optional[int], Optional[int]]:
         """Return (effective_group_rpm, effective_group_rpd) for user_id in group."""
         override = self._user_group_overrides.get((user_id, group.group_id))
+        g_rpm = override.rpm_limit if (override and override.rpm_limit is not None) else group.rpm_default
+        g_rpd = override.rpd_limit if (override and override.rpd_limit is not None) else group.rpd_default
+        return g_rpm, g_rpd
+
+    def _resolve_instance_group_limits(
+        self, user_id: int, group: _InstanceGroupSnapshot
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """Return (effective_group_rpm, effective_group_rpd) for user_id in an instance group."""
+        override = self._user_instance_group_overrides.get((user_id, group.group_id))
         g_rpm = override.rpm_limit if (override and override.rpm_limit is not None) else group.rpm_default
         g_rpd = override.rpd_limit if (override and override.rpd_limit is not None) else group.rpd_default
         return g_rpm, g_rpd
@@ -478,6 +597,78 @@ class RateLimitTracker:
             group_bucket.count += 1
 
         return None  # group checks passed
+
+    async def check_instance_group_limit(
+        self, user_id: int, username: str, provider_key: str
+    ) -> Optional[RateLimitDecision]:
+        """Check only instance-group limits. Returns a denied decision or None if allowed/no group.
+
+        Called from route handlers after the instance (provider_key) is resolved.
+        Takes precedence over model-group limits.
+        """
+        global_lock = await self._get_lock()
+        async with global_lock:
+            group_id = self._provider_to_group.get(provider_key)
+            if group_id is None:
+                return None
+            group = self._instance_groups.get(group_id)
+            if group is None:
+                return None
+            g_rpm, g_rpd = self._resolve_instance_group_limits(user_id, group)
+
+        if g_rpm is None and g_rpd is None:
+            return None
+
+        user_lock = self._get_user_lock(user_id)
+        async with user_lock:
+            now = time.time()
+            current_window = int(now // 60)
+
+            gk = (user_id, group.group_id)
+            group_bucket = self._instance_group_minute_buckets.get(gk)
+            if group_bucket is None or group_bucket.window != current_window:
+                group_bucket = _MinuteBucket(window=current_window, count=0)
+                self._instance_group_minute_buckets[gk] = group_bucket
+
+            # Instance-group RPM check
+            if g_rpm is not None and group_bucket.count >= g_rpm:
+                retry_after = max(1, 60 - int(now - current_window * 60))
+                return RateLimitDecision(
+                    allowed=False,
+                    rpm_limit=None, rpm_remaining=None,
+                    rpd_limit=None, rpd_remaining=None,
+                    retry_after_seconds=retry_after,
+                    limited_by="instance_group_rpm",
+                    group_id=group.group_id,
+                    group_name=group.name,
+                    group_rpm_limit=g_rpm,
+                    group_rpm_remaining=0,
+                    group_rpd_limit=g_rpd,
+                )
+
+            # Instance-group RPD check
+            if g_rpd is not None:
+                group_today_count = await self._get_today_instance_group_count(
+                    username, group.provider_keys, group.group_id
+                )
+                if group_today_count >= g_rpd:
+                    return RateLimitDecision(
+                        allowed=False,
+                        rpm_limit=None, rpm_remaining=None,
+                        rpd_limit=None, rpd_remaining=None,
+                        retry_after_seconds=_seconds_until_utc_midnight(),
+                        limited_by="instance_group_rpd",
+                        group_id=group.group_id,
+                        group_name=group.name,
+                        group_rpm_limit=g_rpm,
+                        group_rpd_limit=g_rpd,
+                        group_rpd_remaining=0,
+                    )
+
+            # Passed — increment instance-group RPM bucket
+            group_bucket.count += 1
+
+        return None  # instance-group checks passed
 
     async def check_and_increment(
         self, user_id: int, username: str, model_id: Optional[str] = None
@@ -615,6 +806,18 @@ class RateLimitTracker:
             group_rpd_remaining=g_rpd_remaining,
         )
 
+    async def get_group_rpd_count(
+        self, user_identity: str, model_ids: List[str], group_id: int
+    ) -> int:
+        """Read-only — today's request count for a model group (TTL-cached, no increment)."""
+        return await self._get_today_group_count(user_identity, model_ids, group_id)
+
+    async def get_instance_group_rpd_count(
+        self, user_identity: str, provider_keys: List[str], group_id: int
+    ) -> int:
+        """Read-only — today's request count for an instance group (TTL-cached, no increment)."""
+        return await self._get_today_instance_group_count(user_identity, provider_keys, group_id)
+
     async def _get_today_count(self, user_identity: str) -> int:
         """Return today's total request count with a 5-second TTL cache."""
         now = time.time()
@@ -650,6 +853,27 @@ class RateLimitTracker:
             count = 0
 
         self._group_rpd_cache[cache_key] = _RpdCacheEntry(
+            count=count, expires_at=now + _RPD_TTL
+        )
+        return count
+
+    async def _get_today_instance_group_count(
+        self, user_identity: str, provider_keys: List[str], group_id: int
+    ) -> int:
+        """Return today's total request count across all instances in the group, with TTL cache."""
+        now = time.time()
+        cache_key = (user_identity, group_id)
+        entry = self._instance_group_rpd_cache.get(cache_key)
+        if entry and entry.expires_at > now:
+            return entry.count
+
+        try:
+            from app.request_tracker import request_tracker
+            count = await request_tracker.get_today_instance_group_count(user_identity, provider_keys)
+        except Exception:
+            count = 0
+
+        self._instance_group_rpd_cache[cache_key] = _RpdCacheEntry(
             count=count, expires_at=now + _RPD_TTL
         )
         return count

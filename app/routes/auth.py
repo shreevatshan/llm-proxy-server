@@ -20,7 +20,7 @@ from app.auth.models import (
     UserCreate, UserLogin, UserResponse, Token, APIKeyCreate,
     APIKeyResponse, APIKeyListResponse, UserUpdate, PasswordUpdate, AccountDelete,
     ZohoOAuthCallback,
-    MyQuotasResponse, QuotaOverallResponse, QuotaGroupResponse,
+    MyQuotasResponse, QuotaOverallResponse, QuotaGroupResponse, QuotaInstanceGroupResponse,
 )
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin
@@ -515,12 +515,15 @@ async def get_my_quotas(
     - Admins are exempt from rate limits and receive is_admin=True with no quota data.
     """
     from app.auth.models import ModelGroup
-    from app.auth.database import list_model_groups, get_user_group_rate_limit
+    from app.auth.database import (
+        list_model_groups, get_user_group_rate_limit,
+        list_instance_groups, get_user_instance_group_rate_limit,
+    )
     from app.rate_limit import rate_limit_tracker
 
     # Admins bypass all rate limits; AdminUser has no integer DB id
     if isinstance(current_user, AdminUser):
-        return MyQuotasResponse(is_admin=True, overall=None, groups=[])
+        return MyQuotasResponse(is_admin=True, overall=None, groups=[], instance_groups=[])
 
     # --- Overall request-level quota (read-only, no increment) ---
     status_obj = await rate_limit_tracker.get_user_status(current_user.id, current_user.username)
@@ -542,15 +545,42 @@ async def get_my_quotas(
         eff_rpm = ov.rpm_limit if (ov and ov.rpm_limit is not None) else group.rpm_default
         eff_rpd = ov.rpd_limit if (ov and ov.rpd_limit is not None) else group.rpd_default
         models = [m.model_id for m in group.members]
+        cnt = await rate_limit_tracker.get_group_rpd_count(current_user.username, models, group.id)
+        rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
         quota_groups.append(QuotaGroupResponse(
             name=group.name,
             description=group.description,
             rpm_limit=eff_rpm,
             rpd_limit=eff_rpd,
+            rpd_count=cnt,
+            rpd_remaining=rpd_remaining,
             models=models,
         ))
 
-    return MyQuotasResponse(is_admin=False, overall=overall, groups=quota_groups)
+    # --- Per-instance-group quotas ---
+    instance_group_rows = await list_instance_groups(db)  # eager-loads .members
+    quota_instance_groups: list[QuotaInstanceGroupResponse] = []
+    for group in instance_group_rows:
+        ov = await get_user_instance_group_rate_limit(db, current_user.id, group.id)
+        eff_rpm = ov.rpm_limit if (ov and ov.rpm_limit is not None) else group.rpm_default
+        eff_rpd = ov.rpd_limit if (ov and ov.rpd_limit is not None) else group.rpd_default
+        instances = [m.provider_key for m in group.members]
+        cnt = await rate_limit_tracker.get_instance_group_rpd_count(current_user.username, instances, group.id)
+        rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
+        quota_instance_groups.append(QuotaInstanceGroupResponse(
+            name=group.name,
+            description=group.description,
+            rpm_limit=eff_rpm,
+            rpd_limit=eff_rpd,
+            rpd_count=cnt,
+            rpd_remaining=rpd_remaining,
+            instances=instances,
+        ))
+
+    return MyQuotasResponse(
+        is_admin=False, overall=overall,
+        groups=quota_groups, instance_groups=quota_instance_groups,
+    )
 
 
 # ZOHO OAuth Routes

@@ -69,6 +69,165 @@ from app.config import config
 import uvicorn
 import os
 
+# ---------------------------------------------------------------------------
+# Crash / exception / hang diagnostics → log file (size-bounded)
+#
+# All four servers share one event loop, so a single blocking call freezes
+# every endpoint at once.  We capture three kinds of evidence to a file so it
+# survives container restarts and can be inspected after the fact:
+#
+#   1. Application errors/exceptions logged via the `logging` module
+#      (e.g. the bedrock stream traceback) → rotating file `app.log`.
+#   2. Uncaught exceptions on any thread (main, worker, asyncio) → `app.log`.
+#   3. Low-level fatal faults (segfault, abort) + on-demand all-thread stack
+#      dumps for diagnosing a hang → `faulthandler.log`.
+#
+# All files live under LOG_DIR (default: ./logs, mounted via docker-compose).
+# Sizes are bounded: app.log rotates (LOG_MAX_BYTES × LOG_BACKUP_COUNT), and
+# faulthandler.log is truncated at startup + before each periodic dump.
+#
+# Getting an all-thread stack dump for a hang:
+#   • On demand: `kill -SIGUSR1 <pid>` (host: `docker kill --signal=SIGUSR1 <ctr>`;
+#     inside the container if run.py is PID 1: `kill -SIGUSR1 1`).
+#   • Periodically: set FAULTHANDLER_DUMP_INTERVAL=<seconds> to dump every N s.
+# ---------------------------------------------------------------------------
+import faulthandler
+import logging
+import signal
+import sys
+import threading
+from logging.handlers import RotatingFileHandler
+
+_LOG_DIR = os.getenv("LOG_DIR", "logs")
+_LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(10 * 1024 * 1024)))   # 10 MiB / file
+_LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "5"))               # → ~60 MiB cap
+_FAULT_MAX_BYTES = int(os.getenv("FAULTHANDLER_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 MiB cap
+
+# Keep the faulthandler file handle alive for the whole process lifetime.
+_fault_fp = None
+
+
+def _setup_diagnostics() -> None:
+    """Wire up file-based crash/exception/hang logging. Best-effort: never fatal."""
+    global _fault_fp
+    try:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+    except Exception as e:  # noqa: BLE001 - diagnostics must not break startup
+        print(f"[diagnostics] could not create LOG_DIR={_LOG_DIR!r}: {e}", file=sys.stderr)
+        return
+
+    # (1) Application logs → rotating file. Attached to the root logger so every
+    #     module's logger (and exc_info=True tracebacks) is captured. We add a
+    #     handler rather than replacing existing ones so `docker logs` still works.
+    app_log_path = os.path.join(_LOG_DIR, "app.log")
+    try:
+        file_handler = RotatingFileHandler(
+            app_log_path,
+            maxBytes=_LOG_MAX_BYTES,
+            backupCount=_LOG_BACKUP_COUNT,
+            encoding="utf-8",
+            delay=True,
+        )
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+        ))
+        file_handler.setLevel(logging.WARNING)  # warnings + errors + tracebacks
+        root_logger = logging.getLogger()
+        if root_logger.level == logging.NOTSET or root_logger.level > logging.WARNING:
+            root_logger.setLevel(logging.WARNING)
+        root_logger.addHandler(file_handler)
+    except Exception as e:  # noqa: BLE001
+        print(f"[diagnostics] could not open {app_log_path}: {e}", file=sys.stderr)
+
+    _diag_logger = logging.getLogger("diagnostics")
+
+    # (2) Uncaught exceptions on every thread → app.log (+ still printed to stderr).
+    def _log_uncaught(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        _diag_logger.critical(
+            "Uncaught exception", exc_info=(exc_type, exc_value, exc_tb)
+        )
+
+    sys.excepthook = _log_uncaught
+
+    def _log_thread_uncaught(args):
+        if args.exc_type is SystemExit:
+            return
+        _diag_logger.critical(
+            "Uncaught exception in thread %s",
+            args.thread.name if args.thread else "?",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    threading.excepthook = _log_thread_uncaught
+
+    # (3) faulthandler → dedicated file. Truncated at startup so it never carries
+    #     unbounded history across restarts.
+    fault_log_path = os.path.join(_LOG_DIR, "faulthandler.log")
+    try:
+        _fault_fp = open(fault_log_path, "w", buffering=1, encoding="utf-8")
+        faulthandler.enable(file=_fault_fp, all_threads=True)
+        if hasattr(signal, "SIGUSR1"):
+            # chain=False: do NOT call the previous handler. SIGUSR1's default OS
+            # disposition is to terminate the process, so chaining would kill the
+            # server right after dumping. We only want the dump.
+            faulthandler.register(
+                signal.SIGUSR1, file=_fault_fp, all_threads=True, chain=False
+            )
+    except Exception as e:  # noqa: BLE001
+        print(f"[diagnostics] could not open {fault_log_path}: {e}", file=sys.stderr)
+        faulthandler.enable()  # fall back to stderr so we still get fatal dumps
+        return
+
+    # Optional periodic all-thread dump to catch an intermittent hang unattended.
+    # We run our own truncate-then-dump loop (instead of dump_traceback_later)
+    # so faulthandler.log stays bounded to the most recent dump.
+    _dump_interval = os.getenv("FAULTHANDLER_DUMP_INTERVAL")
+    if _dump_interval:
+        try:
+            interval_seconds = float(_dump_interval)
+        except ValueError:
+            print(
+                f"[diagnostics] ignoring invalid FAULTHANDLER_DUMP_INTERVAL="
+                f"{_dump_interval!r} (expected seconds)",
+                file=sys.stderr,
+            )
+            interval_seconds = 0.0
+
+        if interval_seconds > 0:
+            stop = threading.Event()
+
+            def _periodic_dump():
+                while not stop.wait(interval_seconds):
+                    try:
+                        # Keep the file bounded: cap by truncating once it grows
+                        # past the limit, so only recent dumps are retained.
+                        if _fault_fp.tell() >= _FAULT_MAX_BYTES:
+                            _fault_fp.seek(0)
+                            _fault_fp.truncate()
+                        _fault_fp.write(
+                            f"\n----- periodic dump (interval={interval_seconds}s) -----\n"
+                        )
+                        _fault_fp.flush()
+                        faulthandler.dump_traceback(file=_fault_fp, all_threads=True)
+                        _fault_fp.flush()
+                    except Exception:  # noqa: BLE001 - watchdog must never die
+                        pass
+
+            t = threading.Thread(
+                target=_periodic_dump, name="faulthandler-watchdog", daemon=True
+            )
+            t.start()
+            print(
+                f"[diagnostics] periodic stack dump every {interval_seconds}s → "
+                f"{fault_log_path}"
+            )
+
+
+_setup_diagnostics()
+
 # start tracing only if OTEL_EXPORTER_OTLP_ENDPOINT is set
 if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
 

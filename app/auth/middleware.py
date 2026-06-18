@@ -56,6 +56,18 @@ async def _enforce_rate_limit(
         return
 
     from app.rate_limit import rate_limit_tracker, RateLimitExceeded
+    # Precedence (most-specific wins): instance group > model group > overall.
+    # If the request's instance belongs to an instance group, or the model belongs
+    # to a model group, that group's limit governs and is enforced at the route
+    # level (enforce_group_rate_limit). Skip the overall gate here so an unlimited
+    # group means truly unlimited. If the model is unknown, fall through to the
+    # overall limit (the safe, stricter default).
+    model = getattr(request.state, "model", None)
+    if model:
+        provider_key = model.split("/", 1)[0] if "/" in model else None
+        if (provider_key and rate_limit_tracker.instance_belongs_to_group(provider_key)) \
+                or rate_limit_tracker.model_belongs_to_group(model):
+            return
     decision = await rate_limit_tracker.check_and_increment(user_id, username)
     if not decision.allowed:
         envelope = _envelope_for(request.url.path, envelope_override)

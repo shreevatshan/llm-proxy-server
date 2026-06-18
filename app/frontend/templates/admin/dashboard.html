@@ -429,6 +429,11 @@
                 Model
             </button>
         </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" id="rl-subtab-instance-groups-btn" onclick="showRateLimitSubTab('instance-groups')" type="button" role="tab">
+                Instance
+            </button>
+        </li>
     </ul>
 
     <!-- Sub-pane: Request Rate Limits -->
@@ -550,6 +555,124 @@
                         </tbody>
                     </table>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sub-pane: Instance Groups -->
+    <div id="rl-subtab-instance-groups" style="display:none;">
+
+        <div class="card mb-4">
+            <div class="card-header d-flex align-items-center justify-content-between">
+                <h5 class="mb-0"><i class="fas fa-server me-2"></i>Instance Groups</h5>
+                <div>
+                    <button class="btn btn-outline-secondary btn-sm me-2" onclick="window.InstanceGroupManager?.load()">
+                        <i class="fas fa-sync-alt me-1"></i>Refresh
+                    </button>
+                    <button class="btn btn-primary btn-sm" onclick="window.InstanceGroupManager?.openCreateModal()">
+                        <i class="fas fa-plus me-1"></i>Create Instance Group
+                    </button>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Instances</th>
+                                <th>RPM Default</th>
+                                <th>RPD Default</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="instance-groups-tbody">
+                            <tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Per-User Overrides card -->
+        <div class="card">
+            <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+                <h5 class="mb-0"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
+                <div class="d-flex align-items-center">
+                    <select id="ig-user-group-select" class="form-select form-select-sm" style="width:auto"
+                        onchange="window.InstanceGroupManager?.onGroupSelect(this.value)">
+                        <option value="">— Select an instance group —</option>
+                    </select>
+                    <button class="btn btn-outline-secondary btn-sm ms-4" onclick="window.InstanceGroupManager?.refreshUserOverrides()">
+                        <i class="fas fa-sync-alt me-1"></i>Refresh
+                    </button>
+                </div>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-hover mb-0">
+                        <thead>
+                            <tr>
+                                <th>User</th>
+                                <th>RPM Limit</th>
+                                <th>RPD Limit</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ig-user-overrides-tbody">
+                            <tr><td colspan="4" class="text-center text-muted py-4">Select an instance group to manage per-user overrides.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Instance Group Create/Edit Modal -->
+<div class="modal fade" id="instanceGroupModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="instanceGroupModalTitle">New Instance Group</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="ig-group-id">
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label class="form-label">Name <span class="text-danger">*</span></label>
+                        <input type="text" id="ig-name" class="form-control" maxlength="64" placeholder="e.g. primary-pool">
+                        <div class="form-text">Letters, digits, spaces, hyphens, underscores. Max 64 chars.</div>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label">Description</label>
+                        <input type="text" id="ig-description" class="form-control" maxlength="256" placeholder="Optional">
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label">RPM Default</label>
+                        <input type="number" id="ig-rpm" class="form-control" min="0" placeholder="Unlimited">
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label">RPD Default</label>
+                        <input type="number" id="ig-rpd" class="form-control" min="0" placeholder="Unlimited">
+                    </div>
+                    <div class="col-12">
+                        <label class="form-label">Instances in this group</label>
+                        <input type="text" id="ig-instance-search" class="form-control form-control-sm mb-2"
+                            placeholder="Search instances…" oninput="window.InstanceGroupManager?.filterInstances(this.value)">
+                        <div class="border rounded p-2" style="max-height:200px;overflow-y:auto;" id="ig-instance-picker">
+                            <div class="text-muted small">Loading instances…</div>
+                        </div>
+                        <div class="form-text">Each instance can belong to at most one group.</div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="window.InstanceGroupManager?.saveGroup()">
+                    <i class="fas fa-save me-1"></i>Save Group
+                </button>
             </div>
         </div>
     </div>
@@ -730,5 +853,6 @@
 <script src="/static/js/features/tracking/usage-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/rate-limit-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-group-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/instance-group-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/admin-dashboard.js?v={{ cache_version }}"></script>
 {% endblock %}

@@ -158,7 +158,7 @@ function showTab(tabName) {
 
 // Sub-tab switcher inside the Rate Limits tab
 function showRateLimitSubTab(name) {
-    const panes = ['request', 'model-groups'];
+    const panes = ['request', 'model-groups', 'instance-groups'];
     panes.forEach(p => {
         const el = document.getElementById(`rl-subtab-${p}`);
         if (el) el.style.display = p === name ? '' : 'none';
@@ -167,6 +167,8 @@ function showRateLimitSubTab(name) {
     });
     if (name === 'model-groups') {
         window.ModelGroupManager?.load();
+    } else if (name === 'instance-groups') {
+        window.InstanceGroupManager?.load();
     }
 }
 

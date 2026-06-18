@@ -1,4 +1,11 @@
-"""Helper for per-model-group rate limit enforcement, called from route handlers."""
+"""Helper for per-group rate limit enforcement, called from route handlers.
+
+Precedence (most-specific wins): instance group > model group > overall.
+If the request's instance (provider_key) belongs to an instance group, only the
+instance-group limit applies and the model-group check is skipped. Otherwise the
+model-group limit applies. The overall request limit is handled in auth middleware
+and skipped there whenever either group governs the request.
+"""
 
 from typing import Optional, Union
 
@@ -19,17 +26,28 @@ def _envelope_for(path: str, override: Optional[str]) -> str:
     return "openai"
 
 
+def _provider_key_of(model_id: str) -> Optional[str]:
+    """Extract the instance identifier (provider_key) from a model id.
+
+    Model ids are '{provider_key}/{model_name}' (e.g. 'azure:primary/gpt-4').
+    """
+    if model_id and "/" in model_id:
+        return model_id.split("/", 1)[0]
+    return None
+
+
 async def enforce_group_rate_limit(
     request: Request,
     auth: Union[User, AdminUser, APIKey],
     model_id: str,
     envelope_override: Optional[str] = None,
 ) -> None:
-    """Check model-group limits for the authenticated user and model.
+    """Check group limits for the authenticated user, with instance-group precedence.
 
     Request-level RPM/RPD limits are already enforced in auth middleware.
-    This function checks only the group limits for the resolved model.
-    Raises RateLimitExceeded if the group limit is hit.
+    If the model's instance belongs to an instance group, only that limit is
+    checked; otherwise the model-group limit is checked.
+    Raises RateLimitExceeded if a group limit is hit.
     """
     if isinstance(auth, AdminUser):
         return
@@ -44,7 +62,13 @@ async def enforce_group_rate_limit(
     if user_id is None or username is None:
         return
 
-    decision = await rate_limit_tracker.check_group_limit(user_id, username, model_id)
+    # Instance group takes precedence over model group.
+    provider_key = _provider_key_of(model_id)
+    if provider_key and rate_limit_tracker.instance_belongs_to_group(provider_key):
+        decision = await rate_limit_tracker.check_instance_group_limit(user_id, username, provider_key)
+    else:
+        decision = await rate_limit_tracker.check_group_limit(user_id, username, model_id)
+
     if decision is not None and not decision.allowed:
         envelope = _envelope_for(request.url.path, envelope_override)
         if envelope == "anthropic":

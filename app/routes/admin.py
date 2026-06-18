@@ -24,6 +24,9 @@ from app.auth.database import (
     list_model_groups, create_model_group, update_model_group, delete_model_group,
     set_group_members, get_model_group_limits, update_model_group_limits,
     list_user_group_rate_limits, upsert_user_group_rate_limit, delete_user_group_rate_limit,
+    list_instance_groups, create_instance_group, update_instance_group, delete_instance_group,
+    set_instance_group_members, get_instance_group_limits, update_instance_group_limits,
+    list_user_instance_group_rate_limits, upsert_user_instance_group_rate_limit, delete_user_instance_group_rate_limit,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
@@ -36,6 +39,8 @@ from app.auth.models import (
     UserRateLimitResponse, UserRateLimitUpdate,
     ModelGroupCreate, ModelGroupUpdate, ModelGroupLimitsUpdate, ModelGroupMembersUpdate,
     ModelGroupResponse, UserModelGroupRateLimitResponse, UserModelGroupRateLimitUpdate,
+    InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupLimitsUpdate, InstanceGroupMembersUpdate,
+    InstanceGroupResponse, UserInstanceGroupRateLimitResponse, UserInstanceGroupRateLimitUpdate,
 )
 from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_admin_email
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -1330,6 +1335,309 @@ async def delete_model_group_user_override(
     await rate_limit_tracker.refresh_now()
 
     return {"message": f"Override removed for user {user.username} on group {group_id}"}
+
+
+# ==================== Instance Group Management API Endpoints ====================
+
+@router.get("/instance-groups")
+async def get_instance_groups(
+    group_id: Optional[int] = Query(None, description="Omit to list all groups; provide to fetch one"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all instance groups, or fetch a single group's details including members."""
+    def _to_response(g) -> InstanceGroupResponse:
+        return InstanceGroupResponse(
+            id=g.id,
+            name=g.name,
+            description=g.description,
+            rpm_default=g.rpm_default,
+            rpd_default=g.rpd_default,
+            member_count=len(g.members),
+            members=[m.provider_key for m in g.members],
+            updated_at=g.updated_at,
+            updated_by=g.updated_by,
+        )
+
+    if group_id is not None:
+        group = await list_instance_groups(db, group_id=group_id)
+        if group is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+        return _to_response(group)
+
+    groups = await list_instance_groups(db)
+    return [_to_response(g) for g in groups]
+
+
+@router.post("/instance-groups")
+async def create_instance_group_endpoint(
+    body: InstanceGroupCreate,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new instance group."""
+    from sqlalchemy.future import select as sa_select
+    from app.auth.models import InstanceGroup as InstanceGroupTable
+
+    existing = await db.execute(
+        sa_select(InstanceGroupTable).where(InstanceGroupTable.name.ilike(body.name))
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Instance group '{body.name}' already exists")
+
+    group = await create_instance_group(db, body.name, body.description, body.rpm_default, body.rpd_default, current_admin.username)
+
+    from app.rate_limit import rate_limit_tracker
+    await rate_limit_tracker.refresh_now()
+
+    return InstanceGroupResponse(
+        id=group.id, name=group.name, description=group.description,
+        rpm_default=group.rpm_default, rpd_default=group.rpd_default,
+        member_count=0, members=[], updated_at=group.updated_at, updated_by=group.updated_by,
+    )
+
+
+@router.put("/instance-groups")
+async def update_instance_group_endpoint(
+    group_id: int = Query(..., description="Group ID to update"),
+    body: InstanceGroupUpdate = None,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rename or update description of an instance group."""
+    from sqlalchemy.future import select as sa_select
+    from app.auth.models import InstanceGroup as InstanceGroupTable
+
+    fields = {}
+    if body:
+        update_data = body.model_dump(exclude_unset=True)
+        if "name" in update_data:
+            existing = await db.execute(
+                sa_select(InstanceGroupTable).where(
+                    InstanceGroupTable.name.ilike(update_data["name"]),
+                    InstanceGroupTable.id != group_id,
+                )
+            )
+            if existing.scalar_one_or_none():
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Instance group name '{update_data['name']}' already exists")
+        fields = update_data
+
+    group = await update_instance_group(db, group_id, fields, current_admin.username)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+
+    from app.rate_limit import rate_limit_tracker
+    rate_limit_tracker.invalidate_instance_group(group_id)
+    await rate_limit_tracker.refresh_now()
+
+    refreshed = await list_instance_groups(db, group_id=group_id)
+    return InstanceGroupResponse(
+        id=refreshed.id, name=refreshed.name, description=refreshed.description,
+        rpm_default=refreshed.rpm_default, rpd_default=refreshed.rpd_default,
+        member_count=len(refreshed.members), members=[m.provider_key for m in refreshed.members],
+        updated_at=refreshed.updated_at, updated_by=refreshed.updated_by,
+    )
+
+
+@router.delete("/instance-groups")
+async def delete_instance_group_endpoint(
+    group_id: int = Query(..., description="Group ID to delete"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an instance group (cascades members and per-user overrides)."""
+    from app.rate_limit import rate_limit_tracker
+    rate_limit_tracker.invalidate_instance_group(group_id)
+
+    deleted = await delete_instance_group(db, group_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+
+    await rate_limit_tracker.refresh_now()
+    return {"message": f"Instance group {group_id} deleted"}
+
+
+@router.put("/instance-groups/members")
+async def set_instance_group_members_endpoint(
+    group_id: int = Query(..., description="Group ID to update members for"),
+    body: InstanceGroupMembersUpdate = None,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace the member list for an instance group. Validates each provider_key exists and is not in another group."""
+    from app.auth.models import InstanceGroupMember as InstanceGroupMemberTable, ProviderCredentials
+    from sqlalchemy.future import select as sa_select
+
+    # Confirm group exists
+    group = await list_instance_groups(db, group_id=group_id)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+
+    provider_keys = body.provider_keys if body else []
+
+    # Validate all provider_keys exist
+    if provider_keys:
+        result = await db.execute(sa_select(ProviderCredentials).where(ProviderCredentials.provider_key.in_(provider_keys)))
+        found = {r.provider_key for r in result.scalars().all()}
+        missing = [pk for pk in provider_keys if pk not in found]
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"provider_key(s) not found: {missing}",
+            )
+
+    # Check for conflicts: provider_key already in another group
+    if provider_keys:
+        result = await db.execute(
+            sa_select(InstanceGroupMemberTable).where(
+                InstanceGroupMemberTable.provider_key.in_(provider_keys),
+                InstanceGroupMemberTable.group_id != group_id,
+            )
+        )
+        conflicts = [
+            {"provider_key": r.provider_key, "current_group_id": r.group_id}
+            for r in result.scalars().all()
+        ]
+        if conflicts:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"conflicts": conflicts})
+
+    await set_instance_group_members(db, group_id, provider_keys)
+
+    from app.rate_limit import rate_limit_tracker
+    rate_limit_tracker.invalidate_instance_group(group_id)
+    await rate_limit_tracker.refresh_now()
+
+    return {"group_id": group_id, "provider_keys": provider_keys}
+
+
+@router.get("/instance-groups/limits")
+async def get_instance_group_limits_endpoint(
+    group_id: int = Query(..., description="Group ID"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the RPM/RPD defaults for an instance group."""
+    row = await get_instance_group_limits(db, group_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+    return {"group_id": group_id, "rpm_default": row.rpm_default, "rpd_default": row.rpd_default}
+
+
+@router.put("/instance-groups/limits")
+async def update_instance_group_limits_endpoint(
+    group_id: int = Query(..., description="Group ID"),
+    body: InstanceGroupLimitsUpdate = None,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the RPM/RPD defaults for an instance group."""
+    rpm = body.rpm_default if body else None
+    rpd = body.rpd_default if body else None
+
+    group = await update_instance_group_limits(db, group_id, rpm, rpd, current_admin.username)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+
+    from app.rate_limit import rate_limit_tracker
+    rate_limit_tracker.invalidate_instance_group(group_id)
+    await rate_limit_tracker.refresh_now()
+
+    return {"group_id": group_id, "rpm_default": group.rpm_default, "rpd_default": group.rpd_default}
+
+
+@router.get("/instance-groups/users")
+async def get_instance_group_user_overrides(
+    group_id: int = Query(..., description="Group ID"),
+    user_id: Optional[int] = Query(None, description="User ID (omit for all users in this group)"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List per-user overrides for an instance group."""
+    group_row = await get_instance_group_limits(db, group_id)
+    if group_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+
+    overrides = await list_user_instance_group_rate_limits(db, group_id, user_id=user_id)
+
+    async def _build(ov):
+        user = await get_user_by_id(db, ov.user_id)
+        if not user:
+            return None
+        effective_rpm = ov.rpm_limit if ov.rpm_limit is not None else group_row.rpm_default
+        effective_rpd = ov.rpd_limit if ov.rpd_limit is not None else group_row.rpd_default
+        return UserInstanceGroupRateLimitResponse(
+            user_id=user.id, username=user.username, email=user.email,
+            group_id=group_id,
+            rpm_limit=ov.rpm_limit, rpd_limit=ov.rpd_limit,
+            effective_rpm=effective_rpm, effective_rpd=effective_rpd,
+        )
+
+    import asyncio as _asyncio
+    results = await _asyncio.gather(*[_build(ov) for ov in overrides])
+    return [r for r in results if r is not None]
+
+
+@router.put("/instance-groups/users")
+async def upsert_instance_group_user_override(
+    group_id: int = Query(..., description="Group ID"),
+    user_id: int = Query(..., description="User ID"),
+    body: UserInstanceGroupRateLimitUpdate = None,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set or update a per-user rate limit override for an instance group."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    group_row = await get_instance_group_limits(db, group_id)
+    if group_row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
+
+    rpm = body.rpm_limit if body else None
+    rpd = body.rpd_limit if body else None
+    fields_set = body.model_fields_set if body else set()
+
+    override = await upsert_user_instance_group_rate_limit(
+        db, user_id, group_id, rpm, rpd, current_admin.username, fields_set
+    )
+
+    from app.rate_limit import rate_limit_tracker
+    rate_limit_tracker.invalidate_user_instance_group(user_id, group_id)
+    await rate_limit_tracker.refresh_now()
+
+    effective_rpm = override.rpm_limit if override.rpm_limit is not None else group_row.rpm_default
+    effective_rpd = override.rpd_limit if override.rpd_limit is not None else group_row.rpd_default
+
+    return UserInstanceGroupRateLimitResponse(
+        user_id=user.id, username=user.username, email=user.email,
+        group_id=group_id,
+        rpm_limit=override.rpm_limit, rpd_limit=override.rpd_limit,
+        effective_rpm=effective_rpm, effective_rpd=effective_rpd,
+    )
+
+
+@router.delete("/instance-groups/users")
+async def delete_instance_group_user_override(
+    group_id: int = Query(..., description="Group ID"),
+    user_id: int = Query(..., description="User ID"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove per-user override; user reverts to instance-group default."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    deleted = await delete_user_instance_group_rate_limit(db, user_id, group_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No override found for this user and group")
+
+    from app.rate_limit import rate_limit_tracker
+    rate_limit_tracker.invalidate_user_instance_group(user_id, group_id)
+    await rate_limit_tracker.refresh_now()
+
+    return {"message": f"Override removed for user {user.username} on instance group {group_id}"}
 
 
 @router.post("/logout")

@@ -217,6 +217,42 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Stream timeout exceeded (0.01s)", chunks[1])
         self.assertEqual(chunks[2], "data: [DONE]\n\n")
 
+    async def test_openai_wrapper_cancel_mid_chunk_closes_generator_without_error(self):
+        # Regression: cancelling while blocked in __anext__ must cancel the
+        # in-flight chunk task BEFORE aclose(), otherwise aclose() raises
+        # "asynchronous generator is already running" and the socket leaks.
+        request = _FakeRequest()
+        closed = {"value": False}
+        started = asyncio.Event()
+
+        async def generator():
+            try:
+                yield 'data: {"id":"chunk-1"}\n\n'
+                started.set()
+                await asyncio.sleep(3600)  # park inside the second __anext__
+                yield 'data: {"id":"never"}\n\n'
+            finally:
+                closed["value"] = True
+
+        agen = stream_utils._stream_with_timeout_and_disconnect(
+            generator(), request, timeout=600
+        )
+
+        async def consume():
+            async for _ in agen:
+                pass
+
+        task = asyncio.create_task(consume())
+        await started.wait()
+        await asyncio.sleep(0)  # let the wrapper enter the wait for chunk 2
+
+        with self.assertNoLogs(stream_utils.logger, level="WARNING"):
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertTrue(closed["value"], "generator should be closed on cancel")
+
 
 if __name__ == "__main__":
     unittest.main()

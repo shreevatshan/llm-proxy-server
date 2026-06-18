@@ -199,6 +199,12 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
     """
     # Create an async iterator from the generator
     gen_iter = generator.__aiter__()
+    # Own the in-flight __anext__ as an explicit task so a cancel/timeout can
+    # cancel it *before* we aclose() the generator. Awaiting __anext__ bare
+    # inside asyncio.wait_for leaves the generator mid-run on cancellation, so
+    # the finally-block aclose() raises "asynchronous generator is already
+    # running". This mirrors _stream_with_timeout_and_disconnect_anthropic.
+    next_chunk_task: Optional[asyncio.Task] = None
     try:
         chunk_count = 0
 
@@ -213,16 +219,19 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                     logger.info(f"Client disconnected after {chunk_count} chunks, stopping stream")
                     break
 
-            try:
-                # Wait for next chunk with per-chunk timeout
-                chunk = await asyncio.wait_for(
-                    gen_iter.__anext__(),
-                    timeout=STREAM_CHUNK_TIMEOUT_SECONDS
-                )
-                yield chunk
+            if next_chunk_task is None:
+                next_chunk_task = asyncio.create_task(gen_iter.__anext__())
 
-            except asyncio.TimeoutError:
+            # Wait for next chunk with per-chunk timeout.
+            done, _ = await asyncio.wait(
+                {next_chunk_task}, timeout=STREAM_CHUNK_TIMEOUT_SECONDS
+            )
+            if not done:
                 logger.warning(f"Chunk timeout after {STREAM_CHUNK_TIMEOUT_SECONDS}s")
+                await _cancel_pending_task(
+                    next_chunk_task, task_name="next chunk task after chunk timeout"
+                )
+                next_chunk_task = None
                 # Send timeout notification (OpenAI-compatible error format)
                 error_data = {
                     "error": {
@@ -236,14 +245,26 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                 yield "data: [DONE]\n\n"  # Proper stream termination
                 break
 
+            task = next_chunk_task
+            next_chunk_task = None
+            try:
+                chunk = task.result()
             except StopAsyncIteration:
                 # Generator exhausted normally
                 break
+            yield chunk
 
     except asyncio.CancelledError:
         logger.info("Stream task cancelled")
         raise
     finally:
+        # Cancel any in-flight chunk fetch before closing the generator, so
+        # aclose() does not race a running __anext__.
+        await _cancel_pending_task(
+            next_chunk_task,
+            task_name="next chunk task during cleanup",
+            timeout_seconds=2.0,
+        )
         # Close the upstream generator to release HTTP connections back to the pool.
         # Without this, abandoned streams (client disconnect, timeout) leak sockets.
         await _close_async_iterator(gen_iter, iterator_name="stream generator")

@@ -219,6 +219,7 @@ def _add_request_tracking(app: FastAPI, server_name: str):
             #   RuntimeError: Unexpected message received: http.request
 
         request.state.tracking_request_id = request_id
+        request.state.model = model
 
         await request_tracker.start_request(
             request_id=request_id,

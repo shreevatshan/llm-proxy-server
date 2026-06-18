@@ -32,21 +32,17 @@ class QuotasManager {
         } catch (error) {
             this._loadError = true;
             console.error('[QuotasManager] fetch failed:', error);
-            document.getElementById('quotaGroupsContainer').innerHTML = `
+            const errHtml = `
                 <div class="alert alert-danger">
                     <i class="fas fa-exclamation-circle me-2"></i>
                     Failed to load quota data. Please refresh the page.
                 </div>
             `;
-            this._renderOverallError();
+            ['quotaOverallContainer', 'quotaGroupsContainer', 'quotaInstanceGroupsContainer'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = errHtml;
+            });
         }
-    }
-
-    _renderOverallError() {
-        ['quotaRpmLimit', 'quotaRpdRemaining', 'quotaRpdLimit'].forEach(id => {
-            const el = document.getElementById(id);
-            if (el) el.textContent = '—';
-        });
     }
 
     _fmt(value) {
@@ -59,37 +55,74 @@ class QuotasManager {
 
         if (data.is_admin) {
             // Admin users are exempt from all limits
-            ['quotaRpmLimit', 'quotaRpdRemaining', 'quotaRpdLimit'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el) el.textContent = '∞';
-            });
-            document.getElementById('quotaGroupsContainer').innerHTML = `
+            const adminNote = `
                 <div class="alert alert-info">
                     <i class="fas fa-shield-alt me-2"></i>
                     Admin accounts are exempt from all request limits.
                 </div>
             `;
+            ['quotaOverallContainer', 'quotaGroupsContainer', 'quotaInstanceGroupsContainer'].forEach(id => {
+                const el = document.getElementById(id);
+                if (el) el.innerHTML = adminNote;
+            });
             return;
         }
 
-        // --- Overall stat cards ---
-        const o = data.overall || {};
-        const rpmLimEl = document.getElementById('quotaRpmLimit');
-        const rpdRemEl = document.getElementById('quotaRpdRemaining');
-        const rpdLimEl = document.getElementById('quotaRpdLimit');
-        if (rpmLimEl) rpmLimEl.textContent = this._fmt(o.rpm_limit);
-        if (rpdLimEl) rpdLimEl.textContent = this._fmt(o.rpd_limit);
-        if (rpdRemEl) rpdRemEl.textContent = `Remaining: ${this._fmt(o.rpd_remaining)}`;
+        // --- Overall quota card ---
+        this._renderOverall(data.overall || {});
+
+        // --- Instance-group quota table (precedence over model groups) ---
+        this._renderGroupTable(
+            document.getElementById('quotaInstanceGroupsContainer'),
+            data.instance_groups || [],
+            { itemsKey: 'instances', label: 'Instances', emptyIcon: 'fa-server', emptyText: 'No instance groups have been configured.' }
+        );
 
         // --- Model-group quota table ---
-        const container = document.getElementById('quotaGroupsContainer');
-        const groups = data.groups || [];
+        this._renderGroupTable(
+            document.getElementById('quotaGroupsContainer'),
+            data.groups || [],
+            { itemsKey: 'models', label: 'Models', emptyIcon: 'fa-layer-group', emptyText: 'No model groups have been configured.' }
+        );
+    }
 
+    _renderOverall(o) {
+        const container = document.getElementById('quotaOverallContainer');
+        if (!container) return;
+        const rpdLeft = (o.rpd_remaining === null || o.rpd_remaining === undefined)
+            ? ''
+            : ` <small class="text-muted">(${Number(o.rpd_remaining).toLocaleString()} left)</small>`;
+        container.innerHTML = `
+            <div class="table-responsive">
+                <table class="table table-sm table-hover mb-0">
+                    <thead class="table-light">
+                        <tr>
+                            <th>Metric</th>
+                            <th class="text-end">Limit</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>RPM</strong></td>
+                            <td class="text-end">${this._fmt(o.rpm_limit)}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>RPD</strong></td>
+                            <td class="text-end">${this._fmt(o.rpd_limit)}${rpdLeft}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        `;
+    }
+
+    _renderGroupTable(container, groups, opts) {
+        if (!container) return;
         if (groups.length === 0) {
             container.innerHTML = `
                 <div class="text-center text-muted">
-                    <i class="fas fa-layer-group fa-2x mb-3"></i>
-                    <p>No model groups have been configured.</p>
+                    <i class="fas ${opts.emptyIcon} fa-2x mb-3"></i>
+                    <p>${opts.emptyText}</p>
                 </div>
             `;
             return;
@@ -103,14 +136,18 @@ class QuotasManager {
                             <th>Group</th>
                             <th class="text-end">RPM Limit</th>
                             <th class="text-end">RPD Limit</th>
-                            <th>Models</th>
+                            <th>${opts.label}</th>
                         </tr>
                     </thead>
                     <tbody>
                         ${groups.map(g => {
-                            const modelBadges = (g.models || []).length > 0
-                                ? g.models.map(m => `<span class="badge bg-secondary me-1 mb-1" style="font-size:0.7rem;font-weight:400;">${this._escapeHtml(m)}</span>`).join('')
-                                : '<span class="text-muted fst-italic">No models</span>';
+                            const items = g[opts.itemsKey] || [];
+                            const badges = items.length > 0
+                                ? items.map(m => `<span class="badge bg-secondary me-1 mb-1" style="font-size:0.7rem;font-weight:400;">${this._escapeHtml(m)}</span>`).join('')
+                                : `<span class="text-muted fst-italic">No ${opts.label.toLowerCase()}</span>`;
+                            const rpdLeft = (g.rpd_remaining === null || g.rpd_remaining === undefined)
+                                ? ''
+                                : `<br><small class="text-muted">${Number(g.rpd_remaining).toLocaleString()} left</small>`;
                             return `
                                 <tr>
                                     <td>
@@ -118,8 +155,8 @@ class QuotasManager {
                                         ${g.description ? `<br><small class="text-muted">${this._escapeHtml(g.description)}</small>` : ''}
                                     </td>
                                     <td class="text-end">${this._fmt(g.rpm_limit)}</td>
-                                    <td class="text-end">${this._fmt(g.rpd_limit)}</td>
-                                    <td style="max-width:340px;">${modelBadges}</td>
+                                    <td class="text-end">${this._fmt(g.rpd_limit)}${rpdLeft}</td>
+                                    <td style="max-width:340px;">${badges}</td>
                                 </tr>
                             `;
                         }).join('')}
@@ -141,6 +178,13 @@ window.QuotasManager = new QuotasManager();
 
 // Lazy-load when the Quotas tab is opened (monkey-patch pattern from user-usage-manager.js)
 document.addEventListener('DOMContentLoaded', function () {
+    // Initialize Bootstrap tooltips for the quota title info icons
+    if (window.bootstrap?.Tooltip) {
+        document.querySelectorAll('#quotas-tab [data-bs-toggle="tooltip"]').forEach(el => {
+            new bootstrap.Tooltip(el, { customClass: 'quota-tooltip' });
+        });
+    }
+
     const originalShowTab = window.showTab;
     window.showTab = function(tabName) {
         originalShowTab(tabName);

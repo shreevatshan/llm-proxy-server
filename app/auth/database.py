@@ -11,7 +11,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit
+from .models import Base, User, APIKey, ModelConfiguration, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -2141,6 +2141,139 @@ async def upsert_user_group_rate_limit(
 
 async def delete_user_group_rate_limit(db: AsyncSession, user_id: int, group_id: int) -> bool:
     row = await get_user_group_rate_limit(db, user_id, group_id)
+    if row is None:
+        return False
+    await db.delete(row)
+    await db.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Instance-group helpers (mirror the model-group helpers, keyed on provider_key)
+# ---------------------------------------------------------------------------
+
+async def list_instance_groups(db: AsyncSession, group_id: Optional[int] = None):
+    """Return all instance groups (with members loaded), or a single group if group_id given."""
+    from sqlalchemy.orm import selectinload as _sil
+    q = select(InstanceGroup).options(_sil(InstanceGroup.members))
+    if group_id is not None:
+        q = q.where(InstanceGroup.id == group_id)
+    result = await db.execute(q)
+    rows = result.scalars().all()
+    return rows[0] if group_id is not None and rows else (None if group_id is not None else rows)
+
+
+async def create_instance_group(
+    db: AsyncSession, name: str, description: Optional[str],
+    rpm_default: Optional[int], rpd_default: Optional[int], admin_username: str,
+) -> InstanceGroup:
+    row = InstanceGroup(
+        name=name, description=description,
+        rpm_default=rpm_default, rpd_default=rpd_default,
+        updated_by=admin_username,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def update_instance_group(
+    db: AsyncSession, group_id: int, fields: dict, admin_username: str,
+) -> Optional[InstanceGroup]:
+    result = await db.execute(select(InstanceGroup).where(InstanceGroup.id == group_id))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    for k, v in fields.items():
+        setattr(row, k, v)
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def delete_instance_group(db: AsyncSession, group_id: int) -> bool:
+    result = await db.execute(select(InstanceGroup).where(InstanceGroup.id == group_id))
+    row = result.scalar_one_or_none()
+    if row is None:
+        return False
+    await db.delete(row)
+    await db.commit()
+    return True
+
+
+async def set_instance_group_members(db: AsyncSession, group_id: int, provider_keys: list) -> list:
+    """Replace the member list for an instance group. Returns list of InstanceGroupMember rows."""
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(InstanceGroupMember).where(InstanceGroupMember.group_id == group_id))
+    new_members = [InstanceGroupMember(group_id=group_id, provider_key=pk) for pk in provider_keys]
+    db.add_all(new_members)
+    await db.commit()
+    return new_members
+
+
+async def get_instance_group_limits(db: AsyncSession, group_id: int) -> Optional[InstanceGroup]:
+    result = await db.execute(select(InstanceGroup).where(InstanceGroup.id == group_id))
+    return result.scalar_one_or_none()
+
+
+async def update_instance_group_limits(
+    db: AsyncSession, group_id: int, rpm_default: Optional[int], rpd_default: Optional[int],
+    admin_username: str,
+) -> Optional[InstanceGroup]:
+    return await update_instance_group(
+        db, group_id,
+        {"rpm_default": rpm_default, "rpd_default": rpd_default},
+        admin_username,
+    )
+
+
+async def get_user_instance_group_rate_limit(
+    db: AsyncSession, user_id: int, group_id: int,
+) -> Optional[UserInstanceGroupRateLimit]:
+    result = await db.execute(
+        select(UserInstanceGroupRateLimit).where(
+            UserInstanceGroupRateLimit.user_id == user_id,
+            UserInstanceGroupRateLimit.group_id == group_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def list_user_instance_group_rate_limits(
+    db: AsyncSession, group_id: int, user_id: Optional[int] = None,
+):
+    q = select(UserInstanceGroupRateLimit).where(UserInstanceGroupRateLimit.group_id == group_id)
+    if user_id is not None:
+        q = q.where(UserInstanceGroupRateLimit.user_id == user_id)
+    result = await db.execute(q)
+    return result.scalars().all()
+
+
+async def upsert_user_instance_group_rate_limit(
+    db: AsyncSession, user_id: int, group_id: int,
+    rpm: Optional[int], rpd: Optional[int],
+    admin_username: str, fields_set: set,
+) -> UserInstanceGroupRateLimit:
+    row = await get_user_instance_group_rate_limit(db, user_id, group_id)
+    if row is None:
+        row = UserInstanceGroupRateLimit(user_id=user_id, group_id=group_id)
+        db.add(row)
+    if "rpm_limit" in fields_set:
+        row.rpm_limit = rpm
+    if "rpd_limit" in fields_set:
+        row.rpd_limit = rpd
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def delete_user_instance_group_rate_limit(db: AsyncSession, user_id: int, group_id: int) -> bool:
+    row = await get_user_instance_group_rate_limit(db, user_id, group_id)
     if row is None:
         return False
     await db.delete(row)

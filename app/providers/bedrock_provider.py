@@ -234,6 +234,7 @@ def _classify_native_stream_exception(exc: Exception) -> str:
     Returns one of: "protocol_error" (urllib3 connection truncation),
     "event_stream_error" (botocore EventStreamError),
     "read_timeout" (urllib3 ReadTimeoutError — socket read deadline hit),
+    "connection_closed" (socket fp set to None mid-stream),
     "other".
     """
     name = type(exc).__name__
@@ -243,6 +244,10 @@ def _classify_native_stream_exception(exc: Exception) -> str:
         return "event_stream_error"
     if name == "ReadTimeoutError":
         return "read_timeout"
+    # http.client sets self.fp = None when the connection is closed; urllib3
+    # then propagates this as AttributeError: 'NoneType' object has no attribute 'read'.
+    if name == "AttributeError" and "'NoneType' object has no attribute 'read'" in str(exc):
+        return "connection_closed"
     return "other"
 
 
@@ -2660,28 +2665,44 @@ class BedrockProvider(BaseProvider):
             )
         except Exception as e:
             error_class = _classify_native_stream_exception(e)
-            logger.warning(
-                "[BEDROCK STREAM NATIVE] Stream error after %d events, elapsed=%.1fs "
-                "aws_request_id=%s error_class=%s: %s",
-                event_count,
-                time.monotonic() - stream_start,
-                aws_request_id or "unknown",
-                error_class,
-                e,
-                exc_info=True,
-            )
-            event_queue.put(
-                (
-                    "error",
-                    {
-                        "code": "internal_error",
-                        "message": str(e),
-                        "error_class": error_class,
-                        "aws_request_id": aws_request_id,
-                        "output_bytes_received": output_bytes_received,
-                    },
+            # When the async consumer asked us to stop (client disconnect or a
+            # pre-output retry), it set stop_event before closing the socket from
+            # its side. The resulting mid-read failure here is self-inflicted and
+            # the consumer is no longer reading this queue, so log it quietly and
+            # skip the error tuple instead of emitting a misleading WARNING+traceback.
+            if stop_event is not None and stop_event.is_set():
+                logger.info(
+                    "[BEDROCK STREAM NATIVE] Worker stopped during requested teardown "
+                    "after %d events, elapsed=%.1fs aws_request_id=%s error_class=%s: %s",
+                    event_count,
+                    time.monotonic() - stream_start,
+                    aws_request_id or "unknown",
+                    error_class,
+                    e,
                 )
-            )
+            else:
+                logger.warning(
+                    "[BEDROCK STREAM NATIVE] Stream error after %d events, elapsed=%.1fs "
+                    "aws_request_id=%s error_class=%s: %s",
+                    event_count,
+                    time.monotonic() - stream_start,
+                    aws_request_id or "unknown",
+                    error_class,
+                    e,
+                    exc_info=True,
+                )
+                event_queue.put(
+                    (
+                        "error",
+                        {
+                            "code": "internal_error",
+                            "message": str(e),
+                            "error_class": error_class,
+                            "aws_request_id": aws_request_id,
+                            "output_bytes_received": output_bytes_received,
+                        },
+                    )
+                )
         finally:
             close_stream = getattr(stream, "close", None)
             if callable(close_stream):

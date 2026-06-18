@@ -260,25 +260,58 @@ class RequestTracker:
             self._subscribers.discard(queue)
 
     async def get_today_count(self, user_identity: str) -> int:
-        """Return total requests today for user_identity (buffer + DB)."""
+        """Return total ungrouped requests today for user_identity (buffer + DB).
+
+        Requests whose model belongs to a model group, or whose instance (provider_key
+        prefix) belongs to an instance group, are excluded — those are governed by the
+        group's own limit and never counted against the overall quota, matching the
+        auth middleware's overall-gate skip.
+        """
         today = time_utils.local_today()
+
+        # Grouped model_ids and provider_keys to exclude from the overall count.
+        try:
+            from app.rate_limit import rate_limit_tracker
+            grouped_models, grouped_providers = rate_limit_tracker.grouped_keys()
+        except Exception:
+            grouped_models, grouped_providers = set(), set()
+
+        def _is_grouped(model) -> bool:
+            if not model:
+                return False
+            if model in grouped_models:
+                return True
+            prefix = model.split('/', 1)[0] if '/' in model else model
+            return prefix in grouped_providers
+
         buffered = 0
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
-                if key[0] == today and key[2] == user_identity:
+                # key = (date, hour, user_identity, user_type, model, server)
+                if key[0] == today and key[2] == user_identity and not _is_grouped(key[4]):
                     buffered += count
 
         try:
             from sqlalchemy.future import select
-            from sqlalchemy import func
+            from sqlalchemy import func, or_, and_, not_
             from app.auth.database import AsyncSessionLocal
             from app.auth.models import RequestUsage
             async with AsyncSessionLocal() as db:
+                conditions = [
+                    RequestUsage.date == today,
+                    RequestUsage.user_identity == user_identity,
+                ]
+                # Exclude grouped models (exact match) and grouped instances (prefix match).
+                exclude = []
+                if grouped_models:
+                    exclude.append(RequestUsage.model.in_(list(grouped_models)))
+                for pk in grouped_providers:
+                    exclude.append(RequestUsage.model.like(f"{pk}/%"))
+                    exclude.append(RequestUsage.model == pk)
+                if exclude:
+                    conditions.append(not_(or_(*exclude)))
                 result = await db.execute(
-                    select(func.sum(RequestUsage.request_count)).where(
-                        RequestUsage.date == today,
-                        RequestUsage.user_identity == user_identity,
-                    )
+                    select(func.sum(RequestUsage.request_count)).where(and_(*conditions))
                 )
                 db_count = result.scalar() or 0
         except Exception:
@@ -310,6 +343,49 @@ class RequestTracker:
                         RequestUsage.date == today,
                         RequestUsage.user_identity == user_identity,
                         RequestUsage.model.in_(model_ids),
+                    )
+                )
+                db_count = result.scalar() or 0
+        except Exception:
+            db_count = 0
+
+        return buffered + db_count
+
+    async def get_today_instance_group_count(self, user_identity: str, provider_keys: list) -> int:
+        """Return total requests today across all instances (provider_keys) in a group (buffer + DB).
+
+        Instance membership matches the stored full model id by prefix: a model id is
+        '{provider_key}/{model_name}', so membership is tested against the part before
+        the first '/'.
+        """
+        if not provider_keys:
+            return 0
+        today = time_utils.local_today()
+        pk_set = set(provider_keys)
+        buffered = 0
+        async with self._usage_lock:
+            for key, count in self._usage_buffer.items():
+                # key = (date, hour, user_identity, user_type, model, server)
+                model = key[4]
+                if key[0] == today and key[2] == user_identity and model:
+                    prefix = model.split('/', 1)[0] if '/' in model else model
+                    if prefix in pk_set:
+                        buffered += count
+
+        try:
+            from sqlalchemy.future import select
+            from sqlalchemy import func, or_
+            from app.auth.database import AsyncSessionLocal
+            from app.auth.models import RequestUsage
+            async with AsyncSessionLocal() as db:
+                conditions = [RequestUsage.model.like(f"{pk}/%") for pk in provider_keys]
+                # Also match a bare provider_key with no model suffix, just in case.
+                conditions += [RequestUsage.model == pk for pk in provider_keys]
+                result = await db.execute(
+                    select(func.sum(RequestUsage.request_count)).where(
+                        RequestUsage.date == today,
+                        RequestUsage.user_identity == user_identity,
+                        or_(*conditions),
                     )
                 )
                 db_count = result.scalar() or 0
