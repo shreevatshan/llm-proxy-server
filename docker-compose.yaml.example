@@ -41,6 +41,8 @@ services:
       #- OTEL_EXPORTER_OTLP_ENDPOINT=https://localhost:4318
       #- OTEL_SERVICE_NAME=llm-proxy-server
       #- OTEL_EXPORTER_OTLP_HEADERS=api-key=*********
+      # Timezone Configuration
+      - TIMEZONE=Asia/Kolkata
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8765/health')"]

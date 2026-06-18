@@ -1834,6 +1834,224 @@ async def get_usage_aggregates(
     }
 
 
+async def get_usage_timeseries(
+    db: AsyncSession,
+    filter_user: Optional[str] = None,
+    filter_model: Optional[str] = None,
+    window: str = "30d",
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+) -> list[dict]:
+    """Return ordered, zero-filled time buckets of request counts for the window.
+
+    Returns a list of {"label": str, "count": int} ordered chronologically. Mirrors
+    the window/table selection of get_usage_aggregates so the chart stays in lockstep
+    with the table:
+      - 24h          -> one bucket per hour (rolling 24h) from the hourly table
+      - today/yest.  -> 24 hourly buckets for that day (falls back to one daily bucket
+                        if no hourly rows exist, e.g. a freshly-deployed instance)
+      - 7d/30d       -> one bucket per day, zero-filled across the range
+      - month        -> one bucket per day of the month (or a single monthly bucket
+                        once the month has been rolled up and daily rows deleted)
+      - all          -> one bucket per month (YYYY-MM), union of daily + monthly tables
+
+    filter_user / filter_model scope the series to a single user or model (drill-down).
+    """
+    from sqlalchemy import func
+    from datetime import date, timedelta
+    from app import time_utils
+
+    today = time_utils.local_today()
+
+    def _apply_filters(q, tbl):
+        if filter_user is not None:
+            q = q.where(tbl.user_identity == filter_user)
+        if filter_model is not None:
+            q = q.where(tbl.model == filter_model)
+        return q
+
+    # ------------------------------------------------------------------ #
+    # 24h — rolling window, hourly buckets
+    # ------------------------------------------------------------------ #
+    if window == "24h":
+        now = time_utils.local_now()
+        cutoff_dt = now - timedelta(hours=24)
+        cutoff_date = cutoff_dt.date()
+        cutoff_hour = cutoff_dt.hour
+
+        q = (
+            select(
+                RequestUsageHourly.date,
+                RequestUsageHourly.hour,
+                func.sum(RequestUsageHourly.request_count).label("rc"),
+            )
+            .where(
+                (RequestUsageHourly.date > cutoff_date)
+                | ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
+            )
+            .group_by(RequestUsageHourly.date, RequestUsageHourly.hour)
+        )
+        q = _apply_filters(q, RequestUsageHourly)
+        rows = (await db.execute(q)).all()
+        counts: dict = {(r.date, r.hour): r.rc for r in rows}
+
+        # Build ordered hourly slots from the cutoff hour through the current hour.
+        # That spans 25 slots: the rolling 24h boundary lands mid-hour, so both the
+        # partial cutoff hour and the partial current hour are included.
+        start = cutoff_dt.replace(minute=0, second=0, microsecond=0)
+        buckets = []
+        for i in range(25):
+            slot = start + timedelta(hours=i)
+            key = (slot.date(), slot.hour)
+            buckets.append({"label": slot.strftime("%Y-%m-%d %H:00"), "count": int(counts.get(key, 0))})
+        return buckets
+
+    # ------------------------------------------------------------------ #
+    # today / yesterday — hourly buckets for a single day, daily fallback
+    # ------------------------------------------------------------------ #
+    if window in ("today", "yesterday"):
+        target = today if window == "today" else today - timedelta(days=1)
+
+        q = (
+            select(RequestUsageHourly.hour, func.sum(RequestUsageHourly.request_count).label("rc"))
+            .where(RequestUsageHourly.date == target)
+            .group_by(RequestUsageHourly.hour)
+        )
+        q = _apply_filters(q, RequestUsageHourly)
+        rows = (await db.execute(q)).all()
+
+        if rows:
+            counts = {int(r.hour): int(r.rc) for r in rows}
+            return [
+                {"label": f"{target.isoformat()} {h:02d}:00", "count": counts.get(h, 0)}
+                for h in range(24)
+            ]
+
+        # Fallback: single daily bucket from the daily table.
+        dq = (
+            select(func.sum(RequestUsage.request_count).label("rc"))
+            .where(RequestUsage.date == target)
+        )
+        dq = _apply_filters(dq, RequestUsage)
+        total = (await db.execute(dq)).scalar() or 0
+        return [{"label": target.isoformat(), "count": int(total)}]
+
+    # ------------------------------------------------------------------ #
+    # 7d / 30d — daily buckets, zero-filled across the range
+    # ------------------------------------------------------------------ #
+    if window in ("7d", "30d"):
+        span = 7 if window == "7d" else 30
+        start = today - timedelta(days=span - 1)
+
+        q = (
+            select(RequestUsage.date, func.sum(RequestUsage.request_count).label("rc"))
+            .where(RequestUsage.date >= start)
+            .group_by(RequestUsage.date)
+        )
+        q = _apply_filters(q, RequestUsage)
+        rows = (await db.execute(q)).all()
+        counts = {r.date.isoformat(): int(r.rc) for r in rows}
+
+        return [
+            {"label": (start + timedelta(days=i)).isoformat(),
+             "count": counts.get((start + timedelta(days=i)).isoformat(), 0)}
+            for i in range(span)
+        ]
+
+    # ------------------------------------------------------------------ #
+    # month — daily buckets for the month, or a single monthly bucket
+    # ------------------------------------------------------------------ #
+    if window == "month" and year and month:
+        yr_str = str(year)
+        mo_str = f"{month:02d}"
+
+        q = (
+            select(RequestUsage.date, func.sum(RequestUsage.request_count).label("rc"))
+            .where(
+                func.strftime('%Y', RequestUsage.date) == yr_str,
+                func.strftime('%m', RequestUsage.date) == mo_str,
+            )
+            .group_by(RequestUsage.date)
+        )
+        q = _apply_filters(q, RequestUsage)
+        rows = (await db.execute(q)).all()
+
+        if rows:
+            counts = {r.date.isoformat(): int(r.rc) for r in rows}
+            # Number of days in the month for zero-fill.
+            if month == 12:
+                next_first = date(year + 1, 1, 1)
+            else:
+                next_first = date(year, month + 1, 1)
+            days_in_month = (next_first - date(year, month, 1)).days
+            return [
+                {"label": date(year, month, d).isoformat(),
+                 "count": counts.get(date(year, month, d).isoformat(), 0)}
+                for d in range(1, days_in_month + 1)
+            ]
+
+        # Rolled-up month: single bucket from the monthly table.
+        mq = (
+            select(func.sum(RequestUsageMonthly.request_count).label("rc"))
+            .where(RequestUsageMonthly.year == year, RequestUsageMonthly.month == month)
+        )
+        mq = _apply_filters(mq, RequestUsageMonthly)
+        total = (await db.execute(mq)).scalar() or 0
+        return [{"label": f"{year}-{month:02d}", "count": int(total)}]
+
+    # ------------------------------------------------------------------ #
+    # all — monthly buckets, union of daily + monthly tables
+    # ------------------------------------------------------------------ #
+    if window == "all":
+        dq = (
+            select(
+                func.strftime('%Y-%m', RequestUsage.date).label("ym"),
+                func.sum(RequestUsage.request_count).label("rc"),
+            )
+            .group_by(func.strftime('%Y-%m', RequestUsage.date))
+        )
+        dq = _apply_filters(dq, RequestUsage)
+        d_rows = (await db.execute(dq)).all()
+
+        mq = (
+            select(
+                RequestUsageMonthly.year,
+                RequestUsageMonthly.month,
+                func.sum(RequestUsageMonthly.request_count).label("rc"),
+            )
+            .group_by(RequestUsageMonthly.year, RequestUsageMonthly.month)
+        )
+        mq = _apply_filters(mq, RequestUsageMonthly)
+        m_rows = (await db.execute(mq)).all()
+
+        combined: dict = {}
+        for r in d_rows:
+            combined[r.ym] = combined.get(r.ym, 0) + int(r.rc)
+        for r in m_rows:
+            ym = f"{int(r.year)}-{int(r.month):02d}"
+            combined[ym] = combined.get(ym, 0) + int(r.rc)
+
+        return [{"label": ym, "count": combined[ym]} for ym in sorted(combined)]
+
+    # ------------------------------------------------------------------ #
+    # Fallback (unknown window) — behave like 30d
+    # ------------------------------------------------------------------ #
+    start = today - timedelta(days=29)
+    q = (
+        select(RequestUsage.date, func.sum(RequestUsage.request_count).label("rc"))
+        .where(RequestUsage.date >= start)
+        .group_by(RequestUsage.date)
+    )
+    q = _apply_filters(q, RequestUsage)
+    rows = (await db.execute(q)).all()
+    counts = {r.date.isoformat(): int(r.rc) for r in rows}
+    return [
+        {"label": (start + timedelta(days=i)).isoformat(),
+         "count": counts.get((start + timedelta(days=i)).isoformat(), 0)}
+        for i in range(30)
+    ]
+
+
 async def init_database():
     """Initialize the database and create tables asynchronously."""
     # Create data directory if it doesn't exist

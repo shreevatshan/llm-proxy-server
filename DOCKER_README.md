@@ -1,5 +1,7 @@
 # LLM Proxy Server
 
+📦 **GitHub:** [shreevatshan/llm-proxy-server](https://github.com/shreevatshan/llm-proxy-server)
+
 A unified proxy server that exposes **OpenAI-compatible**, **Anthropic-compatible**, and **Azure OpenAI-compatible** API endpoints for multiple LLM providers including Azure OpenAI, AWS Bedrock, Google Gemini, OpenAI, Ollama, LlamaCpp, and any custom server. Supports Chat Completions, Embeddings, Images, Audio, the **OpenAI Responses API**, the **Anthropic Messages API**, and **Azure OpenAI deployment-based URLs**.
 
 ## Architecture

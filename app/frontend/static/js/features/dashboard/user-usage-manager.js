@@ -11,6 +11,7 @@ class UserUsageManager {
         this._refreshTimer = null;
         this._refreshIntervalMs = 60_000;
         this._tabIsActive = false;
+        this._chart = null; // Chart.js instance for the usage timeseries graph
 
         // Window state
         this._window = '30d';   // active window key
@@ -114,6 +115,8 @@ class UserUsageManager {
     _render(data) {
         if (!data) return;
 
+        this._renderChart(data.timeseries);
+
         // get_usage_aggregates returns {breakdown:[...]} when filter_user is set,
         // not {per_model:[...], totals:{...}} — normalise here.
         const perModel = data.per_model || data.breakdown || [];
@@ -181,6 +184,66 @@ class UserUsageManager {
     // ------------------------------------------------------------------ //
     // Window buttons & indicator
     // ------------------------------------------------------------------ //
+
+    _renderChart(timeseries) {
+        const canvas = document.getElementById('user-usage-chart');
+        if (!canvas || typeof Chart === 'undefined') return;
+
+        const series = Array.isArray(timeseries) ? timeseries : [];
+        const labels = series.map(b => b.label);
+        const data = series.map(b => b.count);
+
+        const css = getComputedStyle(document.documentElement);
+        const barColor = (css.getPropertyValue('--mono-text-primary') || '#e0e0e0').trim();
+        const mutedColor = (css.getPropertyValue('--mono-text-muted') || '#888').trim();
+        const gridColor = (css.getPropertyValue('--border-color') || 'rgba(255,255,255,0.08)').trim();
+        const fontFamily = (css.getPropertyValue('--font-family-mono') || 'monospace').trim();
+
+        if (this._chart) {
+            this._chart.data.labels = labels;
+            this._chart.data.datasets[0].data = data;
+            this._chart.update();
+            return;
+        }
+
+        this._chart = new Chart(canvas.getContext('2d'), {
+            type: 'bar',
+            data: {
+                labels,
+                datasets: [{
+                    label: 'Requests',
+                    data,
+                    backgroundColor: barColor,
+                    borderWidth: 0,
+                    borderRadius: 2,
+                    maxBarThickness: 48,
+                }],
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                animation: { duration: 200 },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        titleFont: { family: fontFamily },
+                        bodyFont: { family: fontFamily },
+                    },
+                },
+                scales: {
+                    x: {
+                        ticks: { color: mutedColor, font: { family: fontFamily, size: 10 }, maxRotation: 0, autoSkip: true },
+                        grid: { display: false },
+                    },
+                    y: {
+                        beginAtZero: true,
+                        ticks: { color: mutedColor, font: { family: fontFamily, size: 10 }, precision: 0 },
+                        grid: { color: gridColor },
+                    },
+                },
+            },
+        });
+    }
 
     _updateWindowButtons(activeKey) {
         const container = document.getElementById('usage-window-container');

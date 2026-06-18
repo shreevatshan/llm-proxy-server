@@ -813,3 +813,19 @@ input:checked + .model-toggle-slider:before {
     cursor: not-allowed;
     pointer-events: none;
 }
+
+/* ── Usage timeseries chart ───────────────────────────────────────── */
+.usage-chart-card {
+    position: relative;
+    height: 240px;
+    margin-bottom: 1.25rem;
+    padding: 1rem 1.25rem;
+    background: var(--mono-1, #141414);
+    border: 1px solid var(--border-color, var(--mono-4));
+    border-radius: var(--radius-md, 8px);
+}
+
+.usage-chart-card canvas {
+    width: 100% !important;
+    height: 100% !important;
+}

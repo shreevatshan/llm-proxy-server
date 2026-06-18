@@ -2394,7 +2394,7 @@ async def get_usage(
     - window=month requires year and month params.
     """
     from app.request_tracker import request_tracker
-    from app.auth.database import get_usage_earliest_date
+    from app.auth.database import get_usage_earliest_date, get_usage_timeseries
     await request_tracker.flush_pending()
 
     filter_user: Optional[str] = None
@@ -2408,6 +2408,14 @@ async def get_usage(
     result = await get_usage_aggregates(
         db,
         group_by="user",
+        filter_user=filter_user,
+        filter_model=filter_model,
+        window=window,
+        year=year,
+        month=month,
+    )
+    result["timeseries"] = await get_usage_timeseries(
+        db,
         filter_user=filter_user,
         filter_model=filter_model,
         window=window,
