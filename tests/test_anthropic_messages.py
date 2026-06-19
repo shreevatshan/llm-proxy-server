@@ -160,46 +160,6 @@ class FakeSdkBackedCustomProvider(CustomProvider):
         self.api_key = None
 
 
-class FakeSyncBedrockEventStream:
-    def __init__(self, events):
-        self._events = list(events)
-        self._index = 0
-        self._terminal_seen = False
-        self.post_terminal_pulls = 0
-        self.closed = False
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if self._index >= len(self._events):
-            raise StopIteration
-        if self._terminal_seen:
-            self.post_terminal_pulls += 1
-        event = self._events[self._index]
-        self._index += 1
-        if event.get("type") in {"message_stop", "error"}:
-            self._terminal_seen = True
-        return {
-            "chunk": {
-                "bytes": json.dumps(event).encode("utf-8"),
-            }
-        }
-
-    def close(self):
-        self.closed = True
-
-
-class FakeBedrockRuntime:
-    def __init__(self, stream):
-        self.stream = stream
-        self.calls = []
-
-    def invoke_model_with_response_stream(self, **kwargs):
-        self.calls.append(kwargs)
-        return {"body": self.stream}
-
-
 class AnthropicMessagesRouteTests(unittest.TestCase):
     def setUp(self):
         asyncio.run(request_tracker.stop())
@@ -576,75 +536,6 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
                 "error": None,
             },
         )
-
-    def test_bedrock_native_worker_stops_after_message_stop_and_closes_stream(self):
-        event_stream = FakeSyncBedrockEventStream([
-            {"type": "message_start", "message": {"id": "msg_1"}},
-            {"type": "message_stop"},
-            {"type": "ping"},
-        ])
-        provider = BedrockProvider.__new__(BedrockProvider)
-        provider.bedrock_runtime_native_stream = FakeBedrockRuntime(event_stream)
-        event_queue = queue.Queue()
-
-        provider._stream_worker_native("anthropic.claude-sonnet-4-5", {"messages": []}, event_queue)
-
-        queued_items = []
-        while not event_queue.empty():
-            queued_items.append(event_queue.get_nowait())
-
-        self.assertEqual([item[0] for item in queued_items], ["upstream_event", "upstream_event", "done"])
-        self.assertIn("event: message_stop", queued_items[1][1]["sse"])
-        self.assertEqual(queued_items[2][1]["terminal_event_seen"], True)
-        self.assertEqual(queued_items[2][1]["terminal_event_type"], "message_stop")
-        self.assertEqual(event_stream.post_terminal_pulls, 0)
-        self.assertTrue(event_stream.closed)
-
-    def test_bedrock_native_worker_reads_to_eof_without_terminal_event(self):
-        event_stream = FakeSyncBedrockEventStream([
-            {"type": "message_start", "message": {"id": "msg_1"}},
-            {"type": "ping"},
-        ])
-        provider = BedrockProvider.__new__(BedrockProvider)
-        provider.bedrock_runtime_native_stream = FakeBedrockRuntime(event_stream)
-        event_queue = queue.Queue()
-
-        provider._stream_worker_native("anthropic.claude-haiku-4-5", {"messages": []}, event_queue)
-
-        queued_items = []
-        while not event_queue.empty():
-            queued_items.append(event_queue.get_nowait())
-
-        self.assertEqual([item[0] for item in queued_items], ["upstream_event", "upstream_event", "done"])
-        self.assertIn("event: ping", queued_items[1][1]["sse"])
-        self.assertEqual(queued_items[2][1]["terminal_event_seen"], False)
-        self.assertEqual(queued_items[2][1]["transport_eof_observed"], True)
-        self.assertTrue(event_stream.closed)
-
-    def test_bedrock_native_worker_honors_pre_set_stop_signal(self):
-        event_stream = FakeSyncBedrockEventStream([
-            {"type": "message_start", "message": {"id": "msg_1"}},
-        ])
-        provider = BedrockProvider.__new__(BedrockProvider)
-        provider.bedrock_runtime_native_stream = FakeBedrockRuntime(event_stream)
-        event_queue = queue.Queue()
-        stop_event = threading.Event()
-        stop_event.set()
-
-        provider._stream_worker_native(
-            "anthropic.claude-sonnet-4-5",
-            {"messages": []},
-            event_queue,
-            stop_event,
-        )
-
-        queued_items = []
-        while not event_queue.empty():
-            queued_items.append(event_queue.get_nowait())
-
-        self.assertEqual([item[0] for item in queued_items], ["done"])
-        self.assertTrue(queued_items[0][1]["worker_stopped_early"])
-        self.assertEqual(queued_items[0][1]["event_count"], 0)
 
 
 class BedrockNativeSystemNormalizationTests(unittest.TestCase):

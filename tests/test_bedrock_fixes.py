@@ -1,19 +1,25 @@
-"""Unit tests for the Part-1 Bedrock provider fixes (reviews/review.md).
+"""Unit tests for the Bedrock provider.
 
 These cover the pure/synchronous logic that can be tested without live AWS:
 A2 (stream tool-call index), A4 (cache tokens), A5 (reasoning_content),
 A6 (tool pairing), A7 (empty content), A9 (finish reason), C6 (budget clamp),
-B4 (socket extraction structural assertion), and the _map_bedrock_error table.
+and the _map_bedrock_error table.
+
+Plus the AsyncAnthropicBedrock native-path migration (Part 2): _build_native_sdk_kwargs
+shaping, lazy client init, messages.create / messages.stream behavior, and SDK
+error translation to ProviderHTTPError.
 """
 
-import socket
+import json
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 from app.providers.bedrock_provider import (
     BedrockProvider,
-    _extract_stream_socket,
     _map_bedrock_error,
 )
+from app.providers.base import ProviderHTTPError
 
 
 def _provider() -> BedrockProvider:
@@ -163,36 +169,288 @@ class StreamChunkTests(unittest.TestCase):
         self.assertEqual(usage["cache_read_input_tokens"], 3)
 
 
-class SocketExtractionTests(unittest.TestCase):
-    """B4: assert the private-attribute walk still finds a socket, so a
-    dependency bump that changes the layout fails loudly in CI."""
+class BuildNativeSdkKwargsTests(unittest.TestCase):
+    """Part 2: _build_native_sdk_kwargs adapts the Bedrock transform output to
+    the AsyncAnthropicBedrock messages.create/stream call contract."""
 
-    def test_finds_socket_in_expected_layout(self):
-        class _FakeBufferedReader:
-            def __init__(self, sock):
-                self.raw = type("Raw", (), {"_sock": sock})()
+    def setUp(self):
+        from app.anthropic_models import AnthropicMessagesRequest
 
-        class _FakeHttplibResp:
-            def __init__(self, sock):
-                self.fp = _FakeBufferedReader(sock)
+        self.p = _provider()
+        self.Request = AnthropicMessagesRequest
 
-        class _FakeUrllib3Resp:
-            def __init__(self, sock):
-                self._fp = _FakeHttplibResp(sock)
+    def _req(self, **extra):
+        base = {
+            "model": "claude-opus-4-8",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        base.update(extra)
+        return self.Request(**base)
 
-        class _FakeEventStream:
-            def __init__(self, sock):
-                self._raw_stream = _FakeUrllib3Resp(sock)
+    def test_anthropic_version_stripped_and_model_set(self):
+        kwargs, beta = self._build("us.anthropic.claude-opus-4-8")
+        self.assertNotIn("anthropic_version", kwargs)
+        self.assertEqual(kwargs["model"], "us.anthropic.claude-opus-4-8")
 
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            found = _extract_stream_socket(_FakeEventStream(s))
-            self.assertIs(found, s)
-        finally:
-            s.close()
+    def _build(self, model_id, request=None, anthropic_beta=None):
+        request = request or self._req()
+        return self.p._build_native_sdk_kwargs(request, model_id, anthropic_beta)
 
-    def test_returns_none_on_unexpected_layout(self):
-        self.assertIsNone(_extract_stream_socket(object()))
+    def test_beta_moved_to_header_not_body(self):
+        # interleaved-thinking maps to a real Bedrock beta flag.
+        kwargs, beta = self._build(
+            "claude-opus-4-8", anthropic_beta="interleaved-thinking-2025-05-14"
+        )
+        self.assertNotIn("anthropic_beta", kwargs)
+        self.assertIsNotNone(beta)
+        self.assertIn("interleaved-thinking-2025-05-14", beta)
+
+    def test_no_beta_returns_none_header(self):
+        _, beta = self._build("claude-opus-4-8")
+        self.assertIsNone(beta)
+
+    def test_cache_scope_stripped(self):
+        req = self._req(
+            system=[{
+                "type": "text",
+                "text": "sys",
+                "cache_control": {"type": "ephemeral", "scope": {"foo": "bar"}},
+            }]
+        )
+        kwargs, _ = self._build("claude-opus-4-8", request=req)
+        for block in kwargs["system"]:
+            cc = block.get("cache_control")
+            if isinstance(cc, dict):
+                self.assertNotIn("scope", cc)
+
+    def test_caller_stripped_from_tool_use(self):
+        req = self._req(messages=[
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "f", "input": {},
+                 "caller": "should_be_removed"},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ]},
+        ])
+        kwargs, _ = self._build("claude-opus-4-8", request=req)
+        for msg in kwargs["messages"]:
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        self.assertNotIn("caller", block)
+
+    def test_web_search_tool_result_converted(self):
+        req = self._req(messages=[
+            {"role": "user", "content": [
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+                 "content": [{"type": "web_search_result", "title": "T",
+                              "url": "http://x", "encrypted_content": "E"}]},
+            ]},
+        ])
+        kwargs, _ = self._build("claude-opus-4-8", request=req)
+        types = [
+            b.get("type")
+            for m in kwargs["messages"] for b in (m.get("content") or [])
+            if isinstance(b, dict)
+        ]
+        self.assertIn("tool_result", types)
+        self.assertNotIn("web_search_tool_result", types)
+
+    def test_skip_types_dropped(self):
+        req = self._req(tools=[
+            {"type": "web_search_20250305", "name": "ws"},
+            {"name": "real", "description": "d",
+             "input_schema": {"type": "object", "properties": {}}},
+        ])
+        kwargs, _ = self._build("claude-opus-4-8", request=req)
+        tool_names = [t.get("name") for t in kwargs.get("tools", [])]
+        self.assertIn("real", tool_names)
+        self.assertNotIn("ws", tool_names)
+
+    def test_context_management_routed_to_extra_body(self):
+        req = self._req(context_management={"edits": []})
+        kwargs, _ = self._build("claude-opus-4-8", request=req)
+        self.assertNotIn("context_management", kwargs)
+        self.assertIn("extra_body", kwargs)
+        self.assertIn("context_management", kwargs["extra_body"])
+
+
+class InitClientTests(unittest.TestCase):
+    """Part 2: lazy AsyncAnthropicBedrock init wiring."""
+
+    def _bare_provider(self):
+        p = BedrockProvider.__new__(BedrockProvider)
+        p.aws_region = "us-west-2"
+        p.aws_access_key = "AKIA_TEST"
+        p.aws_secret_key = "secret_test"
+        p._anthropic_client = None
+        return p
+
+    def test_builds_client_with_region_and_keys(self):
+        p = self._bare_provider()
+        fake_ctor = mock.MagicMock(return_value="CLIENT")
+        with mock.patch("anthropic.AsyncAnthropicBedrock", fake_ctor):
+            p._init_bedrock_anthropic_client()
+        self.assertEqual(p._anthropic_client, "CLIENT")
+        kwargs = fake_ctor.call_args.kwargs
+        self.assertEqual(kwargs["aws_region"], "us-west-2")
+        self.assertEqual(kwargs["aws_access_key"], "AKIA_TEST")
+        self.assertEqual(kwargs["aws_secret_key"], "secret_test")
+        self.assertIn("timeout", kwargs)
+        self.assertIn("max_retries", kwargs)
+
+    def test_omits_creds_when_absent(self):
+        p = self._bare_provider()
+        p.aws_access_key = None
+        p.aws_secret_key = None
+        fake_ctor = mock.MagicMock(return_value="CLIENT")
+        with mock.patch("anthropic.AsyncAnthropicBedrock", fake_ctor):
+            p._init_bedrock_anthropic_client()
+        kwargs = fake_ctor.call_args.kwargs
+        self.assertNotIn("aws_access_key", kwargs)
+        self.assertNotIn("aws_secret_key", kwargs)
+
+    def test_idempotent(self):
+        p = self._bare_provider()
+        p._anthropic_client = "EXISTING"
+        fake_ctor = mock.MagicMock()
+        with mock.patch("anthropic.AsyncAnthropicBedrock", fake_ctor):
+            p._init_bedrock_anthropic_client()
+        fake_ctor.assert_not_called()
+        self.assertEqual(p._anthropic_client, "EXISTING")
+
+
+class TranslateSdkErrorTests(unittest.TestCase):
+    """Part 2 / C8: SDK exceptions become ProviderHTTPError with correct status."""
+
+    def setUp(self):
+        self.p = _provider()
+        self.p.full_provider_name = "bedrock:test"
+
+    def _make_anthropic_error(self, cls_name, status):
+        import anthropic
+        cls = getattr(anthropic, cls_name)
+        response = SimpleNamespace(
+            status_code=status,
+            headers={},
+            request=None,
+        )
+        body = {"type": "error", "error": {"type": "x", "message": "boom"}}
+        # APIStatusError subclasses take (message, *, response, body)
+        return cls("boom", response=response, body=body)
+
+    def test_bad_request_maps_to_400(self):
+        err = self._make_anthropic_error("BadRequestError", 400)
+        translated = self.p._translate_bedrock_sdk_error(err)
+        self.assertIsInstance(translated, ProviderHTTPError)
+        self.assertEqual(translated.status_code, 400)
+
+    def test_rate_limit_maps_to_429(self):
+        err = self._make_anthropic_error("RateLimitError", 429)
+        translated = self.p._translate_bedrock_sdk_error(err)
+        self.assertIsInstance(translated, ProviderHTTPError)
+        self.assertEqual(translated.status_code, 429)
+
+    def test_non_anthropic_error_passthrough(self):
+        err = ValueError("not an sdk error")
+        translated = self.p._translate_bedrock_sdk_error(err)
+        self.assertIs(translated, err)
+
+
+class NativeMessagesTests(unittest.IsolatedAsyncioTestCase):
+    """Part 2: anthropic_messages / anthropic_messages_stream native branches
+    drive the AsyncAnthropicBedrock SDK."""
+
+    def setUp(self):
+        from app.anthropic_models import AnthropicMessagesRequest
+
+        self.p = _provider()
+        self.p.aws_region = "us-west-2"
+        self.p.bedrock_model_list = {}
+        self.p.full_provider_name = "bedrock:test"
+        self.request = AnthropicMessagesRequest(
+            model="claude-opus-4-8",
+            max_tokens=50,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+    async def test_non_stream_returns_dump_with_model_override(self):
+        dump = {
+            "id": "msg_bdrk_real",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hello"}],
+            "model": "claude-opus-4-8",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+        }
+        fake_resp = mock.MagicMock()
+        fake_resp.model_dump_json.return_value = json.dumps(dump)
+        client = mock.MagicMock()
+        client.messages.create = mock.AsyncMock(return_value=fake_resp)
+        self.p._anthropic_client = client
+
+        result = await self.p.anthropic_messages(self.request)
+        # real upstream id preserved; model echoes the client-facing name
+        self.assertEqual(result["id"], "msg_bdrk_real")
+        self.assertEqual(result["model"], "claude-opus-4-8")
+        self.assertTrue(client.messages.create.await_count == 1)
+
+    async def test_non_stream_error_translated(self):
+        client = mock.MagicMock()
+        import anthropic
+        response = SimpleNamespace(status_code=400, headers={}, request=None)
+        err = anthropic.BadRequestError(
+            "bad", response=response,
+            body={"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}},
+        )
+        client.messages.create = mock.AsyncMock(side_effect=err)
+        self.p._anthropic_client = client
+
+        with self.assertRaises(ProviderHTTPError) as ctx:
+            await self.p.anthropic_messages(self.request)
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_stream_emits_sse_and_stops_at_terminal(self):
+        def _event(payload):
+            e = mock.MagicMock()
+            e.model_dump_json.return_value = json.dumps(payload)
+            return e
+
+        events = [
+            _event({"type": "message_start", "message": {}}),
+            _event({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "hi"}}),
+            _event({"type": "message_stop"}),
+            _event({"type": "should_not_appear"}),
+        ]
+
+        class _FakeStream:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+            async def __aiter__(self_inner):
+                for e in events:
+                    yield e
+
+        client = mock.MagicMock()
+        client.messages.stream = mock.MagicMock(return_value=_FakeStream())
+        self.p._anthropic_client = client
+
+        chunks = []
+        async for sse in self.p.anthropic_messages_stream(self.request):
+            chunks.append(sse)
+
+        joined = "".join(chunks)
+        self.assertIn("event: message_start", joined)
+        self.assertIn("event: message_stop", joined)
+        # post-terminal event within drain budget is consumed but not emitted
+        self.assertNotIn("should_not_appear", joined)
 
 
 if __name__ == "__main__":

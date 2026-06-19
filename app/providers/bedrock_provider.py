@@ -17,13 +17,9 @@ import hashlib
 import json
 import logging
 import os
-import queue
 import re
-import socket
-import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, AsyncGenerator, Literal, Optional
 from collections import defaultdict
 import boto3
@@ -36,51 +32,13 @@ from pydantic import BaseModel
 
 
 # ---------------------------------------------------------------------------
-#  Module-level concurrency primitives for the InvokeModel (native) path.
-#  Shared across BedrockProvider instances.  Thread-pool workers run the
-#  synchronous boto3 calls; the semaphore prevents stampede overload.
-#
-#  Two separate pool/semaphore pairs are used:
-#    • "native stream"  — InvokeModelWithResponseStream (Claude streaming).
-#      Workers are long-lived (hold a thread for the full response duration).
-#    • "native"         — InvokeModel (Claude non-stream / embeddings).
-#      Workers are short-lived (return as soon as the response body is read).
-#
-#  Keeping them separate prevents a burst of long-running streams from
-#  starving synchronous calls and vice versa.  Pool sizes are tunable via
-#  env vars so operators can right-size them for their workload.
+#  Module-level concurrency primitive for the Converse path.
+#  The Claude (native) path now runs on the AsyncAnthropicBedrock SDK, which
+#  owns its own transport/concurrency; only the Converse / converse_stream
+#  path (OpenAI chat + non-Claude Anthropic) still needs a bound, since it
+#  runs on Starlette's default threadpool and is otherwise ungoverned.
 # ---------------------------------------------------------------------------
-_NATIVE_POOL_SIZE = 15
-_NATIVE_SEMAPHORE_LIMIT = 15
-_NATIVE_STREAM_POOL_SIZE = 15   # dedicated to InvokeModelWithResponseStream workers
-_NATIVE_STREAM_SEMAPHORE_LIMIT = 15
-# Governs the Converse / converse_stream path (OpenAI chat + non-Claude
-# Anthropic), which otherwise runs ungoverned on Starlette's default threadpool.
 _CONVERSE_SEMAPHORE_LIMIT = 15
-_BEDROCK_NATIVE_WARNING_THRESHOLD_RATIO = 0.6
-_BEDROCK_NATIVE_FUTURE_DONE_EMPTY_CHECKS = 2
-_BEDROCK_NATIVE_FUTURE_DONE_GRACE_SECONDS = 0.1
-_BEDROCK_NATIVE_SEMAPHORE_WAIT_WARNING_SECONDS = 1.0
-_BEDROCK_NATIVE_PROGRESS_EVENT_TYPES = frozenset(
-    {
-        "message_start",
-        "content_block_start",
-        "content_block_delta",
-        "content_block_stop",
-        "message_delta",
-        "message_stop",
-        "error",
-    }
-)
-
-_native_executor: Optional[ThreadPoolExecutor] = None
-_native_semaphore: Optional[asyncio.Semaphore] = None
-_native_executor_lock = threading.Lock()
-
-# Dedicated to the native streaming (InvokeModelWithResponseStream) path.
-_native_stream_executor: Optional[ThreadPoolExecutor] = None
-_native_stream_semaphore: Optional[asyncio.Semaphore] = None
-_native_stream_executor_lock = threading.Lock()
 
 # Governs the Converse / converse_stream path (run via Starlette's default
 # threadpool, which is otherwise unbounded relative to Bedrock concurrency).
@@ -116,58 +74,6 @@ def _get_positive_int_env(name: str, default: int) -> int:
     return value
 
 
-BEDROCK_NATIVE_INITIAL_IDLE_TIMEOUT_SECONDS = _get_positive_int_env(
-    "BEDROCK_NATIVE_INITIAL_IDLE_TIMEOUT_SECONDS", 180
-)
-BEDROCK_NATIVE_THINKING_INITIAL_IDLE_TIMEOUT_SECONDS = _get_positive_int_env(
-    "BEDROCK_NATIVE_THINKING_INITIAL_IDLE_TIMEOUT_SECONDS", 300
-)
-BEDROCK_NATIVE_MIDSTREAM_IDLE_TIMEOUT_SECONDS = _get_positive_int_env(
-    "BEDROCK_NATIVE_MIDSTREAM_IDLE_TIMEOUT_SECONDS", 90
-)
-BEDROCK_NATIVE_EXTENDED_MIDSTREAM_IDLE_TIMEOUT_SECONDS = _get_positive_int_env(
-    "BEDROCK_NATIVE_EXTENDED_MIDSTREAM_IDLE_TIMEOUT_SECONDS", 900
-)
-BEDROCK_NATIVE_PING_INTERVAL_SECONDS = _get_positive_int_env(
-    "BEDROCK_NATIVE_PING_INTERVAL_SECONDS", 30
-)
-BEDROCK_NATIVE_SOCKET_READ_TIMEOUT_SECONDS = _get_positive_int_env(
-    "BEDROCK_NATIVE_SOCKET_READ_TIMEOUT_SECONDS", 940
-)
-BEDROCK_NATIVE_RETRY_ON_PRE_OUTPUT_DROP = os.environ.get(
-    "BEDROCK_NATIVE_RETRY_ON_PRE_OUTPUT_DROP", "1"
-) not in ("0", "false", "False", "")
-
-
-def _get_native_executor() -> ThreadPoolExecutor:
-    """Get or create the global thread-pool executor for InvokeModel calls."""
-    global _native_executor
-    if _native_executor is None:
-        with _native_executor_lock:
-            if _native_executor is None:
-                _native_executor = ThreadPoolExecutor(
-                    max_workers=_NATIVE_POOL_SIZE,
-                    thread_name_prefix="bedrock-native-",
-                )
-                logger.info(
-                    "[BEDROCK] Created native thread pool with %d workers",
-                    _NATIVE_POOL_SIZE,
-                )
-    return _native_executor
-
-
-def _get_native_semaphore() -> asyncio.Semaphore:
-    """Get or create the global semaphore for InvokeModel (non-stream) concurrency."""
-    global _native_semaphore
-    if _native_semaphore is None:
-        _native_semaphore = asyncio.Semaphore(_NATIVE_SEMAPHORE_LIMIT)
-        logger.info(
-            "[BEDROCK] Created native semaphore with limit %d",
-            _NATIVE_SEMAPHORE_LIMIT,
-        )
-    return _native_semaphore
-
-
 def _get_converse_semaphore() -> asyncio.Semaphore:
     """Get or create the semaphore bounding the Converse / converse_stream path.
 
@@ -184,185 +90,6 @@ def _get_converse_semaphore() -> asyncio.Semaphore:
         _converse_semaphore = asyncio.Semaphore(limit)
         logger.info("[BEDROCK] Created converse semaphore with limit %d", limit)
     return _converse_semaphore
-
-
-def _get_native_stream_executor() -> ThreadPoolExecutor:
-    """Get or create the dedicated thread-pool for InvokeModelWithResponseStream workers.
-
-    Kept separate from the non-stream executor so long-running stream workers
-    cannot starve short synchronous InvokeModel calls, and vice versa.
-    Pool size is configurable via BEDROCK_NATIVE_STREAM_POOL_SIZE env var.
-    """
-    global _native_stream_executor
-    if _native_stream_executor is None:
-        with _native_stream_executor_lock:
-            if _native_stream_executor is None:
-                pool_size = _get_positive_int_env(
-                    "BEDROCK_NATIVE_STREAM_POOL_SIZE", _NATIVE_STREAM_POOL_SIZE
-                )
-                _native_stream_executor = ThreadPoolExecutor(
-                    max_workers=pool_size,
-                    thread_name_prefix="bedrock-native-stream-",
-                )
-                logger.info(
-                    "[BEDROCK] Created native-stream thread pool with %d workers",
-                    pool_size,
-                )
-    return _native_stream_executor
-
-
-def _get_native_stream_semaphore() -> asyncio.Semaphore:
-    """Get or create the dedicated semaphore for InvokeModelWithResponseStream concurrency.
-
-    Kept separate from the non-stream semaphore so streaming and synchronous
-    native calls cannot deplete each other's permit budgets.
-    Limit is configurable via BEDROCK_NATIVE_STREAM_SEMAPHORE_LIMIT env var.
-    """
-    global _native_stream_semaphore
-    if _native_stream_semaphore is None:
-        limit = _get_positive_int_env(
-            "BEDROCK_NATIVE_STREAM_SEMAPHORE_LIMIT", _NATIVE_STREAM_SEMAPHORE_LIMIT
-        )
-        _native_stream_semaphore = asyncio.Semaphore(limit)
-        logger.info(
-            "[BEDROCK] Created native-stream semaphore with limit %d",
-            limit,
-        )
-    return _native_stream_semaphore
-
-
-def _extract_stream_socket(stream: Any) -> Optional[socket.socket]:
-    """Best-effort dig the raw ``socket.socket`` out of a boto3 event-stream.
-
-    botocore's ``EventStream`` wraps a urllib3 ``HTTPResponse`` whose
-    ``_fp`` is an ``http.client.HTTPResponse`` whose ``fp`` is a buffered
-    reader over the underlying ``socket.socket`` (``fp.raw._sock``).  We walk
-    that chain defensively — every attribute access is guarded because the
-    internal layout is not a public API and may differ across versions or
-    once the connection has already been torn down.  Returns ``None`` if the
-    socket cannot be located.
-    """
-    # botocore EventStream -> urllib3 HTTPResponse
-    raw = getattr(stream, "_raw_stream", None)
-    if raw is None:
-        return None
-    # urllib3 HTTPResponse -> http.client.HTTPResponse
-    httplib_resp = getattr(raw, "_fp", None)
-    if httplib_resp is None:
-        return None
-    # http.client.HTTPResponse.fp -> socket.makefile() buffered reader
-    fp = getattr(httplib_resp, "fp", None)
-    if fp is None:
-        return None
-    sock = getattr(fp, "raw", None)
-    sock = getattr(sock, "_sock", None)
-    if isinstance(sock, socket.socket):
-        return sock
-    return None
-
-
-def _close_stream_box(stream_box: Optional[list]) -> None:
-    """Release the boto3 event-stream held in *stream_box[0]* if present.
-
-    Called from the async consumer (on the event-loop thread) when it exits
-    early, so the worker thread parked in ``next(stream)`` is unblocked
-    immediately rather than waiting up to the ~940 s socket read_timeout.
-
-    Why this is not simply ``stream.close()``: ``EventStream.close()`` ends in
-    ``http.client._close_conn()``, which closes the socket's ``BufferedReader``
-    and must acquire that reader's internal lock.  While a worker thread is
-    parked in ``recv_into`` on the same connection it *holds* that lock, so the
-    close would block until the worker's read returns — on the event-loop
-    thread that freezes the entire server.
-
-    The fix: first ``socket.shutdown(SHUT_RDWR)``.  That is a lock-free syscall
-    (it does not touch the ``BufferedReader`` lock), so it returns instantly on
-    the event loop *and* causes the worker's blocked ``recv_into`` to raise
-    immediately — genuinely releasing the worker, not just deferring the wait.
-    With the worker unblocked, ``close()`` no longer contends for the lock; we
-    still hand it to a short-lived daemon thread so any residual teardown I/O
-    can never touch the event loop.
-
-    Idempotent: clears ``stream_box`` up front so a second call (e.g. the retry
-    path followed by ``finally``) is a no-op.
-    """
-    if stream_box is None:
-        return
-    stream = stream_box[0]
-    if stream is None:
-        return
-    # Clear the box up front so a second call cannot act on the same stream.
-    stream_box[0] = None
-
-    # Step 1: shut down the underlying socket from the event-loop thread.  This
-    # is lock-free and immediately interrupts the worker's blocked recv_into.
-    sock = _extract_stream_socket(stream)
-    if sock is not None:
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            # Already shut down / not connected — nothing left to interrupt.
-            pass
-        except Exception:
-            logger.debug(
-                "[BEDROCK STREAM NATIVE] _close_stream_box: ignoring socket shutdown error",
-                exc_info=True,
-            )
-    else:
-        # The socket walk reaches into private botocore/urllib3/http.client
-        # internals; a dependency bump can silently turn it into a no-op,
-        # reintroducing the ~940s zombie-thread hang. Warn loudly so this is
-        # observable in production rather than a silent regression.
-        logger.warning(
-            "[BEDROCK STREAM NATIVE] Could not extract raw socket from event-stream; "
-            "falling back to close() only (worker interrupt may be delayed). "
-            "This usually means a botocore/urllib3 internal layout change."
-        )
-
-    # Step 2: close the stream off the event loop.  The worker is already
-    # released by the shutdown above, so this finishes promptly; the daemon
-    # thread is belt-and-suspenders so no teardown I/O can block the loop.
-    close_fn = getattr(stream, "close", None)
-    if not callable(close_fn):
-        return
-
-    def _do_close() -> None:
-        try:
-            close_fn()
-        except Exception:
-            logger.debug(
-                "[BEDROCK STREAM NATIVE] _close_stream_box: ignoring close error",
-                exc_info=True,
-            )
-
-    threading.Thread(
-        target=_do_close,
-        name="bedrock-stream-close",
-        daemon=True,
-    ).start()
-
-
-def _classify_native_stream_exception(exc: Exception) -> str:
-    """Bucket native-stream worker exceptions by type-name so operators can grep.
-
-    Returns one of: "protocol_error" (urllib3 connection truncation),
-    "event_stream_error" (botocore EventStreamError),
-    "read_timeout" (urllib3 ReadTimeoutError — socket read deadline hit),
-    "connection_closed" (socket fp set to None mid-stream),
-    "other".
-    """
-    name = type(exc).__name__
-    if name == "ProtocolError":
-        return "protocol_error"
-    if name == "EventStreamError":
-        return "event_stream_error"
-    if name == "ReadTimeoutError":
-        return "read_timeout"
-    # http.client sets self.fp = None when the connection is closed; urllib3
-    # then propagates this as AttributeError: 'NoneType' object has no attribute 'read'.
-    if name == "AttributeError" and "'NoneType' object has no attribute 'read'" in str(exc):
-        return "connection_closed"
-    return "other"
 
 
 def _map_bedrock_error(error_code: str, error_message: str) -> Dict[str, Any]:
@@ -404,6 +131,9 @@ from app.anthropic_models import (
     _merge_system_fields,
     is_anthropic_terminal_stream_event,
 )
+from app.providers.anthropic_compatible import (
+    get_anthropic_post_terminal_drain_stop_reason,
+)
 from app.openai_models import (
     ModelInfo,
     ChatCompletionRequest,
@@ -433,70 +163,6 @@ from app.openai_models import (
     ToolMessage,
 )
 
-
-class BedrockNativeStreamError(Exception):
-    """Base class for Bedrock native Claude streaming failures."""
-
-
-class BedrockNativeIdleTimeout(BedrockNativeStreamError):
-    """Raised when Bedrock native Claude streaming goes idle without progress."""
-
-    def __init__(
-        self,
-        *,
-        model: str,
-        phase: str,
-        idle_seconds: float,
-        threshold_seconds: int,
-        last_progress_event_type: Optional[str],
-        progress_event_count: int,
-        proxy_ping_count: int,
-    ):
-        self.model = model
-        self.phase = phase
-        self.idle_seconds = idle_seconds
-        self.threshold_seconds = threshold_seconds
-        self.last_progress_event_type = last_progress_event_type
-        self.progress_event_count = progress_event_count
-        self.proxy_ping_count = proxy_ping_count
-        super().__init__(
-            f"Bedrock native Claude stream stalled during {phase} phase after "
-            f"{idle_seconds:.1f}s without upstream progress (threshold {threshold_seconds}s)."
-        )
-
-
-class BedrockNativePrematureEOF(BedrockNativeStreamError):
-    """Raised when Bedrock closes the stream without a terminal Anthropic event."""
-
-    def __init__(
-        self,
-        *,
-        model: str,
-        transport_eof_observed: bool,
-        last_progress_event_type: Optional[str],
-        progress_event_count: int,
-        proxy_ping_count: int,
-    ):
-        self.model = model
-        self.transport_eof_observed = transport_eof_observed
-        self.last_progress_event_type = last_progress_event_type
-        self.progress_event_count = progress_event_count
-        self.proxy_ping_count = proxy_ping_count
-        super().__init__(
-            "Bedrock native Claude stream ended before a terminal Anthropic event was received."
-        )
-
-
-class BedrockNativeProviderError(BedrockNativeStreamError):
-    """Raised when the Bedrock worker reports a provider or transport failure."""
-
-    def __init__(self, error_code: str, error_message: str):
-        self.error_code = error_code
-        self.error_message = error_message
-        mapped = _map_bedrock_error(error_code, error_message)
-        self.status_code = mapped["status"]
-        self.body = mapped["body"]
-        super().__init__(f"{error_code}: {error_message}")
 
 logger = logging.getLogger(__name__)
 
@@ -608,53 +274,19 @@ class BedrockProvider(BaseProvider):
             max_pool_connections=50
         )
 
-        required_min_native_socket_timeout = (
-            max(
-                BEDROCK_NATIVE_THINKING_INITIAL_IDLE_TIMEOUT_SECONDS,
-                BEDROCK_NATIVE_EXTENDED_MIDSTREAM_IDLE_TIMEOUT_SECONDS,
-            )
-            + 30
-        )
-        configured_native_socket_timeout = BEDROCK_NATIVE_SOCKET_READ_TIMEOUT_SECONDS
-        if configured_native_socket_timeout < required_min_native_socket_timeout:
-            logger.warning(
-                "[BEDROCK] BEDROCK_NATIVE_SOCKET_READ_TIMEOUT_SECONDS=%s is too low; "
-                "using %s instead so native stream cleanup outlives the idle watchdog",
-                configured_native_socket_timeout,
-                required_min_native_socket_timeout,
-            )
-        self.native_stream_socket_read_timeout = max(
-            configured_native_socket_timeout,
-            required_min_native_socket_timeout,
-        )
-        self.native_stream_ping_interval = BEDROCK_NATIVE_PING_INTERVAL_SECONDS
-
         # Initialize boto3 clients
         client_kwargs = {
             'service_name': 'bedrock-runtime',
             'region_name': self.aws_region,
             'config': boto_config
         }
-        
+
         if self.aws_access_key and self.aws_secret_key:
             client_kwargs['aws_access_key_id'] = self.aws_access_key
             client_kwargs['aws_secret_access_key'] = self.aws_secret_key
 
         self.bedrock_runtime = boto3.client(**client_kwargs)
 
-        native_stream_client_kwargs = dict(client_kwargs)
-        native_stream_client_kwargs["config"] = Config(
-            connect_timeout=60,
-            read_timeout=self.native_stream_socket_read_timeout,
-            # 3 attempts (initial + 2 retries) is sufficient for transient
-            # connection errors; the idle watchdog handles genuine slow starts.
-            # The original value of 8 adaptive retries prolonged thread holding
-            # on Bedrock throttling, contributing to pool exhaustion.
-            retries={'max_attempts': 3, 'mode': 'adaptive'},
-            max_pool_connections=50,
-        )
-        self.bedrock_runtime_native_stream = boto3.client(**native_stream_client_kwargs)
-        
         # Client for listing models
         control_client_kwargs = {
             'service_name': 'bedrock',
@@ -672,68 +304,6 @@ class BedrockProvider(BaseProvider):
         self.bedrock_model_list = {}
 
         self._anthropic_client = None
-
-    def _is_native_stream_thinking_enabled(self, request: Any) -> bool:
-        """Return True when the Anthropic request enables extended thinking."""
-        thinking = getattr(request, "thinking", None)
-        if thinking is None:
-            return False
-
-        if hasattr(thinking, "model_dump"):
-            thinking = thinking.model_dump(exclude_none=True)
-
-        if isinstance(thinking, dict):
-            return thinking.get("type", "disabled") != "disabled"
-
-        return getattr(thinking, "type", "disabled") != "disabled"
-
-    def _log_native_stream_drop(
-        self,
-        *,
-        request: Any,
-        model_id: str,
-        aws_request_id: Optional[str],
-        error_class: str,
-        elapsed_seconds: float,
-        progress_event_count: int,
-        last_progress_event_type: Optional[str],
-        proxy_ping_count: int,
-        output_bytes_received: int,
-    ) -> None:
-        """Emit one structured drop record. Grep [BEDROCK STREAM NATIVE DROP]."""
-        logger.warning(
-            "[BEDROCK STREAM NATIVE DROP] aws_request_id=%s model_id=%s error_class=%s "
-            "elapsed_seconds=%.1f progress_event_count=%d last_progress_event=%s "
-            "proxy_ping_count=%d output_bytes_received=%d thinking_enabled=%s "
-            "tools_present=%s max_tokens=%s",
-            aws_request_id or "unknown",
-            model_id,
-            error_class,
-            elapsed_seconds,
-            progress_event_count,
-            last_progress_event_type or "none",
-            proxy_ping_count,
-            output_bytes_received,
-            self._is_native_stream_thinking_enabled(request),
-            bool(getattr(request, "tools", None)),
-            getattr(request, "max_tokens", None),
-        )
-
-    def _get_native_stream_idle_timeout(
-        self,
-        request: Any,
-        saw_first_progress_event: bool,
-    ) -> tuple[int, str]:
-        """Return the effective Bedrock native idle threshold and phase name."""
-        thinking_enabled = self._is_native_stream_thinking_enabled(request)
-        if not saw_first_progress_event:
-            if thinking_enabled:
-                return BEDROCK_NATIVE_THINKING_INITIAL_IDLE_TIMEOUT_SECONDS, "initial"
-            return BEDROCK_NATIVE_INITIAL_IDLE_TIMEOUT_SECONDS, "initial"
-
-        if thinking_enabled or bool(getattr(request, "tools", None)):
-            return BEDROCK_NATIVE_EXTENDED_MIDSTREAM_IDLE_TIMEOUT_SECONDS, "midstream"
-        return BEDROCK_NATIVE_MIDSTREAM_IDLE_TIMEOUT_SECONDS, "midstream"
 
     def get_model_id(self, model_name: str) -> str:
         """
@@ -2733,785 +2303,94 @@ class BedrockProvider(BaseProvider):
             if isinstance(tool, dict):
                 _strip(tool)
 
-    # --- native response conversion ---
+    # --- AsyncAnthropicBedrock SDK helpers ---
 
-    def _convert_native_response(
-        self, response_body: Dict[str, Any], original_model: str
-    ) -> Dict[str, Any]:
-        """Wrap a native InvokeModel response into the dict we return from
-        ``anthropic_messages``.  The response is already Anthropic JSON —
-        we just stamp our own ``id`` and echo the client-facing model name.
+    def _init_bedrock_anthropic_client(self) -> None:
+        """Lazily build the AsyncAnthropicBedrock client for the native Claude path.
+
+        Mirrors ``anthropic_compatible._init_anthropic_client``. The SDK owns the
+        transport, retries, SSE parsing and typed error mapping that the old
+        hand-rolled native worker/queue/socket machinery reimplemented.
         """
-        usage = response_body.get("usage", {})
-        usage_data: Dict[str, Any] = {
-            "input_tokens": usage.get("input_tokens", 0),
-            "output_tokens": usage.get("output_tokens", 0),
-        }
-        for optional_key in (
-            "cache_creation_input_tokens",
-            "cache_read_input_tokens",
-            "iterations",
-        ):
-            if usage.get(optional_key) is not None:
-                usage_data[optional_key] = usage[optional_key]
-
-        return {
-            "id": f"msg_{uuid.uuid4().hex}",
-            "type": "message",
-            "role": "assistant",
-            "content": response_body.get("content", []),
-            "model": original_model,
-            "stop_reason": response_body.get("stop_reason"),
-            "stop_sequence": response_body.get("stop_sequence"),
-            "usage": usage_data,
-        }
-
-    # --- native stream worker (runs in thread pool) ---
-
-    def _start_native_stream_worker(
-        self,
-        model_id: str,
-        native_request: Dict[str, Any],
-    ) -> tuple["queue.Queue", asyncio.Future, threading.Event, list]:
-        """Launch a fresh worker for the native Claude streaming path.
-
-        Returns the (event_queue, future, stop_event, stream_box) 4-tuple
-        driving one invocation of ``_stream_worker_native``. Used both at
-        stream entry and on the pre-output retry path.
-
-        ``stream_box`` is a single-element list that the worker populates with
-        the boto3 event-stream object once it has been opened.  The consumer
-        can call ``stream_box[0].close()`` from the async side to immediately
-        unblock a worker thread parked inside ``next(stream)`` — this prevents
-        zombie threads from exhausting the thread pool when the consumer exits
-        early (client disconnect, idle timeout, outer stream wrapper timeout).
-        """
-        event_queue: queue.Queue = queue.Queue()
-        stop_event = threading.Event()
-        stream_box: list = [None]  # filled by worker after stream is opened
-        loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(
-            _get_native_stream_executor(),
-            self._stream_worker_native,
-            model_id,
-            native_request,
-            event_queue,
-            stop_event,
-            stream_box,
-        )
-        return event_queue, future, stop_event, stream_box
-
-    def _stream_worker_native(
-        self,
-        bedrock_model_id: str,
-        native_request: Dict[str, Any],
-        event_queue: "queue.Queue[tuple]",
-        stop_event: Optional[threading.Event] = None,
-        stream_box: Optional[list] = None,
-    ) -> None:
-        """Thread-pool worker: call ``invoke_model_with_response_stream`` and
-        push native Anthropic SSE events into *event_queue*.
-
-        Queue protocol:
-            ("upstream_event", {"sse": str, "event_type": str})
-            ("done", {...})         — worker finished and reports terminal state
-            ("error", {...})        — an error occurred
-
-        ``stream_box`` is a single-element list shared with the consumer.  The
-        worker stores the open boto3 event-stream in ``stream_box[0]`` as soon
-        as it is available so the async consumer can close it from the event
-        loop thread, unblocking this thread if it is parked in ``next(stream)``.
-        """
-        stream = None
-        terminal_event_type = None
-        transport_eof_observed = False
-        worker_stopped_early = False
-        event_count = 0
-        output_bytes_received = 0
-        aws_request_id: Optional[str] = None
-        stream_start = time.monotonic()
+        if self._anthropic_client is not None:
+            return
         try:
-            if stop_event is not None and stop_event.is_set():
-                worker_stopped_early = True
-                logger.info(
-                    "[BEDROCK STREAM NATIVE] Stop requested before invoke for model=%s",
-                    bedrock_model_id,
-                )
-                event_queue.put(
-                    (
-                        "done",
-                        {
-                            "terminal_event_seen": False,
-                            "terminal_event_type": None,
-                            "transport_eof_observed": False,
-                            "event_count": 0,
-                            "worker_stopped_early": True,
-                            "aws_request_id": None,
-                            "output_bytes_received": 0,
-                        },
-                    )
-                )
-                return
-
-            response = self.bedrock_runtime_native_stream.invoke_model_with_response_stream(
-                modelId=bedrock_model_id,
-                contentType="application/json",
-                accept="application/json",
-                body=json.dumps(native_request),
-            )
-            response_metadata = response.get("ResponseMetadata", {}) or {}
-            aws_request_id = response_metadata.get("RequestId")
-            logger.info(
-                "[BEDROCK STREAM NATIVE] Stream opened: model=%s aws_request_id=%s",
-                bedrock_model_id,
-                aws_request_id or "unknown",
-            )
-            stream = response.get("body")
-            if not stream:
-                event_queue.put(
-                    (
-                        "error",
-                        {
-                            "code": "no_stream",
-                            "message": "No stream body returned from Bedrock",
-                            "error_class": "other",
-                            "aws_request_id": aws_request_id,
-                            "output_bytes_received": output_bytes_received,
-                        },
-                    )
-                )
-                return
-            # Publish the stream object so the async consumer can close it
-            # from the event loop if it needs to exit early, which unblocks
-            # this thread parked in next(stream) without waiting for the
-            # ~940s socket read_timeout.
-            if stream_box is not None:
-                stream_box[0] = stream
-
-            for event in stream:
-                if stop_event is not None and stop_event.is_set():
-                    worker_stopped_early = True
-                    logger.info(
-                        "[BEDROCK STREAM NATIVE] Stop requested during stream for model=%s events_received=%d elapsed=%.1fs",
-                        bedrock_model_id,
-                        event_count,
-                        time.monotonic() - stream_start,
-                    )
-                    break
-                if terminal_event_type is not None:
-                    # Stop consuming once the upstream sent a terminal event.
-                    # The stream is closed in the finally block below.
-                    break
-                chunk = event.get("chunk")
-                if chunk:
-                    chunk_bytes = chunk.get("bytes")
-                    if chunk_bytes:
-                        event_count += 1
-                        output_bytes_received += len(chunk_bytes)
-                        event_data = json.loads(chunk_bytes.decode("utf-8"))
-                        event_type = event_data.get("type", "unknown")
-                        sse = f"event: {event_type}\ndata: {json.dumps(event_data, ensure_ascii=False, separators=(',', ':'))}\n\n"
-                        event_queue.put(
-                            (
-                                "upstream_event",
-                                {
-                                    "sse": sse,
-                                    "event_type": event_type,
-                                    "event_data": event_data,
-                                },
-                            )
-                        )
-                        if is_anthropic_terminal_stream_event(
-                            event_type=event_type,
-                            event_data=event_data,
-                        ):
-                            terminal_event_type = event_type
-                            logger.info(
-                                "[BEDROCK STREAM NATIVE] Terminal event for model=%s event_type=%s",
-                                bedrock_model_id,
-                                event_type,
-                            )
-                            break
-
-            if terminal_event_type is None:
-                transport_eof_observed = True
-                logger.warning(
-                    "[BEDROCK STREAM NATIVE] Transport EOF without terminal event: model=%s events_received=%d elapsed=%.1fs",
-                    bedrock_model_id,
-                    event_count,
-                    time.monotonic() - stream_start,
-                )
-
-            event_queue.put(
-                (
-                    "done",
-                    {
-                        "terminal_event_seen": terminal_event_type is not None,
-                        "terminal_event_type": terminal_event_type,
-                        "transport_eof_observed": transport_eof_observed,
-                        "event_count": event_count,
-                        "worker_stopped_early": worker_stopped_early,
-                        "aws_request_id": aws_request_id,
-                        "output_bytes_received": output_bytes_received,
-                    },
-                )
-            )
-
-        except ClientError as e:
-            err = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
+            from anthropic import AsyncAnthropicBedrock  # function-scoped: optional dep
+        except ImportError:
             logger.warning(
-                "[BEDROCK STREAM NATIVE] ClientError after %d events, elapsed=%.1fs aws_request_id=%s: %s",
-                event_count,
-                time.monotonic() - stream_start,
-                aws_request_id or "unknown",
-                e,
-                exc_info=True,
+                "[BEDROCK] anthropic SDK not installed — native Claude path unavailable"
             )
-            event_queue.put(
-                (
-                    "error",
-                    {
-                        "code": err.get("Code", "ClientError"),
-                        "message": err.get("Message", str(e)),
-                        "error_class": "client_error",
-                        "aws_request_id": aws_request_id,
-                        "output_bytes_received": output_bytes_received,
-                    },
-                )
+            return
+
+        kwargs: Dict[str, Any] = {
+            "aws_region": self.aws_region,
+            # Generous ceiling so long extended-thinking responses aren't
+            # truncated (old native socket ceiling was ~900s).
+            "timeout": 900.0,
+            "max_retries": 2,
+        }
+        if self.aws_access_key and self.aws_secret_key:
+            kwargs["aws_access_key"] = self.aws_access_key
+            kwargs["aws_secret_key"] = self.aws_secret_key
+        # else: omit creds → SDK uses the default boto3 credential chain, matching
+        # how self.bedrock_runtime is built without explicit creds.
+        try:
+            self._anthropic_client = AsyncAnthropicBedrock(**kwargs)
+            logger.info(
+                "[BEDROCK] AsyncAnthropicBedrock client initialized for region=%s",
+                self.aws_region,
             )
         except Exception as e:
-            error_class = _classify_native_stream_exception(e)
-            # When the async consumer asked us to stop (client disconnect or a
-            # pre-output retry), it set stop_event before closing the socket from
-            # its side. The resulting mid-read failure here is self-inflicted and
-            # the consumer is no longer reading this queue, so log it quietly and
-            # skip the error tuple instead of emitting a misleading WARNING+traceback.
-            if stop_event is not None and stop_event.is_set():
-                logger.info(
-                    "[BEDROCK STREAM NATIVE] Worker stopped during requested teardown "
-                    "after %d events, elapsed=%.1fs aws_request_id=%s error_class=%s: %s",
-                    event_count,
-                    time.monotonic() - stream_start,
-                    aws_request_id or "unknown",
-                    error_class,
-                    e,
-                )
-            else:
-                logger.warning(
-                    "[BEDROCK STREAM NATIVE] Stream error after %d events, elapsed=%.1fs "
-                    "aws_request_id=%s error_class=%s: %s",
-                    event_count,
-                    time.monotonic() - stream_start,
-                    aws_request_id or "unknown",
-                    error_class,
-                    e,
-                    exc_info=True,
-                )
-                event_queue.put(
-                    (
-                        "error",
-                        {
-                            "code": "internal_error",
-                            "message": str(e),
-                            "error_class": error_class,
-                            "aws_request_id": aws_request_id,
-                            "output_bytes_received": output_bytes_received,
-                        },
-                    )
-                )
-        finally:
-            close_stream = getattr(stream, "close", None)
-            if callable(close_stream):
-                try:
-                    close_stream()
-                except Exception:
-                    logger.debug(
-                        "[BEDROCK STREAM NATIVE] Failed to close stream for model=%s terminal_event=%s transport_eof_observed=%s",
-                        bedrock_model_id,
-                        terminal_event_type,
-                        transport_eof_observed,
-                        exc_info=True,
-                    )
-            # Clear stream_box so a stale reference cannot be used after the worker exits.
-            if stream_box is not None:
-                stream_box[0] = None
+            logger.warning("[BEDROCK] Failed to init AsyncAnthropicBedrock client: %s", e)
 
-    def _synthesize_native_finalization_events(
-        self,
-        *,
-        cb_started: set,
-        cb_stopped: set,
-        buffered_stop_reason: Optional[str],
-        buffered_stop_sequence: Optional[str],
-        message_delta_emitted: bool,
-        message_stop_emitted: bool,
-    ):
-        """Yield synthetic terminal SSE events to close an incomplete native stream.
+    def _build_native_sdk_kwargs(
+        self, request, model_id: str, anthropic_beta: Optional[str]
+    ) -> tuple[Dict[str, Any], Optional[str]]:
+        """Build messages.create/stream kwargs from a request via the Bedrock transform.
 
-        Emits content_block_stop for every still-open block, then message_delta
-        (with stop_reason="end_turn" if none was buffered) and message_stop if
-        the message was never cleanly terminated.  Called before raising on every
-        error path in _consume_native_stream_events so that clients receive a
-        well-formed Anthropic SSE stream even when the upstream connection drops.
+        Reuses ``_convert_to_anthropic_native_request`` (which encodes every
+        Bedrock-Claude quirk) then adapts the resulting body to the SDK call
+        contract: drop the body-level ``anthropic_version`` (SDK injects it),
+        lift ``anthropic_beta`` to the header, set ``model``, and route the
+        non-native ``context_management`` field into ``extra_body``.
         """
-        for idx in sorted(cb_started - cb_stopped):
-            yield self._format_anthropic_sse_event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": idx,
-            })
-        if not message_stop_emitted:
-            if not message_delta_emitted:
-                yield self._format_anthropic_sse_event("message_delta", {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": buffered_stop_reason or "end_turn",
-                        "stop_sequence": buffered_stop_sequence,
-                    },
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
-                })
-            yield self._format_anthropic_sse_event("message_stop", {"type": "message_stop"})
+        native = self._convert_to_anthropic_native_request(request, anthropic_beta)
+        self._apply_native_cache_ttl(native)
+        self._strip_native_cache_scope(native)  # Bedrock rejects cache_control.scope
 
-    async def _consume_native_stream_events(
-        self,
-        request: Any,
-        model_id: str,
-        event_queue: "queue.Queue[tuple]",
-        future: asyncio.Future,
-        stop_event: Optional[threading.Event] = None,
-        restart_worker: Optional[Any] = None,
-        stream_box: Optional[list] = None,
-    ) -> AsyncGenerator[str, None]:
-        """Consume worker events for Bedrock native Claude streaming.
+        native.pop("anthropic_version", None)  # SDK injects bedrock-2023-05-31 itself
+        betas = native.pop("anthropic_beta", None)  # SDK takes betas as a header
+        native["model"] = model_id  # transform doesn't set model
 
-        ``stream_box`` is a single-element list populated by the worker with
-        the open boto3 event-stream object.  On early consumer exit (client
-        disconnect, idle timeout, outer stream-wrapper timeout) the ``finally``
-        block calls ``stream_box[0].close()`` to immediately unblock a worker
-        thread parked inside ``next(stream)``, preventing zombie threads that
-        would otherwise hold thread-pool slots for up to ~940 s.
+        # context_management is NOT a native messages.create param (the SDK would
+        # raise a client-side TypeError). Route it through extra_body so it reaches
+        # Bedrock. output_config IS a native param and stays top-level.
+        if "context_management" in native:
+            native.setdefault("extra_body", {})["context_management"] = native.pop(
+                "context_management"
+            )
+
+        beta_header = ",".join(betas) if betas else None
+        return native, beta_header
+
+    def _translate_bedrock_sdk_error(self, e: Exception):
+        """Map an AsyncAnthropicBedrock SDK error to a ProviderHTTPError.
+
+        Reuses the canonical translator so SDK exceptions become correct HTTP
+        statuses (429/400/403/404/5xx) with Anthropic-shaped bodies. Non-Anthropic
+        exceptions are returned unchanged for the caller to re-raise.
         """
-        stream_started_at = time.monotonic()
-        last_progress_event_at = stream_started_at
-        last_progress_event_type: Optional[str] = None
-        progress_event_count = 0
-        proxy_ping_count = 0
-        saw_first_progress_event = False
-        warning_logged = False
-        future_done_empty_checks = 0
-        future_done_since: Optional[float] = None
-        last_ping_sent_at = stream_started_at
-        # One retry permitted when the upstream drops before any progress event
-        # has been forwarded to the client. Resetting it requires a fresh worker.
-        retries_remaining = 1 if (BEDROCK_NATIVE_RETRY_ON_PRE_OUTPUT_DROP and restart_worker is not None) else 0
-        # Stream-state tracking for graceful finalization on mid-stream errors.
-        _message_start_seen = False
-        _cb_started: set = set()
-        _cb_stopped: set = set()
-        _buffered_stop_reason: Optional[str] = None
-        _buffered_stop_sequence: Optional[str] = None
-        _message_delta_emitted = False
-        _message_stop_emitted = False
-        # Drop-diagnostic state, populated from worker queue payloads.
-        _aws_request_id: Optional[str] = None
-        _output_bytes_received = 0
-
-        initial_timeout, initial_phase = self._get_native_stream_idle_timeout(
-            request,
-            saw_first_progress_event=False,
-        )
-        logger.info(
-            "[BEDROCK STREAM NATIVE] Start: provider=%s model=%s phase=%s "
-            "idle_timeout_seconds=%s thinking_enabled=%s tools_present=%s",
-            getattr(self, "full_provider_name", "bedrock"),
-            model_id,
-            initial_phase,
-            initial_timeout,
-            self._is_native_stream_thinking_enabled(request),
-            bool(getattr(request, "tools", None)),
-        )
-
         try:
-            while True:
-                try:
-                    msg_type, data = event_queue.get_nowait()
-                except queue.Empty:
-                    await asyncio.sleep(0.01)
-                    now = time.monotonic()
+            import anthropic
+        except ImportError:
+            return e
+        if isinstance(e, anthropic.AnthropicError):
+            from app.providers.anthropic_compatible import _translate_anthropic_sdk_error
 
-                    active_timeout, phase = self._get_native_stream_idle_timeout(
-                        request,
-                        saw_first_progress_event,
-                    )
-                    idle_seconds = now - last_progress_event_at
-                    warning_threshold = active_timeout * _BEDROCK_NATIVE_WARNING_THRESHOLD_RATIO
-                    if not warning_logged and idle_seconds >= warning_threshold:
-                        logger.warning(
-                            "[BEDROCK STREAM NATIVE] Upstream idle warning: model=%s phase=%s "
-                            "idle_seconds=%.1f threshold_seconds=%s last_progress_event=%s "
-                            "progress_event_count=%s proxy_ping_count=%s",
-                            model_id,
-                            phase,
-                            idle_seconds,
-                            active_timeout,
-                            last_progress_event_type or "none",
-                            progress_event_count,
-                            proxy_ping_count,
-                        )
-                        warning_logged = True
-
-                    if idle_seconds >= active_timeout:
-                        logger.warning(
-                            "[BEDROCK STREAM NATIVE] Upstream idle timeout: model=%s phase=%s "
-                            "idle_seconds=%.1f threshold_seconds=%s last_progress_event=%s "
-                            "progress_event_count=%s proxy_ping_count=%s",
-                            model_id,
-                            phase,
-                            idle_seconds,
-                            active_timeout,
-                            last_progress_event_type or "none",
-                            progress_event_count,
-                            proxy_ping_count,
-                        )
-                        self._log_native_stream_drop(
-                            request=request,
-                            model_id=model_id,
-                            aws_request_id=_aws_request_id,
-                            error_class="idle_timeout",
-                            elapsed_seconds=now - stream_started_at,
-                            progress_event_count=progress_event_count,
-                            last_progress_event_type=last_progress_event_type,
-                            proxy_ping_count=proxy_ping_count,
-                            output_bytes_received=_output_bytes_received,
-                        )
-                        if _message_start_seen:
-                            for _sse in self._synthesize_native_finalization_events(
-                                cb_started=_cb_started,
-                                cb_stopped=_cb_stopped,
-                                buffered_stop_reason=_buffered_stop_reason,
-                                buffered_stop_sequence=_buffered_stop_sequence,
-                                message_delta_emitted=_message_delta_emitted,
-                                message_stop_emitted=_message_stop_emitted,
-                            ):
-                                yield _sse
-                        raise BedrockNativeIdleTimeout(
-                            model=request.model,
-                            phase=phase,
-                            idle_seconds=idle_seconds,
-                            threshold_seconds=active_timeout,
-                            last_progress_event_type=last_progress_event_type,
-                            progress_event_count=progress_event_count,
-                            proxy_ping_count=proxy_ping_count,
-                        )
-
-                    if now - last_ping_sent_at >= self.native_stream_ping_interval:
-                        yield "event: ping\ndata: {}\n\n"
-                        proxy_ping_count += 1
-                        last_ping_sent_at = now
-
-                    # Detect premature worker thread death. We require the queue to
-                    # be empty on 2 consecutive loop iterations after future.done()
-                    # returns True before declaring a premature EOF. This guards
-                    # against the following race: the worker puts the "done" message
-                    # into the queue and then the Future is resolved; if future.done()
-                    # fired first (before the "done" message was consumed), a single
-                    # check could misfire. Two consecutive empty checks are enough
-                    # because the queue-put happens in the worker thread before the
-                    # concurrent.futures executor marks the Future done, and the
-                    # asyncio event loop has always yielded at least once between
-                    # the two checks (via asyncio.sleep(0.01)).
-                    if future.done():
-                        if future_done_since is None:
-                            future_done_since = now
-                        future_done_empty_checks += 1
-                        if (
-                            future_done_empty_checks >= _BEDROCK_NATIVE_FUTURE_DONE_EMPTY_CHECKS
-                            and (now - future_done_since) >= _BEDROCK_NATIVE_FUTURE_DONE_GRACE_SECONDS
-                        ):
-                            try:
-                                future.result()
-                            except Exception as exc:
-                                self._log_native_stream_drop(
-                                    request=request,
-                                    model_id=model_id,
-                                    aws_request_id=_aws_request_id,
-                                    error_class=_classify_native_stream_exception(exc),
-                                    elapsed_seconds=now - stream_started_at,
-                                    progress_event_count=progress_event_count,
-                                    last_progress_event_type=last_progress_event_type,
-                                    proxy_ping_count=proxy_ping_count,
-                                    output_bytes_received=_output_bytes_received,
-                                )
-                                if _message_start_seen:
-                                    for _sse in self._synthesize_native_finalization_events(
-                                        cb_started=_cb_started,
-                                        cb_stopped=_cb_stopped,
-                                        buffered_stop_reason=_buffered_stop_reason,
-                                        buffered_stop_sequence=_buffered_stop_sequence,
-                                        message_delta_emitted=_message_delta_emitted,
-                                        message_stop_emitted=_message_stop_emitted,
-                                    ):
-                                        yield _sse
-                                raise BedrockNativeProviderError(
-                                    "internal_error",
-                                    str(exc),
-                                ) from exc
-                            logger.warning(
-                                "[BEDROCK STREAM NATIVE] Future resolved without terminal queue event: "
-                                "model=%s empty_checks=%s future_done_elapsed=%.3fs",
-                                model_id,
-                                future_done_empty_checks,
-                                now - future_done_since,
-                            )
-                            self._log_native_stream_drop(
-                                request=request,
-                                model_id=model_id,
-                                aws_request_id=_aws_request_id,
-                                error_class="premature_eof",
-                                elapsed_seconds=now - stream_started_at,
-                                progress_event_count=progress_event_count,
-                                last_progress_event_type=last_progress_event_type,
-                                proxy_ping_count=proxy_ping_count,
-                                output_bytes_received=_output_bytes_received,
-                            )
-                            if _message_start_seen:
-                                for _sse in self._synthesize_native_finalization_events(
-                                    cb_started=_cb_started,
-                                    cb_stopped=_cb_stopped,
-                                    buffered_stop_reason=_buffered_stop_reason,
-                                    buffered_stop_sequence=_buffered_stop_sequence,
-                                    message_delta_emitted=_message_delta_emitted,
-                                    message_stop_emitted=_message_stop_emitted,
-                                ):
-                                    yield _sse
-                            raise BedrockNativePrematureEOF(
-                                model=request.model,
-                                transport_eof_observed=False,
-                                last_progress_event_type=last_progress_event_type,
-                                progress_event_count=progress_event_count,
-                                proxy_ping_count=proxy_ping_count,
-                            )
-                    else:
-                        future_done_empty_checks = 0
-                        future_done_since = None
-                    continue
-
-                future_done_empty_checks = 0
-                future_done_since = None
-
-                if msg_type == "upstream_event":
-                    event_type = data.get("event_type", "unknown")
-                    yield data.get("sse", "")
-
-                    event_data_fwd = data.get("event_data") or {}
-                    if event_type == "message_start":
-                        _message_start_seen = True
-                    elif event_type == "content_block_start":
-                        idx = event_data_fwd.get("index")
-                        if idx is not None:
-                            _cb_started.add(idx)
-                    elif event_type == "content_block_stop":
-                        idx = event_data_fwd.get("index")
-                        if idx is not None:
-                            _cb_stopped.add(idx)
-                    elif event_type == "message_delta":
-                        _message_delta_emitted = True
-                        delta = event_data_fwd.get("delta") or {}
-                        _buffered_stop_reason = delta.get("stop_reason") or _buffered_stop_reason
-                        _buffered_stop_sequence = delta.get("stop_sequence") or _buffered_stop_sequence
-                    elif event_type == "message_stop":
-                        _message_stop_emitted = True
-
-                    if event_type in _BEDROCK_NATIVE_PROGRESS_EVENT_TYPES:
-                        last_progress_event_at = time.monotonic()
-                        last_progress_event_type = event_type
-                        progress_event_count += 1
-                        warning_logged = False
-
-                        if not saw_first_progress_event:
-                            saw_first_progress_event = True
-                            active_timeout, phase = self._get_native_stream_idle_timeout(
-                                request,
-                                saw_first_progress_event,
-                            )
-                            logger.info(
-                                "[BEDROCK STREAM NATIVE] First upstream progress event: model=%s "
-                                "event_type=%s phase=%s next_idle_threshold_seconds=%s",
-                                model_id,
-                                event_type,
-                                phase,
-                                active_timeout,
-                            )
-                    continue
-
-                if msg_type == "error":
-                    _aws_request_id = data.get("aws_request_id") or _aws_request_id
-                    _output_bytes_received = max(
-                        _output_bytes_received,
-                        int(data.get("output_bytes_received") or 0),
-                    )
-                    logger.warning(
-                        "[BEDROCK STREAM NATIVE] Worker reported provider error: provider=%s "
-                        "model=%s last_progress_event=%s progress_event_count=%s "
-                        "proxy_ping_count=%s code=%s",
-                        getattr(self, "full_provider_name", "bedrock"),
-                        model_id,
-                        last_progress_event_type or "none",
-                        progress_event_count,
-                        proxy_ping_count,
-                        data.get("code", "internal_error"),
-                    )
-                    self._log_native_stream_drop(
-                        request=request,
-                        model_id=model_id,
-                        aws_request_id=_aws_request_id,
-                        error_class=data.get("error_class") or "other",
-                        elapsed_seconds=time.monotonic() - stream_started_at,
-                        progress_event_count=progress_event_count,
-                        last_progress_event_type=last_progress_event_type,
-                        proxy_ping_count=proxy_ping_count,
-                        output_bytes_received=_output_bytes_received,
-                    )
-                    _NON_RETRYABLE_CODES = {
-                        "ValidationException",
-                        "AccessDeniedException",
-                        "ResourceNotFoundException",
-                        "ModelNotReadyException",
-                    }
-                    if (
-                        progress_event_count == 0
-                        and retries_remaining > 0
-                        and restart_worker is not None
-                        and data.get("code") not in _NON_RETRYABLE_CODES
-                    ):
-                        retries_remaining -= 1
-                        logger.warning(
-                            "[BEDROCK STREAM NATIVE] Retrying after pre-output drop: model=%s "
-                            "error_class=%s aws_request_id=%s",
-                            model_id,
-                            data.get("error_class") or "other",
-                            _aws_request_id or "unknown",
-                        )
-                        if stop_event is not None and not stop_event.is_set():
-                            stop_event.set()
-                        # Close any still-open stream on the old worker so its
-                        # thread exits without waiting for the socket timeout.
-                        _close_stream_box(stream_box)
-                        event_queue, future, stop_event, stream_box = restart_worker()
-                        # Reset per-attempt diagnostic state; client has seen
-                        # at most proxy pings, so any synthesis state is moot.
-                        stream_started_at = time.monotonic()
-                        last_progress_event_at = stream_started_at
-                        last_ping_sent_at = stream_started_at
-                        future_done_empty_checks = 0
-                        future_done_since = None
-                        warning_logged = False
-                        _aws_request_id = None
-                        _output_bytes_received = 0
-                        continue
-                    if _message_start_seen:
-                        for _sse in self._synthesize_native_finalization_events(
-                            cb_started=_cb_started,
-                            cb_stopped=_cb_stopped,
-                            buffered_stop_reason=_buffered_stop_reason,
-                            buffered_stop_sequence=_buffered_stop_sequence,
-                            message_delta_emitted=_message_delta_emitted,
-                            message_stop_emitted=_message_stop_emitted,
-                        ):
-                            yield _sse
-                    raise BedrockNativeProviderError(
-                        data.get("code", "internal_error"),
-                        data.get("message", "Bedrock native streaming failed"),
-                    )
-
-                if msg_type == "done":
-                    _aws_request_id = data.get("aws_request_id") or _aws_request_id
-                    _output_bytes_received = max(
-                        _output_bytes_received,
-                        int(data.get("output_bytes_received") or 0),
-                    )
-                    terminal_event_seen = bool(data.get("terminal_event_seen"))
-                    terminal_event_type = data.get("terminal_event_type")
-                    transport_eof_observed = bool(data.get("transport_eof_observed"))
-                    event_count = int(data.get("event_count", 0))
-                    worker_stopped_early = bool(data.get("worker_stopped_early"))
-                    if terminal_event_seen or worker_stopped_early:
-                        logger.info(
-                            "[BEDROCK STREAM NATIVE] Completed: model=%s terminal_event_type=%s "
-                            "worker_stopped_early=%s event_count=%s progress_event_count=%s "
-                            "proxy_ping_count=%s duration_seconds=%.2f aws_request_id=%s "
-                            "output_bytes_received=%d",
-                            model_id,
-                            terminal_event_type,
-                            worker_stopped_early,
-                            event_count,
-                            progress_event_count,
-                            proxy_ping_count,
-                            time.monotonic() - stream_started_at,
-                            _aws_request_id or "unknown",
-                            _output_bytes_received,
-                        )
-                        break
-
-                    logger.warning(
-                        "[BEDROCK STREAM NATIVE] Premature EOF: provider=%s model=%s "
-                        "transport_eof_observed=%s last_progress_event=%s "
-                        "progress_event_count=%s proxy_ping_count=%s event_count=%s",
-                        getattr(self, "full_provider_name", "bedrock"),
-                        model_id,
-                        transport_eof_observed,
-                        last_progress_event_type or "none",
-                        progress_event_count,
-                        proxy_ping_count,
-                        event_count,
-                    )
-                    self._log_native_stream_drop(
-                        request=request,
-                        model_id=model_id,
-                        aws_request_id=_aws_request_id,
-                        error_class="premature_eof",
-                        elapsed_seconds=time.monotonic() - stream_started_at,
-                        progress_event_count=progress_event_count,
-                        last_progress_event_type=last_progress_event_type,
-                        proxy_ping_count=proxy_ping_count,
-                        output_bytes_received=_output_bytes_received,
-                    )
-                    if _message_start_seen:
-                        for _sse in self._synthesize_native_finalization_events(
-                            cb_started=_cb_started,
-                            cb_stopped=_cb_stopped,
-                            buffered_stop_reason=_buffered_stop_reason,
-                            buffered_stop_sequence=_buffered_stop_sequence,
-                            message_delta_emitted=_message_delta_emitted,
-                            message_stop_emitted=_message_stop_emitted,
-                        ):
-                            yield _sse
-                    raise BedrockNativePrematureEOF(
-                        model=request.model,
-                        transport_eof_observed=transport_eof_observed,
-                        last_progress_event_type=last_progress_event_type,
-                        progress_event_count=progress_event_count,
-                        proxy_ping_count=proxy_ping_count,
-                    )
-
-                logger.warning(
-                    "[BEDROCK STREAM NATIVE] Ignoring unknown worker queue message type=%s for model=%s",
-                    msg_type,
-                    model_id,
-                )
-        finally:
-            if stop_event is not None and not stop_event.is_set() and not future.done():
-                stop_event.set()
-                logger.debug(
-                    "[BEDROCK STREAM NATIVE] Signalled worker stop for model=%s future_done=%s",
-                    model_id,
-                    future.done(),
-                )
-            # Close the boto3 event-stream (if still open) so the worker thread
-            # unblocks out of next(stream) immediately instead of waiting up to
-            # ~940 s for the socket read_timeout.  Safe to call from the async
-            # side because boto3's EventStream.close() acquires no Python-side
-            # lock that the worker holds; it only closes the underlying socket.
-            _close_stream_box(stream_box)
+            return _translate_anthropic_sdk_error(
+                e, getattr(self, "full_provider_name", "bedrock")
+            )
+        return e
 
     def _cache_control_to_cache_point_block(self, cache_control: Any) -> Optional[Dict[str, Any]]:
         if cache_control is None:
@@ -3896,51 +2775,43 @@ class BedrockProvider(BaseProvider):
     async def anthropic_messages(self, request, anthropic_beta: Optional[str] = None) -> Any:
         """Handle Anthropic Messages API request.
 
-        Routes Claude models through the InvokeModel API (native Anthropic JSON)
-        and non-Claude models through the Converse API.
+        Routes Claude models through the AsyncAnthropicBedrock SDK (native
+        Anthropic JSON) and non-Claude models through the Converse API.
         """
         model_id = self._resolve_bedrock_anthropic_model_id(request.model)
 
-        # ── Native InvokeModel path for Claude models ──────────────────────
+        # ── Native path for Claude models (AsyncAnthropicBedrock SDK) ──────
         if self._is_claude_model(model_id):
-            native_request = self._convert_to_anthropic_native_request(request, anthropic_beta)
-            self._apply_native_cache_ttl(native_request)
-            self._strip_native_cache_scope(native_request)
+            self._init_bedrock_anthropic_client()
+            if self._anthropic_client is None:
+                raise NotImplementedError(
+                    "anthropic SDK not available for Bedrock native path"
+                )
+
+            kwargs, beta_header = self._build_native_sdk_kwargs(
+                request, model_id, anthropic_beta
+            )
+            if beta_header:
+                kwargs["extra_headers"] = {"anthropic-beta": beta_header}
 
             if self.debug:
                 logger.info(
-                    "[BEDROCK NATIVE] InvokeModel request: model=%s, msgs=%d, tools=%s, thinking=%s",
+                    "[BEDROCK NATIVE] messages.create: model=%s, msgs=%d, tools=%s, thinking=%s",
                     model_id,
-                    len(native_request.get("messages", [])),
-                    bool(native_request.get("tools")),
-                    bool(native_request.get("thinking")),
+                    len(kwargs.get("messages", [])),
+                    bool(kwargs.get("tools")),
+                    bool(kwargs.get("thinking")),
                 )
 
-            def _invoke() -> Dict[str, Any]:
-                resp = self.bedrock_runtime.invoke_model(
-                    modelId=model_id,
-                    contentType="application/json",
-                    accept="application/json",
-                    body=json.dumps(native_request),
-                )
-                return json.loads(resp["body"].read())
+            try:
+                response = await self._anthropic_client.messages.create(**kwargs)
+            except Exception as e:
+                raise self._translate_bedrock_sdk_error(e) from e
 
-            semaphore = _get_native_semaphore()
-            async with semaphore:
-                loop = asyncio.get_running_loop()
-                try:
-                    response_body = await loop.run_in_executor(
-                        _get_native_executor(), _invoke
-                    )
-                except ClientError as e:
-                    err = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
-                    code = err.get("Code", "ClientError")
-                    msg = err.get("Message", str(e))
-                    mapped = _map_bedrock_error(code, msg)
-                    from fastapi import HTTPException
-                    raise HTTPException(status_code=mapped["status"], detail=mapped["body"])
-
-            return self._convert_native_response(response_body, request.model)
+            result = json.loads(response.model_dump_json(warnings="none"))
+            # Echo the client-facing model name; keep the real upstream message id.
+            result["model"] = request.model
+            return result
 
         # ── Converse path for non-Claude models ────────────────────────────
         args = await run_in_threadpool(self._build_bedrock_anthropic_args, request, anthropic_beta)
@@ -3992,68 +2863,84 @@ class BedrockProvider(BaseProvider):
     async def anthropic_messages_stream(self, request, anthropic_beta: Optional[str] = None) -> AsyncGenerator[str, None]:
         """Handle streaming Anthropic Messages API request.
 
-        Routes Claude models through InvokeModelWithResponseStream (native
-        Anthropic SSE events via a queue+thread worker), and non-Claude models
-        through the Converse Stream API.
+        Routes Claude models through the AsyncAnthropicBedrock SDK
+        (``messages.stream`` → native Anthropic SSE events), and non-Claude
+        models through the Converse Stream API.
         """
         model_id = self._resolve_bedrock_anthropic_model_id(request.model)
 
-        # ── Native InvokeModelWithResponseStream for Claude models ─────────
+        # ── Native streaming for Claude models (AsyncAnthropicBedrock SDK) ──
         if self._is_claude_model(model_id):
-            native_request = self._convert_to_anthropic_native_request(request, anthropic_beta)
-            self._apply_native_cache_ttl(native_request)
-            self._strip_native_cache_scope(native_request)
+            self._init_bedrock_anthropic_client()
+            if self._anthropic_client is None:
+                raise NotImplementedError(
+                    "anthropic SDK not available for Bedrock native streaming path"
+                )
+
+            kwargs, beta_header = self._build_native_sdk_kwargs(
+                request, model_id, anthropic_beta
+            )
+            if beta_header:
+                kwargs["extra_headers"] = {"anthropic-beta": beta_header}
 
             if self.debug:
                 logger.info(
-                    "[BEDROCK STREAM NATIVE] model=%s, msgs=%d, tools=%s, thinking=%s",
+                    "[BEDROCK STREAM NATIVE] messages.stream: model=%s, msgs=%d, tools=%s, thinking=%s",
                     model_id,
-                    len(native_request.get("messages", [])),
-                    bool(native_request.get("tools")),
-                    bool(native_request.get("thinking")),
+                    len(kwargs.get("messages", [])),
+                    bool(kwargs.get("tools")),
+                    bool(kwargs.get("thinking")),
                 )
 
-            # Use the dedicated streaming semaphore (separate from the non-stream
-            # InvokeModel semaphore) so long-running stream workers cannot starve
-            # synchronous calls and vice versa.
-            semaphore = _get_native_stream_semaphore()
-            semaphore_wait_started_at = time.monotonic()
-            acquired_semaphore = False
+            full_provider_name = getattr(self, "full_provider_name", "bedrock")
+            terminal_event_type = None
+            terminal_seen_at: Optional[float] = None
+            drained_event_count = 0
 
             try:
-                await semaphore.acquire()
-                acquired_semaphore = True
-                semaphore_wait_seconds = time.monotonic() - semaphore_wait_started_at
-                if semaphore_wait_seconds >= _BEDROCK_NATIVE_SEMAPHORE_WAIT_WARNING_SECONDS:
-                    logger.warning(
-                        "[BEDROCK STREAM NATIVE] Waited %.2fs for native stream semaphore: model=%s",
-                        semaphore_wait_seconds,
-                        model_id,
-                    )
-                else:
-                    logger.debug(
-                        "[BEDROCK STREAM NATIVE] Acquired native stream semaphore in %.2fs: model=%s",
-                        semaphore_wait_seconds,
-                        model_id,
-                    )
+                async with self._anthropic_client.messages.stream(**kwargs) as stream:
+                    async for event in stream:
+                        if terminal_event_type is not None:
+                            drained_event_count += 1
+                            drain_stop_reason = get_anthropic_post_terminal_drain_stop_reason(
+                                terminal_seen_at=terminal_seen_at,
+                                drained_event_count=drained_event_count,
+                            )
+                            if drain_stop_reason is not None:
+                                logger.warning(
+                                    "[BEDROCK STREAM NATIVE] post-terminal drain budget reached "
+                                    "provider=%s model=%s terminal_event=%s drained_event_count=%s stop_reason=%s",
+                                    full_provider_name,
+                                    request.model,
+                                    terminal_event_type,
+                                    drained_event_count,
+                                    drain_stop_reason,
+                                )
+                                break
+                            continue
 
-                event_queue, future, stop_event, stream_box = self._start_native_stream_worker(
-                    model_id, native_request,
-                )
+                        json_str = event.model_dump_json(exclude_none=True, warnings="none")
+                        event_data = json.loads(json_str)
+                        event_type = (
+                            event_data.get("type", "unknown")
+                            if isinstance(event_data, dict)
+                            else "unknown"
+                        )
+                        yield f"event: {event_type}\ndata: {json_str}\n\n"
 
-                async for sse_chunk in self._consume_native_stream_events(
-                    request,
-                    model_id,
-                    event_queue,
-                    future,
-                    stop_event,
-                    restart_worker=lambda: self._start_native_stream_worker(model_id, native_request),
-                    stream_box=stream_box,
-                ):
-                    yield sse_chunk
-            finally:
-                if acquired_semaphore:
-                    semaphore.release()
+                        if is_anthropic_terminal_stream_event(
+                            event_type=event_type, event_data=event_data
+                        ):
+                            terminal_event_type = event_type
+                            terminal_seen_at = time.monotonic()
+                            logger.info(
+                                "[BEDROCK STREAM NATIVE] terminal event provider=%s model=%s event_type=%s",
+                                full_provider_name,
+                                request.model,
+                                event_type,
+                            )
+            except Exception as e:
+                raise self._translate_bedrock_sdk_error(e) from e
             return
 
         # ── Converse Stream path for non-Claude models ─────────────────────

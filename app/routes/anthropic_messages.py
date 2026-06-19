@@ -22,11 +22,6 @@ from app.anthropic_models import (
     is_anthropic_terminal_stream_event,
 )
 from app.providers.provider_manager import provider_manager
-from app.providers.bedrock_provider import (
-    BedrockNativeIdleTimeout,
-    BedrockNativePrematureEOF,
-    BedrockNativeProviderError,
-)
 from app.providers.custom_providers import CustomProvider
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
 from app.auth.middleware import authenticate_anthropic_request
@@ -313,71 +308,6 @@ async def create_message(
                                         error_message,
                                     )
                             yield chunk
-                    except BedrockNativeIdleTimeout as e:
-                        logger.warning("Bedrock native idle timeout: %s", e)
-                        current_span = get_current_span()
-                        if current_span:
-                            add_span_attributes(
-                                current_span,
-                                {
-                                    "stream.termination_reason": "bedrock_native_idle_timeout",
-                                    "bedrock.stream.phase": e.phase,
-                                },
-                            )
-                        set_request_tracking_outcome(
-                            request_obj,
-                            status="errored",
-                            termination_reason="bedrock_native_idle_timeout",
-                            error=str(e),
-                        )
-                        yield format_anthropic_sse_event("error", {
-                            "type": "error",
-                            "error": {
-                                "type": "timeout_error",
-                                "message": str(e),
-                            }
-                        })
-                    except BedrockNativePrematureEOF as e:
-                        logger.warning("Bedrock native premature EOF: %s", e)
-                        current_span = get_current_span()
-                        if current_span:
-                            add_span_attributes(
-                                current_span,
-                                {
-                                    "stream.termination_reason": "bedrock_native_premature_eof",
-                                },
-                            )
-                        set_request_tracking_outcome(
-                            request_obj,
-                            status="errored",
-                            termination_reason="bedrock_native_premature_eof",
-                            error=str(e),
-                        )
-                        yield format_anthropic_sse_event("error", {
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": str(e),
-                            }
-                        })
-                    except BedrockNativeProviderError as e:
-                        logger.warning("Bedrock native provider error: %s", e)
-                        current_span = get_current_span()
-                        if current_span:
-                            add_span_attributes(
-                                current_span,
-                                {
-                                    "stream.termination_reason": "bedrock_native_provider_error",
-                                    "bedrock.error_code": e.error_code,
-                                },
-                            )
-                        set_request_tracking_outcome(
-                            request_obj,
-                            status="errored",
-                            termination_reason="bedrock_native_provider_error",
-                            error=e.error_message,
-                        )
-                        yield format_anthropic_sse_event("error", e.body)
                     except NotImplementedError:
                         set_request_tracking_outcome(
                             request_obj,

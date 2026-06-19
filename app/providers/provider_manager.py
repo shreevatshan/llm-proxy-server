@@ -105,7 +105,7 @@ class ProviderManager:
                     elif hasattr(anthropic_client, 'close'):
                         await anthropic_client.close()
                 # Close boto3 sync clients (urllib3 connection pools)
-                for boto_attr in ('bedrock_runtime', 'bedrock_runtime_native_stream', 'bedrock_client'):
+                for boto_attr in ('bedrock_runtime', 'bedrock_client'):
                     boto_client = getattr(provider, boto_attr, None)
                     if boto_client is not None:
                         try:
@@ -720,9 +720,14 @@ class ProviderManager:
             try:
                 for attr in ('client', '_responses_client', '_v1_client', '_anthropic_client'):
                     client = getattr(provider, attr, None)
-                    if client and hasattr(client, 'close'):
+                    if not client:
+                        continue
+                    # Prefer aclose() (anthropic SDK), fall back to close().
+                    if hasattr(client, 'aclose'):
+                        await client.aclose()
+                    elif hasattr(client, 'close'):
                         await client.close()
-                for boto_attr in ('bedrock_runtime', 'bedrock_runtime_native_stream', 'bedrock_client'):
+                for boto_attr in ('bedrock_runtime', 'bedrock_client'):
                     boto_client = getattr(provider, boto_attr, None)
                     if boto_client is not None:
                         try:

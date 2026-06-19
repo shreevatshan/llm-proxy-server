@@ -205,11 +205,16 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
     # the finally-block aclose() raises "asynchronous generator is already
     # running". This mirrors _stream_with_timeout_and_disconnect_anthropic.
     next_chunk_task: Optional[asyncio.Task] = None
+    pending_chunk_started_at: Optional[float] = None
     try:
         chunk_count = 0
 
         while True:
-            # Check if client disconnected (debounced - every N chunks)
+            # Check if client disconnected (debounced - every N chunks).
+            # This is the post-chunk check; disconnect is ALSO polled during the
+            # per-chunk wait below so a hang before the first/next chunk is caught
+            # within STREAM_DISCONNECT_POLL_SECONDS rather than after the full
+            # STREAM_CHUNK_TIMEOUT_SECONDS budget (matches the Anthropic path).
             chunk_count += 1
             if (
                 chunk_count <= STREAM_EARLY_DISCONNECT_CHECK_CHUNKS
@@ -221,17 +226,20 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
 
             if next_chunk_task is None:
                 next_chunk_task = asyncio.create_task(gen_iter.__anext__())
+                pending_chunk_started_at = time.monotonic()
 
-            # Wait for next chunk with per-chunk timeout.
-            done, _ = await asyncio.wait(
-                {next_chunk_task}, timeout=STREAM_CHUNK_TIMEOUT_SECONDS
-            )
-            if not done:
+            # Enforce the per-chunk timeout across multiple short waits so we can
+            # poll for client disconnect in between.
+            assert pending_chunk_started_at is not None
+            elapsed_wait = time.monotonic() - pending_chunk_started_at
+            remaining_chunk_budget = STREAM_CHUNK_TIMEOUT_SECONDS - elapsed_wait
+            if remaining_chunk_budget <= 0:
                 logger.warning(f"Chunk timeout after {STREAM_CHUNK_TIMEOUT_SECONDS}s")
                 await _cancel_pending_task(
                     next_chunk_task, task_name="next chunk task after chunk timeout"
                 )
                 next_chunk_task = None
+                pending_chunk_started_at = None
                 # Send timeout notification (OpenAI-compatible error format)
                 error_data = {
                     "error": {
@@ -245,8 +253,21 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                 yield "data: [DONE]\n\n"  # Proper stream termination
                 break
 
+            wait_timeout = min(STREAM_DISCONNECT_POLL_SECONDS, remaining_chunk_budget)
+            done, _ = await asyncio.wait({next_chunk_task}, timeout=wait_timeout)
+            if not done:
+                # Provider still producing the next chunk; check whether the
+                # client gave up before we burn the whole chunk budget waiting.
+                if await _request_is_disconnected(request):
+                    logger.info(
+                        f"Client disconnected after {chunk_count} chunks while waiting for next chunk, stopping stream"
+                    )
+                    break
+                continue
+
             task = next_chunk_task
             next_chunk_task = None
+            pending_chunk_started_at = None
             try:
                 chunk = task.result()
             except StopAsyncIteration:

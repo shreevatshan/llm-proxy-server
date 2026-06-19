@@ -148,6 +148,19 @@ async def shared_shutdown():
     except Exception as e:
         print(f"Error closing provider clients: {e}")
 
+    # Phase 3: Dispose the SQLAlchemy engines. aiosqlite runs each connection on
+    # a non-daemon worker thread that only terminates when the connection is
+    # closed; the async engine's pool keeps it open, so without disposal that
+    # thread blocks interpreter shutdown. Safe here because every DB user
+    # (request_tracker, auth_cache, rate_limit_tracker, model_cache) was stopped
+    # in Phase 1 and provider clients closed in Phase 2.
+    try:
+        from app.auth.database import engine, sync_engine
+        await engine.dispose()
+        sync_engine.dispose()
+    except Exception as e:
+        print(f"Error disposing DB engines: {e}")
+
     print("Application shutdown complete")
 
 

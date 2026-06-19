@@ -253,6 +253,41 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(closed["value"], "generator should be closed on cancel")
 
+    async def test_openai_wrapper_detects_client_disconnect_while_chunk_pending(self):
+        # Regression: the chat path must poll for client disconnect DURING the
+        # per-chunk wait, not only after a chunk arrives. Otherwise a request
+        # whose first/next chunk is slow stays "active" with no output until the
+        # full STREAM_CHUNK_TIMEOUT_SECONDS budget elapses. The Anthropic path
+        # already did this; the chat path was brought to parity.
+        request = _FakeRequest(disconnect_after=1)
+        closed = {"value": False}
+
+        async def generator():
+            try:
+                # Never yields — emulates a provider that opened the stream
+                # (headers sent, 200 OK logged) but stalls before the first event.
+                await asyncio.Future()
+                yield 'data: {"id":"never"}\n\n'  # pragma: no cover
+            finally:
+                closed["value"] = True
+
+        with patch.object(stream_utils, "STREAM_DISCONNECT_POLL_SECONDS", 0.05), \
+                patch.object(stream_utils, "STREAM_CHUNK_TIMEOUT_SECONDS", 600), \
+                patch.object(stream_utils, "STREAM_EARLY_DISCONNECT_CHECK_CHUNKS", 0):
+            chunks = await asyncio.wait_for(
+                _collect_chunks(
+                    stream_utils._stream_with_timeout_and_disconnect(
+                        generator(), request, timeout=600
+                    )
+                ),
+                timeout=5,
+            )
+
+        # No chunks emitted, and the wrapper exited promptly (well under the
+        # 600s chunk budget) because it noticed the disconnect mid-wait.
+        self.assertEqual(chunks, [])
+        self.assertTrue(closed["value"], "generator should be closed on disconnect")
+
 
 if __name__ == "__main__":
     unittest.main()
