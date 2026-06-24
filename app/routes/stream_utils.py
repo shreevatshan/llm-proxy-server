@@ -14,13 +14,36 @@ from typing import Any, Optional
 from fastapi import Request
 from opentelemetry.context import attach
 
+from app import diagnostics
 from app.tracing import safe_detach
 
 logger = logging.getLogger(__name__)
 
 # Streaming configuration
 STREAM_TIMEOUT_SECONDS = int(os.getenv("STREAM_TIMEOUT_SECONDS", "600"))  # 10 minutes default
-STREAM_CHUNK_TIMEOUT_SECONDS = int(os.getenv("STREAM_CHUNK_TIMEOUT_SECONDS", "600"))  # 10 minutes per chunk
+# Per-chunk (mid-stream) gap budget. This bounds silence *after* the first token
+# has arrived. It must tolerate legitimate long gaps — e.g. Claude extended
+# thinking on Bedrock, where the Anthropic SDK silently swallows `ping`
+# keepalive events (anthropic/lib/streaming/_messages.py::build_events has no
+# `ping` case), so a thinking pause looks like dead air to this loop. The FIRST
+# chunk gets the much shorter STREAM_FIRST_CHUNK_TIMEOUT_SECONDS budget below,
+# which is what actually catches the "accepted but never responds" hang — so
+# this value no longer needs to be aggressive.
+STREAM_CHUNK_TIMEOUT_SECONDS = int(os.getenv("STREAM_CHUNK_TIMEOUT_SECONDS", "300"))  # 5 minutes per chunk
+# Dedicated time-to-first-token (TTFT) budget. A provider that accepts the
+# request but never emits a first event is the most common stall (see the stall
+# watchdog dumps). Give the first chunk a much shorter budget than subsequent
+# chunks so the proxy surfaces a fast, actionable error well before the client's
+# own (shorter) timeout fires. Capped at STREAM_CHUNK_TIMEOUT_SECONDS so a tiny
+# per-chunk timeout (e.g. in tests) still wins.
+STREAM_FIRST_CHUNK_TIMEOUT_SECONDS = int(os.getenv("STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", "45"))  # TTFT
+# Independent stall-dump deadline: how long a stream may make no progress before
+# the watchdog dumps all-thread stacks. Deliberately decoupled from (and much
+# shorter than) STREAM_CHUNK_TIMEOUT_SECONDS so the dump fires *before* the
+# client gives up and disconnects — otherwise the disconnect disarms the
+# watchdog first and no dump is ever written. Tune below a typical client
+# timeout (most are 30-120s).
+STREAM_STALL_DUMP_SECONDS = float(os.getenv("STREAM_STALL_DUMP_SECONDS", "20"))
 DISCONNECT_CHECK_INTERVAL = int(os.getenv("DISCONNECT_CHECK_INTERVAL", "10"))  # Check disconnect every N chunks
 STREAM_DISCONNECT_POLL_SECONDS = float(os.getenv("STREAM_DISCONNECT_POLL_SECONDS", "5"))
 STREAM_DISCONNECT_CHECK_TIMEOUT_SECONDS = float(
@@ -35,6 +58,33 @@ def _set_stream_state(stream_state: dict[str, Any], *, status: str, termination_
     """Update stream status + termination reason together."""
     stream_state["final_status"] = status
     stream_state["termination_reason"] = termination_reason
+
+
+def _stall_watchdog_seconds() -> float:
+    """Deadline for the stall watchdog (an independent, short stall budget).
+
+    Capped at the per-chunk timeout so a deliberately tiny STREAM_CHUNK_TIMEOUT
+    (e.g. in tests) still tears the stream down before the dump would fire.
+    """
+    return min(STREAM_STALL_DUMP_SECONDS, STREAM_CHUNK_TIMEOUT_SECONDS)
+
+
+def _chunk_budget_seconds(chunks_seen: int) -> float:
+    """Per-chunk wait budget: a short TTFT budget for the first chunk, the full
+    per-chunk budget thereafter.
+
+    The first-token budget is capped at the per-chunk budget so a deliberately
+    tiny STREAM_CHUNK_TIMEOUT (e.g. in tests) still bounds the first chunk too.
+    """
+    if chunks_seen == 0:
+        return min(STREAM_FIRST_CHUNK_TIMEOUT_SECONDS, STREAM_CHUNK_TIMEOUT_SECONDS)
+    return STREAM_CHUNK_TIMEOUT_SECONDS
+
+
+def _stall_watchdog_key(request: Request, fallback: str) -> str:
+    """Build a stable watchdog key from the tracking request id + a path label."""
+    request_id = getattr(getattr(request, "state", None), "tracking_request_id", None)
+    return f"{fallback}:{request_id or id(request)}"
 
 
 async def _cancel_pending_task(
@@ -146,10 +196,14 @@ async def stream_with_context_and_timeout(
     token = attach(context_token)
     start_time = request_started_at if request_started_at is not None else time.monotonic()
     chunks_yielded = 0
-    
+    watchdog_key = _stall_watchdog_key(request, "chat")
+    diagnostics.arm(watchdog_key, _stall_watchdog_seconds())
+
     try:
         async for chunk in _stream_with_timeout_and_disconnect(generator, request, timeout):
             chunks_yielded += 1
+            # Progress made — push the stall deadline out before yielding.
+            diagnostics.reset(watchdog_key, _stall_watchdog_seconds())
 
             # Check overall timeout
             elapsed = time.monotonic() - start_time
@@ -184,6 +238,7 @@ async def stream_with_context_and_timeout(
         logger.error(f"Stream error after {chunks_yielded} chunks: {e}")
         raise
     finally:
+        diagnostics.disarm(watchdog_key)
         elapsed = time.monotonic() - start_time
         logger.debug(f"Stream completed: {chunks_yielded} chunks in {elapsed:.2f}s")
         # Detach the context when done
@@ -208,6 +263,7 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
     pending_chunk_started_at: Optional[float] = None
     try:
         chunk_count = 0
+        chunks_yielded = 0  # drives first-chunk (TTFT) vs subsequent-chunk budget
 
         while True:
             # Check if client disconnected (debounced - every N chunks).
@@ -229,12 +285,15 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                 pending_chunk_started_at = time.monotonic()
 
             # Enforce the per-chunk timeout across multiple short waits so we can
-            # poll for client disconnect in between.
+            # poll for client disconnect in between. The first chunk uses the
+            # shorter TTFT budget; subsequent chunks use the full per-chunk budget.
             assert pending_chunk_started_at is not None
+            chunk_budget = _chunk_budget_seconds(chunks_yielded)
             elapsed_wait = time.monotonic() - pending_chunk_started_at
-            remaining_chunk_budget = STREAM_CHUNK_TIMEOUT_SECONDS - elapsed_wait
+            remaining_chunk_budget = chunk_budget - elapsed_wait
             if remaining_chunk_budget <= 0:
-                logger.warning(f"Chunk timeout after {STREAM_CHUNK_TIMEOUT_SECONDS}s")
+                budget_label = "first chunk (TTFT)" if chunks_yielded == 0 else "chunk"
+                logger.warning(f"{budget_label} timeout after {chunk_budget}s")
                 await _cancel_pending_task(
                     next_chunk_task, task_name="next chunk task after chunk timeout"
                 )
@@ -243,7 +302,7 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                 # Send timeout notification (OpenAI-compatible error format)
                 error_data = {
                     "error": {
-                        "message": f"Provider response timeout ({STREAM_CHUNK_TIMEOUT_SECONDS}s)",
+                        "message": f"Provider response timeout ({chunk_budget}s)",
                         "type": "server_error",
                         "param": None,
                         "code": "chunk_timeout"
@@ -273,6 +332,7 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
             except StopAsyncIteration:
                 # Generator exhausted normally
                 break
+            chunks_yielded += 1
             yield chunk
 
     except asyncio.CancelledError:
@@ -296,6 +356,8 @@ async def stream_with_context(generator, context_token):
     Legacy wrapper for backward compatibility (without timeout).
     Use stream_with_context_and_timeout for new code.
     """
+    # No stall watchdog here: this wrapper has no per-chunk timeout, so there is
+    # no pre-timeout margin to dump against. Instrument the timeout wrappers only.
     # Attach the parent context
     token = attach(context_token)
     try:
@@ -336,6 +398,8 @@ async def anthropic_stream_with_context_and_timeout(
     token = attach(context_token)
     start_time = request_started_at if request_started_at is not None else time.monotonic()
     chunks_yielded = 0
+    watchdog_key = _stall_watchdog_key(request, "anthropic")
+    diagnostics.arm(watchdog_key, _stall_watchdog_seconds())
     stream_state: dict[str, Any] = {
         "termination_reason": "completed",
         "final_status": "completed",
@@ -352,6 +416,8 @@ async def anthropic_stream_with_context_and_timeout(
             stream_state=stream_state,
         ):
             chunks_yielded += 1
+            # Progress made — push the stall deadline out before yielding.
+            diagnostics.reset(watchdog_key, _stall_watchdog_seconds())
             yield chunk
         set_request_tracking_outcome(
             request,
@@ -391,6 +457,7 @@ async def anthropic_stream_with_context_and_timeout(
         )
         raise
     finally:
+        diagnostics.disarm(watchdog_key)
         elapsed = time.monotonic() - start_time
         logger.info(
             "Anthropic stream finished reason=%s chunks=%s duration_seconds=%.2f%s",
@@ -421,6 +488,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
     next_chunk_task: Optional[asyncio.Task] = None
     pending_chunk_started_at: Optional[float] = None
     stream_started_at = time.monotonic()
+    chunks_yielded = 0  # drives first-chunk (TTFT) vs subsequent-chunk budget
     try:
         while True:
             now = time.monotonic()
@@ -463,20 +531,25 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                 next_chunk_task = asyncio.create_task(gen_iter.__anext__())
                 pending_chunk_started_at = time.monotonic()
 
+            # The first chunk uses the shorter TTFT budget; subsequent chunks use
+            # the full per-chunk budget. A provider that accepts the request but
+            # never emits a first event is the most common stall.
             assert pending_chunk_started_at is not None
+            chunk_budget = _chunk_budget_seconds(chunks_yielded)
             elapsed_wait = time.monotonic() - pending_chunk_started_at
-            remaining_chunk_budget = STREAM_CHUNK_TIMEOUT_SECONDS - elapsed_wait
+            remaining_chunk_budget = chunk_budget - elapsed_wait
             if remaining_chunk_budget <= 0:
+                budget_reason = "first_chunk_timeout" if chunks_yielded == 0 else "chunk_timeout"
                 _set_stream_state(
                     stream_state,
                     status="errored",
-                    termination_reason="chunk_timeout",
+                    termination_reason=budget_reason,
                 )
                 set_request_tracking_outcome(
                     request,
                     status="errored",
-                    termination_reason="chunk_timeout",
-                    error=f"Provider response timeout ({STREAM_CHUNK_TIMEOUT_SECONDS}s)",
+                    termination_reason=budget_reason,
+                    error=f"Provider response timeout ({chunk_budget}s)",
                 )
                 await _cancel_pending_task(
                     next_chunk_task,
@@ -485,8 +558,9 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                 next_chunk_task = None
                 pending_chunk_started_at = None
                 logger.warning(
-                    "Anthropic chunk timeout after %ss%s",
-                    STREAM_CHUNK_TIMEOUT_SECONDS,
+                    "Anthropic %s after %ss%s",
+                    budget_reason,
+                    chunk_budget,
                     _format_stream_log_context(log_context),
                 )
                 yield format_anthropic_sse_event(
@@ -495,7 +569,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                         "type": "error",
                         "error": {
                             "type": "server_error",
-                            "message": f"Provider response timeout ({STREAM_CHUNK_TIMEOUT_SECONDS}s)",
+                            "message": f"Provider response timeout ({chunk_budget}s)",
                         },
                     },
                 )
@@ -537,6 +611,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                 stream_state.setdefault("termination_reason", "completed")
                 break
 
+            chunks_yielded += 1
             yield chunk
 
     except asyncio.CancelledError:

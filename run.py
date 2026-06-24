@@ -84,13 +84,17 @@ import os
 #
 # All files live under LOG_DIR (default: ./logs, mounted via docker-compose).
 # Sizes are bounded: app.log rotates (LOG_MAX_BYTES × LOG_BACKUP_COUNT), and
-# faulthandler.log is truncated at startup + before each periodic dump.
+# faulthandler.log is truncated at startup + before each dump.
 #
 # Getting an all-thread stack dump for a hang:
 #   • On demand: `kill -SIGUSR1 <pid>` (host: `docker kill --signal=SIGUSR1 <ctr>`;
 #     inside the container if run.py is PID 1: `kill -SIGUSR1 1`).
-#   • Periodically: set FAULTHANDLER_DUMP_INTERVAL=<seconds> to dump every N s.
+#   • Automatically when a stream stalls: the stall watchdog (app/diagnostics.py)
+#     dumps all-thread stacks when a streaming request makes no progress for
+#     STREAM_STALL_DUMP_SECONDS (default 20) — short enough to fire BEFORE the
+#     client gives up and disconnects, capturing the live blocking frame.
 # ---------------------------------------------------------------------------
+import atexit
 import faulthandler
 import logging
 import signal
@@ -181,49 +185,22 @@ def _setup_diagnostics() -> None:
         faulthandler.enable()  # fall back to stderr so we still get fatal dumps
         return
 
-    # Optional periodic all-thread dump to catch an intermittent hang unattended.
-    # We run our own truncate-then-dump loop (instead of dump_traceback_later)
-    # so faulthandler.log stays bounded to the most recent dump.
-    _dump_interval = os.getenv("FAULTHANDLER_DUMP_INTERVAL")
-    if _dump_interval:
-        try:
-            interval_seconds = float(_dump_interval)
-        except ValueError:
-            print(
-                f"[diagnostics] ignoring invalid FAULTHANDLER_DUMP_INTERVAL="
-                f"{_dump_interval!r} (expected seconds)",
-                file=sys.stderr,
-            )
-            interval_seconds = 0.0
+    # (4) Stall watchdog: dump all-thread stacks just before a stalled streaming
+    #     request hits its per-chunk timeout. Streaming wrappers arm/reset/disarm
+    #     a deadline per request (see app/routes/stream_utils.py); if a request
+    #     makes no progress until the deadline, the watchdog captures the live
+    #     blocking frame — far more useful than periodic snapshots of idle threads.
+    try:
+        from app import diagnostics
 
-        if interval_seconds > 0:
-            stop = threading.Event()
-
-            def _periodic_dump():
-                while not stop.wait(interval_seconds):
-                    try:
-                        # Keep the file bounded: cap by truncating once it grows
-                        # past the limit, so only recent dumps are retained.
-                        if _fault_fp.tell() >= _FAULT_MAX_BYTES:
-                            _fault_fp.seek(0)
-                            _fault_fp.truncate()
-                        _fault_fp.write(
-                            f"\n----- periodic dump (interval={interval_seconds}s) -----\n"
-                        )
-                        _fault_fp.flush()
-                        faulthandler.dump_traceback(file=_fault_fp, all_threads=True)
-                        _fault_fp.flush()
-                    except Exception:  # noqa: BLE001 - watchdog must never die
-                        pass
-
-            t = threading.Thread(
-                target=_periodic_dump, name="faulthandler-watchdog", daemon=True
-            )
-            t.start()
-            print(
-                f"[diagnostics] periodic stack dump every {interval_seconds}s → "
-                f"{fault_log_path}"
-            )
+        diagnostics.init_watchdog(_fault_fp, _FAULT_MAX_BYTES)
+        atexit.register(diagnostics.shutdown)  # stop the daemon thread on clean exit
+        print(
+            "[diagnostics] stall watchdog armed; stalled streams dump to "
+            f"{fault_log_path}"
+        )
+    except Exception as e:  # noqa: BLE001 - diagnostics must never break startup
+        print(f"[diagnostics] could not start stall watchdog: {e}", file=sys.stderr)
 
 
 _setup_diagnostics()

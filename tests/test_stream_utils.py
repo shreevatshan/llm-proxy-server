@@ -43,6 +43,23 @@ async def _collect_chunks(generator):
     return chunks
 
 
+class ChunkBudgetTests(unittest.TestCase):
+    def test_first_chunk_uses_ttft_budget(self):
+        with patch.object(stream_utils, "STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", 45), patch.object(
+            stream_utils, "STREAM_CHUNK_TIMEOUT_SECONDS", 120
+        ):
+            self.assertEqual(stream_utils._chunk_budget_seconds(0), 45)
+            self.assertEqual(stream_utils._chunk_budget_seconds(1), 120)
+            self.assertEqual(stream_utils._chunk_budget_seconds(99), 120)
+
+    def test_ttft_budget_capped_at_per_chunk_budget(self):
+        # A tiny per-chunk timeout (e.g. in tests) bounds the first chunk too.
+        with patch.object(stream_utils, "STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", 45), patch.object(
+            stream_utils, "STREAM_CHUNK_TIMEOUT_SECONDS", 1
+        ):
+            self.assertEqual(stream_utils._chunk_budget_seconds(0), 1)
+
+
 class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
     async def test_set_request_tracking_outcome_preserves_error_over_completed(self):
         request = _FakeRequest()
@@ -119,14 +136,21 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_anthropic_wrapper_emits_chunk_timeout_error(self):
+    async def test_anthropic_wrapper_emits_first_chunk_timeout_error(self):
+        # A provider that never emits a first event hits the TTFT (first-chunk)
+        # budget and is reported as `first_chunk_timeout`, distinct from a
+        # mid-stream `chunk_timeout`.
         request = _FakeRequest()
         generator = _PendingAsyncIterator()
 
         with patch.object(stream_utils, "STREAM_DISCONNECT_POLL_SECONDS", 0.01), patch.object(
             stream_utils,
-            "STREAM_CHUNK_TIMEOUT_SECONDS",
+            "STREAM_FIRST_CHUNK_TIMEOUT_SECONDS",
             0.03,
+        ), patch.object(
+            stream_utils,
+            "STREAM_CHUNK_TIMEOUT_SECONDS",
+            10,
         ):
             chunks = await _collect_chunks(
                 stream_utils.anthropic_stream_with_context_and_timeout(
@@ -140,6 +164,60 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(chunks), 1)
         self.assertIn("event: error", chunks[0])
         self.assertIn("Provider response timeout (0.03s)", chunks[0])
+        self.assertTrue(generator.closed)
+        self.assertEqual(request.state.tracking_final["status"], "errored")
+        self.assertEqual(
+            request.state.tracking_final["termination_reason"], "first_chunk_timeout"
+        )
+
+    async def test_anthropic_wrapper_emits_chunk_timeout_after_first_chunk(self):
+        # Once a first chunk has been delivered, a subsequent stall uses the full
+        # per-chunk budget and is reported as `chunk_timeout`.
+        request = _FakeRequest()
+
+        class _OneChunkThenStall:
+            def __init__(self):
+                self.closed = False
+                self._yielded = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._yielded:
+                    self._yielded = True
+                    return stream_utils.format_anthropic_sse_event(
+                        "message_start", {"type": "message_start"}
+                    )
+                await asyncio.Future()  # stall forever on the second chunk
+
+            async def aclose(self):
+                self.closed = True
+
+        generator = _OneChunkThenStall()
+
+        with patch.object(stream_utils, "STREAM_DISCONNECT_POLL_SECONDS", 0.01), patch.object(
+            stream_utils,
+            "STREAM_FIRST_CHUNK_TIMEOUT_SECONDS",
+            10,
+        ), patch.object(
+            stream_utils,
+            "STREAM_CHUNK_TIMEOUT_SECONDS",
+            0.03,
+        ):
+            chunks = await _collect_chunks(
+                stream_utils.anthropic_stream_with_context_and_timeout(
+                    generator,
+                    get_current(),
+                    request,
+                    timeout=1,
+                )
+            )
+
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("event: message_start", chunks[0])
+        self.assertIn("event: error", chunks[1])
+        self.assertIn("Provider response timeout (0.03s)", chunks[1])
         self.assertTrue(generator.closed)
         self.assertEqual(request.state.tracking_final["status"], "errored")
         self.assertEqual(request.state.tracking_final["termination_reason"], "chunk_timeout")
@@ -196,6 +274,54 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
             request.state.tracking_final["termination_reason"],
             "bedrock_native_idle_timeout",
         )
+
+    async def test_anthropic_wrapper_arms_and_disarms_stall_watchdog(self):
+        # On a normal finish the wrapper must arm the stall watchdog on entry
+        # and disarm it in finally, so a completed stream leaves no live deadline.
+        request = _FakeRequest()
+
+        async def generator():
+            yield stream_utils.format_anthropic_sse_event("message_start", {"type": "message_start"})
+
+        with patch.object(stream_utils.diagnostics, "arm") as arm, \
+                patch.object(stream_utils.diagnostics, "disarm") as disarm:
+            await _collect_chunks(
+                stream_utils.anthropic_stream_with_context_and_timeout(
+                    generator(),
+                    get_current(),
+                    request,
+                    timeout=1,
+                )
+            )
+
+        self.assertEqual(arm.call_count, 1)
+        self.assertEqual(disarm.call_count, 1)
+        # Same key armed and disarmed.
+        self.assertEqual(arm.call_args.args[0], disarm.call_args.args[0])
+
+    async def test_chat_wrapper_arms_and_disarms_stall_watchdog(self):
+        # Mirror of the anthropic test for the OpenAI-style timeout wrapper: it
+        # must arm the watchdog on entry and disarm it in finally on a clean finish.
+        request = _FakeRequest()
+
+        async def generator():
+            yield 'data: {"id":"chunk-1"}\n\n'
+
+        with patch.object(stream_utils.diagnostics, "arm") as arm, \
+                patch.object(stream_utils.diagnostics, "disarm") as disarm:
+            await _collect_chunks(
+                stream_utils.stream_with_context_and_timeout(
+                    generator(),
+                    get_current(),
+                    request,
+                    timeout=1,
+                )
+            )
+
+        self.assertEqual(arm.call_count, 1)
+        self.assertEqual(disarm.call_count, 1)
+        # Same key armed and disarmed.
+        self.assertEqual(arm.call_args.args[0], disarm.call_args.args[0])
 
     async def test_openai_wrapper_preserves_final_chunk_when_timeout_boundary_is_crossed(self):
         request = _FakeRequest()
