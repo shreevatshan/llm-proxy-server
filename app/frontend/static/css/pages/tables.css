@@ -146,6 +146,75 @@
     color: var(--mono-0);
 }
 
+/* ================================
+   SUB-TAB NAVIGATION (segmented, in-card)
+   Lighter-weight sibling of .tab-navigation for sub-sections.
+   ================================ */
+.subtab-navigation {
+    display: inline-flex;
+    background: var(--mono-2);
+    border-radius: var(--radius-lg);
+    border: 1px solid var(--dark-border);
+    padding: 3px;
+    gap: 2px;
+    position: relative;
+}
+
+.subtab-button {
+    padding: 0.5rem 1.25rem;
+    background: transparent;
+    border: none;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    font-size: 0.8125rem;
+    font-weight: 500;
+    color: var(--dark-text-secondary);
+    transition: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    white-space: nowrap;
+    font-family: var(--font-family-mono);
+}
+
+.subtab-button:hover {
+    background: var(--mono-3);
+    color: var(--dark-text-primary);
+}
+
+.subtab-button.active {
+    background: var(--mono-text-primary);
+    color: var(--mono-0);
+    font-weight: 600;
+}
+
+.subtab-button i,
+.subtab-button .fas,
+.subtab-button .far,
+.subtab-button .fab {
+    font-size: 0.9375rem;
+    color: inherit;
+}
+
+.subtab-button.active i,
+.subtab-button.active .fas,
+.subtab-button.active .far,
+.subtab-button.active .fab {
+    color: var(--mono-0);
+}
+
+@media (max-width: 480px) {
+    .subtab-navigation {
+        display: flex;
+        width: 100%;
+    }
+    .subtab-button {
+        flex: 1;
+        padding: 0.5rem 0.5rem;
+    }
+}
+
 /* Tab content */
 .tab-content {
     display: none;

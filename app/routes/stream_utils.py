@@ -29,14 +29,14 @@ STREAM_TIMEOUT_SECONDS = int(os.getenv("STREAM_TIMEOUT_SECONDS", "600"))  # 10 m
 # chunk gets the much shorter STREAM_FIRST_CHUNK_TIMEOUT_SECONDS budget below,
 # which is what actually catches the "accepted but never responds" hang — so
 # this value no longer needs to be aggressive.
-STREAM_CHUNK_TIMEOUT_SECONDS = int(os.getenv("STREAM_CHUNK_TIMEOUT_SECONDS", "300"))  # 5 minutes per chunk
+STREAM_CHUNK_TIMEOUT_SECONDS = int(os.getenv("STREAM_CHUNK_TIMEOUT_SECONDS", "600"))  # 10 minutes per chunk
 # Dedicated time-to-first-token (TTFT) budget. A provider that accepts the
 # request but never emits a first event is the most common stall (see the stall
 # watchdog dumps). Give the first chunk a much shorter budget than subsequent
 # chunks so the proxy surfaces a fast, actionable error well before the client's
 # own (shorter) timeout fires. Capped at STREAM_CHUNK_TIMEOUT_SECONDS so a tiny
 # per-chunk timeout (e.g. in tests) still wins.
-STREAM_FIRST_CHUNK_TIMEOUT_SECONDS = int(os.getenv("STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", "45"))  # TTFT
+STREAM_FIRST_CHUNK_TIMEOUT_SECONDS = int(os.getenv("STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", "300"))  # TTFT
 # Independent stall-dump deadline: how long a stream may make no progress before
 # the watchdog dumps all-thread stacks. Deliberately decoupled from (and much
 # shorter than) STREAM_CHUNK_TIMEOUT_SECONDS so the dump fires *before* the
@@ -52,6 +52,31 @@ STREAM_DISCONNECT_CHECK_TIMEOUT_SECONDS = float(
 STREAM_EARLY_DISCONNECT_CHECK_CHUNKS = int(
     os.getenv("STREAM_EARLY_DISCONNECT_CHECK_CHUNKS", "5")
 )
+# Keepalive cadence during upstream silence. The Anthropic SDK swallows upstream
+# `ping` keepalive events (see note above _async_iterate / build_events), so a
+# long thinking pause or slow time-to-first-token sends the client zero bytes
+# and trips its own read timeout. We emit our own SSE keepalive every N seconds
+# while waiting for the next chunk. This does NOT extend the per-chunk timeout
+# budget (which still detects a genuinely hung upstream). 0 disables.
+STREAM_KEEPALIVE_INTERVAL_SECONDS = float(os.getenv("STREAM_KEEPALIVE_INTERVAL_SECONDS", "15"))
+
+_OPENAI_KEEPALIVE_CHUNK = ": keepalive\n\n"
+_ANTHROPIC_KEEPALIVE_CHUNK = 'event: ping\ndata: {"type":"ping"}\n\n'
+
+
+def _is_openai_keepalive_chunk(chunk: Any) -> bool:
+    """Return True for internally generated OpenAI-compatible SSE keepalives."""
+    return chunk == _OPENAI_KEEPALIVE_CHUNK
+
+
+def _is_anthropic_keepalive_chunk(chunk: Any) -> bool:
+    """Return True for internally generated Anthropic SSE ping keepalives."""
+    return chunk == _ANTHROPIC_KEEPALIVE_CHUNK
+
+
+def _is_keepalive_chunk(chunk: Any) -> bool:
+    """Return True for proxy-generated keepalives that are not upstream progress."""
+    return _is_openai_keepalive_chunk(chunk) or _is_anthropic_keepalive_chunk(chunk)
 
 
 def _set_stream_state(stream_state: dict[str, Any], *, status: str, termination_reason: str) -> None:
@@ -201,13 +226,35 @@ async def stream_with_context_and_timeout(
 
     try:
         async for chunk in _stream_with_timeout_and_disconnect(generator, request, timeout):
+            # Check overall timeout
+            elapsed = time.monotonic() - start_time
+            timed_out = elapsed > timeout
+
+            if _is_keepalive_chunk(chunk):
+                if timed_out:
+                    logger.warning(
+                        "Stream exceeded timeout of %ss while emitting keepalives; terminating",
+                        timeout,
+                    )
+                    error_data = {
+                        "error": {
+                            "message": f"Stream timeout exceeded ({timeout}s)",
+                            "type": "server_error",
+                            "param": None,
+                            "code": "stream_timeout"
+                        }
+                    }
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+
+                yield chunk
+                continue
+
             chunks_yielded += 1
             # Progress made — push the stall deadline out before yielding.
             diagnostics.reset(watchdog_key, _stall_watchdog_seconds())
 
-            # Check overall timeout
-            elapsed = time.monotonic() - start_time
-            timed_out = elapsed > timeout
             if timed_out:
                 logger.warning(
                     "Stream exceeded timeout of %ss after %s chunks; emitting final chunk before terminating",
@@ -264,6 +311,7 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
     try:
         chunk_count = 0
         chunks_yielded = 0  # drives first-chunk (TTFT) vs subsequent-chunk budget
+        last_keepalive_at = time.monotonic()  # cadence anchor for SSE keepalive comments
 
         while True:
             # Check if client disconnected (debounced - every N chunks).
@@ -322,6 +370,15 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                         f"Client disconnected after {chunk_count} chunks while waiting for next chunk, stopping stream"
                     )
                     break
+                # Upstream still silent this poll. Emit an SSE comment keepalive
+                # (ignored by all SSE clients, never parsed as a JSON delta) so the
+                # client's read timer doesn't fire. Does NOT touch next_chunk_task /
+                # pending_chunk_started_at, so the real per-chunk timeout is unaffected.
+                if STREAM_KEEPALIVE_INTERVAL_SECONDS > 0 and (
+                    time.monotonic() - last_keepalive_at >= STREAM_KEEPALIVE_INTERVAL_SECONDS
+                ):
+                    last_keepalive_at = time.monotonic()
+                    yield ": keepalive\n\n"
                 continue
 
             task = next_chunk_task
@@ -333,6 +390,7 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                 # Generator exhausted normally
                 break
             chunks_yielded += 1
+            last_keepalive_at = time.monotonic()  # measure cadence from last real byte
             yield chunk
 
     except asyncio.CancelledError:
@@ -415,6 +473,10 @@ async def anthropic_stream_with_context_and_timeout(
             log_context=log_context,
             stream_state=stream_state,
         ):
+            if _is_keepalive_chunk(chunk):
+                yield chunk
+                continue
+
             chunks_yielded += 1
             # Progress made — push the stall deadline out before yielding.
             diagnostics.reset(watchdog_key, _stall_watchdog_seconds())
@@ -488,6 +550,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
     next_chunk_task: Optional[asyncio.Task] = None
     pending_chunk_started_at: Optional[float] = None
     stream_started_at = time.monotonic()
+    last_keepalive_at = stream_started_at  # cadence anchor for SSE keepalive pings
     chunks_yielded = 0  # drives first-chunk (TTFT) vs subsequent-chunk budget
     try:
         while True:
@@ -600,6 +663,15 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                         _format_stream_log_context(log_context),
                     )
                     break
+                # Upstream still silent this poll. Emit a keepalive ping so the
+                # client's read timer doesn't fire on a long thinking pause. This
+                # does NOT touch next_chunk_task / pending_chunk_started_at, so the
+                # real per-chunk timeout keeps counting against the in-flight task.
+                if STREAM_KEEPALIVE_INTERVAL_SECONDS > 0 and (
+                    time.monotonic() - last_keepalive_at >= STREAM_KEEPALIVE_INTERVAL_SECONDS
+                ):
+                    last_keepalive_at = time.monotonic()
+                    yield format_anthropic_sse_event("ping", {"type": "ping"})
                 continue
 
             task = next_chunk_task
@@ -612,6 +684,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                 break
 
             chunks_yielded += 1
+            last_keepalive_at = time.monotonic()  # measure cadence from last real byte
             yield chunk
 
     except asyncio.CancelledError:

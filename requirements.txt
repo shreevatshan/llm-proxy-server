@@ -29,4 +29,4 @@ opentelemetry-exporter-otlp>=1.39.1
 opentelemetry-semantic-conventions>=0.60b1
 opentelemetry-semantic-conventions-ai>=0.4.13
 opentelemetry-propagator-aws-xray>=1.0.2
-traceloop-sdk>=0.50.1
+traceloop-sdk==0.61.0

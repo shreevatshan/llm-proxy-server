@@ -6,9 +6,47 @@ These models mirror the Anthropic API specification for:
 - SSE streaming events
 """
 
+import math
+import os
 import logging
 from typing import List, Optional, Dict, Any, Union, Literal, Annotated, Tuple
 from pydantic import BaseModel, Field
+
+
+_logger = logging.getLogger(__name__)
+_ANTHROPIC_SDK_TIMEOUT_ENV = "ANTHROPIC_SDK_TIMEOUT_SECONDS"
+_DEFAULT_ANTHROPIC_SDK_TIMEOUT_SECONDS = 900.0
+
+
+def _get_positive_float_env(name: str, default: float) -> float:
+    """Read a positive finite float env var with a safe fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        _logger.warning("Invalid float for %s=%r, using default %s", name, raw, default)
+        return default
+
+    if not math.isfinite(value) or value <= 0:
+        _logger.warning("Non-positive or non-finite float for %s=%r, using default %s", name, raw, default)
+        return default
+
+    return value
+
+
+# Default request timeout (seconds) applied to every Anthropic SDK call. Passing
+# an explicit timeout also disables the SDK's client-side non-streaming guard
+# (anthropic/_base_client.py::_calculate_nonstreaming_timeout), which otherwise
+# rejects any non-streaming call whose max_tokens *could* take >10 min — even
+# when generation actually finishes fast. Matches the Bedrock client's 900s
+# ceiling and is operator-overridable.
+ANTHROPIC_SDK_TIMEOUT_SECONDS = _get_positive_float_env(
+    _ANTHROPIC_SDK_TIMEOUT_ENV,
+    _DEFAULT_ANTHROPIC_SDK_TIMEOUT_SECONDS,
+)
 
 
 # ==================== Content Block Types ====================
@@ -430,9 +468,6 @@ def _strip_signatureless_thinking_blocks(messages: list) -> list:
         cleaned.append({**msg, "content": new_content})
     return cleaned
 
-
-_logger = logging.getLogger(__name__)
-
 _VALID_MESSAGE_ROLES = {"user", "assistant"}
 
 
@@ -584,6 +619,11 @@ def build_anthropic_sdk_kwargs(
         kwargs["metadata"] = request.metadata.model_dump(exclude_none=True)
     if request.thinking is not None:
         kwargs["thinking"] = request.thinking.model_dump(exclude_none=True)
+
+    # Apply an explicit timeout to every SDK call. Besides bounding the request,
+    # this disables the SDK's client-side non-streaming guard that would
+    # otherwise reject non-streaming calls with a large max_tokens.
+    kwargs["timeout"] = ANTHROPIC_SDK_TIMEOUT_SECONDS
 
     # Forward any extra/unknown fields via extra_body so the Anthropic SDK
     # does not reject them as unexpected kwargs. This preserves forward

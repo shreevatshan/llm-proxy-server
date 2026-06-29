@@ -323,6 +323,52 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
         # Same key armed and disarmed.
         self.assertEqual(arm.call_args.args[0], disarm.call_args.args[0])
 
+    async def test_openai_keepalive_does_not_reset_stall_watchdog(self):
+        request = _FakeRequest()
+
+        async def generator():
+            yield ": keepalive\n\n"
+            yield 'data: {"id":"chunk-1"}\n\n'
+
+        with patch.object(stream_utils.diagnostics, "reset") as reset:
+            chunks = await _collect_chunks(
+                stream_utils.stream_with_context_and_timeout(
+                    generator(),
+                    get_current(),
+                    request,
+                    timeout=1,
+                )
+            )
+
+        self.assertEqual(chunks, [": keepalive\n\n", 'data: {"id":"chunk-1"}\n\n'])
+        self.assertEqual(reset.call_count, 1)
+
+    async def test_anthropic_keepalive_does_not_reset_stall_watchdog(self):
+        request = _FakeRequest()
+
+        async def generator():
+            yield stream_utils.format_anthropic_sse_event("ping", {"type": "ping"})
+            yield stream_utils.format_anthropic_sse_event("message_start", {"type": "message_start"})
+
+        with patch.object(stream_utils.diagnostics, "reset") as reset:
+            chunks = await _collect_chunks(
+                stream_utils.anthropic_stream_with_context_and_timeout(
+                    generator(),
+                    get_current(),
+                    request,
+                    timeout=1,
+                )
+            )
+
+        self.assertEqual(
+            chunks,
+            [
+                'event: ping\ndata: {"type":"ping"}\n\n',
+                'event: message_start\ndata: {"type":"message_start"}\n\n',
+            ],
+        )
+        self.assertEqual(reset.call_count, 1)
+
     async def test_openai_wrapper_preserves_final_chunk_when_timeout_boundary_is_crossed(self):
         request = _FakeRequest()
 
@@ -342,6 +388,28 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunks[0], 'data: {"id":"chunk-1"}\n\n')
         self.assertIn("Stream timeout exceeded (0.01s)", chunks[1])
         self.assertEqual(chunks[2], "data: [DONE]\n\n")
+
+    async def test_openai_keepalive_does_not_bypass_overall_timeout(self):
+        request = _FakeRequest()
+
+        async def generator():
+            yield ": keepalive\n\n"
+
+        with patch.object(stream_utils.diagnostics, "reset") as reset:
+            chunks = await _collect_chunks(
+                stream_utils.stream_with_context_and_timeout(
+                    generator(),
+                    get_current(),
+                    request,
+                    timeout=0.01,
+                    request_started_at=time.monotonic() - 1,
+                )
+            )
+
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("Stream timeout exceeded (0.01s)", chunks[0])
+        self.assertEqual(chunks[1], "data: [DONE]\n\n")
+        self.assertEqual(reset.call_count, 0)
 
     async def test_openai_wrapper_cancel_mid_chunk_closes_generator_without_error(self):
         # Regression: cancelling while blocked in __anext__ must cancel the
@@ -378,6 +446,132 @@ class StreamUtilsTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
         self.assertTrue(closed["value"], "generator should be closed on cancel")
+
+    async def test_anthropic_wrapper_emits_keepalive_ping_during_silence(self):
+        # While the upstream is silent between real events, the wrapper must emit
+        # SSE `ping` keepalives so the client's read timer doesn't fire. The pings
+        # appear between the real chunks and the stream still completes cleanly.
+        class _SlowThenFinish:
+            def __init__(self):
+                self.closed = False
+                self._step = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._step += 1
+                if self._step == 1:
+                    return stream_utils.format_anthropic_sse_event(
+                        "message_start", {"type": "message_start"}
+                    )
+                if self._step == 2:
+                    await asyncio.sleep(0.15)  # long silence → keepalive should fire
+                    return stream_utils.format_anthropic_sse_event(
+                        "content_block_delta", {"type": "content_block_delta"}
+                    )
+                if self._step == 3:
+                    return stream_utils.format_anthropic_sse_event(
+                        "message_stop", {"type": "message_stop"}
+                    )
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                self.closed = True
+
+        request = _FakeRequest()
+        generator = _SlowThenFinish()
+
+        with patch.object(stream_utils, "STREAM_DISCONNECT_POLL_SECONDS", 0.01), \
+                patch.object(stream_utils, "STREAM_KEEPALIVE_INTERVAL_SECONDS", 0.03), \
+                patch.object(stream_utils, "STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", 10), \
+                patch.object(stream_utils, "STREAM_CHUNK_TIMEOUT_SECONDS", 10):
+            chunks = await _collect_chunks(
+                stream_utils.anthropic_stream_with_context_and_timeout(
+                    generator,
+                    get_current(),
+                    request,
+                    timeout=5,
+                )
+            )
+
+        pings = [c for c in chunks if c == 'event: ping\ndata: {"type":"ping"}\n\n']
+        self.assertGreaterEqual(len(pings), 1)
+        # No error event — the silence was covered by keepalives, not a timeout.
+        self.assertFalse(any("event: error" in c for c in chunks))
+        # Real events still present and in order.
+        self.assertIn("event: message_start", chunks[0])
+        self.assertTrue(any("event: content_block_delta" in c for c in chunks))
+        self.assertIn("event: message_stop", chunks[-1])
+        self.assertEqual(request.state.tracking_final["status"], "completed")
+
+    async def test_keepalive_pings_do_not_extend_per_chunk_timeout(self):
+        # Regression guard: keepalive pings must NOT reset the real per-chunk
+        # budget. A genuinely hung upstream still times out even though pings are
+        # being emitted in the meantime.
+        request = _FakeRequest()
+        generator = _PendingAsyncIterator()
+
+        with patch.object(stream_utils, "STREAM_DISCONNECT_POLL_SECONDS", 0.01), \
+                patch.object(stream_utils, "STREAM_KEEPALIVE_INTERVAL_SECONDS", 0.01), \
+                patch.object(stream_utils, "STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", 0.05), \
+                patch.object(stream_utils, "STREAM_CHUNK_TIMEOUT_SECONDS", 10):
+            chunks = await _collect_chunks(
+                stream_utils.anthropic_stream_with_context_and_timeout(
+                    generator,
+                    get_current(),
+                    request,
+                    timeout=5,
+                )
+            )
+
+        # Despite keepalives firing, the real first-chunk timeout still fires.
+        self.assertTrue(any("event: error" in c for c in chunks))
+        self.assertTrue(any("Provider response timeout (0.05s)" in c for c in chunks))
+        self.assertTrue(generator.closed)
+        self.assertEqual(
+            request.state.tracking_final["termination_reason"], "first_chunk_timeout"
+        )
+
+    async def test_openai_wrapper_emits_keepalive_comment_during_silence(self):
+        # The OpenAI-format path emits an SSE comment keepalive (never a JSON
+        # delta) during upstream silence.
+        class _SlowThenFinish:
+            def __init__(self):
+                self.closed = False
+                self._step = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self._step += 1
+                if self._step == 1:
+                    return 'data: {"id":"chunk-1"}\n\n'
+                if self._step == 2:
+                    await asyncio.sleep(0.15)
+                    return 'data: {"id":"chunk-2"}\n\n'
+                raise StopAsyncIteration
+
+            async def aclose(self):
+                self.closed = True
+
+        request = _FakeRequest()
+        generator = _SlowThenFinish()
+
+        with patch.object(stream_utils, "STREAM_DISCONNECT_POLL_SECONDS", 0.01), \
+                patch.object(stream_utils, "STREAM_KEEPALIVE_INTERVAL_SECONDS", 0.03), \
+                patch.object(stream_utils, "STREAM_FIRST_CHUNK_TIMEOUT_SECONDS", 10), \
+                patch.object(stream_utils, "STREAM_CHUNK_TIMEOUT_SECONDS", 10):
+            chunks = await _collect_chunks(
+                stream_utils._stream_with_timeout_and_disconnect(
+                    generator, request, timeout=5
+                )
+            )
+
+        self.assertIn(": keepalive\n\n", chunks)
+        self.assertIn('data: {"id":"chunk-1"}\n\n', chunks)
+        self.assertIn('data: {"id":"chunk-2"}\n\n', chunks)
 
     async def test_openai_wrapper_detects_client_disconnect_while_chunk_pending(self):
         # Regression: the chat path must poll for client disconnect DURING the

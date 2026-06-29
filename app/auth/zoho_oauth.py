@@ -63,7 +63,7 @@ class ZohoOAuth:
             
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get("https://accounts.zoho.com/oauth/serverinfo")
+                response = await client.get("https://accounts.zoho.in/oauth/serverinfo")
                 response.raise_for_status()
                 server_info = response.json()
                 
@@ -75,11 +75,11 @@ class ZohoOAuth:
                     return locations
                 else:
                     # Fallback if no locations in response
-                    return {"us": "https://accounts.zoho.com"}
-                    
+                    return {"in": "https://accounts.zoho.in"}
+
         except Exception as e:
-            # Fallback to default US datacenter on error
-            return {"us": "https://accounts.zoho.com"}
+            # Fallback to default IN datacenter on error
+            return {"in": "https://accounts.zoho.in"}
     
     async def _get_base_url(self, location: Optional[str] = None) -> str:
         """Get ZOHO base URL for a specific location or default.
@@ -93,12 +93,12 @@ class ZohoOAuth:
         locations = await self._fetch_server_info()
         
         if location:
-            # Return URL for specified location, fallback to US if not found
-            return locations.get(location, locations.get("us", "https://accounts.zoho.com"))
-        
-        # Default to US datacenter
+            # Return URL for specified location, fallback to IN if not found
+            return locations.get(location, locations.get("in", "https://accounts.zoho.in"))
+
+        # Default to IN datacenter
         if not self._cached_base_url:
-            self._cached_base_url = locations.get("us", "https://accounts.zoho.com")
+            self._cached_base_url = locations.get("in", "https://accounts.zoho.in")
         
         return self._cached_base_url
     

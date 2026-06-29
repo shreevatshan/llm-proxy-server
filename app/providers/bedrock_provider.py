@@ -127,6 +127,7 @@ def _map_bedrock_error(error_code: str, error_message: str) -> Dict[str, Any]:
 
 from app.providers.base import AnthropicRequestMetadata, BaseProvider
 from app.anthropic_models import (
+    ANTHROPIC_SDK_TIMEOUT_SECONDS,
     _extract_system_messages_from_messages,
     _merge_system_fields,
     is_anthropic_terminal_stream_event,
@@ -2325,8 +2326,10 @@ class BedrockProvider(BaseProvider):
         kwargs: Dict[str, Any] = {
             "aws_region": self.aws_region,
             # Generous ceiling so long extended-thinking responses aren't
-            # truncated (old native socket ceiling was ~900s).
-            "timeout": 900.0,
+            # truncated (old native socket ceiling was ~900s). Shares the same
+            # operator knob as the other Anthropic-SDK providers; an explicit
+            # timeout also disables the SDK's client-side non-streaming guard.
+            "timeout": ANTHROPIC_SDK_TIMEOUT_SECONDS,
             "max_retries": 2,
         }
         if self.aws_access_key and self.aws_secret_key:

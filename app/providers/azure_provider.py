@@ -34,6 +34,7 @@ from app.providers.anthropic_compatible import (
     _translate_anthropic_sdk_error,
 )
 from app.anthropic_models import (
+    ANTHROPIC_SDK_TIMEOUT_SECONDS,
     build_anthropic_sdk_kwargs,
     is_anthropic_terminal_stream_event,
 )
@@ -126,6 +127,12 @@ class AzureProvider(OpenAICompatibleProvider):
             self._anthropic_client = AsyncAnthropic(
                 base_url=f"{self.endpoint}/anthropic",
                 api_key=self.api_key,
+                # Explicit timeout disables the SDK's client-side non-streaming
+                # guard (anthropic/_base_client.py::_calculate_nonstreaming_timeout),
+                # which otherwise rejects any non-streaming call whose max_tokens
+                # *could* take >10 min — even when generation actually finishes
+                # fast. Shares the same operator knob as Bedrock/direct SDK providers.
+                timeout=ANTHROPIC_SDK_TIMEOUT_SECONDS,
             )
             logger.info("Anthropic SDK client initialized for Azure Foundry")
         except ImportError:

@@ -422,23 +422,17 @@
 <!-- Rate Limits Section -->
 <div class="section tab-content" id="rate-limits-tab" style="display: none;">
     <!-- Sub-tab nav -->
-    <ul class="nav nav-tabs mb-4" id="rateLimitSubTabs" role="tablist">
-        <li class="nav-item" role="presentation">
-            <button class="nav-link active" id="rl-subtab-request-btn" onclick="showRateLimitSubTab('request')" type="button" role="tab">
-                Overall
-            </button>
-        </li>
-        <li class="nav-item" role="presentation">
-            <button class="nav-link" id="rl-subtab-model-groups-btn" onclick="showRateLimitSubTab('model-groups')" type="button" role="tab">
-                Model
-            </button>
-        </li>
-        <li class="nav-item" role="presentation">
-            <button class="nav-link" id="rl-subtab-instance-groups-btn" onclick="showRateLimitSubTab('instance-groups')" type="button" role="tab">
-                Instance
-            </button>
-        </li>
-    </ul>
+    <div class="subtab-navigation mb-4" id="rateLimitSubTabs" role="tablist">
+        <button class="subtab-button active" id="rl-subtab-request-btn" onclick="showRateLimitSubTab('request')" type="button" role="tab">
+            <i class="fas fa-gauge-high"></i> Overall
+        </button>
+        <button class="subtab-button" id="rl-subtab-model-groups-btn" onclick="showRateLimitSubTab('model-groups')" type="button" role="tab">
+            <i class="fas fa-layer-group"></i> Model
+        </button>
+        <button class="subtab-button" id="rl-subtab-instance-groups-btn" onclick="showRateLimitSubTab('instance-groups')" type="button" role="tab">
+            <i class="fas fa-server"></i> Instance
+        </button>
+    </div>
 
     <!-- Sub-pane: Request Rate Limits -->
     <div id="rl-subtab-request">
