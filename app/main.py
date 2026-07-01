@@ -541,8 +541,25 @@ def create_azure_openai_app() -> FastAPI:
 
 # ==================== Management Server ======================================
 
-def create_management_app() -> FastAPI:
-    """Create the management server (port 8765)."""
+def create_management_app(
+    openai_app: FastAPI,
+    anthropic_app: FastAPI,
+    azure_openai_app: FastAPI,
+) -> FastAPI:
+    """Create the management server (port 8765).
+
+    The three provider API apps are mounted under path prefixes so every API is
+    reachable through this single port in addition to its own dedicated port:
+
+      /openai/*        -> openai_app        (same as the OpenAI port)
+      /anthropic/*     -> anthropic_app     (same as the Anthropic port)
+      /azure-openai/*  -> azure_openai_app  (same as the Azure OpenAI port)
+
+    Starlette strips the mount prefix before dispatching, so each sub-app sees
+    its normal paths and all of its own middleware runs unchanged. The apps are
+    the same instances served by their own uvicorn servers, which own their
+    lifespans — the mounts intentionally add no lifespan wiring.
+    """
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -567,6 +584,11 @@ def create_management_app() -> FastAPI:
     mgmt_app.include_router(auth.router)
     mgmt_app.include_router(dashboard.router)
     mgmt_app.include_router(admin.router)
+
+    # Unified entry point: expose every provider API under this port too.
+    mgmt_app.mount("/openai", openai_app)
+    mgmt_app.mount("/anthropic", anthropic_app)
+    mgmt_app.mount("/azure-openai", azure_openai_app)
 
     @mgmt_app.get("/")
     async def root(

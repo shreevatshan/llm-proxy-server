@@ -259,8 +259,8 @@ async def _run_multi_server():
     )
     servers.append(uvicorn.Server(azure_openai_cfg))
 
-    # Management server
-    mgmt_app = create_management_app()
+    # Management server (also mounts the three API apps for a unified entry point)
+    mgmt_app = create_management_app(openai_app, anthropic_app, azure_openai_app)
     mgmt_cfg = uvicorn.Config(
         mgmt_app,
         host=config.server.host,
@@ -274,6 +274,7 @@ async def _run_multi_server():
     print(f"  Anthropic API      → http://{config.server.host}:{config.server.anthropic_port}")
     print(f"  Azure OpenAI API   → http://{config.server.host}:{config.server.azure_openai_port}")
     print(f"  Management         → http://{config.server.host}:{config.server.management_port}")
+    print(f"  Unified (all APIs) → http://{config.server.host}:{config.server.management_port}/{{openai,anthropic,azure-openai}}/")
     print()
 
     await asyncio.gather(*(s.serve() for s in servers))
