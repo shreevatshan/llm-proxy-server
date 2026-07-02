@@ -8,6 +8,7 @@ These models mirror the Anthropic API specification for:
 
 import math
 import os
+import re
 import logging
 from typing import List, Optional, Dict, Any, Union, Literal, Annotated, Tuple
 from pydantic import BaseModel, Field
@@ -16,6 +17,30 @@ from pydantic import BaseModel, Field
 _logger = logging.getLogger(__name__)
 _ANTHROPIC_SDK_TIMEOUT_ENV = "ANTHROPIC_SDK_TIMEOUT_SECONDS"
 _DEFAULT_ANTHROPIC_SDK_TIMEOUT_SECONDS = 900.0
+
+_CLAUDE_VERSION_RE = re.compile(r'claude-(?:sonnet|opus|haiku)-(\d+)(?:-(\d+))?')
+
+
+def is_claude_at_least(model_id: str, min_major: int, min_minor: int) -> bool:
+    """True if ``model_id`` is a Claude model at or above ``min_major.min_minor``.
+
+    Handles both the "major-minor" naming (e.g. "claude-sonnet-4-5") and the
+    newer "major only" naming (e.g. "claude-sonnet-5"), and ignores any trailing
+    date snapshot (e.g. "claude-sonnet-5-20250101") — an 8-digit segment is a
+    date, not a minor version. A missing minor is treated as 0.
+    """
+    if not model_id:
+        return False
+    lower = model_id.lower()
+    if "claude" not in lower:
+        return False
+    match = _CLAUDE_VERSION_RE.search(lower)
+    if not match:
+        return False
+    major = int(match.group(1))
+    minor_raw = match.group(2)
+    minor = int(minor_raw) if (minor_raw is not None and len(minor_raw) <= 2) else 0
+    return (major, minor) >= (min_major, min_minor)
 
 
 def _get_positive_float_env(name: str, default: float) -> float:
@@ -602,6 +627,12 @@ def build_anthropic_sdk_kwargs(
         value = getattr(request, param, None)
         if value is not None:
             kwargs[param] = value
+
+    # Claude >= 4.7 deprecated top_p; forwarding it makes the model reject the
+    # request with "top_p is deprecated for this model". Drop it here so every
+    # Anthropic-SDK provider (direct Anthropic, Azure Foundry, ...) is covered.
+    if kwargs.get("top_p") is not None and is_claude_at_least(model_id, 4, 7):
+        kwargs.pop("top_p", None)
 
     # Complex model parameters
     if request.tools:

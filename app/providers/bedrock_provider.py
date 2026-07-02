@@ -131,6 +131,7 @@ from app.anthropic_models import (
     _extract_system_messages_from_messages,
     _merge_system_fields,
     is_anthropic_terminal_stream_event,
+    is_claude_at_least,
 )
 from app.providers.anthropic_compatible import (
     get_anthropic_post_terminal_drain_stop_reason,
@@ -1947,14 +1948,7 @@ class BedrockProvider(BaseProvider):
 
     @staticmethod
     def _is_claude_at_least(model_id: str, min_major: int, min_minor: int) -> bool:
-        lower = model_id.lower()
-        if "claude" not in lower:
-            return False
-        match = re.search(r'claude-(?:sonnet|opus|haiku)-(\d+)-(\d+)', lower)
-        if not match:
-            return False
-        major, minor = int(match.group(1)), int(match.group(2))
-        return (major, minor) >= (min_major, min_minor)
+        return is_claude_at_least(model_id, min_major, min_minor)
 
     @staticmethod
     def _supports_output_config_effort(model_id: str) -> bool:
@@ -2112,7 +2106,9 @@ class BedrockProvider(BaseProvider):
         # --- scalar params -----------------------------------------------------
         if request.temperature is not None:
             native["temperature"] = request.temperature
-        if request.top_p is not None:
+        # Claude >= 4.7 deprecated top_p — passing it triggers a
+        # "top_p is deprecated for this model" error. Drop it for those models.
+        if request.top_p is not None and not self._is_claude_at_least(request.model, 4, 7):
             native["top_p"] = request.top_p
         if request.top_k is not None:
             native["top_k"] = request.top_k

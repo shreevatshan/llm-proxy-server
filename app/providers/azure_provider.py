@@ -37,6 +37,7 @@ from app.anthropic_models import (
     ANTHROPIC_SDK_TIMEOUT_SECONDS,
     build_anthropic_sdk_kwargs,
     is_anthropic_terminal_stream_event,
+    is_claude_at_least,
 )
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
 from app.conversion.anthropic_openai import _is_codex_model
@@ -243,6 +244,12 @@ class AzureProvider(OpenAICompatibleProvider):
         payload["stream"] = stream
         dropped_fields: List[str] = []
 
+        # Claude >= 4.7 deprecated top_p; forwarding it triggers a
+        # "top_p is deprecated for this model" error.
+        if payload.get("top_p") is not None and is_claude_at_least(payload["model"], 4, 7):
+            payload.pop("top_p", None)
+            dropped_fields.append("top_p")
+
         if self._strip_cache_control_scope(payload.get("system")):
             dropped_fields.append("system.cache_control.scope")
 
@@ -269,7 +276,8 @@ class AzureProvider(OpenAICompatibleProvider):
         """Apply Azure Foundry-specific fixups to Anthropic SDK kwargs in-place.
 
         Strips cache_control.scope (unsupported on Foundry) and normalises
-        input_schema.type 'custom' → 'object'.
+        input_schema.type 'custom' → 'object'. (Deprecated-top_p removal is
+        handled centrally in build_anthropic_sdk_kwargs.)
         """
         self._strip_cache_control_scope(kwargs.get("system"))
 

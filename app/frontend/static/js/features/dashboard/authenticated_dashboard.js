@@ -320,6 +320,14 @@ function initEndpointsTab() {
     el('anthropic-base-url').textContent = anthropicBaseUrl;
     el('azure-openai-base-url').textContent = azureBaseUrl;
 
+    // Unified base URLs: every provider is also reachable through the single
+    // management port under a path prefix (see create_management_app).
+    if (typeof _managementPort !== 'undefined') {
+        el('openai-unified-url').textContent       = `http://${_domain}:${_managementPort}/openai/v1`;
+        el('anthropic-unified-url').textContent    = `http://${_domain}:${_managementPort}/anthropic`;
+        el('azure-openai-unified-url').textContent = `http://${_domain}:${_managementPort}/azure-openai`;
+    }
+
     _renderEndpoints(endpointsData,          'openai-endpoints',    openaiBaseUrl);
     _renderEndpoints(anthropicEndpointsData,  'anthropic-endpoints', anthropicBaseUrl);
     _renderEndpoints(azureEndpointsData,      'azure-openai-endpoints', azureBaseUrl);
@@ -356,17 +364,30 @@ function toggleEndpoints(section) {
         container.style.maxHeight = container.scrollHeight + 'px';
         requestAnimationFrame(() => { container.style.maxHeight = '0'; });
         container.classList.remove('show');
-        toggle.classList.remove('open');
-        card.classList.remove('expanded');
+        if (toggle) toggle.classList.remove('open');
+        if (card) {
+            card.classList.remove('expanded');
+            card.setAttribute('aria-expanded', 'false');
+        }
     } else {
         container.classList.add('show');
         container.style.maxHeight = container.scrollHeight + 'px';
-        toggle.classList.add('open');
-        card.classList.add('expanded');
+        if (toggle) toggle.classList.add('open');
+        if (card) {
+            card.classList.add('expanded');
+            card.setAttribute('aria-expanded', 'true');
+        }
         container.addEventListener('transitionend', function handler() {
             if (container.classList.contains('show')) container.style.maxHeight = 'none';
             container.removeEventListener('transitionend', handler);
         });
+    }
+}
+
+function handleEndpointCardKeydown(event, section) {
+    if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggleEndpoints(section);
     }
 }
 
