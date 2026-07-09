@@ -52,9 +52,17 @@
     </div>
     
     <div class="section-header">
-        <h2 class="section-title">User Management</h2>
+        <div class="d-flex align-items-center gap-2">
+            <h2 class="section-title me-4">User Management</h2>
+            <div class="position-relative flex-shrink-0" style="width: 240px;">
+                <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                <input type="text" id="user-mgmt-search" class="form-control form-control-sm ps-5"
+                    placeholder="Search users"
+                    oninput="window.UserManager?.filterUsers(this.value)">
+            </div>
+        </div>
     </div>
-    
+
     {% if users %}
     <div class="table-responsive">
         <table class="table table-hover mb-0">
@@ -69,9 +77,9 @@
                     <th>Actions</th>
                 </tr>
             </thead>
-            <tbody>
+            <tbody id="users-mgmt-tbody">
                 {% for user in users %}
-                <tr>
+                <tr class="user-mgmt-row" data-username="{{ user.username|lower }}" data-email="{{ user.email|lower }}">
                     <td>{{ user.id }}</td>
                     <td>{{ user.username }}</td>
                     <td>{{ user.email }}</td>
@@ -109,6 +117,9 @@
                     </td>
                 </tr>
                 {% endfor %}
+                <tr id="user-mgmt-no-match" style="display:none;">
+                    <td colspan="7" class="text-center text-muted py-4">No users match your search.</td>
+                </tr>
             </tbody>
         </table>
     </div>
@@ -461,8 +472,16 @@
 
         <!-- Per-User Limits Card -->
         <div class="card">
-            <div class="card-header d-flex align-items-center justify-content-between">
-                <h5 class="mb-0"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
+            <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+                <div class="d-flex align-items-center gap-2">
+                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
+                    <div class="position-relative flex-shrink-0" style="width: 240px;">
+                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                        <input type="text" id="rl-user-search" class="form-control form-control-sm ps-5"
+                            placeholder="Search users"
+                            oninput="window.RateLimitManager?.filterUsers(this.value)">
+                    </div>
+                </div>
                 <button class="btn btn-outline-secondary btn-sm" onclick="window.RateLimitManager?.load()">
                     <i class="fas fa-sync-alt me-1"></i>Refresh
                 </button>
@@ -526,13 +545,21 @@
         <!-- Per-User Overrides card -->
         <div class="card">
             <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                <h5 class="mb-0"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
-                <div class="d-flex align-items-center">
-                    <select id="mg-user-group-select" class="form-select form-select-sm" style="width:auto"
+                <div class="d-flex align-items-center gap-2">
+                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
+                    <div class="position-relative flex-shrink-0" style="width: 240px;">
+                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                        <input type="text" id="mg-user-search" class="form-control form-control-sm ps-5"
+                            placeholder="Search users"
+                            oninput="window.ModelGroupManager?.filterUserOverrides()">
+                    </div>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <select id="mg-user-group-select" class="form-select form-select-sm me-2" style="width:auto"
                         onchange="window.ModelGroupManager?.onGroupSelect(this.value)">
                         <option value="">— Select a model group —</option>
                     </select>
-                    <button class="btn btn-outline-secondary btn-sm ms-4" onclick="window.ModelGroupManager?.refreshUserOverrides()">
+                    <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelGroupManager?.refreshUserOverrides()">
                         <i class="fas fa-sync-alt me-1"></i>Refresh
                     </button>
                 </div>
@@ -595,13 +622,21 @@
         <!-- Per-User Overrides card -->
         <div class="card">
             <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                <h5 class="mb-0"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
-                <div class="d-flex align-items-center">
-                    <select id="ig-user-group-select" class="form-select form-select-sm" style="width:auto"
+                <div class="d-flex align-items-center gap-2">
+                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
+                    <div class="position-relative flex-shrink-0" style="width: 240px;">
+                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                        <input type="text" id="ig-user-search" class="form-control form-control-sm ps-5"
+                            placeholder="Search users"
+                            oninput="window.InstanceGroupManager?.filterUserOverrides()">
+                    </div>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <select id="ig-user-group-select" class="form-select form-select-sm me-2" style="width:auto"
                         onchange="window.InstanceGroupManager?.onGroupSelect(this.value)">
                         <option value="">— Select an instance group —</option>
                     </select>
-                    <button class="btn btn-outline-secondary btn-sm ms-4" onclick="window.InstanceGroupManager?.refreshUserOverrides()">
+                    <button class="btn btn-outline-secondary btn-sm" onclick="window.InstanceGroupManager?.refreshUserOverrides()">
                         <i class="fas fa-sync-alt me-1"></i>Refresh
                     </button>
                 </div>

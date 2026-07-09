@@ -189,6 +189,74 @@ _TRACKED_PREFIXES = ("/v1/", "/openai/deployments/")
 _EXCLUDED_PATHS = ("/v1/messages/count_tokens",)
 
 
+def _model_from_multipart(body: bytes, content_type: str) -> Optional[str]:
+    """Extract the "model" form field from an already-buffered multipart body.
+
+    Multipart endpoints (audio transcription/translation, image edit/variation)
+    send the model as a form field rather than JSON, so the tracking
+    middleware's json.loads() misses it. Rather than call request.form() —
+    which spools every uploaded file part to a temporary file (rolling to disk
+    past 1 MB) just to read one small field — this reuses python_multipart's
+    tokenizer with field-only callbacks: file parts are skipped entirely and no
+    spooling happens. Returns None if the field is absent or the body is
+    malformed (tracking must never break the request).
+    """
+    try:
+        from multipart.multipart import MultipartParser, parse_options_header
+
+        _, params = parse_options_header(content_type)
+        boundary = params.get(b"boundary")
+        if not boundary:
+            return None
+
+        state = {"name": b"", "header": b"", "is_file": False, "data": bytearray()}
+        result: dict[str, str] = {}
+
+        def on_header_field(data: bytes, start: int, end: int) -> None:
+            state["header"] = data[start:end].lower()
+
+        def on_header_value(data: bytes, start: int, end: int) -> None:
+            if state["header"] == b"content-disposition":
+                disp, opts = parse_options_header(b"form-data; " + data[start:end])
+                state["name"] = opts.get(b"name", b"")
+                state["is_file"] = b"filename" in opts
+
+        # Only the "model" field is needed; ignore everything else and cap its
+        # size so a crafted text field can't be copied unbounded into memory.
+        _MODEL_FIELD_MAX = 1024
+
+        def on_part_data(data: bytes, start: int, end: int) -> None:
+            if (not state["is_file"]
+                    and state["name"] == b"model"
+                    and len(state["data"]) < _MODEL_FIELD_MAX):
+                state["data"].extend(data[start:end])
+
+        def on_part_end() -> None:
+            if not state["is_file"] and state["name"]:
+                try:
+                    result[state["name"].decode()] = bytes(state["data"]).decode()
+                except UnicodeDecodeError:
+                    pass
+            state["name"] = b""
+            state["is_file"] = False
+            state["data"] = bytearray()
+
+        parser = MultipartParser(
+            boundary,
+            {
+                "on_header_field": on_header_field,
+                "on_header_value": on_header_value,
+                "on_part_data": on_part_data,
+                "on_part_end": on_part_end,
+            },
+        )
+        parser.write(body)
+        parser.finalize()
+        return result.get("model")
+    except Exception:
+        return None
+
+
 def _add_request_tracking(app: FastAPI, server_name: str):
     """Add request tracking middleware to an API server."""
     from app.request_tracker import request_tracker
@@ -213,6 +281,14 @@ def _add_request_tracking(app: FastAPI, server_name: str):
                 is_streaming = bool(body_json.get("stream", False))
             except Exception:
                 body_bytes = b""
+
+            # Multipart endpoints (audio transcription/translation, image
+            # edit/variation) carry the model as a form field, not JSON, so the
+            # json.loads above fails and leaves model=None.  Read just the model
+            # field from the already-buffered body (see _model_from_multipart).
+            content_type = request.headers.get("content-type", "")
+            if not model and "multipart/form-data" in content_type:
+                model = _model_from_multipart(body_bytes, content_type.encode("latin-1"))
 
             # For Azure-style deployment paths the deployment name lives in the URL,
             # not the body (the Azure SDK omits the "model" field).  Fall back to
@@ -269,7 +345,12 @@ def _add_request_tracking(app: FastAPI, server_name: str):
 
                 response.body_iterator = tracking_iterator()
             else:
-                await request_tracker.end_request(request_id, status="completed")
+                # Non-streaming: derive the outcome from the HTTP status code so
+                # error responses returned without raising (e.g. a handler that
+                # returns a 4xx/5xx JSONResponse) are not counted as successful.
+                status_code = getattr(response, "status_code", 200)
+                final_status = "completed" if status_code < 400 else "errored"
+                await request_tracker.end_request(request_id, status=final_status)
 
             return response
         except Exception as exc:

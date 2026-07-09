@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, Depends, File, UploadFile, Form, Request
 from fastapi.security import HTTPBearer
 from typing import Dict, Any, Optional
 from app.openai_models import ImageGenerationRequest, ImageEditRequest, ImageVariationRequest, ImageResponse
@@ -6,6 +6,8 @@ from app.providers.provider_manager import provider_manager
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
+from app.rate_limit_dep import enforce_group_rate_limit
+from app.rate_limit import RateLimitExceeded
 from typing import Union
 from app.tracing import create_span, add_span_attributes, set_span_error
 import logging
@@ -18,13 +20,16 @@ security = HTTPBearer()
 
 @router.post("/v1/images/generations", response_model=ImageResponse)
 async def create_image(
+    request_obj: Request,
     request: ImageGenerationRequest,
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ) -> ImageResponse:
     """Generate images from text prompts."""
-    
+
     with create_span("image_generation_request") as span:
         try:
+            # Group rate limit check (request-level limits already handled in middleware)
+            await enforce_group_rate_limit(request_obj, auth, request.model)
             # Add span attributes
             add_span_attributes(span, {
                 "model": request.model,
@@ -63,8 +68,14 @@ async def create_image(
             
             return response
             
-        except HTTPException:
+        except (HTTPException, RateLimitExceeded):
             raise
+        except ValueError as e:
+            # Bad model name / unknown provider is a client error, not a 500.
+            error_msg = f"No provider found for model: {request.model}"
+            logger.error(f"{error_msg} ({e})")
+            set_span_error(span, error_msg)
+            raise HTTPException(status_code=404, detail=error_msg)
         except NotImplementedError as e:
             error_msg = f"Image generation not supported: {str(e)}"
             logger.error(error_msg)
@@ -79,6 +90,7 @@ async def create_image(
 
 @router.post("/v1/images/edits", response_model=ImageResponse)
 async def edit_image(
+    request_obj: Request,
     image: UploadFile = File(...),
     prompt: str = Form(...),
     mask: Optional[UploadFile] = File(None),
@@ -90,9 +102,12 @@ async def edit_image(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ) -> ImageResponse:
     """Edit images with text prompts."""
-    
+
     with create_span("image_edit_request") as span:
         try:
+            # Group rate limit check (request-level limits already handled in middleware)
+            await enforce_group_rate_limit(request_obj, auth, model)
+
             # Read and encode image file
             image_content = await image.read()
             image_b64 = base64.b64encode(image_content).decode('utf-8')
@@ -152,8 +167,14 @@ async def edit_image(
             
             return response
             
-        except HTTPException:
+        except (HTTPException, RateLimitExceeded):
             raise
+        except ValueError as e:
+            # Bad model name / unknown provider is a client error, not a 500.
+            error_msg = f"No provider found for model: {request.model}"
+            logger.error(f"{error_msg} ({e})")
+            set_span_error(span, error_msg)
+            raise HTTPException(status_code=404, detail=error_msg)
         except NotImplementedError as e:
             error_msg = f"Image editing not supported: {str(e)}"
             logger.error(error_msg)
@@ -168,6 +189,7 @@ async def edit_image(
 
 @router.post("/v1/images/variations", response_model=ImageResponse)
 async def create_image_variation(
+    request_obj: Request,
     image: UploadFile = File(...),
     model: Optional[str] = Form("dall-e-2"),
     n: Optional[int] = Form(1),
@@ -177,9 +199,12 @@ async def create_image_variation(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ) -> ImageResponse:
     """Create variations of images."""
-    
+
     with create_span("image_variation_request") as span:
         try:
+            # Group rate limit check (request-level limits already handled in middleware)
+            await enforce_group_rate_limit(request_obj, auth, model)
+
             # Read and encode image file
             image_content = await image.read()
             image_b64 = base64.b64encode(image_content).decode('utf-8')
@@ -229,8 +254,14 @@ async def create_image_variation(
             
             return response
             
-        except HTTPException:
+        except (HTTPException, RateLimitExceeded):
             raise
+        except ValueError as e:
+            # Bad model name / unknown provider is a client error, not a 500.
+            error_msg = f"No provider found for model: {request.model}"
+            logger.error(f"{error_msg} ({e})")
+            set_span_error(span, error_msg)
+            raise HTTPException(status_code=404, detail=error_msg)
         except NotImplementedError as e:
             error_msg = f"Image variations not supported: {str(e)}"
             logger.error(error_msg)

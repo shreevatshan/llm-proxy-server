@@ -852,6 +852,10 @@ class ProviderManager:
                 return response
             except Exception as e:
                 set_span_error(span, e)
+                # Preserve ValueError (bad model name / provider not found) so
+                # the route maps it to a 400/404 client error rather than 500.
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Chat completion error: {str(e)}")
     
     async def completion(self, request: CompletionRequest) -> CompletionResponse:
@@ -864,6 +868,8 @@ class ProviderManager:
                 return await provider.completion(request)
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Completion error: {str(e)}")
     
     async def chat_completion_stream(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
@@ -968,6 +974,8 @@ class ProviderManager:
                 return response
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Responses create error: {str(e)}")
     
     async def responses_create_stream(self, request: ResponsesCreateRequest) -> AsyncGenerator[str, None]:
@@ -1024,6 +1032,8 @@ class ProviderManager:
                 return await provider.responses_retrieve(response_id, **kwargs)
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Responses retrieve error: {str(e)}")
     
     async def responses_delete(self, response_id: str) -> ResponseDeletedObject:
@@ -1039,6 +1049,8 @@ class ProviderManager:
                 return result
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Responses delete error: {str(e)}")
     
     async def responses_cancel(self, response_id: str) -> ResponseObject:
@@ -1049,6 +1061,8 @@ class ProviderManager:
                 return await provider.responses_cancel(response_id)
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Responses cancel error: {str(e)}")
     
     async def responses_list_input_items(self, response_id: str, **kwargs) -> ResponseItemList:
@@ -1059,6 +1073,8 @@ class ProviderManager:
                 return await provider.responses_list_input_items(response_id, **kwargs)
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Responses list input items error: {str(e)}")
     
     async def responses_input_tokens(self, request: ResponsesInputTokensRequest) -> ResponseInputTokensResult:
@@ -1070,6 +1086,8 @@ class ProviderManager:
                 return await provider.responses_input_tokens(request)
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Responses input tokens error: {str(e)}")
     
     async def responses_compact(self, request: ResponsesCompactRequest) -> CompactedResponseObject:
@@ -1081,6 +1099,8 @@ class ProviderManager:
                 return await provider.responses_compact(request)
             except Exception as e:
                 set_span_error(span, e)
+                if isinstance(e, ValueError):
+                    raise
                 raise Exception(f"Responses compact error: {str(e)}")
     
     def get_provider_for_model(self, model_name: str) -> BaseProvider:

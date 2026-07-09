@@ -5,136 +5,138 @@
 {% block extra_css %}
 <link rel="stylesheet" href="/static/css/main.css?v={{ cache_version }}">
 <style>
+    /* ============================================================
+       Endpoints — provider routing blocks
+       Each provider is reachable two ways: a dedicated DIRECT port,
+       or the unified GATEWAY port by path. The URL is syntax-lit so
+       the shared host recedes and the differing token stands out.
+       ============================================================ */
+
     .endpoint-section {
-        margin-bottom: 16px;
+        margin-bottom: 14px;
     }
-    .base-url-card {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr);
-        align-items: center;
-        padding: 14px 16px;
-        background-color: var(--dark-surface);
+
+    /* ---- Provider block ---- */
+    .provider-block {
         border: 1px solid var(--dark-border);
-        border-radius: 6px;
+        border-radius: var(--radius-md);
+        background-color: var(--dark-surface);
+        overflow: hidden;
         transition: border-color 0.2s;
-        cursor: pointer;
     }
-    .base-url-card:hover {
+    .provider-block:hover {
         border-color: var(--mono-5);
-        background-color: var(--mono-1);
     }
-    .base-url-card.expanded {
-        border-radius: 6px 6px 0 0;
-        border-bottom-color: transparent;
-    }
-    .base-url-left {
-        display: grid;
-        grid-template-columns: minmax(120px, 1fr) minmax(0, 7fr) minmax(96px, 1fr);
-        grid-auto-rows: minmax(34px, auto);
-        align-items: center;
-        column-gap: 18px;
-        row-gap: 0;
-        width: 100%;
-        min-width: 0;
-    }
-    .base-url-urls {
-        display: contents;
-    }
-    .base-url-row {
-        display: contents;
-    }
-    .base-url-row .base-url-text {
-        grid-column: 2;
-        justify-self: center;
-        min-width: 0;
-        width: 100%;
-    }
-    .base-url-row:first-child .base-url-text,
-    .base-url-row:first-child .copy-btn {
-        padding-bottom: 8px;
-    }
-    .base-url-row + .base-url-row .base-url-text {
-        position: relative;
-        padding-top: 8px;
-    }
-    .base-url-row + .base-url-row .base-url-text::before {
-        content: '';
-        position: absolute;
-        top: 0;
-        left: 6%;
-        right: 6%;
-        height: 1px;
-        background: var(--dark-border);
-        opacity: 0.75;
-    }
-    .base-url-row + .base-url-row .copy-btn {
-        margin-top: 0;
-        padding-top: 8px;
-    }
-    .base-url-right {
+
+    /* ---- Block header: socket + name + api metadata ---- */
+    .provider-head {
         display: flex;
         align-items: center;
-        justify-content: center;
-        width: 34px;
+        gap: 14px;
+        padding: 14px 18px;
+        border-bottom: 1px solid var(--dark-border);
+    }
+    .provider-socket {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: var(--mono-text-primary);
+        box-shadow: 0 0 0 3px rgba(250, 250, 250, 0.08);
         flex-shrink: 0;
     }
-    .api-badge {
-        display: inline-block;
-        padding: 3px 10px;
-        border-radius: 4px;
-        font-size: 11px;
-        font-weight: 600;
-        letter-spacing: 0.3px;
-        text-transform: uppercase;
-        flex-shrink: 0;
-        width: 100%;
-        text-align: center;
-    }
-    .base-url-left > .api-badge {
-        grid-column: 1;
-        grid-row: 1 / span 2;
-        justify-self: center;
-        align-self: center;
-        max-width: 120px;
-    }
-    .api-badge.openai,
-    .api-badge.anthropic,
-    .api-badge.azure_openai {
-        background-color: var(--mono-3);
+    .provider-name {
+        font-family: var(--font-family-display);
+        font-weight: var(--font-semibold);
+        font-size: 0.95rem;
+        letter-spacing: 0.02em;
         color: var(--mono-text-primary);
-        border: 1px solid var(--mono-5);
     }
-    .base-url-text {
+    .provider-meta {
+        margin-left: auto;
+        font-size: 0.72rem;
+        color: var(--mono-text-secondary);
+        letter-spacing: 0.04em;
         font-family: var(--font-family-mono);
-        font-size: 14px;
-        color: var(--mono-text-primary);
-        word-break: break-all;
-        line-height: 1.5;
-        text-align: center;
     }
-    .copy-btn {
-        padding: 6px 14px;
-        background-color: transparent;
+    .provider-meta b {
         color: var(--mono-text-primary);
+        font-weight: var(--font-medium);
+    }
+
+    /* ---- Route rows (direct / gateway) ---- */
+    .provider-routes {
+        padding: 6px 18px 14px;
+    }
+    .route-row {
+        display: grid;
+        grid-template-columns: 86px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 16px;
+        padding: 11px 0;
+    }
+    .route-row + .route-row {
+        border-top: 1px solid var(--mono-3);
+    }
+    .route-label {
+        font-size: 0.62rem;
+        letter-spacing: var(--tracking-wide);
+        text-transform: uppercase;
+        color: var(--mono-text-secondary);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-family: var(--font-family-mono);
+    }
+    .route-glyph {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+    .route-row.direct .route-glyph {
+        background: var(--mono-text-primary);
+    }
+    .route-row.gateway .route-glyph {
+        background: transparent;
+        border: 1px solid var(--mono-6);
+    }
+
+    /* URL with syntax highlighting */
+    .route-url {
+        font-family: var(--font-family-mono);
+        font-size: 0.9rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
+    }
+    .route-url .u-scheme { color: var(--mono-5); }
+    .route-url .u-host   { color: var(--mono-text-muted); }
+    .route-url .u-key    { color: var(--mono-text-primary); font-weight: var(--font-medium); }
+
+    /* ---- Copy button ---- */
+    .copy-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        padding: 7px 14px;
+        background-color: transparent;
+        color: var(--mono-text-secondary);
         border: 1px solid var(--mono-5);
         border-radius: var(--radius-sm);
         cursor: pointer;
-        font-size: 13px;
-        transition: all 0.2s;
-        display: flex;
-        align-items: center;
-        gap: 6px;
+        font-size: 0.72rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        transition: all 0.15s ease;
         white-space: nowrap;
         font-family: var(--font-family-mono);
-        justify-content: center;
     }
-    .base-url-row .copy-btn {
-        grid-column: 3;
-        justify-self: center;
-        width: 80px;
-    }
+    .copy-btn i { font-size: 0.72rem; }
     .copy-btn:hover {
         border-color: var(--mono-text-primary);
+        color: var(--mono-text-primary);
         background-color: var(--mono-3);
     }
     .copy-btn.copied {
@@ -142,108 +144,88 @@
         color: var(--mono-0);
         background-color: var(--mono-text-primary);
     }
-    .toggle-btn {
-        padding: 6px 10px;
-        background-color: transparent;
-        color: var(--mono-text-secondary);
-        border: 1px solid var(--mono-5);
-        border-radius: var(--radius-sm);
-        cursor: pointer;
-        font-size: 13px;
-        transition: all 0.2s;
+
+    /* ---- Expand footer ---- */
+    .provider-foot {
         display: flex;
         align-items: center;
-        justify-content: center;
-        gap: 5px;
-        white-space: nowrap;
-        width: 34px;
-        height: 34px;
+        justify-content: space-between;
+        padding: 11px 18px;
+        background-color: var(--mono-2);
+        border-top: 1px solid var(--dark-border);
+        cursor: pointer;
+        transition: background-color 0.2s;
     }
-    .toggle-btn:hover {
-        border-color: var(--mono-text-primary);
+    .provider-foot:hover { background-color: var(--mono-3); }
+    .foot-label {
+        font-size: 0.72rem;
+        letter-spacing: 0.06em;
+        color: var(--mono-text-secondary);
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        font-family: var(--font-family-mono);
+    }
+    .foot-label .foot-count {
         color: var(--mono-text-primary);
-        background-color: var(--mono-3);
+        font-weight: var(--font-semibold);
     }
-    .toggle-btn .chevron {
+    .foot-chevron {
+        font-size: 0.65rem;
+        color: var(--mono-text-secondary);
         transition: transform 0.25s ease;
-        font-size: 11px;
     }
-    .toggle-btn.open .chevron {
-        transform: rotate(180deg);
-    }
+    .provider-block.expanded .foot-chevron { transform: rotate(180deg); }
+
+    /* ---- Endpoint list (collapsible) ---- */
     .endpoints-collapse {
         max-height: 0;
         overflow: hidden;
         transition: max-height 0.3s ease;
-        border: 1px solid var(--dark-border);
-        border-top: none;
-        border-radius: 0 0 6px 6px;
-    }
-    .endpoints-collapse.show {
-        max-height: none;
-    }
-    .endpoints-collapse:not(.show) {
-        border-color: transparent;
     }
     .endpoint-list-item {
-        display: flex;
-        justify-content: space-between;
+        display: grid;
+        grid-template-columns: 56px minmax(0, 1fr) auto auto;
         align-items: center;
-        padding: 10px 16px;
-        background-color: var(--dark-surface);
-        border-top: 1px solid var(--dark-border);
+        gap: 14px;
+        padding: 10px 18px;
+        border-top: 1px solid var(--mono-3);
         transition: background-color 0.2s;
-        gap: 12px;
     }
-    .endpoint-list-item:last-child {
-        border-radius: 0 0 6px 6px;
-    }
-    .endpoint-list-item:hover {
-        background-color: var(--mono-2);
-    }
-    .endpoint-info {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        flex: 1;
-        min-width: 0;
-    }
+    .endpoint-list-item:hover { background-color: var(--mono-2); }
     .endpoint-method {
-        display: inline-block;
-        padding: 2px 7px;
-        border-radius: 3px;
-        font-size: 10px;
-        font-weight: 700;
-        letter-spacing: 0.3px;
-        text-transform: uppercase;
-        flex-shrink: 0;
-        min-width: 46px;
-        text-align: center;
-    }
-    .endpoint-method,
-    .endpoint-method.get,
-    .endpoint-method.post,
-    .endpoint-method.put,
-    .endpoint-method.delete,
-    .endpoint-method.patch {
         font-family: var(--font-family-mono);
-        letter-spacing: var(--tracking-wider);
-        background-color: transparent;
-        color: var(--mono-text-primary);
+        font-size: 0.6rem;
+        font-weight: var(--font-bold);
+        letter-spacing: var(--tracking-wide);
+        text-transform: uppercase;
+        text-align: center;
+        padding: 3px 0;
         border: 1px solid var(--mono-5);
+        border-radius: 2px;
+        color: var(--mono-text-primary);
+        background-color: transparent;
     }
     .endpoint-path {
-        font-size: 13px;
+        font-size: 0.82rem;
         color: var(--mono-text-primary);
         font-family: var(--font-family-mono);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
     }
     .endpoint-desc {
-        font-size: 12px;
+        font-size: 0.72rem;
         color: var(--mono-text-muted);
-        margin-left: auto;
-        flex-shrink: 0;
+        text-align: right;
         font-family: var(--font-family-mono);
+        white-space: nowrap;
     }
+
+    /* ---- Copy-in-endpoint: reuse copy-btn but icon-only-ish ---- */
+    .endpoint-list-item .copy-btn { padding: 5px 12px; }
+
+    /* ---- Toast ---- */
     .toast-container {
         position: fixed;
         top: 20px;
@@ -266,6 +248,19 @@
         from { transform: translateX(100%); opacity: 0; }
         to { transform: translateX(0); opacity: 1; }
     }
+
+    /* ---- Responsive: stack route grid on narrow screens ---- */
+    @media (max-width: 640px) {
+        .route-row {
+            grid-template-columns: 1fr auto;
+            row-gap: 6px;
+        }
+        .route-label { grid-column: 1 / -1; }
+        .endpoint-list-item {
+            grid-template-columns: 52px 1fr auto;
+        }
+        .endpoint-desc { display: none; }
+    }
 </style>
 {% endblock %}
 
@@ -286,74 +281,98 @@
 <div class="section" style="background-color: transparent !important;">
     <!-- OpenAI -->
     <div class="endpoint-section">
-        <div class="base-url-card" id="openai-card" role="button" tabindex="0" aria-expanded="false" onclick="toggleEndpoints('openai')" onkeydown="handleEndpointCardKeydown(event, 'openai')">
-            <div class="base-url-left">
-                <span class="api-badge openai">OpenAI</span>
-                <div class="base-url-urls">
-                    <div class="base-url-row">
-                        <span class="base-url-text" id="openai-base-url"></span>
-                        <button class="copy-btn" onclick="event.stopPropagation(); copyText(document.getElementById('openai-base-url').textContent, this)">
-                            <i class="fas fa-copy"></i> Copy
-                        </button>
-                    </div>
-                    <div class="base-url-row">
-                        <span class="base-url-text" id="openai-unified-url"></span>
-                        <button class="copy-btn" onclick="event.stopPropagation(); copyText(document.getElementById('openai-unified-url').textContent, this)">
-                            <i class="fas fa-copy"></i> Copy
-                        </button>
-                    </div>
+        <div class="provider-block" id="openai-block">
+            <div class="provider-head">
+                <span class="provider-socket"></span>
+                <span class="provider-name">OpenAI</span>
+                <span class="provider-meta">OpenAI-compatible &nbsp;·&nbsp; suffix <b>/v1</b></span>
+            </div>
+            <div class="provider-routes">
+                <div class="route-row direct">
+                    <span class="route-label"><span class="route-glyph"></span>Direct</span>
+                    <span class="route-url" id="openai-base-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('openai-base-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+                <div class="route-row gateway">
+                    <span class="route-label"><span class="route-glyph"></span>Gateway</span>
+                    <span class="route-url" id="openai-unified-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('openai-unified-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
                 </div>
             </div>
+            <div class="provider-foot" role="button" tabindex="0" aria-expanded="false" aria-controls="openai-endpoints" onclick="toggleEndpoints('openai')" onkeydown="handleEndpointCardKeydown(event, 'openai')">
+                <span class="foot-label"><span class="foot-count" id="openai-count">0</span> request endpoints</span>
+                <i class="fas fa-chevron-down foot-chevron"></i>
+            </div>
+            <div class="endpoints-collapse" id="openai-endpoints"></div>
         </div>
-        <div class="endpoints-collapse" id="openai-endpoints"></div>
     </div>
 
     <!-- Anthropic -->
     <div class="endpoint-section">
-        <div class="base-url-card" id="anthropic-card" role="button" tabindex="0" aria-expanded="false" onclick="toggleEndpoints('anthropic')" onkeydown="handleEndpointCardKeydown(event, 'anthropic')">
-            <div class="base-url-left">
-                <span class="api-badge anthropic">Anthropic</span>
-                <div class="base-url-urls">
-                    <div class="base-url-row">
-                        <span class="base-url-text" id="anthropic-base-url"></span>
-                        <button class="copy-btn" onclick="event.stopPropagation(); copyText(document.getElementById('anthropic-base-url').textContent, this)">
-                            <i class="fas fa-copy"></i> Copy
-                        </button>
-                    </div>
-                    <div class="base-url-row">
-                        <span class="base-url-text" id="anthropic-unified-url"></span>
-                        <button class="copy-btn" onclick="event.stopPropagation(); copyText(document.getElementById('anthropic-unified-url').textContent, this)">
-                            <i class="fas fa-copy"></i> Copy
-                        </button>
-                    </div>
+        <div class="provider-block" id="anthropic-block">
+            <div class="provider-head">
+                <span class="provider-socket"></span>
+                <span class="provider-name">Anthropic</span>
+                <span class="provider-meta">Messages API &nbsp;·&nbsp; suffix <b>none</b></span>
+            </div>
+            <div class="provider-routes">
+                <div class="route-row direct">
+                    <span class="route-label"><span class="route-glyph"></span>Direct</span>
+                    <span class="route-url" id="anthropic-base-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('anthropic-base-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+                <div class="route-row gateway">
+                    <span class="route-label"><span class="route-glyph"></span>Gateway</span>
+                    <span class="route-url" id="anthropic-unified-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('anthropic-unified-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
                 </div>
             </div>
+            <div class="provider-foot" role="button" tabindex="0" aria-expanded="false" aria-controls="anthropic-endpoints" onclick="toggleEndpoints('anthropic')" onkeydown="handleEndpointCardKeydown(event, 'anthropic')">
+                <span class="foot-label"><span class="foot-count" id="anthropic-count">0</span> request endpoints</span>
+                <i class="fas fa-chevron-down foot-chevron"></i>
+            </div>
+            <div class="endpoints-collapse" id="anthropic-endpoints"></div>
         </div>
-        <div class="endpoints-collapse" id="anthropic-endpoints"></div>
     </div>
 
     <!-- Azure OpenAI -->
     <div class="endpoint-section">
-        <div class="base-url-card" id="azure-openai-card" role="button" tabindex="0" aria-expanded="false" onclick="toggleEndpoints('azure-openai')" onkeydown="handleEndpointCardKeydown(event, 'azure-openai')">
-            <div class="base-url-left">
-                <span class="api-badge azure_openai">Azure OpenAI</span>
-                <div class="base-url-urls">
-                    <div class="base-url-row">
-                        <span class="base-url-text" id="azure-openai-base-url"></span>
-                        <button class="copy-btn" onclick="event.stopPropagation(); copyText(document.getElementById('azure-openai-base-url').textContent, this)">
-                            <i class="fas fa-copy"></i> Copy
-                        </button>
-                    </div>
-                    <div class="base-url-row">
-                        <span class="base-url-text" id="azure-openai-unified-url"></span>
-                        <button class="copy-btn" onclick="event.stopPropagation(); copyText(document.getElementById('azure-openai-unified-url').textContent, this)">
-                            <i class="fas fa-copy"></i> Copy
-                        </button>
-                    </div>
+        <div class="provider-block" id="azure-openai-block">
+            <div class="provider-head">
+                <span class="provider-socket"></span>
+                <span class="provider-name">Azure OpenAI</span>
+                <span class="provider-meta">Deployment-routed &nbsp;·&nbsp; suffix <b>none</b></span>
+            </div>
+            <div class="provider-routes">
+                <div class="route-row direct">
+                    <span class="route-label"><span class="route-glyph"></span>Direct</span>
+                    <span class="route-url" id="azure-openai-base-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('azure-openai-base-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+                <div class="route-row gateway">
+                    <span class="route-label"><span class="route-glyph"></span>Gateway</span>
+                    <span class="route-url" id="azure-openai-unified-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('azure-openai-unified-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
                 </div>
             </div>
+            <div class="provider-foot" role="button" tabindex="0" aria-expanded="false" aria-controls="azure-openai-endpoints" onclick="toggleEndpoints('azure-openai')" onkeydown="handleEndpointCardKeydown(event, 'azure-openai')">
+                <span class="foot-label"><span class="foot-count" id="azure-openai-count">0</span> request endpoints</span>
+                <i class="fas fa-chevron-down foot-chevron"></i>
+            </div>
+            <div class="endpoints-collapse" id="azure-openai-endpoints"></div>
         </div>
-        <div class="endpoints-collapse" id="azure-openai-endpoints"></div>
     </div>
 </div>
 
@@ -392,11 +411,9 @@
             const fullUrl = baseUrl + ep.path;
             html += `
                 <div class="endpoint-list-item">
-                    <div class="endpoint-info">
-                        <span class="endpoint-method ${ep.method.toLowerCase()}">${ep.method}</span>
-                        <span class="endpoint-path">${escapeHtml(ep.path)}</span>
-                        <span class="endpoint-desc">${escapeHtml(ep.desc)}</span>
-                    </div>
+                    <span class="endpoint-method ${ep.method.toLowerCase()}">${ep.method}</span>
+                    <span class="endpoint-path">${escapeHtml(ep.path)}</span>
+                    <span class="endpoint-desc">${escapeHtml(ep.desc)}</span>
                     <button class="copy-btn" data-url="${escapeHtml(fullUrl)}" onclick="copyText(this.getAttribute('data-url'), this)">
                         <i class="fas fa-copy"></i> Copy
                     </button>
@@ -408,9 +425,10 @@
 
     function toggleEndpoints(section) {
         const container = document.getElementById(section + '-endpoints');
-        const toggle = document.getElementById(section + '-toggle');
-        const card = document.getElementById(section + '-card');
-        const isOpen = container.classList.contains('show');
+        const block = document.getElementById(section + '-block');
+        if (!container || !block) return;
+        const foot = block.querySelector('.provider-foot');
+        const isOpen = block.classList.contains('expanded');
 
         if (isOpen) {
             // Collapse: set explicit height first so transition works, then set to 0
@@ -418,19 +436,15 @@
             requestAnimationFrame(() => {
                 container.style.maxHeight = '0';
             });
-            container.classList.remove('show');
-            if (toggle) toggle.classList.remove('open');
-            card.classList.remove('expanded');
-            card.setAttribute('aria-expanded', 'false');
+            block.classList.remove('expanded');
+            if (foot) foot.setAttribute('aria-expanded', 'false');
         } else {
             // Expand: animate to scrollHeight, then remove inline style so it adapts
-            container.classList.add('show');
+            block.classList.add('expanded');
             container.style.maxHeight = container.scrollHeight + 'px';
-            if (toggle) toggle.classList.add('open');
-            card.classList.add('expanded');
-            card.setAttribute('aria-expanded', 'true');
+            if (foot) foot.setAttribute('aria-expanded', 'true');
             container.addEventListener('transitionend', function handler() {
-                if (container.classList.contains('show')) {
+                if (block.classList.contains('expanded')) {
                     container.style.maxHeight = 'none';
                 }
                 container.removeEventListener('transitionend', handler);
@@ -506,13 +520,36 @@
         return div.innerHTML;
     }
 
+    // Render a URL with syntax highlighting: dim the scheme, mute the shared
+    // host, and burn the distinguishing tail (port + path) bright. The raw URL
+    // is stashed on dataset.url so Copy still yields plain text.
+    function setUrl(elementId, url) {
+        const el = document.getElementById(elementId);
+        el.dataset.url = url;
+        const m = url.match(/^(https?:\/\/)([^\/:]+)(.*)$/);
+        if (!m) { el.textContent = url; return; }
+        const [, scheme, host, rest] = m;
+        el.innerHTML =
+            `<span class="u-scheme">${escapeHtml(scheme)}</span>` +
+            `<span class="u-host">${escapeHtml(host)}</span>` +
+            `<span class="u-key">${escapeHtml(rest)}</span>`;
+    }
+
+    function setCount(elementId, endpoints) {
+        const el = document.getElementById(elementId);
+        if (el) el.textContent = (endpoints || []).length;
+    }
+
     document.addEventListener('DOMContentLoaded', function() {
-        document.getElementById('openai-base-url').textContent = openaiBaseUrl;
-        document.getElementById('anthropic-base-url').textContent = anthropicBaseUrl;
-        document.getElementById('azure-openai-base-url').textContent = azureOpenaiBaseUrl;
-        document.getElementById('openai-unified-url').textContent = openaiUnifiedUrl;
-        document.getElementById('anthropic-unified-url').textContent = anthropicUnifiedUrl;
-        document.getElementById('azure-openai-unified-url').textContent = azureOpenaiUnifiedUrl;
+        setUrl('openai-base-url', openaiBaseUrl);
+        setUrl('anthropic-base-url', anthropicBaseUrl);
+        setUrl('azure-openai-base-url', azureOpenaiBaseUrl);
+        setUrl('openai-unified-url', openaiUnifiedUrl);
+        setUrl('anthropic-unified-url', anthropicUnifiedUrl);
+        setUrl('azure-openai-unified-url', azureOpenaiUnifiedUrl);
+        setCount('openai-count', openaiEndpoints);
+        setCount('anthropic-count', anthropicEndpoints);
+        setCount('azure-openai-count', azureOpenaiEndpoints);
         renderEndpoints(openaiEndpoints, 'openai-endpoints', openaiBaseUrl);
         renderEndpoints(anthropicEndpoints, 'anthropic-endpoints', anthropicBaseUrl);
         renderEndpoints(azureOpenaiEndpoints, 'azure-openai-endpoints', azureOpenaiBaseUrl);

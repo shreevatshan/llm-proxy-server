@@ -5,6 +5,7 @@ class ModelGroupManager {
         this._modal = null;
         this._selectedIds = new Set();
         this._selectedGroupId = '';
+        this._userOverrides = [];
     }
 
     async load() {
@@ -322,11 +323,16 @@ class ModelGroupManager {
         this._loadUserOverrides();
     }
 
+    filterUserOverrides() {
+        this._renderUserOverrides();
+    }
+
     async _loadUserOverrides() {
         const tbody = document.getElementById('mg-user-overrides-tbody');
         if (!tbody) return;
         const groupId = this._selectedGroupId;
         if (!groupId) {
+            this._userOverrides = [];
             tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">Select a model group to manage per-user overrides.</td></tr>';
             return;
         }
@@ -339,17 +345,36 @@ class ModelGroupManager {
             const allUsers = usersResp.ok ? await usersResp.json() : [];
             const overrides = ovResp.ok ? await ovResp.json() : [];
             const ovByUser = new Map(overrides.map(o => [o.user_id, o]));
-
-            if (!allUsers.length) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users found.</td></tr>';
-                return;
-            }
-            tbody.innerHTML = allUsers
-                .map(u => this._renderOverrideRow(u, ovByUser.get(u.id), groupId))
-                .join('');
+            this._userOverrides = allUsers.map(u => ({ user: u, ov: ovByUser.get(u.id) }));
+            this._renderUserOverrides();
         } catch (e) {
+            this._userOverrides = [];
             tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger py-4">Error loading overrides.</td></tr>';
         }
+    }
+
+    _renderUserOverrides() {
+        const tbody = document.getElementById('mg-user-overrides-tbody');
+        if (!tbody) return;
+        const groupId = this._selectedGroupId;
+        const rows = this._userOverrides || [];
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users found.</td></tr>';
+            return;
+        }
+        const q = (document.getElementById('mg-user-search')?.value || '').trim().toLowerCase();
+        const filtered = q
+            ? rows.filter(r =>
+                (r.user.username || '').toLowerCase().includes(q)
+                || (r.user.email || '').toLowerCase().includes(q))
+            : rows;
+        if (!filtered.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users match your search.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = filtered
+            .map(r => this._renderOverrideRow(r.user, r.ov, groupId))
+            .join('');
     }
 
     _renderOverrideRow(user, ov, groupId) {

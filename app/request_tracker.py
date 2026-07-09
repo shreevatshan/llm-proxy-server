@@ -174,8 +174,16 @@ class RequestTracker:
         if entry is None:
             return
 
-        # Accumulate usage (skip unauthenticated requests)
-        if entry.user_type != "unknown":
+        # Accumulate usage (skip unauthenticated requests).
+        # Only successful requests count toward usage / rate limits: a 2xx
+        # response ("completed") or a request the client cancelled mid-flight
+        # ("cancelled", work was already done). Errored requests (4xx/5xx,
+        # stream/timeout failures) must NOT consume quota.
+        # Requests with no model (metadata/listing endpoints like GET
+        # /v1/models, /v1/responses/{id}, etc.) are not real model usage and
+        # are skipped so they don't surface as an "unknown" model row.
+        _COUNTED_STATUSES = ("completed", "cancelled")
+        if entry.model and entry.user_type != "unknown" and status in _COUNTED_STATUSES:
             now_local = time_utils.local_now()
             key = (
                 now_local.date(),

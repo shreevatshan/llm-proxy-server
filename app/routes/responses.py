@@ -27,6 +27,8 @@ from app.providers.provider_manager import provider_manager
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
+from app.rate_limit_dep import enforce_group_rate_limit
+from app.rate_limit import RateLimitExceeded
 from typing import Union
 from app.routes.stream_utils import (
     stream_with_context_and_timeout,
@@ -106,7 +108,16 @@ async def responses_create(
     request_started_at = time.monotonic()
     with create_span("responses_create", kind=trace.SpanKind.INTERNAL) as span:
         try:
+            # Group rate limit check (request-level limits already handled in middleware)
+            await enforce_group_rate_limit(request_obj, auth, request.model)
+
             if request.stream:
+                # Validate the model up front so a bad/unknown model name yields
+                # a clean 400 (caught below) instead of an SSE error chunk inside
+                # a 200 response — the latter would be mis-counted as a completed
+                # request in usage stats. Mirrors the non-streaming path.
+                provider_manager.get_provider_for_model(request.model)
+
                 # Capture current trace context for streaming
                 current_context = otel_context.get_current()
                 
@@ -139,7 +150,9 @@ async def responses_create(
             else:
                 response = await provider_manager.responses_create(request)
                 return response
-                
+
+        except (HTTPException, RateLimitExceeded):
+            raise
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=400, detail=str(e))

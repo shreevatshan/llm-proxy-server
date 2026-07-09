@@ -315,22 +315,46 @@ function initEndpointsTab() {
     const anthropicBaseUrl = `http://${_domain}:${_anthropicPort}`;
     const azureBaseUrl     = `http://${_domain}:${_azurePort}`;
 
-    const el = id => document.getElementById(id);
-    el('openai-base-url').textContent    = openaiBaseUrl;
-    el('anthropic-base-url').textContent = anthropicBaseUrl;
-    el('azure-openai-base-url').textContent = azureBaseUrl;
+    _setUrl('openai-base-url', openaiBaseUrl);
+    _setUrl('anthropic-base-url', anthropicBaseUrl);
+    _setUrl('azure-openai-base-url', azureBaseUrl);
 
     // Unified base URLs: every provider is also reachable through the single
     // management port under a path prefix (see create_management_app).
     if (typeof _managementPort !== 'undefined') {
-        el('openai-unified-url').textContent       = `http://${_domain}:${_managementPort}/openai/v1`;
-        el('anthropic-unified-url').textContent    = `http://${_domain}:${_managementPort}/anthropic`;
-        el('azure-openai-unified-url').textContent = `http://${_domain}:${_managementPort}/azure-openai`;
+        _setUrl('openai-unified-url',       `http://${_domain}:${_managementPort}/openai/v1`);
+        _setUrl('anthropic-unified-url',    `http://${_domain}:${_managementPort}/anthropic`);
+        _setUrl('azure-openai-unified-url', `http://${_domain}:${_managementPort}/azure-openai`);
     }
+
+    _setCount('openai-count', endpointsData);
+    _setCount('anthropic-count', anthropicEndpointsData);
+    _setCount('azure-openai-count', azureEndpointsData);
 
     _renderEndpoints(endpointsData,          'openai-endpoints',    openaiBaseUrl);
     _renderEndpoints(anthropicEndpointsData,  'anthropic-endpoints', anthropicBaseUrl);
     _renderEndpoints(azureEndpointsData,      'azure-openai-endpoints', azureBaseUrl);
+}
+
+// Render a URL with syntax highlighting: dim the scheme, mute the shared host,
+// and burn the distinguishing tail (port + path) bright. The raw URL is stashed
+// on dataset.url so Copy still yields plain text.
+function _setUrl(elementId, url) {
+    const elm = document.getElementById(elementId);
+    if (!elm) return;
+    elm.dataset.url = url;
+    const m = url.match(/^(https?:\/\/)([^\/:]+)(.*)$/);
+    if (!m) { elm.textContent = url; return; }
+    const [, scheme, host, rest] = m;
+    elm.innerHTML =
+        `<span class="u-scheme">${escapeHtml(scheme)}</span>` +
+        `<span class="u-host">${escapeHtml(host)}</span>` +
+        `<span class="u-key">${escapeHtml(rest)}</span>`;
+}
+
+function _setCount(elementId, endpoints) {
+    const elm = document.getElementById(elementId);
+    if (elm) elm.textContent = (endpoints || []).length;
 }
 
 function _renderEndpoints(endpoints, containerId, baseUrl) {
@@ -341,11 +365,9 @@ function _renderEndpoints(endpoints, containerId, baseUrl) {
         const fullUrl = baseUrl + ep.path;
         html += `
             <div class="endpoint-list-item">
-                <div class="endpoint-info">
-                    <span class="endpoint-method ${escapeHtml(ep.method.toLowerCase())}">${escapeHtml(ep.method)}</span>
-                    <span class="endpoint-path">${escapeHtml(ep.path)}</span>
-                    <span class="endpoint-desc">${escapeHtml(ep.desc || '')}</span>
-                </div>
+                <span class="endpoint-method ${escapeHtml(ep.method.toLowerCase())}">${escapeHtml(ep.method)}</span>
+                <span class="endpoint-path">${escapeHtml(ep.path)}</span>
+                <span class="endpoint-desc">${escapeHtml(ep.desc || '')}</span>
                 <button class="copy-btn" data-url="${escapeHtml(fullUrl)}" onclick="copyText(this.getAttribute('data-url'), this)">
                     <i class="fas fa-copy"></i> Copy
                 </button>
@@ -356,29 +378,21 @@ function _renderEndpoints(endpoints, containerId, baseUrl) {
 
 function toggleEndpoints(section) {
     const container = document.getElementById(section + '-endpoints');
-    const toggle    = document.getElementById(section + '-toggle');
-    const card      = document.getElementById(section + '-card');
-    if (!container) return;
-    const isOpen = container.classList.contains('show');
+    const block     = document.getElementById(section + '-block');
+    if (!container || !block) return;
+    const foot   = block.querySelector('.provider-foot');
+    const isOpen = block.classList.contains('expanded');
     if (isOpen) {
         container.style.maxHeight = container.scrollHeight + 'px';
         requestAnimationFrame(() => { container.style.maxHeight = '0'; });
-        container.classList.remove('show');
-        if (toggle) toggle.classList.remove('open');
-        if (card) {
-            card.classList.remove('expanded');
-            card.setAttribute('aria-expanded', 'false');
-        }
+        block.classList.remove('expanded');
+        if (foot) foot.setAttribute('aria-expanded', 'false');
     } else {
-        container.classList.add('show');
+        block.classList.add('expanded');
         container.style.maxHeight = container.scrollHeight + 'px';
-        if (toggle) toggle.classList.add('open');
-        if (card) {
-            card.classList.add('expanded');
-            card.setAttribute('aria-expanded', 'true');
-        }
+        if (foot) foot.setAttribute('aria-expanded', 'true');
         container.addEventListener('transitionend', function handler() {
-            if (container.classList.contains('show')) container.style.maxHeight = 'none';
+            if (block.classList.contains('expanded')) container.style.maxHeight = 'none';
             container.removeEventListener('transitionend', handler);
         });
     }

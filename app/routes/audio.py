@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends, Request
 from fastapi.responses import Response
 from typing import Optional, List, Union
 import base64
@@ -15,6 +15,8 @@ from app.providers.provider_manager import provider_manager
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
+from app.rate_limit_dep import enforce_group_rate_limit
+from app.rate_limit import RateLimitExceeded
 from app.tracing import create_span, add_span_attributes, set_span_error
 import logging
 
@@ -24,6 +26,7 @@ router = APIRouter()
 
 @router.post("/v1/audio/speech")
 async def create_speech(
+    request_obj: Request,
     request: AudioSpeechRequest,
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
@@ -31,6 +34,9 @@ async def create_speech(
     Generate audio from text using text-to-speech.
     """
     try:
+        # Group rate limit check (request-level limits already handled in middleware)
+        await enforce_group_rate_limit(request_obj, auth, request.model)
+
         # Get provider for the model
         provider_name, model_id = provider_manager._parse_model_name(request.model)
         provider = provider_manager._get_provider(provider_name)
@@ -58,6 +64,13 @@ async def create_speech(
             }
         )
         
+    except (HTTPException, RateLimitExceeded):
+        raise
+    except ValueError as e:
+        # Bad model name / unknown provider is a client error, not a 500.
+        error_msg = f"No provider found for model: {request.model}"
+        logger.error(f"{error_msg} ({e})")
+        raise HTTPException(status_code=404, detail=error_msg)
     except NotImplementedError as e:
         raise HTTPException(status_code=501, detail=str(e))
     except Exception as e:
@@ -67,6 +80,7 @@ async def create_speech(
 
 @router.post("/v1/audio/transcriptions", response_model=AudioTranscriptionResponse)
 async def create_transcription(
+    request_obj: Request,
     file: UploadFile = File(...),
     model: str = Form(...),
     language: Optional[str] = Form(None),
@@ -80,6 +94,9 @@ async def create_transcription(
     Transcribe audio to text.
     """
     try:
+        # Group rate limit check (request-level limits already handled in middleware)
+        await enforce_group_rate_limit(request_obj, auth, model)
+
         # Read file content
         file_content = await file.read()
         
@@ -127,6 +144,13 @@ async def create_transcription(
             # JSON format (default and verbose_json)
             return result
         
+    except (HTTPException, RateLimitExceeded):
+        raise
+    except ValueError as e:
+        # Bad model name / unknown provider is a client error, not a 500.
+        error_msg = f"No provider found for model: {request.model}"
+        logger.error(f"{error_msg} ({e})")
+        raise HTTPException(status_code=404, detail=error_msg)
     except NotImplementedError as e:
         raise HTTPException(status_code=501, detail=str(e))
     except Exception as e:
@@ -136,6 +160,7 @@ async def create_transcription(
 
 @router.post("/v1/audio/translations", response_model=AudioTranslationResponse)
 async def create_translation(
+    request_obj: Request,
     file: UploadFile = File(...),
     model: str = Form(...),
     prompt: Optional[str] = Form(None),
@@ -147,6 +172,9 @@ async def create_translation(
     Translate audio to English text.
     """
     try:
+        # Group rate limit check (request-level limits already handled in middleware)
+        await enforce_group_rate_limit(request_obj, auth, model)
+
         # Read file content
         file_content = await file.read()
         
@@ -184,6 +212,13 @@ async def create_translation(
             # JSON format (default and verbose_json)
             return result
         
+    except (HTTPException, RateLimitExceeded):
+        raise
+    except ValueError as e:
+        # Bad model name / unknown provider is a client error, not a 500.
+        error_msg = f"No provider found for model: {request.model}"
+        logger.error(f"{error_msg} ({e})")
+        raise HTTPException(status_code=404, detail=error_msg)
     except NotImplementedError as e:
         raise HTTPException(status_code=501, detail=str(e))
     except Exception as e:

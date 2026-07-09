@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer
 from typing import Dict, Any
 from app.openai_models import EmbeddingRequest, EmbeddingResponse
@@ -6,6 +6,8 @@ from app.providers.provider_manager import provider_manager
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
+from app.rate_limit_dep import enforce_group_rate_limit
+from app.rate_limit import RateLimitExceeded
 from typing import Union
 from app.tracing import create_span, add_span_attributes, set_span_error
 import logging
@@ -17,13 +19,16 @@ security = HTTPBearer()
 
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
 async def create_embeddings(
+    request_obj: Request,
     request: EmbeddingRequest,
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ) -> EmbeddingResponse:
     """Create embeddings for the given input."""
-    
+
     with create_span("embeddings_request") as span:
         try:
+            # Group rate limit check (request-level limits already handled in middleware)
+            await enforce_group_rate_limit(request_obj, auth, request.model)
             # Add span attributes
             add_span_attributes(span, {
                 "model": request.model,
@@ -60,8 +65,14 @@ async def create_embeddings(
             
             return response
             
-        except HTTPException:
+        except (HTTPException, RateLimitExceeded):
             raise
+        except ValueError as e:
+            # Bad model name / unknown provider is a client error, not a 500.
+            error_msg = f"No provider found for model: {request.model}"
+            logger.error(f"{error_msg} ({e})")
+            set_span_error(span, error_msg)
+            raise HTTPException(status_code=404, detail=error_msg)
         except NotImplementedError as e:
             error_msg = f"Embeddings not supported: {str(e)}"
             logger.error(error_msg)

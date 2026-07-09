@@ -4,6 +4,21 @@
  */
 
 class UserManager {
+    filterUsers(query) {
+        const q = (query || '').trim().toLowerCase();
+        const rows = document.querySelectorAll('.user-mgmt-row');
+        let visible = 0;
+        rows.forEach(row => {
+            const username = row.dataset.username || '';
+            const email = row.dataset.email || '';
+            const match = !q || username.includes(q) || email.includes(q);
+            row.style.display = match ? '' : 'none';
+            if (match) visible++;
+        });
+        const noMatch = document.getElementById('user-mgmt-no-match');
+        if (noMatch) noMatch.style.display = (rows.length && visible === 0) ? '' : 'none';
+    }
+
     async deactivateUser(button) {
         const userId = button.getAttribute('data-user-id');
         const username = button.getAttribute('data-username');
@@ -244,3 +259,4 @@ window.activateUser = (button) => window.UserManager.activateUser(button);
 window.approveUser = (button) => window.UserManager.approveUser(button);
 window.removeUser = (button) => window.UserManager.removeUser(button);
 window.resetPassword = (button) => window.UserManager.resetPassword(button);
+window.filterUsers = (query) => window.UserManager.filterUsers(query);

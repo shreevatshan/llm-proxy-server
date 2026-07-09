@@ -84,6 +84,12 @@ async def chat_completions(
                 request = await transformation_manager.preprocess_request(request, context)
             
             if request.stream:
+                # Validate the model up front so a bad/unknown model name yields
+                # a clean 400 (caught below) instead of an SSE error chunk inside
+                # a 200 response — the latter would be mis-counted as a completed
+                # request in usage stats. Mirrors the non-streaming path.
+                provider_manager.get_provider_for_model(request.model)
+
                 # For streaming responses, we need to preserve the trace context
                 # Capture the current context before exiting the span
                 from opentelemetry import context as otel_context

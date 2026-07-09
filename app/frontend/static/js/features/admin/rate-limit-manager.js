@@ -2,6 +2,7 @@ class RateLimitManager {
     constructor() {
         this._refreshTimer = null;
         this._REFRESH_INTERVAL = 10000;
+        this._allUsers = [];
     }
 
     async load() {
@@ -18,7 +19,17 @@ class RateLimitManager {
 
     _startAutoRefresh() {
         this.stopAutoRefresh();
-        this._refreshTimer = setInterval(() => this._loadUsers(), this._REFRESH_INTERVAL);
+        this._refreshTimer = setInterval(() => {
+            // Don't re-render while the admin is typing in the search box or editing a limit,
+            // otherwise their input/focus would be wiped every tick.
+            const active = document.activeElement;
+            if (active && (active.id === 'rl-user-search'
+                || active.classList?.contains('rl-rpm-input')
+                || active.classList?.contains('rl-rpd-input'))) {
+                return;
+            }
+            this._loadUsers();
+        }, this._REFRESH_INTERVAL);
     }
 
     async _loadDefaults() {
@@ -41,19 +52,41 @@ class RateLimitManager {
         try {
             const resp = await fetch('/admin/rate-limits/users', { credentials: 'include' });
             if (!resp.ok) {
+                this._allUsers = [];
                 tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger py-4">Failed to load rate limit data.</td></tr>';
                 return;
             }
-            const users = await resp.json();
-            if (!users.length) {
-                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users found.</td></tr>';
-                return;
-            }
-            tbody.innerHTML = users.map(u => this._renderRow(u)).join('');
+            this._allUsers = await resp.json();
+            this._applyFilter();
         } catch (e) {
             console.error('RateLimitManager: failed to load users', e);
+            this._allUsers = [];
             tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger py-4">Error loading data.</td></tr>';
         }
+    }
+
+    filterUsers() {
+        this._applyFilter();
+    }
+
+    _applyFilter() {
+        const tbody = document.getElementById('rate-limits-tbody');
+        if (!tbody) return;
+        if (!this._allUsers.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users found.</td></tr>';
+            return;
+        }
+        const q = (document.getElementById('rl-user-search')?.value || '').trim().toLowerCase();
+        const filtered = q
+            ? this._allUsers.filter(u =>
+                (u.username || '').toLowerCase().includes(q)
+                || (u.email || '').toLowerCase().includes(q))
+            : this._allUsers;
+        if (!filtered.length) {
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users match your search.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = filtered.map(u => this._renderRow(u)).join('');
     }
 
     _renderRow(u) {
