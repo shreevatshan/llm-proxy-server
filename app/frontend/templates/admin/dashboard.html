@@ -26,6 +26,9 @@
     <button class="tab-button" onclick="showTab('providers')">
         <i class="fas fa-server"></i> Providers
     </button>
+    <button class="tab-button" onclick="showTab('models')">
+        <i class="fas fa-cubes"></i> Models
+    </button>
     <button class="tab-button" onclick="showTab('requests')">
         <i class="fas fa-satellite-dish"></i> Active Requests
     </button>
@@ -34,9 +37,6 @@
     </button>
     <button class="tab-button" onclick="showTab('rate-limits')">
         <i class="fas fa-tachometer-alt"></i> Rate Limits
-    </button>
-    <button class="tab-button" onclick="showTab('models')">
-        <i class="fas fa-cubes"></i> Models
     </button>
 </div>
 
@@ -152,9 +152,6 @@
     <div class="section-header">
         <div class="d-flex align-items-center gap-2">
             <h2 class="section-title mb-0">Providers</h2>
-            <a href="/admin/models/search" class="btn btn-outline-primary btn-sm" title="Search Providers & Models">
-                <i class="fas fa-search"></i>
-            </a>
         </div>
         <div class="section-actions">
             <button class="btn btn-primary btn-sm tip" aria-label="Add Provider" onclick="showAddProviderForm()">
