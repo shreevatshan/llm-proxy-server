@@ -6,6 +6,7 @@ from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
+from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.rate_limit import RateLimitExceeded
 from typing import Union
 from app.tracing import (
@@ -34,6 +35,7 @@ async def completions(
         try:
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, request.model)
+            await enforce_model_access(request_obj, auth, request.model)
             if request.stream:
                 # Validate the model up front so a bad/unknown model name yields
                 # a clean 400 (caught below) instead of an SSE error chunk inside
@@ -63,7 +65,7 @@ async def completions(
                 if hasattr(response, 'model_dump'):
                     return response.model_dump(exclude_unset=True)
                 return response
-        except (HTTPException, RateLimitExceeded):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
             raise
         except ValueError as e:
             set_span_error(span, e)

@@ -2,7 +2,11 @@
 
 {% block title %}{{ title }}{% endblock %}
 
-{% block extra_css %}{% endblock %}
+{% block extra_css %}
+<!-- Load admin page styles through a versioned URL so new rules aren't masked
+     by a stale copy the browser cached from main.css's unversioned @import. -->
+<link href="/static/css/pages/admin.css?v={{ cache_version | default('1') }}" rel="stylesheet">
+{% endblock %}
 
 {% block content %}
 <!-- Admin Dashboard Header -->
@@ -20,7 +24,7 @@
         <i class="fas fa-users"></i> User Management
     </button>
     <button class="tab-button" onclick="showTab('providers')">
-        <i class="fas fa-server"></i> Provider & Model Management
+        <i class="fas fa-server"></i> Providers
     </button>
     <button class="tab-button" onclick="showTab('requests')">
         <i class="fas fa-satellite-dish"></i> Active Requests
@@ -30,6 +34,9 @@
     </button>
     <button class="tab-button" onclick="showTab('rate-limits')">
         <i class="fas fa-tachometer-alt"></i> Rate Limits
+    </button>
+    <button class="tab-button" onclick="showTab('models')">
+        <i class="fas fa-cubes"></i> Models
     </button>
 </div>
 
@@ -132,23 +139,19 @@
     {% endif %}
 </div>
 
-<!-- Unified Provider & Model Management Section -->
+<!-- Providers Section -->
 <div class="section tab-content" id="providers-tab" style="display: none;">
-    <!-- Provider/Model Stats -->
+    <!-- Provider Stats -->
     <div class="dashboard-stats mb-4">
         <div class="stat-card" id="provider-stats">
             <div class="stat-number" id="enabled-providers">-</div>
             <div class="stat-label">Active Providers</div>
         </div>
-        <div class="stat-card" id="model-stats">
-            <div class="stat-number" id="enabled-models">-</div>
-            <div class="stat-label">Enabled Models</div>
-        </div>
     </div>
-    
+
     <div class="section-header">
         <div class="d-flex align-items-center gap-2">
-            <h2 class="section-title mb-0">Provider & Model Management</h2>
+            <h2 class="section-title mb-0">Providers</h2>
             <a href="/admin/models/search" class="btn btn-outline-primary btn-sm" title="Search Providers & Models">
                 <i class="fas fa-search"></i>
             </a>
@@ -156,9 +159,6 @@
         <div class="section-actions">
             <button class="btn btn-primary btn-sm tip" aria-label="Add Provider" onclick="showAddProviderForm()">
                 <i class="fas fa-plus"></i>
-            </button>
-            <button class="btn btn-outline-secondary btn-sm tip" aria-label="Sync Models" onclick="syncModels()">
-                <i class="fas fa-sync"></i>
             </button>
             <button class="btn btn-outline-secondary btn-sm tip" aria-label="Export Config" onclick="exportProviderConfig()">
                 <i class="fas fa-download"></i>
@@ -169,12 +169,6 @@
             <input type="file" id="import-file-input" accept=".json" style="display:none" onchange="importProviderConfig(this)">
             <button class="btn btn-danger btn-sm tip" aria-label="Reinit System" onclick="reinitSystem()">
                 <i class="fas fa-power-off"></i>
-            </button>
-            <button class="btn btn-secondary btn-sm tip" aria-label="Enable All" onclick="bulkToggle('enable_all')">
-                <i class="fas fa-check-circle"></i>
-            </button>
-            <button class="btn btn-danger btn-sm tip" aria-label="Disable All" onclick="bulkToggle('disable_all')">
-                <i class="fas fa-times-circle"></i>
             </button>
         </div>
     </div>
@@ -662,6 +656,139 @@
     </div>
 </div>
 
+<!-- Models Section (unified global + per-user management) -->
+<div class="section tab-content" id="models-tab" style="display: none;">
+    <div class="row g-3 model-access-grid">
+        <!-- Left: scope picker (Global + users) -->
+        <div class="col-lg-4">
+            <div class="card h-100">
+                <div class="card-header d-flex align-items-center justify-content-between">
+                    <h5 class="mb-0"><i class="fas fa-layer-group me-2"></i>Scope</h5>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelsManager?.load()" title="Refresh">
+                        <i class="fas fa-sync-alt"></i>
+                    </button>
+                </div>
+                <div class="card-body">
+                    <!-- Global scope (applies to everyone) -->
+                    <button type="button" class="ma-user-item ma-scope-global" id="ma-scope-global"
+                        onclick="window.ModelsManager?.selectScope('global')">
+                        <span class="ma-scope-lead">
+                            <span class="ma-scope-icon"><i class="fas fa-globe"></i></span>
+                            <span class="ma-user-text">
+                                <span class="ma-user-name">All users</span>
+                                <span class="ma-user-email">Global availability</span>
+                            </span>
+                        </span>
+                        <span class="ma-editing-flag"><i class="fas fa-pen me-1"></i>Editing</span>
+                    </button>
+
+                    <div class="ma-scope-group-label"></div>
+                    <div class="position-relative mb-3">
+                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                        <input type="text" id="ma-user-search" class="form-control form-control-sm ps-5"
+                            placeholder="Search users"
+                            oninput="window.ModelsManager?.filterUsers()">
+                    </div>
+                    <div id="ma-user-list" class="ma-user-list">
+                        <div class="text-muted small py-3 text-center">Loading…</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right: global availability OR per-user policy + models -->
+        <div class="col-lg-8">
+            <!-- Scope banner — states in words which scope is being edited -->
+            <div id="ma-scope-banner" class="ma-scope-banner" style="display: none;"></div>
+
+            <!-- Empty state (no scope selected) -->
+            <div id="ma-empty" class="card" style="display: none;">
+                <div class="card-body empty-state text-center py-5">
+                    <i class="fas fa-cubes fa-2x mb-3 text-muted"></i>
+                    <p class="text-muted mb-0">Select Global or a user to manage models.</p>
+                </div>
+            </div>
+
+            <!-- Global scope: enable/disable models for everyone -->
+            <div id="ma-global" style="display: none;">
+                <div class="card">
+                    <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+                        <div class="d-flex align-items-center">
+                            <h5 class="mb-0"><i class="fas fa-globe me-2"></i>Global model availability</h5>
+                            <span id="ma-global-summary" class="text-muted small ms-3"></span>
+                        </div>
+                        <div class="d-flex align-items-center gap-3 flex-wrap ma-global-actions">
+                            <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelsManager?.syncGlobal()">
+                                <i class="fas fa-sync me-2"></i>Sync models
+                            </button>
+                            <button class="btn btn-outline-success btn-sm" onclick="window.ModelsManager?.bulkGlobal('enable_all')">
+                                <i class="fas fa-check-circle me-2"></i>Enable all
+                            </button>
+                            <button class="btn btn-outline-danger btn-sm" onclick="window.ModelsManager?.bulkGlobal('disable_all')">
+                                <i class="fas fa-times-circle me-2"></i>Disable all
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body pt-3">
+                        <div class="position-relative mb-3">
+                            <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                            <input type="text" id="ma-global-search" class="form-control form-control-sm ps-5"
+                                placeholder="Search models"
+                                oninput="window.ModelsManager?.filterGlobal()">
+                        </div>
+                        <div id="ma-global-list" class="ma-model-list"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Per-user scope (shown once a user is picked) -->
+            <div id="ma-detail" style="display: none;">
+                <!-- Access policy card -->
+                <div class="card mb-3">
+                    <div class="card-header">
+                        <h5 class="mb-0"><i class="fas fa-sliders-h me-2"></i>Access policy —
+                            <span id="ma-selected-username" class="text-accent"></span></h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="d-flex align-items-center gap-3 flex-wrap">
+                            <div class="ma-segment" role="group" aria-label="Model access mode">
+                                <button type="button" class="ma-segment-btn" id="ma-policy-default"
+                                    onclick="window.ModelsManager?.setMode('default')">Default</button>
+                                <button type="button" class="ma-segment-btn" id="ma-policy-allow"
+                                    onclick="window.ModelsManager?.setMode('allow')">Allow all</button>
+                                <button type="button" class="ma-segment-btn" id="ma-policy-deny"
+                                    onclick="window.ModelsManager?.setMode('deny')">Deny all</button>
+                                <button type="button" class="ma-segment-btn" id="ma-policy-custom"
+                                    onclick="window.ModelsManager?.setMode('custom')">Custom</button>
+                            </div>
+                        </div>
+                        <p class="text-muted small mb-0 mt-2" id="ma-mode-hint"></p>
+                    </div>
+                </div>
+
+                <!-- Models card -->
+                <div class="card">
+                    <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+                        <div class="d-flex align-items-center">
+                            <h5 class="mb-0"><i class="fas fa-cubes me-2"></i>Models</h5>
+                            <span id="ma-summary" class="text-muted small ms-3"></span>
+                        </div>
+                        <div class="position-relative flex-shrink-0" style="width: 240px;">
+                            <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                            <input type="text" id="ma-model-search" class="form-control form-control-sm ps-5"
+                                placeholder="Search models"
+                                oninput="window.ModelsManager?.filterModels()">
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div id="ma-model-list" class="ma-model-list"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Instance Group Create/Edit Modal -->
 <div class="modal fade" id="instanceGroupModal" tabindex="-1" aria-hidden="true">
     <div class="modal-dialog modal-lg modal-dialog-centered">
@@ -887,5 +1014,6 @@
 <script src="/static/js/features/admin/rate-limit-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-group-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/instance-group-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/model-access-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/admin-dashboard.js?v={{ cache_version }}"></script>
 {% endblock %}

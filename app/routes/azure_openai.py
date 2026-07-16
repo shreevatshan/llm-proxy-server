@@ -56,6 +56,7 @@ from app.routes.stream_utils import (
     STREAM_TIMEOUT_SECONDS,
 )
 from app.rate_limit_dep import enforce_group_rate_limit
+from app.model_access_dep import enforce_model_access
 from app.tracing import (
     get_w3c_traceparent,
     create_span,
@@ -164,12 +165,21 @@ def _build_model_name(provider_name: str, deployment: str) -> str:
 
 # ==================== Models / Deployments ====================
 
+def _caller_user_id(auth: Union[User, AdminUser, APIKey]) -> Optional[int]:
+    """User id for per-user model filtering; None for admins (see full list)."""
+    if isinstance(auth, AdminUser):
+        return None
+    return getattr(auth, "user_id", None) or getattr(auth, "id", None)
+
+
 @router.get("/openai/models", tags=["azure_openai"])
 async def list_azure_models(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """List all models across all Azure providers."""
-    models = await provider_manager.get_all_models(api_filter="azure_openai")
+    models = await provider_manager.get_all_models(
+        api_filter="azure_openai", user_id=_caller_user_id(auth)
+    )
     return {
         "object": "list",
         "data": [
@@ -236,6 +246,7 @@ async def azure_chat_completions(
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_chat_completion", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -305,6 +316,7 @@ async def azure_completions(
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_completion", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -366,6 +378,7 @@ async def azure_embeddings(
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_embeddings", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -409,6 +422,7 @@ async def azure_image_generation(
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_image_generation", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {

@@ -625,19 +625,36 @@ class ProviderManager:
         """Load model and provider configurations from database into cache."""
         with create_span("provider.load_model_configurations") as span:
             try:
-                from app.auth.database import AsyncSessionLocal, get_model_configurations_dict, get_provider_configurations_dict
-                
+                from app.auth.database import (
+                    AsyncSessionLocal,
+                    get_model_configurations_dict,
+                    get_provider_configurations_dict,
+                    get_all_user_model_policies,
+                    get_all_user_model_exceptions,
+                )
+
                 # Create database session directly using session factory
                 async with AsyncSessionLocal() as db:
                     try:
                         # Load configurations from database
                         model_configs = await get_model_configurations_dict(db)
                         provider_configs = await get_provider_configurations_dict(db)
-                        
+
                         # Update cache
                         self.model_cache.update_model_configurations(model_configs, provider_configs)
-                        
+
+                        # Load per-user model access (policies + exceptions)
+                        user_policies = {
+                            p.user_id: (p.mode or "default")
+                            for p in await get_all_user_model_policies(db)
+                        }
+                        user_exceptions: dict = {}
+                        for ex in await get_all_user_model_exceptions(db):
+                            user_exceptions.setdefault(ex.user_id, {})[ex.model_id] = ex.is_allowed
+                        self.model_cache.update_user_model_access(user_policies, user_exceptions)
+
                         print(f"Loaded {len(model_configs)} model configs and {len(provider_configs)} provider configs")
+                        print(f"Loaded model access for {len(user_policies)} user policies and {len(user_exceptions)} users with exceptions")
                         
                         add_span_attributes(span, {
                             "config.models_loaded_count": len(model_configs),
@@ -763,14 +780,20 @@ class ProviderManager:
             print(f"Error refreshing providers from database: {e}")
             raise
     
-    async def get_all_models(self, api_filter: str = None) -> List[ModelInfo]:
+    async def get_all_models(self, api_filter: str = None, user_id: Optional[int] = None) -> List[ModelInfo]:
         """Get all available models (from cache, filtered by configuration).
-        
+
         Args:
             api_filter: If set (e.g., "openai" or "anthropic"), only return models
                        from providers that support that API format.
+            user_id: If set, further restrict to models the user is allowed to
+                     access (per-user policy + exceptions). None => no per-user
+                     filter (e.g. admin callers).
         """
-        models = self.model_cache.get_enabled_models()
+        if user_id is not None:
+            models = self.model_cache.get_enabled_models_for_user(user_id)
+        else:
+            models = self.model_cache.get_enabled_models()
         
         if api_filter:
             filtered = []

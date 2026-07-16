@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List, Optional
+from typing import List, Optional, Literal
 import json
 import urllib.parse
 import logging
@@ -27,6 +27,9 @@ from app.auth.database import (
     list_instance_groups, create_instance_group, update_instance_group, delete_instance_group,
     set_instance_group_members, get_instance_group_limits, update_instance_group_limits,
     list_user_instance_group_rate_limits, upsert_user_instance_group_rate_limit, delete_user_instance_group_rate_limit,
+    get_user_model_policy, upsert_user_model_policy,
+    list_user_model_exceptions, get_user_model_exception, upsert_user_model_exception,
+    delete_user_model_exception, set_user_model_exceptions_bulk,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
@@ -1335,6 +1338,217 @@ async def delete_model_group_user_override(
     await rate_limit_tracker.refresh_now()
 
     return {"message": f"Override removed for user {user.username} on group {group_id}"}
+
+
+# ==================== Per-User Model Access API Endpoints ====================
+
+class UserModelAccessItem(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    model_id: str
+    model_name: str
+    provider_key: str
+    globally_enabled: bool          # ModelConfiguration.is_enabled
+    is_exception: bool              # explicit per-user override exists
+    is_allowed: Optional[bool]      # exception value; None if no exception
+    effective_allowed: bool         # final decision (global AND policy/exception)
+
+
+class UserModelAccessResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    user_id: int
+    username: str
+    email: Optional[str] = None
+    mode: str                       # default|allow|deny|custom (absent row -> "default")
+    models: List[UserModelAccessItem]
+
+
+class UserModelPolicyUpdate(BaseModel):
+    mode: Literal["default", "allow", "deny", "custom"]
+
+
+class UserModelExceptionUpdate(BaseModel):
+    is_allowed: bool
+
+
+def _global_ok(model: ModelConfigurationResponse) -> bool:
+    """Whether the model passes the global gate.
+
+    Must mirror the cache's decision exactly: a model is globally available only when
+    its own enabled flag AND its provider's enabled flag are both on. Checking just
+    ``model.is_enabled`` here would disagree with the cache whenever a whole provider is
+    globally disabled, causing every follow-global override to be mis-flagged as a
+    per-user exception (spurious pencils)."""
+    return provider_manager.model_cache._passes_global_gate(model.model_id)
+
+
+def _compute_access_item(
+    model: ModelConfigurationResponse,
+    mode: str,
+    exception_map: dict,
+) -> UserModelAccessItem:
+    """Build one model's access state for a user, mirroring the cache decision."""
+    has_override = model.model_id in exception_map
+    exc_val = exception_map.get(model.model_id)
+
+    if mode == "allow":
+        effective = True
+        is_exception = False
+    elif mode == "deny":
+        effective = False
+        is_exception = False
+    elif mode == "custom":
+        # Any stored override is a per-user exception (pencil); otherwise follow global.
+        if has_override:
+            effective = bool(exc_val)
+            is_exception = True
+        else:
+            effective = _global_ok(model)
+            is_exception = False
+    else:  # "default"
+        effective = _global_ok(model)
+        is_exception = False
+
+    return UserModelAccessItem(
+        model_id=model.model_id,
+        model_name=model.model_name,
+        provider_key=model.provider_key,
+        globally_enabled=model.is_enabled,
+        is_exception=is_exception,
+        is_allowed=exc_val if is_exception else None,
+        effective_allowed=effective,
+    )
+
+
+async def _build_user_model_access(db: AsyncSession, user: User) -> UserModelAccessResponse:
+    """Assemble the full per-user model-access view."""
+    models = await get_all_model_configurations(db)
+    policy = await get_user_model_policy(db, user.id)
+    mode = (policy.mode if policy else "default") or "default"
+    exceptions = await list_user_model_exceptions(db, user.id)
+    exception_map = {e.model_id: e.is_allowed for e in exceptions}
+
+    items = [
+        _compute_access_item(ModelConfigurationResponse.from_orm(m), mode, exception_map)
+        for m in models
+    ]
+    return UserModelAccessResponse(
+        user_id=user.id,
+        username=user.username,
+        email=user.email,
+        mode=mode,
+        models=items,
+    )
+
+
+@router.get("/users/model-access", response_model=UserModelAccessResponse)
+async def get_user_model_access(
+    user_id: int = Query(..., description="User ID to get model access for"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a user's default policy plus per-model effective access."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return await _build_user_model_access(db, user)
+
+
+@router.put("/users/model-access/policy", response_model=UserModelAccessResponse)
+async def update_user_model_policy(
+    body: UserModelPolicyUpdate,
+    user_id: int = Query(..., description="User ID to update access mode for"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set the user's model-access mode (default | allow | deny | custom).
+
+    Stored per-model overrides are kept but only consulted in 'custom' mode; switching
+    to allow/deny/default leaves them inert, and returning to custom reactivates them.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    await upsert_user_model_policy(db, user_id, body.mode, current_admin.username)
+    provider_manager.model_cache.set_user_model_mode(user_id, body.mode)
+
+    return await _build_user_model_access(db, user)
+
+
+@router.put("/users/model-access", response_model=UserModelAccessResponse)
+async def upsert_user_model_access_exception(
+    body: UserModelExceptionUpdate,
+    user_id: int = Query(..., description="User ID"),
+    model_id: str = Query(..., description="Model ID, e.g. 'azure:primary/gpt-4'"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set an explicit per-model access override for a user.
+
+    Toggling an individual model always puts the user in 'custom' mode. When the user
+    was previously in allow/deny, the current effective state of every model is first
+    seeded as explicit overrides so the switch is loss-less (e.g. 'deny all' then
+    enabling one model leaves only that model on). From 'default'/'custom' no seeding
+    is needed — untoggled models keep following the global config.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    model = await get_model_configuration(db, model_id)
+    if not model:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
+
+    policy = await get_user_model_policy(db, user_id)
+    prev_mode = (policy.mode if policy else "default") or "default"
+
+    if prev_mode in ("allow", "deny"):
+        # Seed a fresh custom baseline from the old blanket mode, then apply this toggle.
+        # Every model gets an explicit override so the previous blanket state is preserved
+        # loss-lessly (e.g. 'deny all' then enabling one model leaves only that one on).
+        all_models = await get_all_model_configurations(db)
+        seed_val = prev_mode == "allow"
+        overrides = {m.model_id: seed_val for m in all_models}
+        overrides[model_id] = body.is_allowed
+        await set_user_model_exceptions_bulk(
+            db, user_id, overrides, current_admin.username, replace=True
+        )
+        await upsert_user_model_policy(db, user_id, "custom", current_admin.username)
+        # Mirror into cache.
+        provider_manager.model_cache.update_user_model_access_for_user(
+            user_id, "custom", overrides
+        )
+    else:
+        # 'default' or already 'custom': just set/replace this one override.
+        await upsert_user_model_exception(db, user_id, model_id, body.is_allowed, current_admin.username)
+        provider_manager.model_cache.set_user_model_exception(user_id, model_id, body.is_allowed)
+        if prev_mode != "custom":
+            await upsert_user_model_policy(db, user_id, "custom", current_admin.username)
+            provider_manager.model_cache.set_user_model_mode(user_id, "custom")
+
+    return await _build_user_model_access(db, user)
+
+
+@router.delete("/users/model-access")
+async def delete_user_model_access_exception(
+    user_id: int = Query(..., description="User ID"),
+    model_id: str = Query(..., description="Model ID to reset to policy default"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove an explicit per-model override; the model reverts to the user's default."""
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    deleted = await delete_user_model_exception(db, user_id, model_id)
+    provider_manager.model_cache.clear_user_model_exception(user_id, model_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No override found for this user and model")
+
+    return {"message": f"Override removed for user {user.username} on model {model_id}"}
 
 
 # ==================== Instance Group Management API Endpoints ====================

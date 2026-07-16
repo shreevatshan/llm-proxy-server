@@ -386,6 +386,12 @@ def create_openai_app() -> FastAPI:
     async def _openai_rl_handler(req, exc: RateLimitExceeded):
         return _JSONResponse(status_code=429, content=exc.body, headers=exc.headers)
 
+    from app.model_access_dep import ModelAccessDenied
+
+    @openai_app.exception_handler(ModelAccessDenied)
+    async def _openai_access_handler(req, exc: ModelAccessDenied):
+        return _JSONResponse(status_code=exc.status_code, content=exc.body)
+
     from app.routes import models, chat, completions, embeddings, images, audio, responses
     openai_app.include_router(models.router)
     openai_app.include_router(chat.router)
@@ -460,6 +466,12 @@ def create_anthropic_app() -> FastAPI:
     async def _anthropic_rl_handler(req, exc: RateLimitExceeded):
         return _JSONResponse(status_code=429, content=exc.body, headers=exc.headers)
 
+    from app.model_access_dep import ModelAccessDenied
+
+    @anthropic_app.exception_handler(ModelAccessDenied)
+    async def _anthropic_access_handler(req, exc: ModelAccessDenied):
+        return _JSONResponse(status_code=exc.status_code, content=exc.body)
+
     from app.routes import anthropic_messages, anthropic_models
     anthropic_app.include_router(anthropic_messages.router)
     anthropic_app.include_router(anthropic_models.router)
@@ -524,6 +536,12 @@ def create_azure_openai_app() -> FastAPI:
     @azure_openai_app.exception_handler(RateLimitExceeded)
     async def _azure_rl_handler(req, exc: RateLimitExceeded):
         return _JSONResponse(status_code=429, content=exc.body, headers=exc.headers)
+
+    from app.model_access_dep import ModelAccessDenied
+
+    @azure_openai_app.exception_handler(ModelAccessDenied)
+    async def _azure_access_handler(req, exc: ModelAccessDenied):
+        return _JSONResponse(status_code=exc.status_code, content=exc.body)
 
     from app.routes import azure_openai
     azure_openai_app.include_router(azure_openai.router)

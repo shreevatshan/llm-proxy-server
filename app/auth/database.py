@@ -11,7 +11,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit
+from .models import Base, User, APIKey, ModelConfiguration, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -507,6 +507,152 @@ async def delete_user_rate_limit(db: AsyncSession, user_id: int) -> bool:
     await db.delete(row)
     await db.commit()
     return True
+
+
+# ==================== Per-User Model Access ====================
+
+async def get_user_model_policy(db: AsyncSession, user_id: int) -> Optional[UserModelAccessPolicy]:
+    """Return the per-user model-access default policy, or None (⇒ allow-all)."""
+    result = await db.execute(
+        select(UserModelAccessPolicy).where(UserModelAccessPolicy.user_id == user_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_user_model_policy(
+    db: AsyncSession,
+    user_id: int,
+    mode: str,
+    admin_username: str,
+) -> UserModelAccessPolicy:
+    """Create or update a user's model-access policy mode (default|allow|deny|custom)."""
+    row = await get_user_model_policy(db, user_id)
+    if row is None:
+        row = UserModelAccessPolicy(user_id=user_id)
+        db.add(row)
+    row.mode = mode
+    # Keep the legacy boolean roughly in sync for any old readers.
+    row.default_allow = mode in ("allow", "default")
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def delete_user_model_policy(db: AsyncSession, user_id: int) -> bool:
+    """Remove a user's policy row; user reverts to the allow-all default."""
+    row = await get_user_model_policy(db, user_id)
+    if row is None:
+        return False
+    await db.delete(row)
+    await db.commit()
+    return True
+
+
+async def list_user_model_exceptions(db: AsyncSession, user_id: int) -> List[UserModelAccessException]:
+    """Return all explicit per-model access exceptions for a user."""
+    result = await db.execute(
+        select(UserModelAccessException).where(UserModelAccessException.user_id == user_id)
+    )
+    return list(result.scalars().all())
+
+
+async def get_user_model_exception(
+    db: AsyncSession, user_id: int, model_id: str
+) -> Optional[UserModelAccessException]:
+    """Return the explicit exception for (user, model), or None."""
+    result = await db.execute(
+        select(UserModelAccessException).where(
+            UserModelAccessException.user_id == user_id,
+            UserModelAccessException.model_id == model_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def upsert_user_model_exception(
+    db: AsyncSession,
+    user_id: int,
+    model_id: str,
+    is_allowed: bool,
+    admin_username: str,
+) -> UserModelAccessException:
+    """Create or update an explicit per-model access exception for a user."""
+    row = await get_user_model_exception(db, user_id, model_id)
+    if row is None:
+        row = UserModelAccessException(user_id=user_id, model_id=model_id)
+        db.add(row)
+    row.is_allowed = is_allowed
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def delete_user_model_exception(db: AsyncSession, user_id: int, model_id: str) -> bool:
+    """Remove an explicit exception; the (user, model) reverts to policy default."""
+    row = await get_user_model_exception(db, user_id, model_id)
+    if row is None:
+        return False
+    await db.delete(row)
+    await db.commit()
+    return True
+
+
+async def set_user_model_exceptions_bulk(
+    db: AsyncSession,
+    user_id: int,
+    overrides: Dict[str, bool],
+    admin_username: str,
+    replace: bool = False,
+) -> None:
+    """Upsert many per-model overrides in one transaction.
+
+    When replace=True, clears all existing exceptions for the user first (used when
+    seeding a fresh 'custom' baseline from allow/deny). Otherwise merges in place.
+    """
+    if replace:
+        existing = await list_user_model_exceptions(db, user_id)
+        for row in existing:
+            await db.delete(row)
+        await db.flush()
+
+    now = datetime.utcnow()
+    if replace:
+        # Fresh slate: insert directly, no per-row lookup needed.
+        for model_id, is_allowed in overrides.items():
+            db.add(UserModelAccessException(
+                user_id=user_id,
+                model_id=model_id,
+                is_allowed=is_allowed,
+                updated_by=admin_username,
+                updated_at=now,
+            ))
+    else:
+        for model_id, is_allowed in overrides.items():
+            row = await get_user_model_exception(db, user_id, model_id)
+            if row is None:
+                row = UserModelAccessException(user_id=user_id, model_id=model_id)
+                db.add(row)
+            row.is_allowed = is_allowed
+            row.updated_by = admin_username
+            row.updated_at = now
+
+    await db.commit()
+
+
+async def get_all_user_model_policies(db: AsyncSession) -> List[UserModelAccessPolicy]:
+    """Return every user's model-access policy row (for cache warm-up)."""
+    result = await db.execute(select(UserModelAccessPolicy))
+    return list(result.scalars().all())
+
+
+async def get_all_user_model_exceptions(db: AsyncSession) -> List[UserModelAccessException]:
+    """Return every per-model access exception across all users (for cache warm-up)."""
+    result = await db.execute(select(UserModelAccessException))
+    return list(result.scalars().all())
 
 
 async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
@@ -2088,6 +2234,27 @@ async def _run_auto_migrations():
                 logger.info("Auto-migration: 'is_pending_approval' column added successfully")
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add is_pending_approval column: {e}")
+
+        # Add 'mode' column to user_model_access_policies and backfill from the
+        # legacy default_allow boolean (True -> allow, False -> deny).
+        try:
+            result = await conn.execute(text("PRAGMA table_info(user_model_access_policies)"))
+            columns = [row[1] for row in result.fetchall()]
+            if columns and 'mode' not in columns:
+                logger.info("Auto-migration: Adding 'mode' column to user_model_access_policies")
+                await conn.execute(text(
+                    "ALTER TABLE user_model_access_policies ADD COLUMN mode TEXT DEFAULT 'default'"
+                ))
+                if 'default_allow' in columns:
+                    await conn.execute(text(
+                        "UPDATE user_model_access_policies SET mode = 'allow' WHERE default_allow = 1"
+                    ))
+                    await conn.execute(text(
+                        "UPDATE user_model_access_policies SET mode = 'deny' WHERE default_allow = 0"
+                    ))
+                logger.info("Auto-migration: 'mode' column added and backfilled")
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not add mode column: {e}")
 
         # Check if supported_apis column exists
         try:

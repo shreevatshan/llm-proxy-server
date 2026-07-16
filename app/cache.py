@@ -36,6 +36,10 @@ class ModelCache:
         self._provider_configs: Dict[str, bool] = {}  # provider_key -> enabled status
         self._config_last_updated: float = 0
         self._config_lock: Optional[asyncio.Lock] = None
+
+        # Per-user model access cache (guarded by _config_lock)
+        self._user_model_policies: Dict[int, str] = {}  # user_id -> mode (absent -> "default")
+        self._user_model_exceptions: Dict[int, Dict[str, bool]] = {}  # user_id -> {model_id -> is_allowed}
         
         # Threading lock for safe initialization of asyncio locks
         self._init_lock = threading.Lock()
@@ -367,6 +371,95 @@ class ModelCache:
                     enabled_models.append(model)
         return enabled_models
     
+    # ==================== Per-User Model Access ====================
+
+    def update_user_model_access(
+        self,
+        user_policies: Dict[int, str],
+        user_exceptions: Dict[int, Dict[str, bool]],
+    ) -> None:
+        """Replace the full per-user access maps (sync; used on refresh).
+
+        user_policies maps user_id -> mode ("default"|"allow"|"deny"|"custom").
+        """
+        self._user_model_policies = user_policies
+        self._user_model_exceptions = user_exceptions
+        self._config_last_updated = time.time()
+
+    def set_user_model_mode(self, user_id: int, mode: str) -> None:
+        """Update a single user's access mode in place (atomic dict assignment)."""
+        self._user_model_policies[user_id] = mode
+        self._config_last_updated = time.time()
+
+    def update_user_model_access_for_user(
+        self, user_id: int, mode: str, overrides: Dict[str, bool]
+    ) -> None:
+        """Replace a single user's mode and full override map (used when seeding
+        a fresh custom baseline from allow/deny)."""
+        self._user_model_policies[user_id] = mode
+        self._user_model_exceptions[user_id] = dict(overrides)
+        self._config_last_updated = time.time()
+
+    def set_user_model_exception(self, user_id: int, model_id: str, is_allowed: bool) -> None:
+        """Set/replace a single per-model exception for a user."""
+        user_map = self._user_model_exceptions.get(user_id)
+        if user_map is None:
+            user_map = {}
+            self._user_model_exceptions[user_id] = user_map
+        user_map[model_id] = is_allowed
+        self._config_last_updated = time.time()
+
+    def clear_user_model_exception(self, user_id: int, model_id: str) -> None:
+        """Remove a single per-model exception for a user (revert to policy default)."""
+        user_map = self._user_model_exceptions.get(user_id)
+        if user_map is not None:
+            user_map.pop(model_id, None)
+        self._config_last_updated = time.time()
+
+    def clear_user_model_exceptions(self, user_id: int) -> None:
+        """Remove all per-model exceptions for a user (bulk allow-all/deny-all)."""
+        self._user_model_exceptions.pop(user_id, None)
+        self._config_last_updated = time.time()
+
+    def _passes_global_gate(self, model_id: str) -> bool:
+        """True if the model and its provider are globally enabled."""
+        if not self.is_model_enabled(model_id):
+            return False
+        if '/' in model_id:
+            provider_key = model_id.split('/', 1)[0]
+            if not self.is_provider_enabled(provider_key):
+                return False
+        return True
+
+    def is_model_allowed_for_user(self, user_id: int, model_id: str) -> bool:
+        """Effective per-user access decision for a model, by mode:
+
+          default : follow the global gate only.
+          allow   : always allowed (overrides the global gate).
+          deny    : always denied (overrides the global gate).
+          custom  : explicit override wins (beats the gate); otherwise follow global.
+        """
+        mode = self._user_model_policies.get(user_id, "default")
+
+        if mode == "allow":
+            return True
+        if mode == "deny":
+            return False
+        if mode == "custom":
+            user_map = self._user_model_exceptions.get(user_id)
+            if user_map is not None and model_id in user_map:
+                return user_map[model_id]
+            return self._passes_global_gate(model_id)
+
+        # "default" (or any unknown mode) -> obey global config.
+        return self._passes_global_gate(model_id)
+
+    def get_enabled_models_for_user(self, user_id: int) -> List[ModelInfo]:
+        """All models filtered by the user's effective access (may include
+        globally-disabled models when the user's mode overrides the gate)."""
+        models_snapshot = list(self._models)
+        return [m for m in models_snapshot if self.is_model_allowed_for_user(user_id, m.id)]
+
     def get_config_cache_age(self) -> float:
         """Get configuration cache age in seconds."""
         return time.time() - self._config_last_updated

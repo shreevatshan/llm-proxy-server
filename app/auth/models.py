@@ -293,6 +293,43 @@ class UserInstanceGroupRateLimit(Base):
     )
 
 
+class UserModelAccessPolicy(Base):
+    """Per-user model-access policy. Absent row = 'default' mode (obey global config).
+
+    mode is one of:
+      - default : strictly follow the global model config (no per-user override).
+      - allow   : every model ON, overriding the global gate (incl. future models).
+      - deny    : every model OFF, overriding the global gate (incl. future models).
+      - custom  : per-model overrides layered on the global config; untoggled/new
+                  models follow global, explicit overrides win (can beat the gate).
+    """
+    __tablename__ = "user_model_access_policies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, index=True, nullable=False)
+    mode = Column(String(16), default="default", nullable=False)  # default|allow|deny|custom
+    default_allow = Column(Boolean, default=True, nullable=False)  # legacy; kept in sync for back-compat
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+
+class UserModelAccessException(Base):
+    """Explicit per-(user, model) override against the user's default policy."""
+    __tablename__ = "user_model_access_exceptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    model_id = Column(String(200), nullable=False)  # e.g. "azure:primary/gpt-4"
+    is_allowed = Column(Boolean, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "model_id", name="uq_user_model_access_exception"),
+        Index("ix_user_model_access_exceptions_user_id", "user_id"),
+    )
+
+
 class ProviderCredentials(Base):
     """Provider credentials model for storing provider configurations."""
     __tablename__ = "provider_credentials"

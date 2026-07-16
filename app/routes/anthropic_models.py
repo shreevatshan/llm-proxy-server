@@ -5,7 +5,7 @@ Lists only models from providers that support the Anthropic API format.
 """
 
 import logging
-from typing import Union
+from typing import Union, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _caller_user_id(auth: Union[User, AdminUser, APIKey]) -> Optional[int]:
+    """User id for per-user model filtering; None for admins (see full list)."""
+    if isinstance(auth, AdminUser):
+        return None
+    return getattr(auth, "user_id", None) or getattr(auth, "id", None)
+
+
 @router.get("/v1/models", tags=["anthropic"])
 async def list_anthropic_models(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_anthropic_request),
@@ -29,7 +36,9 @@ async def list_anthropic_models(
     """List all available models that support the Anthropic API format."""
     with create_span("api.anthropic.models.list") as span:
         try:
-            models = await provider_manager.get_all_models(api_filter="anthropic")
+            models = await provider_manager.get_all_models(
+                api_filter="anthropic", user_id=_caller_user_id(auth)
+            )
 
             anthropic_models = []
             for model in models:

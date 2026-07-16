@@ -829,3 +829,410 @@ input:checked + .model-toggle-slider:before {
     width: 100% !important;
     height: 100% !important;
 }
+
+/* ================================
+   MODEL ACCESS
+   ================================ */
+
+.model-access-grid {
+    align-items: stretch;
+}
+
+/* The right card's height is driven by its fixed-height model list (a stable scroll
+   container). The left Scope card uses h-100, so it stretches to the row height set by
+   the right card; its user-list flex-fills to consume the extra space. Result: both
+   cards are the same height, and each list scrolls internally. */
+#ma-global .ma-model-list {
+    height: 60vh;
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+/* Left Scope card: card-body becomes a flex column so the user-list can grow to fill
+   the height the card inherits from h-100 (matching the taller right card). */
+.model-access-grid > .col-lg-4 > .card {
+    display: flex;
+    flex-direction: column;
+}
+
+.model-access-grid > .col-lg-4 > .card > .card-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Spacing between the header action buttons (Sync / Enable all / Disable all).
+   Set directly on the children so it doesn't depend on the Bootstrap `gap` utility
+   resolving. */
+.ma-global-actions > .btn + .btn {
+    margin-left: 0.6rem;
+}
+
+/* --- User picker (left pane) --- */
+.ma-user-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--dark-border) var(--dark-bg-secondary);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.ma-user-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-left: 3px solid transparent;
+    border-radius: var(--radius-md, 6px);
+    padding: 0.5rem 0.75rem;
+    color: var(--dark-text-primary);
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+/* Card bg is --mono-1, so hover/active must use a lighter elevated surface
+   (--mono-2/--mono-3) to actually read as distinct from the card. */
+.ma-user-item:hover {
+    background: var(--mono-2);
+}
+
+.ma-user-item.active {
+    background: var(--mono-3);
+    border-left-color: var(--accent-500);
+}
+
+/* Global scope entry — the "applies to everyone" row, pinned above the users.
+   Rendered as an outlined chip so it reads as a distinct, always-present scope
+   WITHOUT looking selected. Only .active (shared with users) marks the current
+   scope, so exactly one row is ever highlighted. */
+.ma-scope-global {
+    /* Uniform outlined chip — equal border on all four sides. */
+    border: 1px solid var(--dark-border);
+}
+
+/* When Global is the active scope, light the whole box (not just the left edge),
+   since this row is a bordered chip rather than a plain list item. */
+.ma-scope-global.active {
+    border-color: var(--accent-500);
+}
+
+.ma-scope-lead {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+}
+
+.ma-scope-icon {
+    color: var(--accent-500);
+    margin-right: 0.6rem;
+    font-size: 0.95rem;
+    flex-shrink: 0;
+}
+
+/* Trailing group so a user's exception badge + editing flag sit together. */
+.ma-user-trailing {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-shrink: 0;
+}
+
+/* Bright pill on the single active row — the unmistakable "you are here". */
+.ma-editing-flag {
+    display: none;
+    align-items: center;
+    flex-shrink: 0;
+    font-family: var(--font-family-mono);
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    /* Near-black text on the white accent pill. !important is required because the
+       global `.card-body span:not(.text-muted)` rule in dark-flat-override.css (loaded
+       after this file) has higher specificity and would otherwise force the pill's text
+       to light gray, making it invisible on the white background. */
+    color: #0d0d0d !important;
+    background: #ffffff;
+    padding: 0.15rem 0.45rem;
+    border-radius: 3px;
+}
+
+.ma-editing-flag i {
+    color: #0d0d0d !important;
+}
+
+.ma-user-item.active .ma-editing-flag {
+    display: inline-flex;
+}
+
+/* "Individual users" group label separating Global from the user list. */
+.ma-scope-group-label {
+    font-family: var(--font-family-mono);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--mono-text-muted);
+    margin: 0.9rem 0 0.6rem;
+}
+
+/* Right-pane banner: says in words which scope is being edited. */
+.ma-scope-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 0.75rem;
+    border: 1px solid var(--dark-border);
+    border-left: 3px solid var(--accent-500);
+    border-radius: var(--radius-md, 6px);
+    background: var(--mono-1);
+    font-size: 0.85rem;
+    color: var(--dark-text-secondary, #b8b8b8);
+}
+
+.ma-scope-banner .ma-scope-tag {
+    font-family: var(--font-family-mono);
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dark-bg-secondary);
+    background: var(--accent-500);
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+.ma-scope-banner .ma-scope-target {
+    color: var(--dark-text-primary);
+    font-weight: 600;
+}
+
+.ma-user-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.ma-user-name {
+    font-weight: 600;
+    font-size: 0.875rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ma-user-email {
+    font-size: 0.75rem;
+    color: var(--mono-text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Exception-count badge — only shown when a user has overrides */
+.ma-exc-badge {
+    flex-shrink: 0;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-family-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--dark-bg-secondary);
+    background: var(--accent-500);
+    border-radius: 10px;
+}
+
+/* --- Policy segmented control --- */
+.ma-segment {
+    display: inline-flex;
+    border: 1px solid var(--dark-border);
+    border-radius: var(--radius-md, 6px);
+    overflow: hidden;
+}
+
+.ma-segment-btn {
+    background: transparent;
+    border: none;
+    color: var(--dark-text-secondary, #b8b8b8);
+    font-family: var(--font-family-mono);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.4rem 1rem;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.ma-segment-btn:not(:last-child) {
+    border-right: 1px solid var(--dark-border);
+}
+
+.ma-segment-btn.active {
+    background: var(--accent-500);
+    color: var(--dark-bg-secondary);
+    font-weight: 600;
+}
+
+/* --- Models list --- */
+.ma-model-list {
+    max-height: 520px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--dark-border) var(--dark-bg-secondary);
+}
+
+.ma-model-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.6rem 1.25rem;
+    border-bottom: 1px solid var(--dark-border);
+    border-left: 3px solid transparent;
+    transition: background-color 0.15s ease;
+}
+
+.ma-model-row:last-child {
+    border-bottom: none;
+}
+
+.ma-model-row:hover {
+    background: var(--mono-2);
+}
+
+/* Signature: exceptions stand out; rows that follow the default stay quiet */
+/* Exceptions are marked only by the pencil glyph (.ma-exc-mark) — the row itself
+   is not highlighted, so a fully-overridden custom list doesn't read as a wall of
+   tinted rows. */
+
+.ma-model-row.is-global-off {
+    opacity: 0.5;
+}
+
+/* Global list: a disabled model mutes its id, but the toggle stays full-strength
+   since it's the control used to turn the model back on. */
+.ma-model-row.is-off .ma-model-id {
+    color: var(--mono-text-muted);
+}
+
+.ma-model-id {
+    font-family: var(--font-family-mono);
+    font-size: 0.8rem;
+    color: var(--dark-text-primary);
+    word-break: break-all;
+}
+
+.ma-exc-mark {
+    font-size: 0.65rem;
+    color: var(--accent-500);
+    margin-left: 0.35rem;
+}
+
+.ma-tag {
+    display: inline-block;
+    font-family: var(--font-family-mono);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    margin-left: 0.4rem;
+}
+
+.ma-tag-off {
+    color: var(--mono-text-muted);
+    border: 1px solid var(--dark-border);
+}
+
+.ma-model-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-shrink: 0;
+}
+
+.ma-reset-btn {
+    color: var(--mono-text-muted);
+    padding: 0.1rem 0.4rem;
+    text-decoration: none;
+}
+
+.ma-reset-btn:hover {
+    color: var(--accent-500);
+}
+
+/* Toggle switch (mirrors .model-toggle-switch) */
+.ma-switch {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 20px;
+    flex-shrink: 0;
+    margin: 0;
+}
+
+.ma-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.ma-slider {
+    position: absolute;
+    cursor: pointer;
+    inset: 0;
+    background-color: var(--dark-border);
+    transition: background-color 0.2s ease;
+    border-radius: 20px;
+}
+
+.ma-slider:before {
+    position: absolute;
+    content: "";
+    height: 16px;
+    width: 16px;
+    left: 2px;
+    bottom: 2px;
+    background-color: var(--dark-text-primary);
+    transition: transform 0.2s ease;
+    border-radius: 50%;
+}
+
+.ma-switch input:checked + .ma-slider {
+    background-color: var(--mono-text-primary);
+}
+
+/* Dark knob on the white track when on — otherwise white-on-white reads as a
+   solid pill with no visible knob (matches the .model-toggle-switch treatment). */
+.ma-switch input:checked + .ma-slider:before {
+    background-color: var(--mono-0);
+    transform: translateX(24px);
+}
+
+.ma-switch input:disabled + .ma-slider {
+    cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ma-user-item,
+    .ma-model-row,
+    .ma-segment-btn,
+    .ma-slider,
+    .ma-slider:before {
+        transition: none;
+    }
+}

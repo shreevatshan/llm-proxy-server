@@ -14,35 +14,17 @@ class ProviderManager {
         this.showProvidersLoading();
 
         try {
-            console.log('🔍 Loading provider and model data...');
+            console.log('🔍 Loading provider data...');
 
-            // Fetch providers and models data
-            const [providersResponse, modelsResponse] = await Promise.all([
-                fetch('/admin/providers', { credentials: 'include' }),
-                fetch('/admin/models', { credentials: 'include' })
-            ]);
+            const providersResponse = await fetch('/admin/providers', { credentials: 'include' });
 
-            console.log('📡 API Response Status:', {
-                providers: providersResponse.status,
-                models: modelsResponse.status
-            });
-
-            if (!providersResponse.ok || !modelsResponse.ok) {
-                const providersError = providersResponse.ok ? 'OK' : await providersResponse.text();
-                const modelsError = modelsResponse.ok ? 'OK' : await modelsResponse.text();
-                console.error('❌ API Errors:', { providersError, modelsError });
-                throw new Error('Failed to fetch provider or model data');
+            if (!providersResponse.ok) {
+                const providersError = await providersResponse.text();
+                console.error('❌ API Errors:', { providersError });
+                throw new Error('Failed to fetch provider data');
             }
 
             const providers = await providersResponse.json();
-            const modelsData = await modelsResponse.json();
-
-            console.log('📊 API Data Received:', {
-                providers: providers.length,
-                modelsData: modelsData,
-                enabledModels: modelsData.enabled_models,
-                totalModels: modelsData.total_models
-            });
 
             // Store data globally
             providersData = providers;
@@ -54,7 +36,7 @@ class ProviderManager {
             }
 
             // Update stats
-            this.updateProviderStats(providers, modelsData);
+            this.updateProviderStats(providers);
 
             if (providers.length === 0) {
                 this.showProvidersEmpty();
@@ -70,41 +52,11 @@ class ProviderManager {
         }
     }
 
-    updateProviderStats(providers, modelsData) {
+    updateProviderStats(providers) {
         const enabledProviders = providers.filter(p => p.enabled).length;
-        const enabledModels = modelsData.enabled_models || 0;
-
-        console.log('🔧 Updating provider stats:', {
-            enabledProviders,
-            enabledModels,
-            providersLength: providers.length,
-            modelsDataStructure: Object.keys(modelsData)
-        });
-
         const providerStatsEl = document.getElementById('enabled-providers');
-        const modelStatsEl = document.getElementById('enabled-models');
-
-        console.log('🎯 DOM Elements found:', {
-            providerStatsEl: !!providerStatsEl,
-            modelStatsEl: !!modelStatsEl,
-            providerCurrentText: providerStatsEl?.textContent,
-            modelCurrentText: modelStatsEl?.textContent
-        });
-
         if (providerStatsEl) {
-            console.log('🔄 Updating provider element...', { before: providerStatsEl.textContent, after: enabledProviders });
             providerStatsEl.textContent = enabledProviders;
-            console.log('✅ Provider element updated. New text:', providerStatsEl.textContent);
-        } else {
-            console.error('❌ Provider stats element not found!');
-        }
-
-        if (modelStatsEl) {
-            console.log('🔄 Updating model element...', { before: modelStatsEl.textContent, after: enabledModels });
-            modelStatsEl.textContent = enabledModels;
-            console.log('✅ Model element updated. New text:', modelStatsEl.textContent);
-        } else {
-            console.error('❌ Model stats element not found!');
         }
     }
 
@@ -206,11 +158,8 @@ class ProviderManager {
                                 </div>
                             </div>
                             <div class="provider-actions">
-                                <button class="btn btn-sm btn-outline-info" onclick="window.ModelManager.toggleProviderModels('${provider.provider_key}')" title="Show/Hide Models" id="models-btn-${provider.provider_key}">
-                                    <i class="fas fa-list"></i> Models (${provider.model_count || 0})
-                                </button>
                                 <label class="toggle-switch">
-                                    <input type="checkbox" ${provider.enabled ? 'checked' : ''} 
+                                    <input type="checkbox" ${provider.enabled ? 'checked' : ''}
                                            onchange="window.ProviderManager.toggleProviderEnabled('${provider.provider_key}', this.checked)">
                                     <span class="toggle-slider"></span>
                                 </label>
@@ -220,43 +169,6 @@ class ProviderManager {
                                 <button class="btn btn-sm btn-outline-danger" onclick="window.ProviderManager.deleteProvider('${provider.provider_key}')" title="Delete">
                                     <i class="fas fa-trash"></i>
                                 </button>
-                            </div>
-                        </div>
-                        
-                        <!-- Models Section -->
-                        <div class="provider-models-section" id="models-section-${provider.provider_key}" style="display: none;">
-                            <div class="models-loading" id="models-loading-${provider.provider_key}">
-                                <div class="text-center py-3">
-                                    <i class="fas fa-spinner fa-spin me-2"></i>
-                                    Loading models...
-                                </div>
-                            </div>
-                            <div class="models-content" id="models-content-${provider.provider_key}" style="display: none;">
-                                <div class="models-header">
-                                    <div class="d-flex justify-content-between align-items-center p-3 border-bottom">
-                                        <h6 class="mb-0">
-                                            <i class="fas fa-cog me-2"></i>
-                                            Individual Model Controls
-                                        </h6>
-                                        <div class="model-bulk-actions">
-                                            <button class="btn btn-sm btn-success" onclick="window.ModelManager.bulkToggleProviderModels('${provider.provider_key}', true)" title="Enable All Models">
-                                                <i class="fas fa-check-circle"></i> Enable All
-                                            </button>
-                                            <button class="btn btn-sm btn-danger" onclick="window.ModelManager.bulkToggleProviderModels('${provider.provider_key}', false)" title="Disable All Models">
-                                                <i class="fas fa-times-circle"></i> Disable All
-                                            </button>
-                                        </div>
-                                    </div>
-                                </div>
-                                <div class="models-list" id="models-list-${provider.provider_key}">
-                                    <!-- Models will be loaded here -->
-                                </div>
-                            </div>
-                            <div class="models-error" id="models-error-${provider.provider_key}" style="display: none;">
-                                <div class="alert alert-warning m-3">
-                                    <i class="fas fa-exclamation-triangle me-2"></i>
-                                    Failed to load models. <a href="#" onclick="window.ModelManager.loadProviderModels('${provider.provider_key}')">Retry</a>
-                                </div>
                             </div>
                         </div>
                     </div>

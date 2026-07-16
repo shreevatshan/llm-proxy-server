@@ -40,6 +40,7 @@ from app.routes.stream_utils import (
     set_request_tracking_outcome,
 )
 from app.rate_limit_dep import enforce_group_rate_limit
+from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.rate_limit import RateLimitExceeded
 from opentelemetry import trace
 from opentelemetry.context import get_current
@@ -239,6 +240,7 @@ async def create_message(
 
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="anthropic")
+            await enforce_model_access(request_obj, auth, model_name, envelope_override="anthropic")
 
             # Pre-flight: confirm the specific model exists in the cached model list.
             preflight_result = await _check_model_exists(provider, model_name)
@@ -412,7 +414,7 @@ async def create_message(
                         str(e)
                     )
 
-        except (HTTPException, RateLimitExceeded):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
             raise
         except ValueError as e:
             logger.warning(f"Anthropic request validation error: {e}")

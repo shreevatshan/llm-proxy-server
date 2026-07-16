@@ -154,6 +154,11 @@ function showTab(tabName) {
     } else {
         window.RateLimitManager?.stopAutoRefresh();
     }
+
+    // Load unified model management when switching to the models tab
+    if (tabName === 'models') {
+        window.ModelsManager?.load();
+    }
 }
 
 // Sub-tab switcher inside the Rate Limits tab

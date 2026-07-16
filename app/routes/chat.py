@@ -31,6 +31,8 @@ from app.routes.stream_utils import (
     DISCONNECT_CHECK_INTERVAL
 )
 from app.rate_limit_dep import enforce_group_rate_limit
+from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.rate_limit import RateLimitExceeded
 from opentelemetry import trace
 from opentelemetry.context import attach
 
@@ -64,6 +66,9 @@ async def chat_completions(
         try:
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, request.model)
+
+            # Per-user model access check
+            await enforce_model_access(request_obj, auth, request.model)
 
             # Apply request transformations
             transformation_manager = get_transformation_manager()
@@ -142,6 +147,8 @@ async def chat_completions(
                     return response.model_dump(exclude_unset=True)
                 return response
                 
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+            raise
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=400, detail=str(e))

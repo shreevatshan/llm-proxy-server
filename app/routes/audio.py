@@ -16,6 +16,7 @@ from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
+from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.rate_limit import RateLimitExceeded
 from app.tracing import create_span, add_span_attributes, set_span_error
 import logging
@@ -36,6 +37,7 @@ async def create_speech(
     try:
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, request.model)
+        await enforce_model_access(request_obj, auth, request.model)
 
         # Get provider for the model
         provider_name, model_id = provider_manager._parse_model_name(request.model)
@@ -64,7 +66,7 @@ async def create_speech(
             }
         )
         
-    except (HTTPException, RateLimitExceeded):
+    except (HTTPException, RateLimitExceeded, ModelAccessDenied):
         raise
     except ValueError as e:
         # Bad model name / unknown provider is a client error, not a 500.
@@ -96,6 +98,7 @@ async def create_transcription(
     try:
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, model)
+        await enforce_model_access(request_obj, auth, model)
 
         # Read file content
         file_content = await file.read()
@@ -144,7 +147,7 @@ async def create_transcription(
             # JSON format (default and verbose_json)
             return result
         
-    except (HTTPException, RateLimitExceeded):
+    except (HTTPException, RateLimitExceeded, ModelAccessDenied):
         raise
     except ValueError as e:
         # Bad model name / unknown provider is a client error, not a 500.
@@ -174,6 +177,7 @@ async def create_translation(
     try:
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, model)
+        await enforce_model_access(request_obj, auth, model)
 
         # Read file content
         file_content = await file.read()
@@ -212,7 +216,7 @@ async def create_translation(
             # JSON format (default and verbose_json)
             return result
         
-    except (HTTPException, RateLimitExceeded):
+    except (HTTPException, RateLimitExceeded, ModelAccessDenied):
         raise
     except ValueError as e:
         # Bad model name / unknown provider is a client error, not a 500.
