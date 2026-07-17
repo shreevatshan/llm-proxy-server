@@ -873,7 +873,11 @@ input:checked + .model-toggle-slider:before {
 .ma-user-list {
     flex: 1 1 auto;
     min-height: 0;
-    max-height: none;
+    /* Self-contained bounded height (like #ma-global .ma-model-list) so the list
+       scrolls internally instead of relying on the flex-height chain, which was
+       breaking and letting the list push the whole page. Slightly under 60vh to
+       account for the scope chip + search box above it in the same card. */
+    max-height: 52vh;
     overflow-y: auto;
     scrollbar-width: thin;
     scrollbar-color: var(--dark-border) var(--dark-bg-secondary);
