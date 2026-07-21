@@ -1,8 +1,9 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
-from fastapi.security import HTTPBearer
 from typing import Dict, Any
 from app.openai_models import EmbeddingRequest, EmbeddingResponse
 from app.providers.provider_manager import provider_manager
+from app.providers.base import ProviderHTTPError
+from app.routes._errors import openai_provider_error_response
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
@@ -15,7 +16,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-security = HTTPBearer()
 
 
 @router.post("/v1/embeddings", response_model=EmbeddingResponse)
@@ -69,6 +69,9 @@ async def create_embeddings(
             
         except (HTTPException, RateLimitExceeded, ModelAccessDenied):
             raise
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             # Bad model name / unknown provider is a client error, not a 500.
             error_msg = f"No provider found for model: {request.model}"

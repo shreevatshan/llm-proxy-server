@@ -2,6 +2,7 @@
 
 from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import JWTError
 from typing import Optional, Union
 from .database import get_api_key, get_user_by_username, AsyncSessionLocal
 from .models import User, APIKey
@@ -37,6 +38,39 @@ def _envelope_for(path: str, override: Optional[str]) -> str:
     return "openai"
 
 
+def get_owner_user_id(auth) -> Optional[int]:
+    """Resolve the owning user id from an authenticated principal.
+
+    Returns None for admins (they bypass per-user ownership checks). For an
+    API key the owner is ``user_id`` (not the key id); for a user it is ``id``.
+    Mirrors the id resolution used elsewhere (see the rate-limit path).
+    """
+    if isinstance(auth, AdminUser):
+        return None
+    uid = getattr(auth, "user_id", None)
+    if uid is None:
+        uid = getattr(auth, "id", None)
+    return int(uid) if uid is not None else None
+
+
+async def verify_response_ownership(response_id: str, auth) -> None:
+    """Enforce Responses API ownership (IDOR guard).
+
+    Admins bypass. A mapping with no recorded owner (legacy/pre-migration rows,
+    or admin-created responses) is treated as unowned and allowed. Otherwise the
+    caller must match the recorded ``user_id`` or the request is rejected with a
+    404 (not 403, to avoid confirming the response exists).
+    """
+    if isinstance(auth, AdminUser):
+        return
+    from .database import AsyncSessionLocal as _SessionLocal, get_response_provider_mapping
+    async with _SessionLocal() as db:
+        mapping = await get_response_provider_mapping(db, response_id)
+    if mapping is not None and mapping.user_id is not None:
+        if mapping.user_id != get_owner_user_id(auth):
+            raise HTTPException(status_code=404, detail="Response not found")
+
+
 async def _enforce_rate_limit(
     request: Request, auth_result, envelope_override: Optional[str] = None
 ) -> None:
@@ -44,7 +78,9 @@ async def _enforce_rate_limit(
     from .admin import AdminUser as _AdminUser
     if isinstance(auth_result, _AdminUser):
         return
-    if request.url.path in RATE_LIMIT_SKIP_PATHS:
+    # Normalize a trailing slash so e.g. "/v1/models/" matches "/v1/models".
+    normalized_path = request.url.path.rstrip("/") or "/"
+    if normalized_path in RATE_LIMIT_SKIP_PATHS:
         return
 
     user_id = getattr(auth_result, "user_id", None) or getattr(auth_result, "id", None)
@@ -137,7 +173,7 @@ async def authenticate_api_key(
             
             # Try to get from cache first
             cached = auth_cache.get_cached_api_key(api_key)
-            if cached and cached.is_active:
+            if cached and cached.is_active and cached.user_is_active:
                 # Cache hit - mark as used (batched update) and return cached object
                 # No DB query needed - the cached object has all required attributes
                 auth_cache.mark_api_key_used(api_key)
@@ -236,7 +272,7 @@ async def get_current_user_from_token(
     # Cache miss - fetch from database
     async with AsyncSessionLocal() as db:
         user = await get_user_by_username(db, username=token_data.username)
-    if user is None:
+    if user is None or not user.is_active:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
@@ -301,7 +337,7 @@ async def get_current_user_or_admin(
         # Cache miss - fetch from database
         async with AsyncSessionLocal() as db:
             user = await get_user_by_username(db, username=token_data.username)
-        if user is None:
+        if user is None or not user.is_active:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="User not found",
@@ -359,7 +395,7 @@ async def get_current_user_optional(
         # Cache miss - fetch from database
         async with AsyncSessionLocal() as db:
             user = await get_user_by_username(db, username=token_data.username)
-        if user is None:
+        if user is None or not user.is_active:
             return None
 
         # Cache the user
@@ -433,7 +469,7 @@ async def authenticate_jwt_or_api_key(
                     # Cache miss - fetch from database
                     async with AsyncSessionLocal() as db:
                         user = await get_user_by_username(db, username=token_data.username)
-                    if user:
+                    if user is not None and user.is_active:
                         auth_cache.cache_user(user)
                         add_span_attributes(span, create_auth_attributes(
                             method="jwt_user",
@@ -444,11 +480,12 @@ async def authenticate_jwt_or_api_key(
                         await _update_tracking_identity(request, user)
                         await _enforce_rate_limit(request, user)
                         return user
-                    
+
                 except RateLimitExceeded:
                     raise
-                except Exception:
-                    # JWT verification failed, try API key authentication
+                except (JWTError, HTTPException):
+                    # JWT verification failed / not a valid JWT: fall through to API key.
+                    # DB/infra errors are NOT swallowed here (propagate to the 500 handler).
                     pass
             
             # If JWT authentication failed or no token from cookies, try API key authentication
@@ -456,7 +493,7 @@ async def authenticate_jwt_or_api_key(
                 try:
                     # Try cache first for API key
                     cached = auth_cache.get_cached_api_key(token)
-                    if cached and cached.is_active:
+                    if cached and cached.is_active and cached.user_is_active:
                         # Cache hit - mark as used (batched update) and return cached object
                         auth_cache.mark_api_key_used(token)
                         
@@ -504,8 +541,9 @@ async def authenticate_jwt_or_api_key(
                         return db_api_key
                 except RateLimitExceeded:
                     raise
-                except Exception:
-                    # API key verification also failed
+                except HTTPException:
+                    # Invalid API key: fall through to the 401 below.
+                    # DB/infra errors are NOT swallowed here (propagate to the 500 handler).
                     pass
             
             # If no authentication method worked, raise 401

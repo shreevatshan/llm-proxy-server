@@ -80,6 +80,7 @@ class ModelManager {
             return;
         }
 
+        const esc = window.UIUtils.escapeHtml;
         let html = '';
         models.forEach(model => {
             const statusClass = model.is_enabled ? 'status-active' : 'status-inactive';
@@ -87,20 +88,22 @@ class ModelManager {
             const itemClass = model.is_enabled ? '' : 'disabled';
 
             html += `
-                <div class="model-item ${itemClass}" id="model-item-${model.id}">
+                <div class="model-item ${itemClass}" id="model-item-${esc(model.id)}">
                     <div class="model-info">
-                        <div class="model-name">${model.model_name}</div>
-                        <div class="model-id">${model.model_id}</div>
+                        <div class="model-name">${esc(model.model_name)}</div>
+                        <div class="model-id">${esc(model.model_id)}</div>
                     </div>
                     <div class="model-actions">
                         <div class="model-status">
                             <span class="status-badge ${statusClass}">${statusText}</span>
                         </div>
                         <label class="model-toggle-switch">
-                            <input type="checkbox" ${model.is_enabled ? 'checked' : ''} 
-                                   onchange="window.ModelManager.toggleIndividualModel('${model.model_id}', this.checked, '${providerKey}')"
-                                   id="toggle-${model.id}">
-                            <span class="model-toggle-slider" id="slider-${model.id}"></span>
+                            <input type="checkbox" ${model.is_enabled ? 'checked' : ''}
+                                   data-action="toggle-model"
+                                   data-model-id="${esc(model.model_id)}"
+                                   data-provider-key="${esc(providerKey)}"
+                                   id="toggle-${esc(model.id)}">
+                            <span class="model-toggle-slider" id="slider-${esc(model.id)}"></span>
                         </label>
                     </div>
                 </div>
@@ -108,6 +111,14 @@ class ModelManager {
         });
 
         listEl.innerHTML = html;
+
+        // Bind toggle handlers via data-* attributes rather than interpolating
+        // model/provider ids into inline on* handlers (XSS/quote-injection risk).
+        listEl.querySelectorAll('[data-action="toggle-model"]').forEach(el => {
+            el.addEventListener('change', () => this.toggleIndividualModel(
+                el.dataset.modelId, el.checked, el.dataset.providerKey
+            ));
+        });
     }
 
     async toggleIndividualModel(modelId, enabled, providerKey) {
@@ -443,9 +454,14 @@ class ModelManager {
     }
 
     escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        if (text === null || text === undefined) return '';
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
+            .replace(/`/g, '&#96;');
     }
 
     async bulkToggle(action) {

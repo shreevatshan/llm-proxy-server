@@ -2,6 +2,8 @@
 
 import os
 import secrets
+import hashlib
+import functools
 import logging
 from pathlib import Path
 from sqlalchemy import create_engine, event, String
@@ -40,21 +42,15 @@ def ensure_db_directory():
         db_dir = os.path.abspath(db_dir)
         db_path = os.path.abspath(db_path)
         
-        # Create directory with open permissions
-        old_umask = os.umask(0)
+        # Create the directory owner-only (0o700). The SQLite file holds password
+        # hashes, API-key hashes and provider secrets, so it must not be world-readable.
+        old_umask = os.umask(0o077)
         try:
-            os.makedirs(db_dir, mode=0o777, exist_ok=True)
+            os.makedirs(db_dir, mode=0o700, exist_ok=True)
         finally:
+            # Restore the process-wide umask so we don't leak permissive defaults
+            # to every file the process later creates.
             os.umask(old_umask)
-        
-        # Ensure directory permissions (handles existing directories)
-        try:
-            os.chmod(db_dir, 0o777)
-        except Exception:
-            pass
-        
-        # Set permissive umask before SQLAlchemy creates the database file
-        os.umask(0o000)
 
 
 # Ensure directory exists before creating engines
@@ -84,6 +80,8 @@ def _set_sqlite_pragmas(dbapi_conn, connection_record):
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA busy_timeout=5000")
+    # Enforce foreign keys so ON DELETE CASCADE actually fires (off by default in SQLite).
+    cursor.execute("PRAGMA foreign_keys=ON")
     cursor.close()
 
 
@@ -99,9 +97,9 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
 # Password hashing with Docker-compatible configuration
 # Use pbkdf2_sha256 which is built into Python and works reliably in Docker
 pwd_context = CryptContext(
-    schemes=["pbkdf2_sha256"], 
+    schemes=["pbkdf2_sha256"],
     deprecated="auto",
-    pbkdf2_sha256__rounds=100000
+    pbkdf2_sha256__rounds=600000  # OWASP guidance for PBKDF2-HMAC-SHA256; older hashes re-hash on next login
 )
 
 
@@ -109,10 +107,20 @@ pwd_context = CryptContext(
 def with_db_retry(max_attempts: int = DB_RETRY_MAX_ATTEMPTS, backoff_ms: int = DB_RETRY_BACKOFF_MS):
     """Decorator to retry database operations with exponential backoff on lock errors."""
     def decorator(func):
+        @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             from sqlalchemy.exc import OperationalError
+            from sqlalchemy.ext.asyncio import AsyncSession
             import asyncio
-            
+
+            # Locate the session (if any) so we can roll it back between attempts;
+            # a failed flush/commit leaves it in a poisoned state that would raise
+            # PendingRollbackError on the next call otherwise.
+            session = next(
+                (a for a in args if isinstance(a, AsyncSession)),
+                kwargs.get("db"),
+            )
+
             last_error = None
             for attempt in range(max_attempts):
                 try:
@@ -121,13 +129,18 @@ def with_db_retry(max_attempts: int = DB_RETRY_MAX_ATTEMPTS, backoff_ms: int = D
                     if "database is locked" in str(e).lower():
                         last_error = e
                         if attempt < max_attempts - 1:
+                            if isinstance(session, AsyncSession):
+                                try:
+                                    await session.rollback()
+                                except Exception:
+                                    pass
                             # Exponential backoff: 100ms, 200ms, 400ms, etc.
                             wait_time = (backoff_ms / 1000) * (2 ** attempt)
                             logger.warning(f"Database locked, retrying in {wait_time}s (attempt {attempt + 1}/{max_attempts})")
                             await asyncio.sleep(wait_time)
                             continue
                     raise  # Re-raise if not a lock error or max attempts reached
-            
+
             # Max attempts reached
             raise last_error
         return wrapper
@@ -167,6 +180,15 @@ def get_password_hash(password: str) -> str:
 def generate_api_key() -> str:
     """Generate a secure API key without prefix."""
     return secrets.token_urlsafe(32)
+
+
+def hash_api_key(api_key: str) -> str:
+    """Return the SHA-256 hex digest used to store and look up API keys.
+
+    Deterministic so the hash stays indexable; the plaintext key is never
+    persisted (shown once at creation time only).
+    """
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
 async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User]:
@@ -211,9 +233,10 @@ async def create_user(db: AsyncSession, username: str, email: str, password: str
 async def authenticate_user(db: AsyncSession, username: str, password: str) -> Optional[User]:
     """Authenticate a user."""
     user = await get_user_by_username(db, username)
-    if not user:
-        return None
-    if not user.hashed_password:  # OAuth user without password
+    if not user or not user.hashed_password:
+        # Run a dummy verification so a missing/passwordless account takes the same
+        # time as a real one, closing the username-enumeration timing side channel.
+        pwd_context.dummy_verify()
         return None
     if not verify_password(password, user.hashed_password):
         return None
@@ -235,8 +258,13 @@ async def get_oauth_user_by_provider_id(db: AsyncSession, provider: str, provide
 async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: str, email: str, name: str,
                            first_name: Optional[str] = None, last_name: Optional[str] = None,
                            picture: Optional[str] = None, raw_data: Optional[str] = None,
-                           is_pending: bool = False) -> tuple[User, OAuthUser]:
-    """Create a new user with OAuth authentication."""
+                           is_pending: bool = False, email_verified: bool = False) -> tuple[User, OAuthUser]:
+    """Create a new user with OAuth authentication.
+
+    An existing local account is auto-linked by email ONLY when the provider
+    asserts the email is verified (email_verified=True). Otherwise linking is
+    refused to prevent account takeover via an unverified attacker-controlled email.
+    """
     # Generate a unique username from email or name
     username = email.split('@')[0] if '@' in email else name.lower().replace(' ', '_')
 
@@ -250,7 +278,14 @@ async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: s
     # Check if email exists
     existing_user_by_email = await get_user_by_email(db, email)
     if existing_user_by_email:
-        # Email exists but might be for OAuth linking
+        # Only auto-link to an existing local account when the provider has
+        # verified ownership of the email; otherwise refuse (email is unique, so
+        # a separate account with the same email cannot be created either).
+        if not email_verified:
+            raise ValueError(
+                "An account with this email already exists and the provider has not "
+                "verified the email address, so it cannot be linked automatically."
+            )
         user = existing_user_by_email
         # Update oauth_provider if not already set (linking existing account to OAuth)
         if not user.oauth_provider:
@@ -321,16 +356,28 @@ async def update_oauth_user(db: AsyncSession, oauth_user_id: int, email: Optiona
 
 
 async def get_api_key(db: AsyncSession, api_key: str) -> Optional[APIKey]:
-    """Get API key from database."""
+    """Get API key from database. Keys are stored as SHA-256 hashes.
+
+    Only resolves when both the key and its owning user are active, so
+    deactivating a user immediately disables all of their API keys.
+    """
+    key_hash = hash_api_key(api_key)
     result = await db.execute(
-        select(APIKey).where(APIKey.api_key == api_key, APIKey.is_active == True)
+        select(APIKey)
+        .join(User, APIKey.user_id == User.id)
+        .where(
+            APIKey.api_key == key_hash,
+            APIKey.is_active == True,
+            User.is_active == True,
+        )
     )
     return result.scalar_one_or_none()
 
 
 async def update_api_key_last_used(db: AsyncSession, api_key: str):
-    """Update the last used timestamp for an API key."""
-    result = await db.execute(select(APIKey).where(APIKey.api_key == api_key))
+    """Update the last used timestamp for an API key (accepts the plaintext key)."""
+    key_hash = hash_api_key(api_key)
+    result = await db.execute(select(APIKey).where(APIKey.api_key == key_hash))
     db_api_key = result.scalar_one_or_none()
     if db_api_key:
         db_api_key.last_used = datetime.utcnow()
@@ -339,16 +386,26 @@ async def update_api_key_last_used(db: AsyncSession, api_key: str):
 
 @with_db_retry()
 async def create_api_key(db: AsyncSession, user_id: int, name: str) -> APIKey:
-    """Create a new API key for a user."""
-    api_key = generate_api_key()
+    """Create a new API key for a user.
+
+    Only the SHA-256 hash and a short display prefix are persisted. The returned
+    object carries the plaintext key in-memory so the caller can show it once;
+    it is never stored and cannot be recovered afterwards.
+    """
+    plaintext = generate_api_key()
     db_api_key = APIKey(
         user_id=user_id,
-        api_key=api_key,
+        api_key=hash_api_key(plaintext),
+        key_prefix=plaintext[:8],
         name=name
     )
     db.add(db_api_key)
     await db.commit()
     await db.refresh(db_api_key)
+    # Surface the plaintext once for the create response (in-memory only, not persisted).
+    # Detach first so this override can never be flushed back over the stored hash.
+    db.expunge(db_api_key)
+    db_api_key.api_key = plaintext
     return db_api_key
 
 
@@ -367,9 +424,11 @@ async def delete_api_key(db: AsyncSession, api_key_id: int, user_id: int) -> boo
     )
     db_api_key = result.scalar_one_or_none()
     if db_api_key:
-        # Invalidate the cache entry before soft-deleting
+        # Invalidate the cache entry before soft-deleting. The DB (and thus this
+        # row) holds the SHA-256 hash while the cache is keyed by plaintext, so
+        # evict via the hash-aware helper.
         from .cache import auth_cache
-        auth_cache.invalidate_api_key(db_api_key.api_key)
+        auth_cache.invalidate_api_key_by_hash(db_api_key.api_key)
         
         db_api_key.is_active = False
         await db.commit()
@@ -410,6 +469,10 @@ async def update_user_password(db: AsyncSession, user_id: int, current_password:
     """Update user password after verifying current password."""
     user = await get_user_by_id(db, user_id)
     if not user:
+        return False
+
+    # OAuth-only users have no password to verify/change.
+    if not user.hashed_password:
         return False
 
     # Verify current password
@@ -656,7 +719,13 @@ async def get_all_user_model_exceptions(db: AsyncSession) -> List[UserModelAcces
 
 
 async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
-    """Permanently delete a user and all associated data from the database."""
+    """Permanently delete a user and all associated data from the database.
+
+    NOTE: users.id is a plain INTEGER PRIMARY KEY (no AUTOINCREMENT), so SQLite may
+    reuse a deleted user's rowid for a future user. Adding AUTOINCREMENT is a schema
+    migration deliberately left out of scope here; deleting dependent rows explicitly
+    below prevents a reused id from inheriting stale overrides/policies.
+    """
     user = await get_user_by_id(db, user_id)
     if not user:
         return False
@@ -679,7 +748,20 @@ async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
         oauth_users = result.scalars().all()
         for oauth_user in oauth_users:
             await db.delete(oauth_user)
-        
+
+        # Explicitly delete all other dependent rows. SQLite does not reliably fire
+        # ON DELETE CASCADE (and rows are keyed by user_id), so remove them by hand
+        # to avoid orphaned rate-limit / model-access records.
+        from sqlalchemy import delete as _sql_delete
+        for _model in (
+            UserRateLimit,
+            UserModelGroupRateLimit,
+            UserInstanceGroupRateLimit,
+            UserModelAccessPolicy,
+            UserModelAccessException,
+        ):
+            await db.execute(_sql_delete(_model).where(_model.user_id == user_id))
+
         # Finally delete the user
         await db.delete(user)
         await db.commit()
@@ -866,8 +948,6 @@ async def bulk_toggle_all_models(db: AsyncSession, enabled: bool) -> bool:
 
 async def search_models_and_providers(db: AsyncSession, query: str) -> Dict[str, List]:
     """Search models and providers by query string (uses ProviderCredentials now)."""
-    query_lower = query.lower()
-    
     # Search models
     models_result = await db.execute(
         select(ModelConfiguration).where(
@@ -1361,14 +1441,20 @@ async def _update_cache_after_database_change(operation: str, **kwargs) -> None:
 # ==================== RESPONSES API PROVIDER MAPPING ====================
 
 async def store_response_provider_mapping(
-    db: AsyncSession, response_id: str, provider_key: str, model_name: str = None
+    db: AsyncSession, response_id: str, provider_key: str, model_name: str = None,
+    user_id: int = None
 ) -> ResponseProviderMapping:
-    """Store a response_id -> provider mapping for Responses API routing."""
+    """Store a response_id -> provider mapping for Responses API routing.
+
+    ``user_id`` records the creating user so retrieve/delete/cancel/input_items
+    can enforce ownership; it is None for admin-created responses.
+    """
     try:
         mapping = ResponseProviderMapping(
             response_id=response_id,
             provider_key=provider_key,
-            model_name=model_name
+            model_name=model_name,
+            user_id=user_id
         )
         db.add(mapping)
         await db.commit()
@@ -1554,36 +1640,6 @@ async def rollup_to_monthly() -> None:
             await db.rollback()
             logger.error(f"Failed to roll up monthly usage: {e}")
             raise
-
-
-def _build_usage_where(window: str, year: Optional[int], month: Optional[int]):
-    """Return (table, where_clauses) for the given window over the daily table.
-
-    Returns None for table when the window should use the monthly table directly.
-    For 'month' window with year/month, returns clauses for both daily and monthly tables
-    so the caller can UNION them.
-    """
-    from datetime import timedelta
-    from sqlalchemy import func
-    from app import time_utils
-    today = time_utils.local_today()
-
-    if window == "all":
-        return None, []  # handled inline in get_usage_aggregates (UNION daily + monthly, no date filter)
-    if window == "24h":
-        # Handled separately via RequestUsageHourly
-        return None, []
-    if window == "today":
-        return RequestUsage, [RequestUsage.date == today]
-    if window == "yesterday":
-        return RequestUsage, [RequestUsage.date == today - timedelta(days=1)]
-    if window == "7d":
-        return RequestUsage, [RequestUsage.date >= today - timedelta(days=6)]
-    if window == "30d":
-        return RequestUsage, [RequestUsage.date >= today - timedelta(days=29)]
-    if window == "month" and year and month:
-        return None, []  # handled inline in get_usage_aggregates
-    return RequestUsage, [RequestUsage.date >= today - timedelta(days=29)]
 
 
 async def get_usage_earliest_date(db: AsyncSession, filter_user: Optional[str] = None) -> Optional[str]:
@@ -2235,6 +2291,21 @@ async def _run_auto_migrations():
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add is_pending_approval column: {e}")
 
+        # Add 'user_id' column to response_provider_mappings for the Responses
+        # API ownership (IDOR) check. Nullable: pre-migration rows keep NULL and
+        # are treated as unowned by the enforcement code.
+        try:
+            result = await conn.execute(text("PRAGMA table_info(response_provider_mappings)"))
+            columns = [row[1] for row in result.fetchall()]
+            if columns and 'user_id' not in columns:
+                logger.info("Auto-migration: Adding 'user_id' column to response_provider_mappings")
+                await conn.execute(text(
+                    "ALTER TABLE response_provider_mappings ADD COLUMN user_id INTEGER"
+                ))
+                logger.info("Auto-migration: 'user_id' column added to response_provider_mappings")
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not add user_id column to response_provider_mappings: {e}")
+
         # Add 'mode' column to user_model_access_policies and backfill from the
         # legacy default_allow boolean (True -> allow, False -> deny).
         try:
@@ -2388,9 +2459,63 @@ async def _run_auto_migrations():
         except Exception as e:
             logger.warning(f"Auto-migration: Could not create global_rate_limits table: {e}")
 
+        # Hash any plaintext API keys in place (SHA-256) and backfill key_prefix.
+        # Existing plaintext keys keep working: the lookup path hashes the incoming
+        # key, and here we replace each stored plaintext value with its hash.
+        # Detection: a already-migrated value is a 64-char lowercase hex digest.
+        try:
+            result = await conn.execute(text("PRAGMA table_info(api_keys)"))
+            columns = [row[1] for row in result.fetchall()]
+            if columns:
+                if 'key_prefix' not in columns:
+                    logger.info("Auto-migration: Adding 'key_prefix' column to api_keys")
+                    await conn.execute(text(
+                        "ALTER TABLE api_keys ADD COLUMN key_prefix VARCHAR(16)"
+                    ))
+
+                import re as _re
+                _hex64 = _re.compile(r'^[0-9a-f]{64}$')
+                rows = (await conn.execute(
+                    text("SELECT id, api_key, key_prefix FROM api_keys")
+                )).fetchall()
+                migrated = 0
+                for row in rows:
+                    key_id, key_val, prefix = row[0], row[1], row[2]
+                    if key_val and not _hex64.match(key_val):
+                        await conn.execute(
+                            text("UPDATE api_keys SET api_key = :h, key_prefix = :p WHERE id = :i"),
+                            {"h": hash_api_key(key_val), "p": prefix or key_val[:8], "i": key_id},
+                        )
+                        migrated += 1
+                if migrated:
+                    logger.info("Auto-migration: Hashed %d plaintext API key(s)", migrated)
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not hash existing API keys: {e}")
+
+        # Enforce uniqueness of (provider, provider_user_id) on oauth_users.
+        # The model declares a UniqueConstraint, but that only applies to freshly
+        # created tables — pre-existing deployments need this index. If existing
+        # duplicate rows make creation fail, warn and continue (do not crash).
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_oauth_provider_user "
+                "ON oauth_users (provider, provider_user_id)"
+            ))
+        except Exception as e:
+            logger.warning(
+                "Auto-migration: Could not create unique index on "
+                "oauth_users(provider, provider_user_id) — likely duplicate rows "
+                "exist; deduplicate them manually to enforce uniqueness: %s", e
+            )
+
 
 def init_database_sync():
-    """Initialize the database and create tables synchronously (for backward compatibility)."""
+    """Initialize the database and create tables synchronously (for backward compatibility).
+
+    NOTE: Unlike the async init_database(), this only runs create_all and does NOT
+    run _run_auto_migrations(), so on a pre-existing DB it leaves the schema
+    unmigrated. init_database() (async) is the authoritative initializer; prefer it.
+    """
     # Create data directory if it doesn't exist
     os.makedirs("data", exist_ok=True)
 

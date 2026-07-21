@@ -3,8 +3,6 @@ import json
 import asyncio
 import logging
 import time
-import os
-import weakref
 from app.config import config
 from app.cache import ModelCache
 from app.openai_models import (
@@ -22,7 +20,7 @@ from app.openai_models import (
     CompactedResponseObject,
     ResponseItemList
 )
-from app.providers.base import BaseProvider
+from app.providers.base import BaseProvider, ProviderHTTPError
 from app.providers.custom_providers import create_custom_provider
 from app.providers.azure_provider import AzureProvider
 from app.providers.bedrock_provider import BedrockProvider
@@ -81,9 +79,13 @@ class ProviderManager:
         self._background_tasks.clear()
         print("Background tasks cleaned up")
 
-    async def close_provider_clients(self) -> None:
-        """Close HTTP clients for all providers to release file descriptors."""
-        for name, provider in self.providers.items():
+    async def close_provider_clients(self, providers: Optional[Dict[str, BaseProvider]] = None) -> None:
+        """Close HTTP clients for providers to release file descriptors.
+
+        Closes the given ``providers`` mapping (defaults to the live registry).
+        """
+        target = providers if providers is not None else self.providers
+        for name, provider in list(target.items()):
             try:
                 # Close AsyncOpenAI / AsyncAzureOpenAI client
                 client = getattr(provider, 'client', None)
@@ -97,6 +99,19 @@ class ProviderManager:
                 v1_client = getattr(provider, '_v1_client', None)
                 if v1_client and v1_client is not client and v1_client is not responses_client and hasattr(v1_client, 'close'):
                     await v1_client.close()
+                # Close Azure per-api-version deployment clients (otherwise these
+                # AsyncAzureOpenAI instances leak on shutdown and every refresh).
+                deployment_clients = getattr(provider, '_deployment_clients', None)
+                if isinstance(deployment_clients, dict):
+                    for dep_client in list(deployment_clients.values()):
+                        try:
+                            if hasattr(dep_client, 'aclose'):
+                                await dep_client.aclose()
+                            elif hasattr(dep_client, 'close'):
+                                await dep_client.close()
+                        except Exception:
+                            pass
+                    deployment_clients.clear()
                 # Close Anthropic async client — try aclose() first (anthropic SDK), then close()
                 anthropic_client = getattr(provider, '_anthropic_client', None)
                 if anthropic_client:
@@ -114,6 +129,19 @@ class ProviderManager:
                             pass
             except Exception as e:
                 print(f"Error closing client for provider {name}: {e}")
+
+    async def _deferred_close_providers(self, providers: Dict[str, BaseProvider], grace_seconds: float = 5.0) -> None:
+        """Close old provider clients after a grace period.
+
+        Called after the registry is swapped so in-flight requests still holding
+        a reference to an old provider can finish before its clients close.
+        """
+        try:
+            await asyncio.sleep(grace_seconds)
+        except asyncio.CancelledError:
+            # On shutdown, close immediately rather than skipping cleanup.
+            pass
+        await self.close_provider_clients(providers)
     
     async def _initialize_providers(self):
         """Initialize all enabled providers from database (async)."""
@@ -125,8 +153,13 @@ class ProviderManager:
             print("Database-only mode: No providers will be loaded. Use the admin panel to configure providers.")
             # No fallback to YAML - database-only mode
     
-    async def _load_providers_from_database(self):
-        """Load providers from database (async)."""
+    async def _load_providers_from_database(self, target: Optional[Dict[str, BaseProvider]] = None):
+        """Load providers from database (async).
+
+        Populates ``target`` when given (used by refresh to build a fresh
+        registry off to the side), otherwise ``self.providers``.
+        """
+        registry = self.providers if target is None else target
         try:
             from app.auth.database import AsyncSessionLocal, get_all_provider_credentials
             
@@ -158,12 +191,12 @@ class ProviderManager:
                                 provider_factory = create_custom_provider
                             
                             provider_config = self._create_provider_config(cred)
-                            self.providers[cred.provider_key] = provider_factory(provider_config)
+                            registry[cred.provider_key] = provider_factory(provider_config)
                             print(f"Initialized {cred.provider_key} provider from database")
                         except Exception as e:
                             print(f"Failed to initialize {cred.provider_key} provider: {e}")
-                
-                print(f"Loaded {len(self.providers)} providers from database")
+
+                print(f"Loaded {len(registry)} providers from database")
                 
         except Exception as e:
             print(f"Database provider loading failed: {e}")
@@ -260,44 +293,12 @@ class ProviderManager:
         ) as span:
             try:
                 print(f"Fetching models from {provider_name} (timeout: {timeout}s)...")
-                
-                # For Azure provider, add extra debugging and error handling
-                if hasattr(provider, 'provider_type') and provider.provider_type == 'azure':
-                    print(f"Azure provider config - endpoint: {getattr(provider, 'endpoint', 'None')}")
-                    print(f"Azure provider config - dynamic_discovery: {getattr(provider, 'dynamic_discovery', 'None')}")
-                    print(f"Azure provider config - deployments: {getattr(provider, 'deployments', 'None')}")
-                    
-                    add_span_attributes(span, {
-                        "provider.azure.endpoint": getattr(provider, 'endpoint', None),
-                        "provider.azure.dynamic_discovery": getattr(provider, 'dynamic_discovery', None)
-                    })
-                    
-                    # Try to fetch deployments first to see if that's working
-                    try:
-                        deployments = await provider._fetch_deployments()
-                        print(f"Azure deployments fetched: {deployments}")
-                        add_span_attributes(span, {
-                            "provider.azure.deployments_fetched": len(deployments) if deployments else 0
-                        })
-                    except Exception as deploy_error:
-                        print(f"Error fetching Azure deployments: {deploy_error}")
-                        add_span_attributes(span, {
-                            "provider.azure.deployment_fetch_error": str(deploy_error)
-                        })
-                        # If deployment fetching fails, try with a fallback configuration
-                        if hasattr(provider, 'deployments') and provider.deployments:
-                            print(f"Using fallback deployments from config: {provider.deployments}")
-                            models = []
-                            for deployment_name in provider.deployments:
-                                models.append(provider.create_model_info(deployment_name, "azure"))
-                            print(f"Created {len(models)} models from fallback deployments")
-                            add_span_attributes(span, {
-                                "provider.models_count": len(models),
-                                "provider.fallback_used": True
-                            })
-                            return models
-                
-                # Use asyncio.wait_for to add timeout
+
+                # Use asyncio.wait_for to add timeout. (The former Azure "debug
+                # pre-fetch" that called _fetch_deployments() here was removed —
+                # get_available_models() fetches deployments itself, so it was a
+                # duplicate upstream call; the except branch below still provides
+                # the Azure deployment fallback on failure.)
                 models = await asyncio.wait_for(
                     provider.get_available_models(),
                     timeout=timeout
@@ -328,7 +329,7 @@ class ProviderManager:
                 set_span_error(span, e)
                 
                 # For Azure provider, try a fallback approach
-                if hasattr(provider, 'provider_type') and provider.provider_type == 'azure':
+                if isinstance(provider, AzureProvider):
                     try:
                         if hasattr(provider, 'deployments') and provider.deployments:
                             print(f"Attempting Azure fallback with deployments: {provider.deployments}")
@@ -603,8 +604,12 @@ class ProviderManager:
             except Exception as e:
                 print(f"Error syncing {provider_name} to database: {e}")
                 set_span_error(span, e)
+                # Propagate so _fetch_and_sync_provider_models counts this as a
+                # failure instead of reporting the provider as succeeded while
+                # cache and DB have silently diverged.
+                raise
 
-    
+
     async def initialize_models(self) -> None:
         """Initialize model cache during startup."""
         print("Initializing model cache...")
@@ -744,6 +749,18 @@ class ProviderManager:
                         await client.aclose()
                     elif hasattr(client, 'close'):
                         await client.close()
+                # Close Azure per-api-version deployment clients too.
+                deployment_clients = getattr(provider, '_deployment_clients', None)
+                if isinstance(deployment_clients, dict):
+                    for dep_client in list(deployment_clients.values()):
+                        try:
+                            if hasattr(dep_client, 'aclose'):
+                                await dep_client.aclose()
+                            elif hasattr(dep_client, 'close'):
+                                await dep_client.close()
+                        except Exception:
+                            pass
+                    deployment_clients.clear()
                 for boto_attr in ('bedrock_runtime', 'bedrock_client'):
                     boto_client = getattr(provider, boto_attr, None)
                     if boto_client is not None:
@@ -762,19 +779,33 @@ class ProviderManager:
         return False
     
     async def refresh_providers_from_database(self) -> None:
-        """Refresh the providers list from database (reload all providers)."""
+        """Refresh the providers list from database (reload all providers).
+
+        Swaps in the freshly-loaded registry BEFORE closing the old providers'
+        clients, so a request currently streaming/awaiting an upstream call
+        (which holds a reference to an old provider) is not torn down mid-flight.
+        Old clients are then closed after a short grace period (best-effort).
+        """
         try:
-            # Close HTTP clients of current providers before discarding them
-            await self.close_provider_clients()
-            # Clear current providers
-            self.providers.clear()
-            
-            # Reload providers from database
-            await self._load_providers_from_database()
-            
+            old_providers = self.providers
+            # Build the fresh registry off to the side, then swap it in with a
+            # single reference assignment — concurrent requests always see
+            # either the old registry or the new one whole, never an
+            # empty/partial map. On failure the swap never happens, so the old
+            # registry keeps serving.
+            new_providers: Dict[str, BaseProvider] = {}
+            await self._load_providers_from_database(target=new_providers)
+            self.providers = new_providers
+
             # Refresh model configurations (without fetching models from providers)
             await self._load_model_configurations()
-            
+
+            # Registry is swapped; close the OLD providers' clients after a grace
+            # period so in-flight requests holding old references can finish.
+            if old_providers:
+                task = asyncio.create_task(self._deferred_close_providers(old_providers))
+                self._track_task(task)
+
             print(f"Provider manager refreshed with {len(self.providers)} providers")
         except Exception as e:
             print(f"Error refreshing providers from database: {e}")
@@ -822,7 +853,7 @@ class ProviderManager:
                 return provider
             else:
                 return None
-        except (ValueError, Exception) as e:
+        except Exception as e:
             logger.debug(f"Could not find Anthropic provider for model '{model_name}': {e}")
             return None
     
@@ -849,14 +880,23 @@ class ProviderManager:
                 if provider_name in self.providers:
                     provider = self.providers[provider_name]
                     return provider
-                
-                # Try to find a provider that starts with the requested name
-                # This handles cases like "openai_compatible" matching "openai_compatible:my-server"
-                for full_name in self.providers.keys():
-                    if full_name.startswith(f"{provider_name}:"):
-                        provider = self.providers[full_name]
-                        return provider
-                
+
+                # Bare-prefix fallback (e.g. "azure" -> "azure:primary"). Only
+                # resolve when EXACTLY ONE instance matches; routing to an
+                # arbitrary instance (dict-insertion order) is nondeterministic
+                # and may pick an instance that doesn't serve the model.
+                candidates = [
+                    full_name for full_name in self.providers.keys()
+                    if full_name.startswith(f"{provider_name}:")
+                ]
+                if len(candidates) == 1:
+                    return self.providers[candidates[0]]
+                if len(candidates) > 1:
+                    raise ValueError(
+                        f"Provider '{provider_name}' is ambiguous; specify the full "
+                        f"provider key. Candidates: {', '.join(sorted(candidates))}"
+                    )
+
                 # Provider not found
                 error_msg = f"Provider '{provider_name}' not available or not enabled"
                 raise ValueError(error_msg)
@@ -877,7 +917,9 @@ class ProviderManager:
                 set_span_error(span, e)
                 # Preserve ValueError (bad model name / provider not found) so
                 # the route maps it to a 400/404 client error rather than 500.
-                if isinstance(e, ValueError):
+                # Preserve ProviderHTTPError so the real upstream status/body
+                # survive instead of collapsing to a generic 500.
+                if isinstance(e, (ValueError, ProviderHTTPError)):
                     raise
                 raise Exception(f"Chat completion error: {str(e)}")
     
@@ -891,7 +933,7 @@ class ProviderManager:
                 return await provider.completion(request)
             except Exception as e:
                 set_span_error(span, e)
-                if isinstance(e, ValueError):
+                if isinstance(e, (ValueError, ProviderHTTPError)):
                     raise
                 raise Exception(f"Completion error: {str(e)}")
     
@@ -916,14 +958,39 @@ class ProviderManager:
                 print(f"Error in chat_completion_stream: {e}")
                 import traceback
                 traceback.print_exc()
-                # Send error as SSE format
-                error_data = {
-                    "error": {
-                        "message": f"Chat completion stream error: {str(e)}",
-                        "type": "server_error"
+                # Send error as SSE format. Preserve status/body for
+                # ProviderHTTPError; preserve the message for ValueError (bad
+                # model name / provider not found — first-party and
+                # client-actionable, not upstream leakage); otherwise emit a
+                # sanitized generic error (never str(e), which can leak
+                # upstream URLs). Terminate with [DONE] so clients reading
+                # until the sentinel don't hang.
+                if isinstance(e, ProviderHTTPError):
+                    err = e.body.get("error", {}) if isinstance(e.body, dict) else {}
+                    error_data = {
+                        "error": {
+                            "message": err.get("message", "Chat completion stream error"),
+                            "type": err.get("type", "upstream_error"),
+                            "code": e.status_code,
+                        }
                     }
-                }
+                elif isinstance(e, ValueError):
+                    error_data = {
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    }
+                else:
+                    error_data = {
+                        "error": {
+                            "message": "Chat completion stream error",
+                            "type": "server_error"
+                        }
+                    }
                 yield f"data: {json.dumps(error_data)}\n\n"
+                yield "data: [DONE]\n\n"
     
     async def completion_stream(self, request: CompletionRequest) -> AsyncGenerator[str, None]:
         """Route streaming completion request to appropriate provider."""
@@ -937,14 +1004,33 @@ class ProviderManager:
                     yield chunk
             except Exception as e:
                 set_span_error(span, e)
-                # Send error as SSE format
-                error_data = {
-                    "error": {
-                        "message": f"Completion stream error: {str(e)}",
-                        "type": "server_error"
+                # Send sanitized error as SSE + [DONE] (see chat_completion_stream).
+                if isinstance(e, ProviderHTTPError):
+                    err = e.body.get("error", {}) if isinstance(e.body, dict) else {}
+                    error_data = {
+                        "error": {
+                            "message": err.get("message", "Completion stream error"),
+                            "type": err.get("type", "upstream_error"),
+                            "code": e.status_code,
+                        }
                     }
-                }
+                elif isinstance(e, ValueError):
+                    error_data = {
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    }
+                else:
+                    error_data = {
+                        "error": {
+                            "message": "Completion stream error",
+                            "type": "server_error"
+                        }
+                    }
                 yield f"data: {json.dumps(error_data)}\n\n"
+                yield "data: [DONE]\n\n"
     
     # ==================== RESPONSES API ====================
     
@@ -960,13 +1046,13 @@ class ProviderManager:
         
         return self._get_provider(mapping.provider_key)
     
-    async def _store_response_mapping(self, response_id: str, provider_name: str, model_name: str = None):
+    async def _store_response_mapping(self, response_id: str, provider_name: str, model_name: str = None, user_id: int = None):
         """Store response_id -> provider mapping in the database."""
         from app.auth.database import AsyncSessionLocal, store_response_provider_mapping
-        
+
         try:
             async with AsyncSessionLocal() as db:
-                await store_response_provider_mapping(db, response_id, provider_name, model_name)
+                await store_response_provider_mapping(db, response_id, provider_name, model_name, user_id=user_id)
         except Exception as e:
             # Log but don't fail the request if mapping storage fails
             print(f"Warning: Failed to store response provider mapping: {e}")
@@ -981,27 +1067,29 @@ class ProviderManager:
         except Exception as e:
             print(f"Warning: Failed to delete response provider mapping: {e}")
     
-    async def responses_create(self, request: ResponsesCreateRequest) -> ResponseObject:
+    async def responses_create(self, request: ResponsesCreateRequest, user_id: int = None) -> ResponseObject:
         """Route Responses API create request to appropriate provider."""
         with create_span("provider.responses_create") as span:
             try:
                 provider_name, model_id = self._parse_model_name(request.model)
                 provider = self._get_provider(provider_name)
-                
+
                 response = await provider.responses_create(request)
-                
+
                 # Store response_id -> provider mapping for future retrieve/delete/cancel
                 if response and response.id:
-                    await self._store_response_mapping(response.id, provider_name, request.model)
+                    await self._store_response_mapping(response.id, provider_name, request.model, user_id=user_id)
                 
                 return response
             except Exception as e:
                 set_span_error(span, e)
-                if isinstance(e, ValueError):
+                # Preserve typed errors so the route layer can map them to the
+                # correct status (ValueError->400, NotImplementedError->501).
+                if isinstance(e, (ValueError, NotImplementedError)):
                     raise
                 raise Exception(f"Responses create error: {str(e)}")
-    
-    async def responses_create_stream(self, request: ResponsesCreateRequest) -> AsyncGenerator[str, None]:
+
+    async def responses_create_stream(self, request: ResponsesCreateRequest, user_id: int = None) -> AsyncGenerator[str, None]:
         """Route streaming Responses API create request to appropriate provider."""
         with create_span("provider.responses_create_stream") as span:
             try:
@@ -1024,7 +1112,7 @@ class ProviderManager:
                                         elif 'id' in event_data:
                                             resp_id = event_data['id']
                                         if resp_id:
-                                            await self._store_response_mapping(resp_id, provider_name, request.model)
+                                            await self._store_response_mapping(resp_id, provider_name, request.model, user_id=user_id)
                                         break
                             except Exception as parse_err:
                                 print(f"Warning: Could not parse response.created event for caching: {parse_err}")
@@ -1039,12 +1127,34 @@ class ProviderManager:
                 print(f"Error in responses_create_stream: {e}")
                 import traceback
                 traceback.print_exc()
-                error_data = {
-                    "error": {
-                        "message": f"Responses stream error: {str(e)}",
-                        "type": "server_error"
+                # Preserve status/body for ProviderHTTPError and the message
+                # for ValueError (first-party, client-actionable); otherwise
+                # emit a sanitized generic error — never raw str(e), which can
+                # leak upstream URLs/bodies (see chat_completion_stream).
+                if isinstance(e, ProviderHTTPError):
+                    err = e.body.get("error", {}) if isinstance(e.body, dict) else {}
+                    error_data = {
+                        "error": {
+                            "message": err.get("message", "Responses stream error"),
+                            "type": err.get("type", "upstream_error"),
+                            "code": e.status_code,
+                        }
                     }
-                }
+                elif isinstance(e, ValueError):
+                    error_data = {
+                        "error": {
+                            "message": str(e),
+                            "type": "invalid_request_error",
+                            "code": 400,
+                        }
+                    }
+                else:
+                    error_data = {
+                        "error": {
+                            "message": "Responses stream error",
+                            "type": "server_error"
+                        }
+                    }
                 yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
     
     async def responses_retrieve(self, response_id: str, **kwargs) -> ResponseObject:

@@ -1,4 +1,16 @@
 
+// Quote-safe HTML escaping (ui-utils.js is not loaded on the signup page).
+function escapeHtml(text) {
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/`/g, '&#96;');
+}
+
 function showFieldError(fieldId, message) {
     const field = document.getElementById(fieldId);
     const errorElement = document.getElementById(fieldId + '-error');
@@ -311,7 +323,7 @@ document.getElementById('signupForm').addEventListener('submit', async function 
                 `<i class="fas fa-clock" style="flex-shrink:0;"></i>` +
                 `<span><strong>Account pending approval.</strong> ` +
                 `Your account has been created and is awaiting admin approval. ` +
-                `Please contact <strong>${adminEmail}</strong> for access.</span>`;
+                `Please contact <strong>${escapeHtml(adminEmail)}</strong> for access.</span>`;
             const backLink = container.querySelector('.back-link');
             if (backLink) {
                 container.insertBefore(pendingDiv, backLink);

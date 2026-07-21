@@ -102,17 +102,19 @@ docker-compose up -d
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `JWT_SECRET_KEY` | **Yes** | - | Secret key for JWT token signing |
+| `JWT_SECRET_KEY` | **Yes** | - | Secret key for JWT token signing. Required — the app refuses to start if unset. Generate a random value (e.g. `python -c "import secrets; print(secrets.token_urlsafe(48))"`). |
+| `COOKIE_SECURE` | No | `true` | Set the `Secure` flag on auth/CSRF cookies so browsers only send them over HTTPS. **If you serve the management panel over plain HTTP on a non-localhost host, set this to `false`** — otherwise browsers drop the cookies and login silently loops. |
 | `DATABASE_URL` | No | `sqlite+aiosqlite:///./data/llm_proxy.db` | Database connection string |
 | `LLMPROXY_HOST` | No | `0.0.0.0` | Host to bind all servers to |
+| `LLMPROXY_DOMAIN` | No | `localhost` | Public domain/host used for building callback and external URLs |
 | `OPENAI_SERVER_PORT` | No | `11440` | Port for OpenAI API server |
 | `ANTHROPIC_SERVER_PORT` | No | `2027` | Port for Anthropic API server |
 | `AZURE_OPENAI_SERVER_PORT` | No | `11439` | Port for Azure OpenAI API server |
 | `MANAGEMENT_SERVER_PORT` | No | `8765` | Port for management panel |
-| `LLMPROXY_ADMIN_ENABLED` | No | `true` | Enable admin dashboard |
-| `LLMPROXY_ADMIN_USERNAME` | No | `admin` | Default admin username |
-| `LLMPROXY_ADMIN_EMAIL` | No | `admin@localhost` | Default admin email |
-| `LLMPROXY_ADMIN_PASSWORD` | No | `admin123` | Default admin password |
+| `LLMPROXY_ADMIN_ENABLED` | No | `false` | Enable admin dashboard (disabled by default) |
+| `LLMPROXY_ADMIN_USERNAME` | No | `admin` | Default admin username (only when admin enabled) |
+| `LLMPROXY_ADMIN_EMAIL` | No | `admin@localhost` | Default admin email (only when admin enabled) |
+| `LLMPROXY_ADMIN_PASSWORD` | Required if admin enabled | - | Admin password. Set a strong value; do not use `admin123`. |
 | `ZOHO_CLIENT_ID` | No | - | Zoho OAuth client ID for SSO login |
 | `ZOHO_CLIENT_SECRET` | No | - | Zoho OAuth client secret for SSO login |
 | `ZOHO_REDIRECT_URI` | No | `http://localhost:8765/auth/zoho/callback` | Zoho OAuth redirect URI |
@@ -386,7 +388,8 @@ Use a webhook testing service to verify notifications:
 - **Timeout**: 10 seconds per webhook request
 - All webhook activity is logged for monitoring and troubleshooting
 
-For detailed webhook documentation, see [docs/WEBHOOK_SETUP.md](https://github.com/yourusername/llm-proxy-server/blob/main/docs/WEBHOOK_SETUP.md) in the repository.
+Webhook behavior is summarized in the section above. (A dedicated webhook setup
+guide is not yet part of the repository.)
 
 ## Observability
 

@@ -40,12 +40,6 @@ class ToolCall(BaseModel):
     type: str = "function"
     function: ResponseFunction
     index: Optional[int] = None
-    
-    class Config:
-        # Enable JSON serialization for this model
-        json_encoders = {}
-        # Ensure the model can be properly serialized
-        arbitrary_types_allowed = False
 
 
 class Tool(BaseModel):
@@ -98,20 +92,18 @@ class ResponseFormat(BaseModel):
     json_schema: Optional[Dict[str, Any]] = None
 
 
-class LogitBias(BaseModel):
-    """Logit bias for specific tokens."""
-    pass
-
-
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[Union[ChatMessage, UserMessage, AssistantMessage, ToolMessage]]
-    temperature: Optional[float] = 1.0
+    # Default to None (not the OpenAI wire defaults) so unset sampling params
+    # are never force-sent — reasoning models (o-series/gpt-5) reject an
+    # explicit temperature, and forcing values overrides backend defaults.
+    temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     max_completion_tokens: Optional[int] = None
-    top_p: Optional[float] = 1.0
-    frequency_penalty: Optional[float] = 0.0
-    presence_penalty: Optional[float] = 0.0
+    top_p: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
@@ -197,7 +189,7 @@ class Usage(BaseModel):
 
 
 class ChatCompletionResponse(BaseModel):
-    model_config = ConfigDict(extra="allow", exclude_none=False)
+    model_config = ConfigDict(extra="allow")
     id: str
     object: str = "chat.completion"
     created: int
@@ -234,16 +226,6 @@ class CompletionStreamResponse(BaseModel):
     created: int
     model: str
     choices: List[CompletionStreamChoice]
-
-
-class ErrorMessage(BaseModel):
-    message: str
-    type: Optional[str] = None
-    code: Optional[str] = None
-
-
-class Error(BaseModel):
-    error: ErrorMessage
 
 
 class ErrorResponse(BaseModel):

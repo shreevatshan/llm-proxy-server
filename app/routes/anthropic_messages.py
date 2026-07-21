@@ -33,6 +33,7 @@ from app.tracing import (
     get_current_span,
     add_span_attributes,
 )
+from app.routes._errors import SAFE_UPSTREAM_HEADERS as _SAFE_UPSTREAM_HEADERS
 from app.routes.stream_utils import (
     anthropic_stream_with_context_and_timeout,
     STREAM_TIMEOUT_SECONDS,
@@ -64,15 +65,19 @@ async def _check_model_exists(provider: object, model_name: str) -> str:
     if model_name in known_ids:
         return "cache_hit"
 
-    # Cache miss — try a single live refresh to handle the staleness window
+    # Cache miss — try a single live refresh to handle the staleness window.
     try:
         fresh_models: List = await provider.get_available_models()
         if fresh_models:
-            # Merge fresh models into the existing cache snapshot (replace provider's slice)
+            # Update only this provider's slice, under the cache's own lock, so
+            # a writer that ran during the await above is not clobbered by a
+            # stale pre-await snapshot (the merge happens inside update_provider_models
+            # against the live cache, not `cached_models`).
             provider_prefix = getattr(provider, "full_provider_name", "")
-            other_models = [m for m in cached_models if not m.id.startswith(f"{provider_prefix}/")]
-            merged = other_models + fresh_models
-            cache.update_models(merged)
+            if not provider_prefix and fresh_models:
+                # Fall back to the id prefix convention ({prefix}/{model}).
+                provider_prefix = fresh_models[0].id.split("/", 1)[0]
+            await cache.update_provider_models(provider_prefix, fresh_models)
             if any(m.id == model_name for m in fresh_models):
                 return "live_refresh_hit"
     except Exception:
@@ -119,14 +124,6 @@ def _get_anthropic_request_metadata(
         mode = mode_fn(request.model)
         return AnthropicRequestMetadata(mode=mode or "unsupported")
     return AnthropicRequestMetadata(mode="unsupported")
-
-
-_SAFE_UPSTREAM_HEADERS = {
-    "retry-after", "x-ratelimit-limit-requests", "x-ratelimit-limit-tokens",
-    "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens",
-    "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
-    "content-type",
-}
 
 
 def _provider_http_error_response(error: ProviderHTTPError) -> JSONResponse:
@@ -429,7 +426,7 @@ async def create_message(
             return _anthropic_error(
                 500,
                 "api_error",
-                f"Internal server error: {str(e)}"
+                "Internal server error"
             )
 
 
@@ -489,6 +486,7 @@ def _extract_content_text(content) -> str:
 
 @router.post("/v1/messages/count_tokens", response_model=AnthropicCountTokensResponse, tags=["anthropic"])
 async def count_message_tokens(
+    request_obj: Request,
     payload: Dict[str, Any] = Body(...),
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_anthropic_request),
 ):
@@ -511,6 +509,16 @@ async def count_message_tokens(
                 "anthropic.model": model_name,
                 "anthropic.provider_resolved": bool(provider),
             })
+
+            # Group rate limit + per-user model access enforcement — this can
+            # invoke provider.anthropic_count_tokens upstream, so gate it.
+            if isinstance(model_name, str) and model_name:
+                await enforce_group_rate_limit(
+                    request_obj, auth, model_name, envelope_override="anthropic"
+                )
+                await enforce_model_access(
+                    request_obj, auth, model_name, envelope_override="anthropic"
+                )
 
             if provider:
                 try:
@@ -578,11 +586,13 @@ async def count_message_tokens(
                     model_name,
                 )
             return AnthropicCountTokensResponse(input_tokens=input_tokens)
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+            raise
         except Exception as e:
             logger.error(f"Anthropic count_tokens error: {e}", exc_info=True)
             set_span_error(span, e)
             return _anthropic_error(
                 500,
                 "api_error",
-                f"Internal server error: {str(e)}"
+                "Internal server error"
             )

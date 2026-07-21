@@ -63,7 +63,7 @@ class OAuthUser(Base):
     
     # Unique constraint on provider + provider_user_id
     __table_args__ = (
-        Column('provider_user_id_unique', String(255), unique=True),
+        UniqueConstraint('provider', 'provider_user_id', name='uq_oauth_provider_user'),
     )
 
 
@@ -73,7 +73,8 @@ class APIKey(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    api_key = Column(String(64), unique=True, index=True, nullable=False)
+    api_key = Column(String(64), unique=True, index=True, nullable=False)  # SHA-256 hex digest of the secret
+    key_prefix = Column(String(16), nullable=True)  # first chars of the plaintext key, for UI display
     name = Column(String(100), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     last_used = Column(DateTime, nullable=True)
@@ -108,6 +109,10 @@ class ResponseProviderMapping(Base):
     response_id = Column(String(200), unique=True, index=True, nullable=False)
     provider_key = Column(String(100), nullable=False)  # e.g., "openai:primary"
     model_name = Column(String(200), nullable=True)      # Original model string from request
+    # Owning user id, for the Responses API ownership (IDOR) check on
+    # retrieve/delete/cancel/input_items. Nullable so pre-migration rows (and
+    # admin-created responses) keep NULL; a NULL owner is treated as unowned.
+    user_id = Column(Integer, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

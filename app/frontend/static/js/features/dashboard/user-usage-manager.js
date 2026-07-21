@@ -168,7 +168,7 @@ class UserUsageManager {
                                     : 0;
                                 return `
                                     <tr>
-                                        <td>${m.model}</td>
+                                        <td>${window.UIUtils.escapeHtml(m.model)}</td>
                                         <td class="text-end">${m.request_count.toLocaleString()}</td>
                                         <td class="text-end">${pct}%</td>
                                     </tr>

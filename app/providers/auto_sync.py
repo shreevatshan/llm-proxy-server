@@ -6,7 +6,6 @@ a provider is created or edited, with special handling for Azure providers
 that use deployment names instead of dynamic model discovery.
 """
 
-import json
 import asyncio
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +18,7 @@ from app.auth.database import (
 )
 from app.providers.provider_manager import provider_manager
 from app.openai_models import ModelInfo
-from app.providers.azure_deployments import build_azure_config_fields, merge_azure_deployments, normalize_azure_deployments
+from app.providers.azure_deployments import merge_azure_deployments, normalize_azure_deployments
 from app.tracing import (
     create_span,
     add_span_attributes,
@@ -114,17 +113,10 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
         }
     ) as span:
         try:
-            # Capture enabled states BEFORE clearing models
+            # Capture enabled states before any mutation
             existing_models = await get_models_by_provider(db, provider_key)
             enabled_states = {model.model_id: model.is_enabled for model in existing_models}
-            
-            # Clear existing models for this provider
-            cleared_count = await clear_models_for_provider(db, provider_key)
-            
-            add_span_attributes(span, {
-                "provider.models_cleared": cleared_count
-            })
-            
+
             deployment_groups = normalize_azure_deployments(provider_creds.deployments_json)
             azure_backend = getattr(provider_creds, "azure_backend", None) or "openai"
             deployments = merge_azure_deployments(
@@ -136,6 +128,10 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
             if dynamic_discovery is None:
                 dynamic_discovery = not bool(deployments)
 
+            # IMPORTANT: fetch models BEFORE clearing the DB. Clearing first and
+            # then failing the fetch (timeout/error) committed a deletion that
+            # left the provider with zero models even though nothing changed
+            # upstream.
             if dynamic_discovery:
                 provider_instance = await _create_provider_instance(provider_creds)
                 if not provider_instance:
@@ -157,12 +153,21 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
                     error_msg = f"Failed to fetch models from {provider_key}: {str(e)}"
                     set_span_error(span, e)
                     return {"error": error_msg}
+                finally:
+                    await _close_provider_instance(provider_instance)
 
                 deployments = []
                 for model in models or []:
                     model_name = model.id.split("/", 1)[1] if "/" in model.id else model.id
                     if model_name not in deployments:
                         deployments.append(model_name)
+
+            # Fetch succeeded (or manual deployments are known): now it's safe to
+            # clear and replace.
+            cleared_count = await clear_models_for_provider(db, provider_key)
+            add_span_attributes(span, {
+                "provider.models_cleared": cleared_count
+            })
 
             if not deployments:
                 add_span_attributes(span, {
@@ -242,32 +247,26 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
         }
     ) as span:
         try:
-            # Capture enabled states BEFORE clearing models
+            # Capture enabled states before any mutation
             existing_models = await get_models_by_provider(db, provider_key)
             enabled_states = {model.model_id: model.is_enabled for model in existing_models}
-            
-            # Clear existing models for this provider
-            cleared_count = await clear_models_for_provider(db, provider_key)
-            
-            add_span_attributes(span, {
-                "provider.models_cleared": cleared_count
-            })
-            
+
             # Create provider instance for model discovery
             provider_instance = await _create_provider_instance(provider_creds)
             if not provider_instance:
                 error_msg = f"Failed to create provider instance for {provider_key}"
                 set_span_error(span, error_msg)
                 return {"error": error_msg}
-            
+
             # Use 3 minutes timeout for all providers
             timeout = 180
-            
+
             add_span_attributes(span, {
                 "provider.fetch_timeout_seconds": timeout
             })
-            
-            # Fetch models from the provider
+
+            # IMPORTANT: fetch models BEFORE clearing the DB — a failed fetch
+            # must not leave the provider with zero models (the clear commits).
             try:
                 models = await asyncio.wait_for(
                     provider_instance.get_available_models(),
@@ -281,7 +280,15 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
                 error_msg = f"Failed to fetch models from {provider_key}: {str(e)}"
                 set_span_error(span, e)
                 return {"error": error_msg}
-            
+            finally:
+                await _close_provider_instance(provider_instance)
+
+            # Fetch succeeded: now it's safe to clear and replace.
+            cleared_count = await clear_models_for_provider(db, provider_key)
+            add_span_attributes(span, {
+                "provider.models_cleared": cleared_count
+            })
+
             if not models:
                 add_span_attributes(span, {
                     "provider.models_fetched": 0,
@@ -359,17 +366,21 @@ async def _create_provider_instance(provider_creds):
             'google': GoogleProvider,
         }
         
-        # Create provider configuration
-        config = _create_provider_config_from_creds(provider_creds)
-        
+        # Reuse the runtime provider config builder so discovery instances are
+        # configured identically to the serving instances (the previous local
+        # builder diverged: it omitted base_url for OpenAI and cross-region /
+        # app-profile flags + base_url for Bedrock, so discovery could see a
+        # different model set than runtime).
+        config = provider_manager._create_provider_config(provider_creds)
+
         # Use specialized provider if available, otherwise use custom provider
         if provider_creds.provider_type in specialized_providers:
             provider_class = specialized_providers[provider_creds.provider_type]
             return provider_class(config)
         else:
-            # All other providers (custom / openai_compatible) 
+            # All other providers (custom / openai_compatible)
             return create_custom_provider(config)
-        
+
     except Exception as e:
         print(f"Error creating provider instance: {e}")
         import traceback
@@ -377,52 +388,19 @@ async def _create_provider_instance(provider_creds):
         return None
 
 
-def _create_provider_config_from_creds(creds) -> Dict[str, Any]:
-    """Create provider configuration dict from database credentials."""
-    config_dict = {
-        'name': creds.instance_name,
-        'enabled': creds.enabled
-    }
-    
-    # Add provider_name for OpenAI-compatible providers
-    if hasattr(creds, 'provider_name') and creds.provider_name:
-        config_dict['provider_name'] = creds.provider_name
-        config_dict['custom_provider_name'] = creds.provider_name  # For backward compatibility
-    
-    # Add provider-specific fields based on type
-    if creds.provider_type == 'azure':
-        config_dict.update(build_azure_config_fields(creds))
-    elif creds.provider_type == 'openai':
-        config_dict.update({
-            'endpoint': creds.endpoint or 'https://api.openai.com/v1',
-            'api_key': creds.api_key
-        })
-    elif creds.provider_type == 'google':
-        config_dict.update({
-            'api_key': creds.api_key,
-            'base_url': creds.base_url,
-        })
-    elif creds.provider_type == 'bedrock':
-        config_dict.update({
-            'region': creds.region or 'us-west-2',
-            'access_key_id': creds.access_key_id,
-            'secret_access_key': creds.secret_access_key
-        })
-    else:
-        # All other providers are custom (including custom, ollama, etc.)
-        config_dict.update({
-            'base_url': creds.base_url or creds.endpoint,
-            'api_key': creds.api_key
-        })
-    
-    # Add supported_apis if available (for custom providers)
-    if hasattr(creds, 'supported_apis') and creds.supported_apis:
-        try:
-            config_dict['supported_apis'] = json.loads(creds.supported_apis)
-        except (json.JSONDecodeError, TypeError):
-            config_dict['supported_apis'] = ['openai']
-    
-    return config_dict
+async def _close_provider_instance(instance) -> None:
+    """Best-effort close of a temporary discovery instance's HTTP clients.
+
+    Discovery instances are created for a single get_available_models() call and
+    discarded; without this each provider create/edit and every sync leaks the
+    instance's connection pools / file descriptors.
+    """
+    if instance is None:
+        return
+    try:
+        await provider_manager.close_provider_clients({"__discovery__": instance})
+    except Exception as e:
+        print(f"Warning: failed to close discovery provider instance: {e}")
 
 
 async def sync_all_provider_models(db: AsyncSession) -> Dict[str, Any]:
@@ -532,16 +510,12 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
                 }
             
             # For create and update, force a complete provider manager refresh first
-            # This is crucial for handling provider renames
+            # This is crucial for handling provider renames. (The former
+            # asyncio.sleep(0.1) "wait for refresh" here was dead — the refresh
+            # is already awaited above — and has been removed.)
             try:
                 print(f"Auto-sync: Forcing provider manager refresh for {action} of {provider_key}")
                 await provider_manager.refresh_providers_from_database()
-                
-                # For updates (which might be renames), wait a moment for the refresh to complete
-                if action == "update":
-                    import asyncio
-                    await asyncio.sleep(0.1)  # Small delay to ensure refresh completes
-                    
             except Exception as e:
                 print(f"Warning: Provider manager refresh failed during auto-sync: {e}")
                 add_span_attributes(span, {
@@ -600,11 +574,15 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
                         # Verify cache was updated
                         cache_models_after = provider_manager.model_cache.get_models()
                         print(f"🔍 Models in cache after update: {len(cache_models_after)}")
-                        
-                        # Refresh providers from database (reloads provider instances and configs)
-                        await provider_manager.refresh_providers_from_database()
-                        print(f"🔍 Provider manager refreshed from database")
-                        
+
+                        # Reload model configurations from DB (enabled states,
+                        # etc.) for the just-synced models. The full provider
+                        # refresh already ran once at the top of this function, so
+                        # the previously-duplicated refresh_providers_from_database()
+                        # here is replaced with the lighter config reload.
+                        await provider_manager.refresh_model_configurations()
+                        print(f"🔍 Provider manager model configurations refreshed")
+
                         # Verify cache after refresh
                         cache_models_final = provider_manager.model_cache.get_models()
                         print(f"🔍 Models in cache after refresh: {len(cache_models_final)}")

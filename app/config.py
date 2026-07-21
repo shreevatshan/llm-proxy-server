@@ -2,6 +2,11 @@ import os
 from typing import Dict, Any, Optional, List, Union
 from pydantic import BaseModel, validator, model_validator
 
+# Single source of truth for the transformation config models. Importing them
+# here (rather than redefining) ensures initialize_transformation_manager()
+# receives the exact type its TransformationManager is annotated with.
+from app.transformation import ProcessorConfig, TransformationConfig
+
 
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
@@ -11,6 +16,10 @@ class ServerConfig(BaseModel):
     azure_openai_port: int = 11439  # Azure OpenAI API server port
     management_port: int = 8765  # Management (admin + user login) server port
     timezone: str = "UTC"  # IANA timezone name, e.g. "Asia/Kolkata"
+    # Credentialed CORS allowlist for the cookie-authenticated management app.
+    # Populated from LLMPROXY_CORS_ALLOW_ORIGINS (comma-separated); defaults to the
+    # management origin derived from domain/management_port plus localhost.
+    cors_allow_origins: List[str] = []
 
 
 class DebugConfig(BaseModel):
@@ -26,7 +35,7 @@ class AdminConfig(BaseModel):
     enabled: bool = False
     username: str = "admin"
     email: str = "admin@localhost"
-    password: str = "admin123"
+    password: str = ""  # No default password shipped; must be set via env when enabled
 
 
 class OAuthConfig(BaseModel):
@@ -38,19 +47,6 @@ class OAuthConfig(BaseModel):
 
 class WebhookConfig(BaseModel):
     notification_webhook_url: Optional[str] = None
-
-
-class ProcessorConfig(BaseModel):
-    name: str
-    enabled: bool = True
-    priority: int = 100
-    config: Dict[str, Any] = {}
-
-
-class TransformationConfig(BaseModel):
-    enabled: bool = True
-    request_processors: List[ProcessorConfig] = []
-    response_processors: List[ProcessorConfig] = []
 
 
 class Config(BaseModel):
@@ -83,16 +79,47 @@ def load_config_from_env() -> Config:
         management_port=int(os.getenv("MANAGEMENT_SERVER_PORT", "8765")),
         timezone=tz_name,
     )
-    
-    # Model configuration from environment  
+
+    # Credentialed-CORS allowlist for the management app. Comma-separated origins
+    # in LLMPROXY_CORS_ALLOW_ORIGINS override the default, which is the management
+    # origin (from LLMPROXY_DOMAIN + management port) plus its localhost variant.
+    cors_env = os.getenv("LLMPROXY_CORS_ALLOW_ORIGINS")
+    if cors_env:
+        server_config.cors_allow_origins = [
+            o.strip() for o in cors_env.split(",") if o.strip()
+        ]
+    else:
+        default_origins = [
+            f"http://{server_config.domain}:{server_config.management_port}"
+        ]
+        localhost_origin = f"http://localhost:{server_config.management_port}"
+        if localhost_origin not in default_origins:
+            default_origins.append(localhost_origin)
+        server_config.cors_allow_origins = default_origins
+
+    # Model configuration from environment
     model_config = ModelConfig()
     
-    # Admin configuration from environment
+    # Admin configuration from environment.
+    # Default OFF (matches the AdminConfig model default) so a no-env deployment
+    # does not expose an admin panel on all interfaces. When explicitly enabled,
+    # a secure LLMPROXY_ADMIN_PASSWORD MUST be provided — we refuse to start with
+    # an empty password, the historical "admin123" default, or the .env.example
+    # placeholder.
+    _placeholder_admin_passwords = {"admin123", "change-this-strong-password"}
+    admin_enabled = os.getenv("LLMPROXY_ADMIN_ENABLED", "false").lower() == "true"
+    admin_password = os.getenv("LLMPROXY_ADMIN_PASSWORD", "")
+    if admin_enabled and (not admin_password or admin_password in _placeholder_admin_passwords):
+        raise ValueError(
+            "LLMPROXY_ADMIN_ENABLED is true but LLMPROXY_ADMIN_PASSWORD is unset or "
+            "set to an insecure default/placeholder. Set LLMPROXY_ADMIN_PASSWORD to "
+            "a strong, non-default value to enable the admin account."
+        )
     admin_config = AdminConfig(
-        enabled=os.getenv("LLMPROXY_ADMIN_ENABLED", "true").lower() == "true",
+        enabled=admin_enabled,
         username=os.getenv("LLMPROXY_ADMIN_USERNAME", "admin"),
         email=os.getenv("LLMPROXY_ADMIN_EMAIL", "admin@localhost"),
-        password=os.getenv("LLMPROXY_ADMIN_PASSWORD", "admin123")
+        password=admin_password,
     )
     
     # OAuth configuration from environment

@@ -1,5 +1,6 @@
 """Admin user class and utilities for config-based authentication."""
 
+import hmac
 from typing import Optional
 from datetime import datetime
 from app.config import config
@@ -36,9 +37,11 @@ def authenticate_admin(username: str, password: str) -> Optional[AdminUser]:
     if username != admin_config.username:
         return None
     
-    # For admin, we'll do a simple password comparison
-    # In production, you might want to hash the admin password in config
-    if password != admin_config.password:
+    # Constant-time comparison to avoid leaking the password via timing.
+    # (In production the admin password should ideally be stored hashed.)
+    if not hmac.compare_digest(
+        password.encode("utf-8"), admin_config.password.encode("utf-8")
+    ):
         return None
     
     # Return admin user object

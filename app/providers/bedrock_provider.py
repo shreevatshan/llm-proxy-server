@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from typing import List, Dict, Any, AsyncGenerator, Literal, Optional
@@ -39,10 +40,6 @@ from pydantic import BaseModel
 #  runs on Starlette's default threadpool and is otherwise ungoverned.
 # ---------------------------------------------------------------------------
 _CONVERSE_SEMAPHORE_LIMIT = 15
-
-# Governs the Converse / converse_stream path (run via Starlette's default
-# threadpool, which is otherwise unbounded relative to Bedrock concurrency).
-_converse_semaphore: Optional[asyncio.Semaphore] = None
 
 
 def _get_positive_int_env(name: str, default: int) -> int:
@@ -72,24 +69,6 @@ def _get_positive_int_env(name: str, default: int) -> int:
         return default
 
     return value
-
-
-def _get_converse_semaphore() -> asyncio.Semaphore:
-    """Get or create the semaphore bounding the Converse / converse_stream path.
-
-    Without this, the OpenAI chat path and the non-Claude Anthropic path call
-    converse/converse_stream on Starlette's default threadpool with no Bedrock-
-    side concurrency bound — the one ungoverned path relative to the native
-    InvokeModel paths. Limit is configurable via BEDROCK_CONVERSE_SEMAPHORE_LIMIT.
-    """
-    global _converse_semaphore
-    if _converse_semaphore is None:
-        limit = _get_positive_int_env(
-            "BEDROCK_CONVERSE_SEMAPHORE_LIMIT", _CONVERSE_SEMAPHORE_LIMIT
-        )
-        _converse_semaphore = asyncio.Semaphore(limit)
-        logger.info("[BEDROCK] Created converse semaphore with limit %d", limit)
-    return _converse_semaphore
 
 
 def _map_bedrock_error(error_code: str, error_message: str) -> Dict[str, Any]:
@@ -134,7 +113,9 @@ from app.anthropic_models import (
     is_claude_at_least,
 )
 from app.providers.anthropic_compatible import (
-    get_anthropic_post_terminal_drain_stop_reason,
+    # Bedrock native Anthropic streams share the same bounded post-terminal
+    # drain policy and event serialization as the other Anthropic-SDK paths.
+    stream_anthropic_sdk_events,
 )
 from app.openai_models import (
     ModelInfo,
@@ -167,28 +148,6 @@ from app.openai_models import (
 
 
 logger = logging.getLogger(__name__)
-
-
-def _raise_anthropic_api_error(e: Exception) -> None:
-    """Re-raise Anthropic SDK errors as HTTPException with proper status codes.
-
-    Forwards the upstream error body as-is so the client receives the exact
-    error response from the provider instead of a synthetic one.
-    Only raises if ``e`` is an ``anthropic.APIStatusError``; otherwise returns
-    so the caller can re-raise the original exception.
-    """
-    import anthropic
-    if isinstance(e, anthropic.APIStatusError):
-        from fastapi import HTTPException
-        # Forward the upstream error body directly — avoid re-constructing it
-        detail = e.body if hasattr(e, "body") and e.body is not None else {
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        }
-        raise HTTPException(
-            status_code=e.status_code,
-            detail=detail,
-        )
 
 
 def _sanitize_for_json(obj: Any) -> Any:
@@ -251,6 +210,18 @@ class BedrockProvider(BaseProvider):
         "compact-2026-01-12",
     }
 
+    # Bedrock Converse rejects a toolConfig whose tools list is empty (it
+    # requires >= 1 entry). When message history carries tool blocks but the
+    # request declares no usable tools, we inject this harmless placeholder so
+    # the required toolConfig stays valid.
+    _PLACEHOLDER_TOOL_SPEC = {
+        "toolSpec": {
+            "name": "noop",
+            "description": "Placeholder tool. Do not call.",
+            "inputSchema": {"json": {"type": "object", "properties": {}}},
+        }
+    }
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         
@@ -307,6 +278,14 @@ class BedrockProvider(BaseProvider):
 
         self._anthropic_client = None
 
+        # Per-instance Converse concurrency bound, created lazily on the running
+        # event loop (a module-level Semaphore would be shared across accounts/
+        # regions and pinned to whichever loop first touched it).
+        self._converse_semaphore: Optional[asyncio.Semaphore] = None
+        # Single-flight guard so concurrent model-list refreshes don't all run
+        # the slow paginated control-plane sweep at once (losers serve stale).
+        self._model_list_refresh_lock = threading.Lock()
+
     def get_model_id(self, model_name: str) -> str:
         """
         Extract actual Bedrock model ID from provider-prefixed model name.
@@ -328,6 +307,24 @@ class BedrockProvider(BaseProvider):
         #    logger.info(f"[BEDROCK] Model name transformation: '{original_model}' -> '{model_name}'")
         
         return model_name
+
+    def _get_converse_semaphore(self) -> asyncio.Semaphore:
+        """Get or create this instance's Converse / converse_stream bound.
+
+        The OpenAI chat path and the non-Claude Anthropic path call
+        converse/converse_stream on Starlette's default threadpool with no
+        Bedrock-side concurrency bound. The Semaphore is created lazily so it
+        binds to the running event loop, and is per-instance so one busy AWS
+        account/region can't starve another. Limit is configurable via
+        BEDROCK_CONVERSE_SEMAPHORE_LIMIT.
+        """
+        if self._converse_semaphore is None:
+            limit = _get_positive_int_env(
+                "BEDROCK_CONVERSE_SEMAPHORE_LIMIT", _CONVERSE_SEMAPHORE_LIMIT
+            )
+            self._converse_semaphore = asyncio.Semaphore(limit)
+            logger.info("[BEDROCK] Created converse semaphore with limit %d", limit)
+        return self._converse_semaphore
 
     def _get_inference_region_prefix(self) -> str:
         """Get inference region prefix for cross-region inference."""
@@ -353,6 +350,38 @@ class BedrockProvider(BaseProvider):
             last = getattr(self, "_model_list_fetched_at", None)
             if last is not None and self.bedrock_model_list and (time.monotonic() - last) < self._MODEL_LIST_TTL_SECONDS:
                 return
+
+        # Single-flight: only one refresh runs the slow paginated control-plane
+        # sweep at a time. On the non-force path, losers return immediately and
+        # serve the existing (possibly stale) list instead of stampeding the
+        # control plane. force=True (explicit refresh) waits for the in-flight
+        # refresh rather than skipping.
+        acquired = self._model_list_refresh_lock.acquire(blocking=force)
+        if not acquired:
+            if self.bedrock_model_list:
+                # Serve the existing (possibly stale) list.
+                return
+            # Cold start: no list has ever been populated, so returning early
+            # would leave callers with an empty model map. Wait for the
+            # in-flight refresh instead. Blocking here is loop-safe — every
+            # caller runs this method via run_in_threadpool.
+            self._model_list_refresh_lock.acquire()
+        try:
+            # Re-check the TTL now that we hold the lock — another thread may
+            # have refreshed while we were waiting.
+            if not force:
+                last = getattr(self, "_model_list_fetched_at", None)
+                if last is not None and self.bedrock_model_list and (time.monotonic() - last) < self._MODEL_LIST_TTL_SECONDS:
+                    return
+            self._refresh_model_list_locked()
+        finally:
+            self._model_list_refresh_lock.release()
+
+    def _refresh_model_list_locked(self):
+        """Run the actual (blocking) control-plane model-list sweep.
+
+        Must be called while holding ``self._model_list_refresh_lock``.
+        """
         try:
             model_list = {}
             profile_list = []
@@ -501,12 +530,29 @@ class BedrockProvider(BaseProvider):
         return modality in modalities
 
     def _parse_system_prompts(self, messages: List[ChatMessage]) -> List[Dict[str, str]]:
-        """Extract system prompts from messages."""
+        """Extract system prompts from messages.
+
+        Handles both plain-string system content and OpenAI's array form
+        (``[{"type": "text", "text": ...}]``); the latter was previously dropped.
+        """
         system_prompts = []
         for message in messages:
-            if message.role == "system":
-                if isinstance(message.content, str):
+            if message.role != "system":
+                continue
+            if isinstance(message.content, str):
+                if message.content:
                     system_prompts.append({"text": message.content})
+            elif isinstance(message.content, list):
+                for part in message.content:
+                    text = None
+                    if isinstance(part, TextContent):
+                        text = part.text
+                    elif isinstance(part, dict) and part.get("type") == "text":
+                        text = part.get("text")
+                    elif hasattr(part, "text"):
+                        text = part.text
+                    if text and text.strip():
+                        system_prompts.append({"text": text})
         return system_prompts
 
     # Image download guard rails (SSRF + resource exhaustion).
@@ -556,23 +602,30 @@ class BedrockProvider(BaseProvider):
 
         # Download from URL (blocking - must be called from threadpool), with a
         # size cap so a large/slow image can't pin a worker or exhaust memory.
-        response = requests.get(image_url, timeout=self._IMAGE_DOWNLOAD_TIMEOUT, stream=True)
-        if response.status_code != 200:
-            raise ValueError(f"Unable to access image URL: {image_url}")
+        # allow_redirects=False so a vetted public URL cannot 3xx-redirect to an
+        # internal address (e.g. 169.254.169.254), bypassing the SSRF guard; the
+        # `with` block guarantees the pooled connection is always released.
+        with requests.get(
+            image_url,
+            timeout=self._IMAGE_DOWNLOAD_TIMEOUT,
+            stream=True,
+            allow_redirects=False,
+        ) as response:
+            if response.status_code != 200:
+                raise ValueError(f"Unable to access image URL: {image_url}")
 
-        chunks = []
-        total = 0
-        for chunk in response.iter_content(chunk_size=65536):
-            total += len(chunk)
-            if total > self._IMAGE_MAX_BYTES:
-                response.close()
-                raise ValueError(f"Image exceeds maximum size of {self._IMAGE_MAX_BYTES} bytes")
-            chunks.append(chunk)
+            chunks = []
+            total = 0
+            for chunk in response.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > self._IMAGE_MAX_BYTES:
+                    raise ValueError(f"Image exceeds maximum size of {self._IMAGE_MAX_BYTES} bytes")
+                chunks.append(chunk)
 
-        content_type = response.headers.get("Content-Type", "image/jpeg")
-        if not content_type.startswith("image"):
-            content_type = "image/jpeg"
-        return b"".join(chunks), content_type
+            content_type = response.headers.get("Content-Type", "image/jpeg")
+            if not content_type.startswith("image"):
+                content_type = "image/jpeg"
+            return b"".join(chunks), content_type
 
     def _parse_content_parts(self, message: ChatMessage, model_id: str) -> List[Dict]:
         """Parse message content into Bedrock format."""
@@ -1041,8 +1094,10 @@ class BedrockProvider(BaseProvider):
                 )
             else:
                 budget_tokens = self._calc_budget_tokens(max_tokens, request.reasoning_effort)
-                # unset topP - Not supported
+                # Extended thinking rejects topP and any temperature != 1, so
+                # drop both from inferenceConfig when reasoning is enabled.
                 inference_config.pop("topP", None)
+                inference_config.pop("temperature", None)
                 args["additionalModelRequestFields"] = {
                     "reasoning_config": {"type": "enabled", "budget_tokens": budget_tokens}
                 }
@@ -1058,7 +1113,12 @@ class BedrockProvider(BaseProvider):
             tool_config = {
                 "tools": [self._convert_tool_spec(t.function, tool_name_mapping=tool_name_mapping) for t in request.tools] if request.tools else []
             }
-            
+
+            # Converse requires >= 1 tool when toolConfig is present; if history
+            # has tool blocks but no tools are declared, inject a placeholder.
+            if not tool_config["tools"]:
+                tool_config["tools"] = [self._PLACEHOLDER_TOOL_SPEC]
+
             if request.tool_choice and request.tools and not request.model.startswith("meta.llama3-1-"):
                 if isinstance(request.tool_choice, str):
                     if request.tool_choice == "required":
@@ -1125,10 +1185,12 @@ class BedrockProvider(BaseProvider):
                 existing_amrf = args.get("additionalModelRequestFields", {})
                 existing_amrf.update(filtered_extra_fields)
                 args["additionalModelRequestFields"] = existing_amrf
-                # Extended thinking doesn't support both temperature and topP
-                # Remove topP to avoid validation error
+                # Extended thinking rejects topP, temperature != 1, and top_k;
+                # scrub all three to avoid a Bedrock validation error.
                 if "thinking" in filtered_extra_fields:
                     inference_config.pop("topP", None)
+                    inference_config.pop("temperature", None)
+                    existing_amrf.pop("top_k", None)
 
         # Claude >= 4.7 doesn't support top_k in additionalModelRequestFields either
         if self._is_claude_at_least(request.model, 4, 7):
@@ -1254,7 +1316,7 @@ class BedrockProvider(BaseProvider):
         # the stream (boto3 returns the EventStream once headers arrive, not
         # when the body is drained), so the permit is released before the
         # client reads the body — a slow consumer never holds a Converse permit.
-        converse_semaphore = _get_converse_semaphore()
+        converse_semaphore = self._get_converse_semaphore()
         try:
             async with converse_semaphore:
                 if stream:
@@ -1305,45 +1367,43 @@ class BedrockProvider(BaseProvider):
         if self.debug:
             logger.info(f"[BEDROCK] Token usage - Input: {input_tokens}, Output: {output_tokens}, Total: {total_tokens}")
         
-        # Parse response message
+        # Parse response message. Accumulate ALL blocks regardless of stop
+        # reason: a tool_use response can still carry preceding text/reasoning
+        # blocks, and multiple text blocks must be concatenated (not overwritten).
         message = ChatMessage(role="assistant", content="")
-        
-        if finish_reason == "tool_use":
-            tool_calls = []
-            for part in output_message["content"]:
-                if "toolUse" in part:
-                    tool = part["toolUse"]
-                    # Ensure we have all required fields
-                    tool_id = tool.get("toolUseId", "")
-                    tool_name = tool.get("name", "")
-                    tool_input = tool.get("input")
-                    if not isinstance(tool_input, dict):
-                        tool_input = {}
-                    
-                    # Restore original tool name if it was truncated
-                    original_tool_name = self._restore_tool_name(tool_name, tool_name_mapping)
-                    
-                    tool_calls.append(ToolCall(
-                        id=tool_id,
-                        type="function",
-                        function=ResponseFunction(
-                            name=original_tool_name,
-                            arguments=json.dumps(tool_input)
-                        )
-                    ))
-            message.tool_calls = tool_calls
-            # Keep content as empty string for tool calls (required field)
-        else:
-            content = ""
-            for c in output_message["content"]:
-                if "reasoningContent" in c:
-                    message.reasoning_content = c["reasoningContent"]["reasoningText"].get("text", "")
-                elif "text" in c:
-                    content = c["text"]
+        content = ""
+        tool_calls = []
+        for part in output_message["content"]:
+            if "toolUse" in part:
+                tool = part["toolUse"]
+                # Ensure we have all required fields
+                tool_id = tool.get("toolUseId", "")
+                tool_name = tool.get("name", "")
+                tool_input = tool.get("input")
+                if not isinstance(tool_input, dict):
+                    tool_input = {}
 
-            # Emit reasoning on the dedicated reasoning_content field; keep
-            # content as the visible text only (no <think> injection).
-            message.content = content
+                # Restore original tool name if it was truncated
+                original_tool_name = self._restore_tool_name(tool_name, tool_name_mapping)
+
+                tool_calls.append(ToolCall(
+                    id=tool_id,
+                    type="function",
+                    function=ResponseFunction(
+                        name=original_tool_name,
+                        arguments=json.dumps(tool_input)
+                    )
+                ))
+            elif "reasoningContent" in part:
+                # Emit reasoning on the dedicated reasoning_content field; keep
+                # content as the visible text only (no <think> injection).
+                message.reasoning_content = part["reasoningContent"]["reasoningText"].get("text", "")
+            elif "text" in part:
+                content += part["text"]
+
+        if tool_calls:
+            message.tool_calls = tool_calls
+        message.content = content
         
         chat_response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -1610,6 +1670,9 @@ class BedrockProvider(BaseProvider):
                 stream_state["block_index_map"][block_idx] = index
                 # Restore original tool name if it was truncated
                 tool_name = self._restore_tool_name(start["toolUse"]["name"], tool_name_mapping)
+                # Emit a plain dict (not the Pydantic ToolCall) so format_sse_data's
+                # json.dumps can serialize the delta — a ToolCall object here raises
+                # "Object of type ToolCall is not JSON serializable".
                 delta = {
                     "tool_calls": [ToolCall(
                         index=index,
@@ -1619,7 +1682,7 @@ class BedrockProvider(BaseProvider):
                             name=tool_name,
                             arguments=""
                         )
-                    )]
+                    ).model_dump(exclude_none=True)]
                 }
 
         elif "contentBlockDelta" in chunk:
@@ -1655,7 +1718,7 @@ class BedrockProvider(BaseProvider):
                             name="",  # Empty name for delta updates
                             arguments=arguments_str
                         )
-                    )]
+                    ).model_dump(exclude_none=True)]
                 }
 
         elif "messageStop" in chunk:
@@ -1728,23 +1791,44 @@ class BedrockProvider(BaseProvider):
                     if data_str and data_str != "[DONE]":
                         try:
                             data = json.loads(data_str)
-                            if "choices" in data and len(data["choices"]) > 0:
-                                choice = data["choices"][0]
-                                # Convert to completion format
-                                completion_chunk = {
-                                    "id": data["id"].replace("chatcmpl", "cmpl"),
-                                    "object": "text_completion",
-                                    "created": data["created"],
-                                    "model": data["model"],
-                                    "choices": [{
-                                        "index": 0,
-                                        "text": choice.get("delta", {}).get("content", ""),
-                                        "finish_reason": choice.get("finish_reason")
-                                    }]
-                                }
-                                yield self.format_sse_data(completion_chunk)
                         except json.JSONDecodeError:
-                            pass
+                            continue
+
+                        # Pass error chunks straight through so a failed stream
+                        # surfaces to the client instead of silently ending.
+                        if "error" in data:
+                            yield self.format_sse_data(data)
+                            continue
+
+                        if "choices" in data and len(data["choices"]) > 0:
+                            choice = data["choices"][0]
+                            # Convert to completion format
+                            completion_chunk = {
+                                "id": data["id"].replace("chatcmpl", "cmpl"),
+                                "object": "text_completion",
+                                "created": data["created"],
+                                "model": data["model"],
+                                "choices": [{
+                                    "index": 0,
+                                    "text": choice.get("delta", {}).get("content", ""),
+                                    "finish_reason": choice.get("finish_reason")
+                                }]
+                            }
+                            # Forward the usage chunk (choices:[] carries usage).
+                            if data.get("usage") is not None:
+                                completion_chunk["usage"] = data["usage"]
+                            yield self.format_sse_data(completion_chunk)
+                        elif data.get("usage") is not None:
+                            # Usage-only chunk (empty choices) — forward it with an
+                            # empty choices list so clients that read usage see it.
+                            yield self.format_sse_data({
+                                "id": data.get("id", "").replace("chatcmpl", "cmpl"),
+                                "object": "text_completion",
+                                "created": data.get("created", int(time.time())),
+                                "model": data.get("model", request.model),
+                                "choices": [],
+                                "usage": data["usage"],
+                            })
 
     async def embeddings(self, request: EmbeddingRequest) -> EmbeddingResponse:
         """Handle embeddings request."""
@@ -2031,14 +2115,12 @@ class BedrockProvider(BaseProvider):
                     ):
                         continue
 
-                    # Convert web_search_tool_result in user messages → tool_result
+                    # Convert web_search_tool_result in user messages → plain
+                    # text. The matching server_tool_use block is dropped from
+                    # the assistant message above, so emitting a tool_result here
+                    # would leave an orphan (no matching tool_use) that the
+                    # Anthropic/Bedrock API rejects with a 400.
                     if bt == "web_search_tool_result":
-                        ws_id = bd.get("tool_use_id", "")
-                        bedrock_id = (
-                            ws_id.replace("srvtoolu_", "toolu_", 1)
-                            if ws_id.startswith("srvtoolu_")
-                            else ws_id
-                        )
                         ws_content = bd.get("content", [])
                         if isinstance(ws_content, list):
                             parts = []
@@ -2054,9 +2136,8 @@ class BedrockProvider(BaseProvider):
                         else:
                             result_text = str(ws_content)
                         bd = {
-                            "type": "tool_result",
-                            "tool_use_id": bedrock_id,
-                            "content": result_text,
+                            "type": "text",
+                            "text": f"[Web search results]\n{result_text}",
                         }
 
                     # Strip citations from text blocks — Bedrock doesn't support them
@@ -2110,7 +2191,9 @@ class BedrockProvider(BaseProvider):
         # "top_p is deprecated for this model" error. Drop it for those models.
         if request.top_p is not None and not self._is_claude_at_least(request.model, 4, 7):
             native["top_p"] = request.top_p
-        if request.top_k is not None:
+        # Claude >= 4.7 deprecated top_k as well; the Converse path strips it, so
+        # apply the same guard here to keep the native path consistent.
+        if request.top_k is not None and not self._is_claude_at_least(request.model, 4, 7):
             native["top_k"] = request.top_k
         if request.stop_sequences:
             native["stop_sequences"] = request.stop_sequences
@@ -2251,33 +2334,6 @@ class BedrockProvider(BaseProvider):
 
     # --- cache TTL helpers (operate on native request dicts) ---
 
-    def _apply_native_cache_ttl(self, body: dict, api_key_cache_ttl: Optional[str] = None) -> None:
-        """Apply cache TTL to all cache_control blocks in a native Anthropic request.
-
-        Priority: api_key_cache_ttl > existing client TTL > (no default for now).
-        """
-        def _update(block: dict) -> None:
-            cc = block.get("cache_control")
-            if not cc or not isinstance(cc, dict):
-                return
-            if api_key_cache_ttl:
-                cc["ttl"] = api_key_cache_ttl
-
-        system = body.get("system")
-        if isinstance(system, list):
-            for part in system:
-                if isinstance(part, dict):
-                    _update(part)
-        for msg in body.get("messages", []):
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        _update(block)
-        for tool in body.get("tools", []):
-            if isinstance(tool, dict):
-                _update(tool)
-
     def _strip_native_cache_scope(self, body: dict) -> None:
         """Remove ``scope`` from every cache_control block — Bedrock doesn't support it."""
         def _strip(block: dict) -> None:
@@ -2354,7 +2410,6 @@ class BedrockProvider(BaseProvider):
         non-native ``context_management`` field into ``extra_body``.
         """
         native = self._convert_to_anthropic_native_request(request, anthropic_beta)
-        self._apply_native_cache_ttl(native)
         self._strip_native_cache_scope(native)  # Bedrock rejects cache_control.scope
 
         native.pop("anthropic_version", None)  # SDK injects bedrock-2023-05-31 itself
@@ -2686,6 +2741,15 @@ class BedrockProvider(BaseProvider):
                     len(special_tools),
                     [t.get("type") for t in special_tools],
                 )
+            # Converse requires >= 1 tool when toolConfig is present. If every
+            # declared tool was a special type (forwarded via
+            # additionalModelRequestFields) or history has tool blocks but no
+            # tools remain, inject a placeholder to keep toolConfig valid.
+            placeholder_only = False
+            if not bedrock_tools:
+                bedrock_tools.append(self._PLACEHOLDER_TOOL_SPEC)
+                placeholder_only = True
+
             tool_config: Dict[str, Any] = {
                 "tools": bedrock_tools,
             }
@@ -2698,7 +2762,14 @@ class BedrockProvider(BaseProvider):
                 )
                 if isinstance(tool_choice_data, dict):
                     tool_choice_type = tool_choice_data.get("type")
-                    if tool_choice_type == "auto":
+                    if placeholder_only and tool_choice_type in ("any", "tool"):
+                        # The only tool in toolConfig is the injected
+                        # placeholder; a forced choice would make the model
+                        # call the fake noop tool (or fail validation for a
+                        # named tool that isn't in toolConfig). Downgrade to
+                        # auto instead.
+                        tool_config["toolChoice"] = {"auto": {}}
+                    elif tool_choice_type == "auto":
                         tool_config["toolChoice"] = {"auto": {}}
                     elif tool_choice_type == "any":
                         tool_config["toolChoice"] = {"any": {}}
@@ -2709,17 +2780,35 @@ class BedrockProvider(BaseProvider):
 
         return _sanitize_for_json(args)
 
+    # Anthropic's stop_reason enum is closed; unmapped Bedrock values (e.g.
+    # "guardrail_intervened") must not leak through as non-enum values.
+    _ANTHROPIC_STOP_REASON_MAP = {
+        "end_turn": "end_turn",
+        "stop_sequence": "stop_sequence",
+        "max_tokens": "max_tokens",
+        "tool_use": "tool_use",
+        "content_filtered": "end_turn",
+    }
+    # Valid Anthropic-native stop reasons that may already be in Anthropic form.
+    _ANTHROPIC_STOP_REASON_PASSTHROUGH = {
+        "end_turn",
+        "stop_sequence",
+        "max_tokens",
+        "tool_use",
+        "pause_turn",
+        "refusal",
+        "model_context_window_exceeded",
+    }
+
     def _convert_bedrock_stop_reason(self, stop_reason: Optional[str]) -> Optional[str]:
         if not stop_reason:
             return None
-        mapping = {
-            "end_turn": "end_turn",
-            "stop_sequence": "stop_sequence",
-            "max_tokens": "max_tokens",
-            "tool_use": "tool_use",
-            "content_filtered": "end_turn",
-        }
-        return mapping.get(stop_reason, stop_reason)
+        if stop_reason in self._ANTHROPIC_STOP_REASON_MAP:
+            return self._ANTHROPIC_STOP_REASON_MAP[stop_reason]
+        if stop_reason in self._ANTHROPIC_STOP_REASON_PASSTHROUGH:
+            return stop_reason
+        logger.warning(f"[BEDROCK] Unknown stop reason '{stop_reason}', defaulting to 'end_turn'")
+        return "end_turn"
 
     def _convert_bedrock_content_to_anthropic(self, content: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         anthropic_content: List[Dict[str, Any]] = []
@@ -2815,13 +2904,18 @@ class BedrockProvider(BaseProvider):
         # ── Converse path for non-Claude models ────────────────────────────
         args = await run_in_threadpool(self._build_bedrock_anthropic_args, request, anthropic_beta)
         try:
-            async with _get_converse_semaphore():
+            async with self._get_converse_semaphore():
                 response = await run_in_threadpool(self.bedrock_runtime.converse, **args)
         except ClientError as e:
             error = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
-            if error.get("Code") == "ValidationException":
+            code = error.get("Code")
+            if code == "ValidationException":
                 raise ValueError(error.get("Message") or str(e)) from e
-            raise
+            # Map throttling/quota/permission errors to their real HTTP status
+            # (429/403/...) with an Anthropic-shaped body instead of a 500.
+            mapped = _map_bedrock_error(code or "ClientError", error.get("Message", str(e)))
+            from fastapi import HTTPException
+            raise HTTPException(status_code=mapped["status"], detail=mapped["body"]) from e
 
         output_message = response.get("output", {}).get("message", {})
         usage = response.get("usage", {})
@@ -2892,52 +2986,23 @@ class BedrockProvider(BaseProvider):
                 )
 
             full_provider_name = getattr(self, "full_provider_name", "bedrock")
-            terminal_event_type = None
-            terminal_seen_at: Optional[float] = None
-            drained_event_count = 0
 
             try:
+                # messages.stream(...) yields the SDK's *processed* event union
+                # (synthesized TextEvent/InputJsonEvent, snapshot-enriched stops),
+                # which the shared generator serializes verbatim. The bounded
+                # post-terminal drain policy and event serialization are shared
+                # with the Azure Foundry / anthropic_compatible paths via
+                # stream_anthropic_sdk_events so cleanup semantics stay aligned
+                # across all three providers.
                 async with self._anthropic_client.messages.stream(**kwargs) as stream:
-                    async for event in stream:
-                        if terminal_event_type is not None:
-                            drained_event_count += 1
-                            drain_stop_reason = get_anthropic_post_terminal_drain_stop_reason(
-                                terminal_seen_at=terminal_seen_at,
-                                drained_event_count=drained_event_count,
-                            )
-                            if drain_stop_reason is not None:
-                                logger.warning(
-                                    "[BEDROCK STREAM NATIVE] post-terminal drain budget reached "
-                                    "provider=%s model=%s terminal_event=%s drained_event_count=%s stop_reason=%s",
-                                    full_provider_name,
-                                    request.model,
-                                    terminal_event_type,
-                                    drained_event_count,
-                                    drain_stop_reason,
-                                )
-                                break
-                            continue
-
-                        json_str = event.model_dump_json(exclude_none=True, warnings="none")
-                        event_data = json.loads(json_str)
-                        event_type = (
-                            event_data.get("type", "unknown")
-                            if isinstance(event_data, dict)
-                            else "unknown"
-                        )
-                        yield f"event: {event_type}\ndata: {json_str}\n\n"
-
-                        if is_anthropic_terminal_stream_event(
-                            event_type=event_type, event_data=event_data
-                        ):
-                            terminal_event_type = event_type
-                            terminal_seen_at = time.monotonic()
-                            logger.info(
-                                "[BEDROCK STREAM NATIVE] terminal event provider=%s model=%s event_type=%s",
-                                full_provider_name,
-                                request.model,
-                                event_type,
-                            )
+                    async for sse in stream_anthropic_sdk_events(
+                        stream,
+                        provider_label=full_provider_name,
+                        model=request.model,
+                        log=logger,
+                    ):
+                        yield sse
             except Exception as e:
                 raise self._translate_bedrock_sdk_error(e) from e
             return
@@ -2947,13 +3012,18 @@ class BedrockProvider(BaseProvider):
         try:
             # Hold the Converse permit only while opening the stream (boto3
             # returns once headers arrive), not while the client drains it.
-            async with _get_converse_semaphore():
+            async with self._get_converse_semaphore():
                 response = await run_in_threadpool(self.bedrock_runtime.converse_stream, **args)
         except ClientError as e:
             error = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
-            if error.get("Code") == "ValidationException":
+            code = error.get("Code")
+            if code == "ValidationException":
                 raise ValueError(error.get("Message") or str(e)) from e
-            raise
+            # Map throttling/quota/permission errors to their real HTTP status
+            # (429/403/...) with an Anthropic-shaped body instead of a 500.
+            mapped = _map_bedrock_error(code or "ClientError", error.get("Message", str(e)))
+            from fastapi import HTTPException
+            raise HTTPException(status_code=mapped["status"], detail=mapped["body"]) from e
         stream = response.get("stream")
 
         message_id = f"msg_{uuid.uuid4().hex}"

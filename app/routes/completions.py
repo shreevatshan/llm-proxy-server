@@ -1,7 +1,11 @@
+import logging
+import time
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse
 from app.openai_models import CompletionRequest, CompletionResponse
 from app.providers.provider_manager import provider_manager
+from app.providers.base import ProviderHTTPError
+from app.routes._errors import openai_provider_error_response
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
@@ -9,6 +13,10 @@ from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.rate_limit import RateLimitExceeded
 from typing import Union
+from app.routes.stream_utils import (
+    stream_with_context_and_timeout,
+    STREAM_TIMEOUT_SECONDS,
+)
 from app.tracing import (
     get_w3c_traceparent,
     create_span,
@@ -16,6 +24,9 @@ from app.tracing import (
     set_span_error
 )
 from opentelemetry import trace
+from opentelemetry import context as otel_context
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -27,6 +38,7 @@ async def completions(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
     """Handle text completion requests."""
+    request_started_at = time.monotonic()
     # Create parent span for the entire completion request
     with create_span(
         "completion_request",
@@ -54,9 +66,19 @@ async def completions(
                 # Add W3C Trace Context header if available
                 if traceparent:
                     headers["traceparent"] = traceparent
-                
+
+                # Preserve trace context and apply streaming timeout / disconnect
+                # detection / cleanup, mirroring the chat completions handler.
+                current_context = otel_context.get_current()
+
                 return StreamingResponse(
-                    provider_manager.completion_stream(request),
+                    stream_with_context_and_timeout(
+                        provider_manager.completion_stream(request),
+                        current_context,
+                        request_obj,
+                        timeout=STREAM_TIMEOUT_SECONDS,
+                        request_started_at=request_started_at,
+                    ),
                     media_type="text/event-stream",
                     headers=headers
                 )
@@ -67,9 +89,13 @@ async def completions(
                 return response
         except (HTTPException, RateLimitExceeded, ModelAccessDenied):
             raise
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Completion error: {str(e)}")
+            logger.error("Completion error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Completion error")

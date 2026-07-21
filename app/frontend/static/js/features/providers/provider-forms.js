@@ -3,6 +3,12 @@
  * Handles provider form generation, validation, and submission
  */
 
+// The backend never returns real secrets: GET /admin/providers/detail masks
+// them with this fixed placeholder (see _mask_secret in app/routes/admin.py).
+// These fields must never be pre-filled with (or submitted as) the mask.
+const SECRET_MASK = '********';
+const SECRET_FIELDS = ['api_key', 'secret_access_key'];
+
 class ProviderFormManager {
     constructor() {
         this.isSubmitting = false;
@@ -340,7 +346,13 @@ class ProviderFormManager {
             fields.forEach(field => {
                 const element = document.getElementById(field);
                 if (element && element.value.trim()) {
-                    formData[field] = element.value.trim();
+                    const value = element.value.trim();
+                    // Never submit the masked placeholder as a credential; omitting
+                    // the field keeps the currently stored secret unchanged.
+                    if (SECRET_FIELDS.includes(field) && value === SECRET_MASK) {
+                        return;
+                    }
+                    formData[field] = value;
                 }
             });
 
@@ -428,7 +440,8 @@ class ProviderFormManager {
                 '/admin/providers';
             const method = isEdit ? 'PUT' : 'POST';
 
-            console.log('🌐 Sending request:', { url, method, formData });
+            // NOTE: never log `formData` here — it contains provider API keys/secrets.
+            console.log('🌐 Sending request:', { url, method });
 
             const response = await fetch(url, {
                 method: method,
@@ -620,6 +633,15 @@ class ProviderFormManager {
         fields.forEach(field => {
             const element = document.getElementById(field);
             if (element && provider[field]) {
+                // Secret fields come back as the fixed mask, never the real value.
+                // Leave them empty so an untouched edit keeps the stored secret
+                // instead of overwriting it with the mask string.
+                if (SECRET_FIELDS.includes(field) && provider[field] === SECRET_MASK) {
+                    element.value = '';
+                    element.placeholder = 'Leave blank to keep the current value';
+                    element.required = false;
+                    return;
+                }
                 element.value = provider[field];
             }
         });

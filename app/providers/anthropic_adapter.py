@@ -102,7 +102,9 @@ def prepare_anthropic_adapter_request(
         if key in _TOP_LEVEL_ADAPTER_ONLY_FIELDS:
             raw.pop(key, None)
             dropped_fields.append(key)
-        elif key not in _KNOWN_ANTHROPIC_FIELDS and key not in {"metadata"}:
+        elif key not in _KNOWN_ANTHROPIC_FIELDS:
+            # "metadata" is already in _KNOWN_ANTHROPIC_FIELDS, so no separate
+            # exclusion is needed here.
             raw.pop(key, None)
             dropped_fields.append(key)
 

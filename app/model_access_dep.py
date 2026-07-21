@@ -3,10 +3,13 @@
 Mirrors app/rate_limit_dep.py: same call site (right after the group
 rate-limit check) so `auth` and the request model are already in scope.
 
-Access decision (see app/cache.py:is_model_allowed_for_user):
-  1. Globally disabled model/provider -> denied (unchanged global behavior).
-  2. Explicit per-user exception -> use it.
-  3. Otherwise the user's default policy (absent -> allow-all / blocklist).
+Access decision (see app/cache.py:is_model_allowed_for_user), resolved by the
+user's access mode:
+  - allow  : always allowed, even for a globally disabled model/provider
+             (the per-user allow mode overrides the global gate).
+  - deny   : always denied.
+  - custom : an explicit per-model exception wins; otherwise the global gate applies.
+  - default: follow the global gate (globally disabled model/provider -> denied).
 AdminUser bypasses all checks.
 """
 

@@ -164,15 +164,32 @@ async def shared_shutdown():
     print("Application shutdown complete")
 
 
-def _add_cors(app: FastAPI):
-    """Add standard CORS middleware to an app."""
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=".*",
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+def _add_cors(app: FastAPI, *, allow_credentials: bool = False):
+    """Add CORS middleware to an app.
+
+    Bearer-token API apps (allow_credentials=False, the default) can safely use a
+    wildcard origin because they never rely on cookies. The cookie-authenticated
+    management app must pass allow_credentials=True, which requires an explicit
+    origin allowlist (config.server.cors_allow_origins): browsers forbid
+    credentialed requests against a wildcard, and reflecting any origin *with*
+    credentials is the canonical credentialed-CORS vulnerability.
+    """
+    if allow_credentials:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.server.cors_allow_origins,
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+    else:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
 
 def _instrument_app(app: FastAPI, name: str):
@@ -187,6 +204,11 @@ def _instrument_app(app: FastAPI, name: str):
 
 _TRACKED_PREFIXES = ("/v1/", "/openai/deployments/")
 _EXCLUDED_PATHS = ("/v1/messages/count_tokens",)
+
+# Max body size the tracking middleware will buffer purely to sniff the "model"
+# field. Above this, we skip the sniff (audio/image uploads shouldn't be pulled
+# fully into memory here) and rely on the path-based fallback where available.
+_MAX_SNIFF_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 
 def _model_from_multipart(body: bytes, content_type: str) -> Optional[str]:
@@ -274,29 +296,48 @@ def _add_request_tracking(app: FastAPI, server_name: str):
         model = None
         is_streaming = False
         if request.method == "POST":
-            try:
-                body_bytes = await request.body()
-                body_json = json.loads(body_bytes)
-                model = body_json.get("model")
-                is_streaming = bool(body_json.get("stream", False))
-            except Exception:
-                body_bytes = b""
+            body_bytes = b""  # keep buffered bytes even if JSON parsing fails
 
-            # Multipart endpoints (audio transcription/translation, image
-            # edit/variation) carry the model as a form field, not JSON, so the
-            # json.loads above fails and leaves model=None.  Read just the model
-            # field from the already-buffered body (see _model_from_multipart).
+            # Skip buffering/sniffing very large bodies (e.g. audio/image uploads)
+            # to avoid pulling the whole upload into memory just to read one field.
+            content_length = request.headers.get("content-length")
+            too_large = (
+                content_length is not None
+                and content_length.isdigit()
+                and int(content_length) > _MAX_SNIFF_BODY_BYTES
+            )
             content_type = request.headers.get("content-type", "")
-            if not model and "multipart/form-data" in content_type:
-                model = _model_from_multipart(body_bytes, content_type.encode("latin-1"))
+
+            if not too_large:
+                body_bytes = await request.body()
+                # Wrap ONLY json.loads so a non-JSON (e.g. multipart) or malformed
+                # body doesn't clobber the buffered bytes we still need below.
+                try:
+                    body_json = json.loads(body_bytes)
+                    model = body_json.get("model")
+                    is_streaming = bool(body_json.get("stream", False))
+                except Exception:
+                    pass
+
+                # Multipart endpoints (audio transcription/translation, image
+                # edit/variation) carry the model as a form field, not JSON, so
+                # the json.loads above fails and leaves model=None. Read just the
+                # model field from the already-buffered body (_model_from_multipart).
+                if not model and "multipart/form-data" in content_type:
+                    model = _model_from_multipart(body_bytes, content_type.encode("latin-1"))
 
             # For Azure-style deployment paths the deployment name lives in the URL,
             # not the body (the Azure SDK omits the "model" field).  Fall back to
             # reconstructing it from the path so usage isn't recorded as "unknown".
-            # Path shape: /openai/deployments/{provider}/{deployment}/...
+            # Only the true deployment shape carries a deployment segment:
+            #   /openai/deployments/{provider}/{deployment}/...
+            # The deployment-scoped Responses API is /openai/deployments/{provider}/responses
+            # (no {deployment}); reconstructing "{provider}/responses" there would
+            # pollute usage with a fake model id, so it is excluded.
             if not model and path.startswith("/openai/deployments/"):
                 parts = path.split("/")
-                if len(parts) >= 5 and parts[3] and parts[4]:
+                if (len(parts) >= 6 and parts[3] and parts[4]
+                        and parts[4] != "responses"):
                     model = f"{parts[3]}/{parts[4]}"
 
             # No need to replace request._receive here.
@@ -341,13 +382,24 @@ def _add_request_tracking(app: FastAPI, server_name: str):
                                 error=tracking_final.get("error"),
                             )
                         else:
-                            await request_tracker.end_request(request_id, status="completed")
+                            # No explicit outcome from the route: derive it from
+                            # the HTTP status code so error responses returned
+                            # without raising (e.g. a handler or exception
+                            # handler returning a 4xx/5xx JSONResponse) are not
+                            # counted as successful. Note BaseHTTPMiddleware's
+                            # call_next wraps EVERY response (including plain
+                            # JSONResponse) in a body_iterator-carrying
+                            # _StreamingResponse, so this path handles
+                            # non-streaming responses too.
+                            status_code = getattr(response, "status_code", 200)
+                            final_status = "completed" if status_code < 400 else "errored"
+                            await request_tracker.end_request(request_id, status=final_status)
 
                 response.body_iterator = tracking_iterator()
             else:
-                # Non-streaming: derive the outcome from the HTTP status code so
-                # error responses returned without raising (e.g. a handler that
-                # returns a 4xx/5xx JSONResponse) are not counted as successful.
+                # Defensive: with BaseHTTPMiddleware this branch is not reached
+                # (call_next always returns a body_iterator wrapper), but keep
+                # the same status-code mapping in case that ever changes.
                 status_code = getattr(response, "status_code", 200)
                 final_status = "completed" if status_code < 400 else "errored"
                 await request_tracker.end_request(request_id, status=final_status)
@@ -403,13 +455,9 @@ def create_openai_app() -> FastAPI:
 
     @openai_app.get("/health")
     async def health_check():
-        from app.providers.provider_manager import provider_manager
-        return {
-            "status": "healthy",
-            "server": "openai",
-            "port": config.server.openai_port,
-            "enabled_providers": provider_manager.get_enabled_providers(),
-        }
+        # Unauthenticated: expose only liveness. Provider inventory is sensitive
+        # and must not leak to anyone who can reach the port.
+        return {"status": "healthy"}
 
     @openai_app.get("/api")
     async def api_info():
@@ -478,13 +526,8 @@ def create_anthropic_app() -> FastAPI:
 
     @anthropic_app.get("/health")
     async def health_check():
-        from app.providers.provider_manager import provider_manager
-        return {
-            "status": "healthy",
-            "server": "anthropic",
-            "port": config.server.anthropic_port,
-            "enabled_providers": provider_manager.get_enabled_providers(),
-        }
+        # Unauthenticated: expose only liveness (no provider inventory).
+        return {"status": "healthy"}
 
     @anthropic_app.get("/api")
     async def api_info():
@@ -590,13 +633,8 @@ def create_azure_openai_app() -> FastAPI:
 
     @azure_openai_app.get("/health")
     async def health_check():
-        from app.providers.provider_manager import provider_manager
-        return {
-            "status": "healthy",
-            "server": "azure_openai",
-            "port": config.server.azure_openai_port,
-            "enabled_providers": provider_manager.get_enabled_providers(),
-        }
+        # Unauthenticated: expose only liveness (no provider inventory).
+        return {"status": "healthy"}
 
     @azure_openai_app.get("/api")
     async def api_info():
@@ -673,8 +711,33 @@ def create_management_app(
         lifespan=lifespan
     )
 
-    _add_cors(mgmt_app)
+    _add_cors(mgmt_app, allow_credentials=True)
     _instrument_app(mgmt_app, "Management")
+
+    # CSRF protection (double-submit cookie) for the cookie-authenticated
+    # management routes. Enforces on unsafe methods under /auth, /admin,
+    # /dashboard (exempting bootstrap login/signup and programmatic Bearer/
+    # api-key clients), and issues the CSRF cookie on browser navigations.
+    from fastapi.responses import JSONResponse as _CsrfJSONResponse
+    from app.auth.csrf import (
+        csrf_should_protect,
+        csrf_token_valid,
+        csrf_should_issue,
+        set_csrf_cookie,
+        generate_csrf_token,
+    )
+
+    @mgmt_app.middleware("http")
+    async def csrf_middleware(request: Request, call_next):
+        if csrf_should_protect(request) and not csrf_token_valid(request):
+            return _CsrfJSONResponse(
+                status_code=403,
+                content={"detail": "CSRF token missing or invalid"},
+            )
+        response = await call_next(request)
+        if csrf_should_issue(request):
+            set_csrf_cookie(response, generate_csrf_token())
+        return response
 
     templates = Jinja2Templates(directory="app/frontend/templates")
     mgmt_app.mount("/static", StaticFiles(directory="app/frontend/static"), name="static")
@@ -722,18 +785,8 @@ def create_management_app(
 
     @mgmt_app.get("/health")
     async def health_check():
-        from app.providers.provider_manager import provider_manager
-        return {
-            "status": "healthy",
-            "server": "management",
-            "port": config.server.management_port,
-            "enabled_providers": provider_manager.get_enabled_providers(),
-            "server_config": {
-                "openai_port": config.server.openai_port,
-                "anthropic_port": config.server.anthropic_port,
-                "azure_openai_port": config.server.azure_openai_port,
-                "management_port": config.server.management_port,
-            }
-        }
+        # Unauthenticated: expose only liveness. Provider inventory and the port
+        # map are sensitive and must not leak to unauthenticated callers.
+        return {"status": "healthy"}
 
     return mgmt_app

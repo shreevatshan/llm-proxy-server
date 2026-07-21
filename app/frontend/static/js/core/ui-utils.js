@@ -121,7 +121,8 @@ function showTab(tabName) {
     });
 
     // Show selected tab
-    document.getElementById(tabName + '-tab').style.display = 'block';
+    const selectedTab = document.getElementById(tabName + '-tab');
+    if (selectedTab) selectedTab.style.display = 'block';
 
     // Add active class to selected button (find the button that corresponds to this tab)
     const tabButton = document.querySelector(`[onclick="showTab('${tabName}')"]`);
@@ -178,10 +179,19 @@ function showRateLimitSubTab(name) {
 }
 
 // Utility Functions
+// Encodes HTML-special characters including quotes so the result is safe to
+// interpolate into both element text and quoted attribute values. The plain
+// textContent round-trip does NOT encode " ' or `, so we build the string
+// manually with replace().
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/`/g, '&#96;');
 }
 
 // Export functions for global access

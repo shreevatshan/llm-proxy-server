@@ -104,8 +104,7 @@ class ModelsManager {
             if (el) el.style.display = key === which ? '' : 'none';
         });
     }
-
-    // Right-pane banner that states, in words, which scope is being edited.
+    
     _setScopeBanner(kind, name) {
         const el = document.getElementById('ma-scope-banner');
         if (!el) return;

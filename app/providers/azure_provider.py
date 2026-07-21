@@ -1,6 +1,9 @@
+import asyncio
+import re
 import time
 import json
 import logging
+from collections import OrderedDict
 from contextvars import ContextVar
 from typing import List, Dict, Any, AsyncGenerator, Optional
 from openai import AsyncAzureOpenAI, AsyncOpenAI
@@ -29,8 +32,9 @@ from app.providers.anthropic_adapter import (
 from app.providers.anthropic_compatible import (
     # Azure Foundry native Anthropic streams intentionally share the same
     # bounded post-terminal drain policy as direct Anthropic-compatible
-    # providers so cleanup semantics stay aligned.
-    get_anthropic_post_terminal_drain_stop_reason,
+    # providers so cleanup semantics stay aligned — via the shared
+    # stream_anthropic_sdk_events generator below.
+    stream_anthropic_sdk_events,
     _translate_anthropic_sdk_error,
 )
 from app.anthropic_models import (
@@ -50,6 +54,40 @@ _AZURE_FOUNDRY_ANTHROPIC_BETA_SUPPORTED = {
     "interleaved-thinking-2025-05-14",
     "context-management-2025-06-27",
 }
+
+# Accepted Azure OpenAI api-version strings, e.g. "2024-10-21",
+# "2024-10-21-preview", "preview", "latest". Anything else is rejected so a
+# client cannot mint unbounded distinct cache keys via arbitrary ?api-version=.
+_AZURE_API_VERSION_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}(-preview)?|preview|latest|v1)$")
+
+# Bound on the per-provider AsyncAzureOpenAI deployment-client LRU cache. Each
+# client owns its own httpx connection pool / file descriptors; without a bound,
+# distinct inbound api-version values would grow this without limit.
+_MAX_DEPLOYMENT_CLIENTS = 8
+
+# Grace period before actually closing an evicted deployment client, so an
+# in-flight request/stream still holding a reference can finish first (mirrors
+# ProviderManager._deferred_close_providers).
+_EVICTED_CLIENT_CLOSE_GRACE_SECONDS = 5.0
+
+# Max length of an upstream response body echoed into an error string (SSRF /
+# information-disclosure guard).
+_MAX_ERROR_BODY_CHARS = 500
+
+
+def _validate_azure_endpoint(endpoint: str) -> None:
+    """Reject non-http(s) Azure endpoint URLs (SSRF hardening).
+
+    Endpoints are admin-supplied and later used for outbound requests; requiring
+    an http/https scheme with a host blocks obviously malformed / non-web URLs.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            f"Invalid Azure endpoint URL (must be http(s) with a host): {endpoint!r}"
+        )
 
 
 class AzureProvider(OpenAICompatibleProvider):
@@ -101,6 +139,9 @@ class AzureProvider(OpenAICompatibleProvider):
         if not self.api_key:
             raise ValueError("Azure OpenAI provider requires 'api_key' to be configured")
 
+        # Reject non-http(s) endpoints up front (SSRF hardening).
+        _validate_azure_endpoint(self.endpoint)
+
         # Initialize the v1 API client (standard OpenAI SDK).
         # Azure's v1 API (GA Aug 2025) uses /openai/v1/ base path with standard OpenAI()
         # client.  This replaces the need for api-version and AzureOpenAI() for v1 callers.
@@ -112,9 +153,13 @@ class AzureProvider(OpenAICompatibleProvider):
         # Backward-compat alias used by OpenAICompatibleProvider._get_responses_client()
         self._responses_client = self._v1_client
 
-        # Cache of AsyncAzureOpenAI clients keyed by api-version string.
-        # Populated lazily by _get_deployment_client() per inbound request api-version.
-        self._deployment_clients: Dict[str, AsyncAzureOpenAI] = {}
+        # Bounded LRU cache of AsyncAzureOpenAI clients keyed by api-version
+        # string. Populated lazily by _get_deployment_client() per inbound
+        # request api-version; evicted clients are closed to release FDs.
+        self._deployment_clients: "OrderedDict[str, AsyncAzureOpenAI]" = OrderedDict()
+        # Strong refs to pending deferred-close tasks so they aren't GC'd
+        # before running; each task discards itself on completion.
+        self._pending_close_tasks: set = set()
 
         # All inference goes through the v1 client; deployment-style callers get a
         # per-request AsyncAzureOpenAI built from the inbound ?api-version= param.
@@ -177,15 +222,58 @@ class AzureProvider(OpenAICompatibleProvider):
             raise ValueError(
                 "api-version is required for deployment-style calls to this Azure provider"
             )
+        # Reject malformed api-version values so a client can't create unbounded
+        # distinct cache entries (each backed by its own connection pool/FDs).
+        if not _AZURE_API_VERSION_RE.match(eff):
+            raise ValueError(f"Invalid Azure api-version: {eff!r}")
+
         client = self._deployment_clients.get(eff)
-        if client is None:
-            client = AsyncAzureOpenAI(
-                azure_endpoint=self.endpoint,
-                api_key=self.api_key,
-                api_version=eff,
-            )
-            self._deployment_clients[eff] = client
+        if client is not None:
+            # Mark as most-recently-used.
+            self._deployment_clients.move_to_end(eff)
+            return client
+
+        # Bound the cache: evict and close the least-recently-used client.
+        while len(self._deployment_clients) >= _MAX_DEPLOYMENT_CLIENTS:
+            _evicted_key, evicted = self._deployment_clients.popitem(last=False)
+            self._schedule_client_close(evicted)
+
+        client = AsyncAzureOpenAI(
+            azure_endpoint=self.endpoint,
+            api_key=self.api_key,
+            api_version=eff,
+        )
+        self._deployment_clients[eff] = client
         return client
+
+    def _schedule_client_close(self, client: AsyncAzureOpenAI) -> None:
+        """Best-effort async close of an evicted deployment client.
+
+        _get_deployment_client is sync (called from the request path under a
+        running loop), so evicted clients are closed via a scheduled task.
+        The close is deferred by a grace period so another in-flight request
+        or stream still using the evicted client can finish first (mirrors
+        ProviderManager._deferred_close_providers).
+        """
+        async def _close() -> None:
+            try:
+                await asyncio.sleep(_EVICTED_CLIENT_CLOSE_GRACE_SECONDS)
+            except asyncio.CancelledError:
+                # On shutdown, close immediately rather than skipping cleanup.
+                pass
+            try:
+                await client.close()
+            except Exception as e:
+                logger.warning("Failed to close evicted Azure deployment client: %s", e)
+
+        try:
+            task = asyncio.get_running_loop().create_task(_close())
+            self._pending_close_tasks.add(task)
+            task.add_done_callback(self._pending_close_tasks.discard)
+        except RuntimeError:
+            # No running loop (unexpected on the request path) — skip; the client
+            # will be reclaimed on interpreter shutdown.
+            pass
 
     def _is_claude_model(self, model_name: str) -> bool:
         return "claude" in self.get_model_id(model_name).lower()
@@ -329,7 +417,7 @@ class AzureProvider(OpenAICompatibleProvider):
                     raise ValueError(
                         "Azure provider requires manual model entries when dynamic_discovery is False"
                     )
-                print(f"Azure provider using configured models: {manual_models}")
+                logger.info("Azure provider using %d configured models", len(manual_models))
                 return manual_models
 
             if not self.discovery_api_version:
@@ -353,19 +441,23 @@ class AzureProvider(OpenAICompatibleProvider):
                             for item in data.get("data", [])
                             if item.get("id")
                         ]
-                        print(
-                            f"Azure provider ({self.azure_backend}) discovered "
-                            f"{len(models)} models via models API: {models}"
+                        logger.info(
+                            "Azure provider (%s) discovered %d models via models API",
+                            self.azure_backend,
+                            len(models),
                         )
                         return models
                     else:
-                        body = await response.text()
+                        # Truncate the upstream body so a misconfigured endpoint
+                        # can't spill large/sensitive responses into error strings
+                        # returned by the admin API.
+                        body = (await response.text())[:_MAX_ERROR_BODY_CHARS]
                         raise Exception(
                             f"Azure models API returned HTTP {response.status}: {body}"
                         )
 
         except Exception as e:
-            print(f"Azure deployment fetch error: {e}")
+            logger.warning("Azure deployment fetch error: %s", e)
             raise Exception(f"Failed to fetch deployments: {e}")
 
     async def responses_input_tokens(self, request, **kwargs):
@@ -437,7 +529,8 @@ class AzureProvider(OpenAICompatibleProvider):
         ])
         if not self._is_foundry_backend():
             endpoints.append("/openai/v1/responses")
-        if not self._is_foundry_backend() and (self._responses_client is not None or self.client is not None):
+            # self._responses_client and self.client are always set in __init__,
+            # so no additional client-presence guard is needed here.
             endpoints.append("/v1/responses")
         return endpoints
 
@@ -542,58 +635,12 @@ class AzureProvider(OpenAICompatibleProvider):
 
             try:
                 async with self._anthropic_client.messages.stream(**kwargs) as stream:
-                    terminal_event_type = None
-                    terminal_seen_at: Optional[float] = None
-                    drained_event_count = 0
-                    async for event in stream:
-                        if terminal_event_type is not None:
-                            drained_event_count += 1
-                            drain_stop_reason = get_anthropic_post_terminal_drain_stop_reason(
-                                terminal_seen_at=terminal_seen_at,
-                                drained_event_count=drained_event_count,
-                            )
-                            if drain_stop_reason is not None:
-                                logger.warning(
-                                    "Anthropic post-terminal drain budget reached for provider=azure-foundry model=%s terminal_event=%s drained_event_count=%s stop_reason=%s",
-                                    request.model,
-                                    terminal_event_type,
-                                    drained_event_count,
-                                    drain_stop_reason,
-                                )
-                                break
-                            continue
-                        if hasattr(event, "model_dump_json"):
-                            json_str = event.model_dump_json(exclude_none=True, warnings="none")
-                            event_data = json.loads(json_str)
-                        else:
-                            event_data = event
-                            json_str = json.dumps(event_data, ensure_ascii=False, separators=(",", ":"))
-                        event_type = (
-                            event_data.get("type", "unknown") if isinstance(event_data, dict) else "unknown"
-                        )
-                        sse = f"event: {event_type}\ndata: {json_str}\n\n"
+                    async for sse in stream_anthropic_sdk_events(
+                        stream,
+                        provider_label="azure-foundry",
+                        model=request.model,
+                    ):
                         yield sse
-
-                        if is_anthropic_terminal_stream_event(event_type=event_type, event_data=event_data):
-                            terminal_event_type = event_type
-                            terminal_seen_at = time.monotonic()
-                            logger.info(
-                                "Anthropic upstream stream reached terminal event for provider=azure-foundry model=%s event_type=%s",
-                                request.model,
-                                event_type,
-                            )
-
-                    if terminal_event_type is not None:
-                        drain_ms = 0.0
-                        if terminal_seen_at is not None:
-                            drain_ms = (time.monotonic() - terminal_seen_at) * 1000
-                        logger.info(
-                            "Anthropic stream completed after terminal event for provider=azure-foundry model=%s event_type=%s drained_event_count=%s post_terminal_drain_ms=%.1f",
-                            request.model,
-                            terminal_event_type,
-                            drained_event_count,
-                            drain_ms,
-                        )
             except ProviderHTTPError:
                 raise
             except Exception as e:

@@ -3,13 +3,15 @@ from contextvars import ContextVar
 import logging
 from typing import List, Dict, Any, AsyncGenerator
 from openai import AsyncOpenAI
-from app.providers.base import BaseProvider
+from app.providers.base import BaseProvider, ProviderHTTPError
 
 # When True, provider methods will NOT overwrite the upstream model name
 # in responses.  Set by the Azure OpenAI routes so the native model
 # version string (e.g. "gpt-4.1-2025-04-14") passes through untouched.
+# Default is False (proxy rewrites the model name to the requested name);
+# every read uses bare .get() so the declared default is the effective one.
 preserve_upstream_model: ContextVar[bool] = ContextVar(
-    "preserve_upstream_model", default=True
+    "preserve_upstream_model", default=False
 )
 
 # Extra HTTP headers to forward to the upstream provider (e.g. Azure "aoai-*"
@@ -48,6 +50,72 @@ from app.openai_models import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_API_KEY = "not-required"
+
+
+def _translate_openai_sdk_error(e: Exception, provider_name: str) -> ProviderHTTPError:
+    """Convert an OpenAI SDK exception into a ProviderHTTPError.
+
+    Preserves the real upstream HTTP status (401/429/4xx/5xx) instead of
+    collapsing everything to 500, and returns a sanitized error body rather
+    than ``str(e)`` — which for httpx/OpenAI SDK errors embeds internal upstream
+    base URLs and raw response bodies (internal-topology disclosure).
+    """
+    try:
+        import openai as _openai
+    except ImportError:
+        _openai = None
+
+    headers = None
+    try:
+        if hasattr(e, "response") and e.response is not None:
+            headers = dict(e.response.headers)
+    except Exception:
+        pass
+
+    if _openai is not None and isinstance(e, _openai.APIStatusError):
+        status = getattr(e, "status_code", None) or 502
+        # Forward the upstream's own JSON error body when available (it is the
+        # provider's error message, not internal topology); otherwise synthesize
+        # a generic envelope. Never embed str(e) (leaks the request URL).
+        body = e.body if isinstance(getattr(e, "body", None), dict) else None
+        if body is None or "error" not in body:
+            body = {
+                "error": {
+                    "message": f"Upstream provider returned status {status}",
+                    "type": "upstream_error",
+                    "code": status,
+                }
+            }
+        return ProviderHTTPError(
+            status_code=status,
+            message=f"Upstream provider '{provider_name}' returned status {status}",
+            body=body,
+            headers=headers,
+        )
+
+    if _openai is not None and isinstance(e, _openai.APITimeoutError):
+        message = f"Request to upstream provider '{provider_name}' timed out"
+        return ProviderHTTPError(
+            status_code=504,
+            message=message,
+            body={"error": {"message": message, "type": "timeout_error"}},
+        )
+
+    if _openai is not None and isinstance(e, (_openai.APIConnectionError, _openai.APIError)):
+        message = f"Connection to upstream provider '{provider_name}' failed"
+        return ProviderHTTPError(
+            status_code=502,
+            message=message,
+            body={"error": {"message": message, "type": "upstream_error"}},
+        )
+
+    # Fallback for any other error type — sanitized, no str(e) leak.
+    message = f"Upstream provider '{provider_name}' error"
+    return ProviderHTTPError(
+        status_code=502,
+        message=message,
+        body={"error": {"message": message, "type": "upstream_error"}},
+    )
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -93,6 +161,16 @@ class OpenAICompatibleProvider(BaseProvider):
         """
         return self.client
 
+    def _supports_stream_options(self) -> bool:
+        """Whether this provider accepts the OpenAI ``stream_options`` param.
+
+        The base streaming paths default ``stream_options={"include_usage": True}``.
+        Subclasses whose upstream rejects the parameter (e.g. GoogleProvider)
+        override this to return False so the default is never injected — this is
+        what makes their UNSUPPORTED_PARAMS filtering actually win.
+        """
+        return True
+
     # ==================== Initialization helpers ====================
 
     def _init_openai_client(self) -> None:
@@ -127,9 +205,17 @@ class OpenAICompatibleProvider(BaseProvider):
             if v is not None and v != [] and v != {}
         }
         
-        # If max_tokens is set, replace it with max_completion_tokens for newer models
-        # This ensures compatibility with models like GPT-4o, o1-preview that don't support max_tokens
-        if "max_tokens" in request_dict and request_dict["max_tokens"] is not None:
+        # If max_tokens is set, replace it with max_completion_tokens for newer
+        # chat models (GPT-4o, o1, etc.) that reject max_tokens.
+        # ONLY for chat completions: the legacy Completions API
+        # (CompletionRequest) has no max_completion_tokens parameter and would
+        # raise "unexpected keyword argument", and embeddings/audio/image/
+        # responses requests have no max_tokens to rename.
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and "max_tokens" in request_dict
+            and request_dict["max_tokens"] is not None
+        ):
             request_dict["max_completion_tokens"] = request_dict["max_tokens"]
             del request_dict["max_tokens"]  # Remove max_tokens to avoid conflicts
         
@@ -228,30 +314,38 @@ class OpenAICompatibleProvider(BaseProvider):
             # preserving response fidelity (e.g. annotations, refusal) and avoiding
             # extra null fields (e.g. reasoning_content, tool_call_id) not in the original.
             response_dict = response.model_dump(exclude_unset=True) if hasattr(response, 'model_dump') else response.dict()
-            if not preserve_upstream_model.get(False):
+            if not preserve_upstream_model.get():
                 response_dict["model"] = request.model  # Preserve original model name
             
             return ChatCompletionResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            # First-party validation errors (e.g. invalid Azure api-version →
+            # routes map ValueError to 400) and already-translated upstream
+            # errors must pass through untouched, not collapse into a 502.
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} chat completion error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     async def chat_completion_stream(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """Handle streaming chat completion request using OpenAI SDK."""
         model_id = self.get_model_id(request.model)
         request_dict = self._prepare_request_dict(request, model_id)
         request_dict["stream"] = True  # Ensure streaming is enabled
-        
-        # Ensure stream_options includes usage by default if not explicitly set
-        if "stream_options" not in request_dict or request_dict["stream_options"] is None:
-            request_dict["stream_options"] = {"include_usage": True}
-        elif isinstance(request_dict["stream_options"], dict) and "include_usage" not in request_dict["stream_options"]:
-            request_dict["stream_options"]["include_usage"] = True
-        
+
+        # Ensure stream_options includes usage by default if not explicitly set.
+        # Skipped when the provider declares stream_options unsupported so the
+        # subclass filter is not undone here.
+        if self._supports_stream_options():
+            if "stream_options" not in request_dict or request_dict["stream_options"] is None:
+                request_dict["stream_options"] = {"include_usage": True}
+            elif isinstance(request_dict["stream_options"], dict) and "include_usage" not in request_dict["stream_options"]:
+                request_dict["stream_options"]["include_usage"] = True
+
         try:
             # Remove any 'options' parameter that might have been passed through
             # Some providers like Ollama don't support this parameter
             request_dict.pop("options", None)
-            
+
             stream = await self._get_inference_client().chat.completions.create(**request_dict)
 
             async for chunk in stream:
@@ -262,7 +356,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 # Convert OpenAI chunk to dict for SSE serialization
                 try:
                     chunk_dict = chunk.model_dump(exclude_unset=True) if hasattr(chunk, 'model_dump') else chunk.dict()
-                    if not preserve_upstream_model.get(False):
+                    if not preserve_upstream_model.get():
                         chunk_dict["model"] = request.model  # Use original model name
                     
                     # Yield as SSE format
@@ -279,16 +373,36 @@ class OpenAICompatibleProvider(BaseProvider):
             
             # Send final done message
             yield self.format_sse_done()
-            
-        except Exception as e:
-            error_data = {
+
+        except ValueError as e:
+            # First-party validation error (e.g. invalid Azure api-version) —
+            # its message is client-actionable, not upstream leakage, so it
+            # must not be masked behind a generic 502.
+            yield self.format_sse_data({
                 "error": {
-                    "message": f"{self.provider_type} chat completion stream error: {str(e)}",
-                    "type": "server_error"
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "code": 400,
                 }
-            }
-            yield self.format_sse_data(error_data)
-    
+            })
+            yield self.format_sse_done()
+        except Exception as e:
+            # Sanitize: never stream str(e) (leaks upstream URLs/bodies). Preserve
+            # the real status/type when the SDK reports one, and pass an
+            # already-translated ProviderHTTPError through untouched.
+            translated = e if isinstance(e, ProviderHTTPError) else _translate_openai_sdk_error(e, self.provider_type)
+            err = translated.body.get("error", {}) if isinstance(translated.body, dict) else {}
+            yield self.format_sse_data({
+                "error": {
+                    "message": err.get("message", "Upstream provider error"),
+                    "type": err.get("type", "upstream_error"),
+                    "code": translated.status_code,
+                }
+            })
+            # Terminate the SSE stream so OpenAI-protocol clients that read until
+            # [DONE] don't hang treating the stream as truncated.
+            yield self.format_sse_done()
+
     # ==================== TEXT COMPLETION ====================
     
     async def completion(self, request: CompletionRequest) -> CompletionResponse:
@@ -305,30 +419,35 @@ class OpenAICompatibleProvider(BaseProvider):
 
             # Convert OpenAI SDK response to our Pydantic model to ensure proper serialization
             response_dict = response.model_dump(exclude_unset=True) if hasattr(response, 'model_dump') else response.dict()
-            if not preserve_upstream_model.get(False):
+            if not preserve_upstream_model.get():
                 response_dict["model"] = request.model  # Preserve original model name
 
             return CompletionResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            # Pass through untouched (see chat_completion).
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} completion error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     async def completion_stream(self, request: CompletionRequest) -> AsyncGenerator[str, None]:
         """Handle streaming text completion request using OpenAI SDK."""
         model_id = self.get_model_id(request.model)
         request_dict = self._prepare_request_dict(request, model_id)
         request_dict["stream"] = True  # Ensure streaming is enabled
-        
-        # Ensure stream_options includes usage by default if not explicitly set
-        if "stream_options" not in request_dict or request_dict["stream_options"] is None:
-            request_dict["stream_options"] = {"include_usage": True}
-        elif isinstance(request_dict["stream_options"], dict) and "include_usage" not in request_dict["stream_options"]:
-            request_dict["stream_options"]["include_usage"] = True
-        
+
+        # Ensure stream_options includes usage by default if not explicitly set.
+        # Skipped when the provider declares stream_options unsupported.
+        if self._supports_stream_options():
+            if "stream_options" not in request_dict or request_dict["stream_options"] is None:
+                request_dict["stream_options"] = {"include_usage": True}
+            elif isinstance(request_dict["stream_options"], dict) and "include_usage" not in request_dict["stream_options"]:
+                request_dict["stream_options"]["include_usage"] = True
+
         try:
             # Remove any 'options' parameter that might have been passed through
             # Some providers like Ollama don't support this parameter
             request_dict.pop("options", None)
-            
+
             stream = await self._get_inference_client().completions.create(**request_dict)
 
             async for chunk in stream:
@@ -339,7 +458,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 # Convert OpenAI chunk to dict for SSE serialization
                 try:
                     chunk_dict = chunk.model_dump(exclude_unset=True) if hasattr(chunk, 'model_dump') else chunk.dict()
-                    if not preserve_upstream_model.get(False):
+                    if not preserve_upstream_model.get():
                         chunk_dict["model"] = request.model  # Use original model name
                     
                     # Yield as SSE format
@@ -356,16 +475,30 @@ class OpenAICompatibleProvider(BaseProvider):
             
             # Send final done message
             yield self.format_sse_done()
-            
-        except Exception as e:
-            error_data = {
+
+        except ValueError as e:
+            # Client-actionable first-party error (see chat_completion_stream).
+            yield self.format_sse_data({
                 "error": {
-                    "message": f"{self.provider_type} completion stream error: {str(e)}",
-                    "type": "server_error"
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "code": 400,
                 }
-            }
-            yield self.format_sse_data(error_data)
-    
+            })
+            yield self.format_sse_done()
+        except Exception as e:
+            # Sanitize + terminate the stream (see chat_completion_stream).
+            translated = e if isinstance(e, ProviderHTTPError) else _translate_openai_sdk_error(e, self.provider_type)
+            err = translated.body.get("error", {}) if isinstance(translated.body, dict) else {}
+            yield self.format_sse_data({
+                "error": {
+                    "message": err.get("message", "Upstream provider error"),
+                    "type": err.get("type", "upstream_error"),
+                    "code": translated.status_code,
+                }
+            })
+            yield self.format_sse_done()
+
     # ==================== EMBEDDINGS ====================
     
     async def embeddings(self, request: EmbeddingRequest) -> EmbeddingResponse:
@@ -382,12 +515,17 @@ class OpenAICompatibleProvider(BaseProvider):
 
             # Convert response and preserve model name
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
-            if not preserve_upstream_model.get(False):
+            if not preserve_upstream_model.get():
                 response_dict["model"] = request.model
             
             return EmbeddingResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            # Pass through untouched (see chat_completion).
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} embeddings error: {str(e)}")
+            # Sanitize: never embed str(e) (leaks upstream URLs/bodies);
+            # preserve the real upstream status when the SDK reports one.
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     # ==================== AUDIO METHODS ====================
     
@@ -399,8 +537,10 @@ class OpenAICompatibleProvider(BaseProvider):
         try:
             response = await self._get_inference_client().audio.speech.create(**request_dict)
             return response.content
+        except (ValueError, ProviderHTTPError):
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} audio speech error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     async def audio_transcription(self, request: AudioTranscriptionRequest) -> AudioTranscriptionResponse:
         """Handle audio transcription request using OpenAI SDK."""
@@ -418,8 +558,10 @@ class OpenAICompatibleProvider(BaseProvider):
                 # For JSON format (default), convert response to our model
                 response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
                 return AudioTranscriptionResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} audio transcription error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     async def audio_translation(self, request: AudioTranslationRequest) -> AudioTranslationResponse:
         """Handle audio translation request using OpenAI SDK."""
@@ -437,8 +579,10 @@ class OpenAICompatibleProvider(BaseProvider):
                 # For JSON format (default), convert response to our model
                 response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
                 return AudioTranslationResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} audio translation error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     # ==================== IMAGE METHODS ====================
     
@@ -453,8 +597,10 @@ class OpenAICompatibleProvider(BaseProvider):
             # Convert OpenAI response to our format
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
             return ImageResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} image generation error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     async def image_edit(self, request: ImageEditRequest) -> ImageResponse:
         """Handle image edit request using OpenAI SDK."""
@@ -467,8 +613,10 @@ class OpenAICompatibleProvider(BaseProvider):
             # Convert OpenAI response to our format
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
             return ImageResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} image edit error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     async def image_variation(self, request: ImageVariationRequest) -> ImageResponse:
         """Handle image variation request using OpenAI SDK."""
@@ -481,8 +629,10 @@ class OpenAICompatibleProvider(BaseProvider):
             # Convert OpenAI response to our format
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
             return ImageResponse(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} image variation error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     # ==================== RESPONSES API ====================
     
@@ -499,7 +649,7 @@ class OpenAICompatibleProvider(BaseProvider):
             response = await self._get_responses_client().responses.create(**request_dict)
             
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
-            if not preserve_upstream_model.get(False):
+            if not preserve_upstream_model.get():
                 response_dict["model"] = request.model  # Preserve original model name
             
             return ResponseObject(**response_dict)
@@ -521,7 +671,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     event_dict = event.model_dump() if hasattr(event, 'model_dump') else event.dict()
                     
                     # Preserve original model name in response.created events
-                    if not preserve_upstream_model.get(False):
+                    if not preserve_upstream_model.get():
                         if event_type == 'response.created' and 'response' in event_dict:
                             event_dict['response']['model'] = request.model
                     
@@ -539,14 +689,26 @@ class OpenAICompatibleProvider(BaseProvider):
             # Responses API streaming does NOT use data: [DONE]
             # The stream ends with response.completed / response.failed / response.incomplete
             
-        except Exception as e:
-            error_data = {
+        except ValueError as e:
+            # Client-actionable first-party error (see chat_completion_stream).
+            yield self.format_sse_event("error", {
                 "error": {
-                    "message": f"{self.provider_type} responses stream error: {str(e)}",
-                    "type": "server_error"
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "code": 400,
                 }
-            }
-            yield self.format_sse_event("error", error_data)
+            })
+        except Exception as e:
+            # Sanitize: never stream str(e) (leaks upstream URLs/bodies).
+            translated = e if isinstance(e, ProviderHTTPError) else _translate_openai_sdk_error(e, self.provider_type)
+            err = translated.body.get("error", {}) if isinstance(translated.body, dict) else {}
+            yield self.format_sse_event("error", {
+                "error": {
+                    "message": err.get("message", "Upstream provider error"),
+                    "type": err.get("type", "upstream_error"),
+                    "code": translated.status_code,
+                }
+            })
     
     async def responses_retrieve(self, response_id: str, **kwargs) -> ResponseObject:
         """Retrieve a response by ID using OpenAI SDK."""

@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Depends, Request
 from fastapi.responses import Response
+from pydantic import ValidationError
 from typing import Optional, List, Union
 import base64
 import io
@@ -12,6 +13,8 @@ from app.openai_models import (
     AudioTranslationResponse
 )
 from app.providers.provider_manager import provider_manager
+from app.providers.base import ProviderHTTPError
+from app.routes._errors import openai_provider_error_response
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
@@ -23,6 +26,18 @@ import logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# Valid audio speech formats. response_format is interpolated into the
+# Content-Disposition filename, so anything outside this set is rejected to
+# prevent header injection via CRLF/oddball bytes.
+_SPEECH_CONTENT_TYPES = {
+    "mp3": "audio/mpeg",
+    "opus": "audio/opus",
+    "aac": "audio/aac",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+    "pcm": "audio/pcm",
+}
 
 
 @router.post("/v1/audio/speech")
@@ -39,35 +54,37 @@ async def create_speech(
         await enforce_group_rate_limit(request_obj, auth, request.model)
         await enforce_model_access(request_obj, auth, request.model)
 
+        # Validate response_format before it is interpolated into the
+        # Content-Disposition header (guards against header injection).
+        response_format = request.response_format or "mp3"
+        if response_format not in _SPEECH_CONTENT_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid response_format: {response_format!r}. "
+                       f"Must be one of {sorted(_SPEECH_CONTENT_TYPES)}",
+            )
+
         # Get provider for the model
         provider_name, model_id = provider_manager._parse_model_name(request.model)
         provider = provider_manager._get_provider(provider_name)
-        
+
         # Generate speech
         audio_data = await provider.audio_speech(request)
-        
-        # Determine content type based on response format
-        content_type_map = {
-            "mp3": "audio/mpeg",
-            "opus": "audio/opus",
-            "aac": "audio/aac",
-            "flac": "audio/flac",
-            "wav": "audio/wav",
-            "pcm": "audio/pcm"
-        }
-        
-        content_type = content_type_map.get(request.response_format, "audio/mpeg")
-        
+
+        content_type = _SPEECH_CONTENT_TYPES[response_format]
+
         return Response(
             content=audio_data,
             media_type=content_type,
             headers={
-                "Content-Disposition": f"attachment; filename=speech.{request.response_format}"
+                "Content-Disposition": f"attachment; filename=speech.{response_format}"
             }
         )
-        
+
     except (HTTPException, RateLimitExceeded, ModelAccessDenied):
         raise
+    except ProviderHTTPError as e:
+        return openai_provider_error_response(e)
     except ValueError as e:
         # Bad model name / unknown provider is a client error, not a 500.
         error_msg = f"No provider found for model: {request.model}"
@@ -76,8 +93,8 @@ async def create_speech(
     except NotImplementedError as e:
         raise HTTPException(status_code=501, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in speech generation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error in speech generation: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/v1/audio/transcriptions", response_model=AudioTranscriptionResponse)
@@ -109,11 +126,8 @@ async def create_transcription(
         # Parse timestamp_granularities if provided
         granularities = None
         if timestamp_granularities:
-            try:
-                granularities = timestamp_granularities.split(',')
-            except:
-                granularities = [timestamp_granularities]
-        
+            granularities = timestamp_granularities.split(',')
+
         # Create request object
         request = AudioTranscriptionRequest(
             file=file_b64,
@@ -149,16 +163,21 @@ async def create_transcription(
         
     except (HTTPException, RateLimitExceeded, ModelAccessDenied):
         raise
+    except ValidationError as e:
+        # Invalid request parameters are a client 400, not a 500.
+        error_msg = "Invalid audio transcription request parameters"
+        logger.error(f"{error_msg} ({e})")
+        raise HTTPException(status_code=400, detail=error_msg)
     except ValueError as e:
         # Bad model name / unknown provider is a client error, not a 500.
-        error_msg = f"No provider found for model: {request.model}"
+        error_msg = f"No provider found for model: {model}"
         logger.error(f"{error_msg} ({e})")
         raise HTTPException(status_code=404, detail=error_msg)
     except NotImplementedError as e:
         raise HTTPException(status_code=501, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in audio transcription: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error in audio transcription: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @router.post("/v1/audio/translations", response_model=AudioTranslationResponse)
@@ -218,16 +237,21 @@ async def create_translation(
         
     except (HTTPException, RateLimitExceeded, ModelAccessDenied):
         raise
+    except ValidationError as e:
+        # Invalid request parameters are a client 400, not a 500.
+        error_msg = "Invalid audio translation request parameters"
+        logger.error(f"{error_msg} ({e})")
+        raise HTTPException(status_code=400, detail=error_msg)
     except ValueError as e:
         # Bad model name / unknown provider is a client error, not a 500.
-        error_msg = f"No provider found for model: {request.model}"
+        error_msg = f"No provider found for model: {model}"
         logger.error(f"{error_msg} ({e})")
         raise HTTPException(status_code=404, detail=error_msg)
     except NotImplementedError as e:
         raise HTTPException(status_code=501, detail=str(e))
     except Exception as e:
-        logger.error(f"Error in audio translation: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+        logger.error(f"Error in audio translation: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 def _convert_to_srt(result: AudioTranscriptionResponse) -> str:

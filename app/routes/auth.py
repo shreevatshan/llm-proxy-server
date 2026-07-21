@@ -28,8 +28,22 @@ from app.auth.admin import authenticate_admin, is_admin_enabled, AdminUser, get_
 from app.auth.models import User
 from app.auth.zoho_oauth import zoho_oauth
 from typing import Union
+import os
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
+
+# Name of the short-lived cookie holding the OAuth `state` value for CSRF
+# protection during the ZOHO OAuth redirect round-trip.
+_OAUTH_STATE_COOKIE = "zoho_oauth_state"
+
+
+def _cookie_secure() -> bool:
+    """Whether auth cookies should carry the Secure flag.
+
+    Defaults to True (production-safe); set COOKIE_SECURE=false for local
+    plaintext-HTTP development.
+    """
+    return os.getenv("COOKIE_SECURE", "true").lower() != "false"
 
 
 @router.post("/signup")
@@ -75,7 +89,7 @@ async def signup(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
             logger.error(f"Hash error traceback: {traceback.format_exc()}")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Password hashing failed: {str(hash_error)}"
+                detail="Failed to create user"
             )
         
         # Create user with pending approval (manual signups require admin approval)
@@ -104,7 +118,7 @@ async def signup(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create user: {str(e)}"
+            detail="Failed to create user"
         )
 
 
@@ -143,10 +157,10 @@ async def login(user_data: UserLogin, response: Response, db: AsyncSession = Dep
         value=access_token,
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         httponly=True,
-        secure=False,  # Set to True in production with HTTPS
+        secure=_cookie_secure(),
         samesite="lax"
     )
-    
+
     return {"access_token": access_token, "token_type": "bearer"}
 
 
@@ -186,6 +200,8 @@ async def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: Async
 async def logout(response: Response):
     """Logout user by clearing the authentication cookie."""
     response.delete_cookie(key="access_token")
+    from app.auth.csrf import clear_csrf_cookie
+    clear_csrf_cookie(response)
     return {"message": "Successfully logged out"}
 
 
@@ -253,7 +269,7 @@ async def list_user_api_keys(
             APIKeyListResponse(
                 id=key.id,
                 name=key.name,
-                api_key_preview=key.api_key[:8] + "..." if len(key.api_key) > 8 else key.api_key,
+                api_key_preview=(key.key_prefix + "...") if key.key_prefix else "***",
                 created_at=key.created_at,
                 last_used=key.last_used,
                 is_active=key.is_active
@@ -273,7 +289,11 @@ async def get_user_api_key(
     current_user: Union[User, AdminUser] = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Get a specific API key by ID (returns full API key) using query parameter."""
+    """Get a specific API key by ID (masked) using query parameter.
+
+    The full key is only shown once, at creation time. Read/detail responses
+    mask the stored value so it cannot be re-retrieved later.
+    """
     if isinstance(current_user, AdminUser):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -299,8 +319,18 @@ async def get_user_api_key(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="API key not found"
             )
-        
-        return APIKeyResponse.from_orm(api_key)
+
+        # Mask the stored key — never re-expose the full value after creation.
+        # The stored value is a SHA-256 hash; show the saved plaintext prefix.
+        masked = (api_key.key_prefix + "...") if api_key.key_prefix else "***"
+        return APIKeyResponse(
+            id=api_key.id,
+            name=api_key.name,
+            api_key=masked,
+            created_at=api_key.created_at,
+            last_used=api_key.last_used,
+            is_active=api_key.is_active,
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -605,32 +635,54 @@ async def zoho_login(request: Request):
             detail="ZOHO OAuth is not configured. Please set ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET environment variables."
         )
     
-    # Generate state parameter for security
+    # Generate state parameter for CSRF protection
     state = secrets.token_urlsafe(32)
-    
-    # Store state in session (you might want to use a more secure session storage)
-    # For now, we'll pass it through the OAuth flow
-    
+
     # Get authorization URL
     auth_url = await current_zoho_oauth.get_authorization_url(state=state)
-    
-    return RedirectResponse(url=auth_url)
+
+    # Store the state in a short-lived HttpOnly cookie so the callback can
+    # verify it matches, preventing login CSRF / session fixation.
+    redirect_response = RedirectResponse(url=auth_url)
+    redirect_response.set_cookie(
+        key=_OAUTH_STATE_COOKIE,
+        value=state,
+        max_age=600,  # 10 minutes — long enough for the OAuth round-trip
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+    )
+    return redirect_response
 
 
 @router.get("/zoho/callback")
-async def zoho_callback(code: str, state: str = None, location: str = None, 
+async def zoho_callback(request: Request, code: str, state: str = None, location: str = None,
                        db: AsyncSession = Depends(get_db)):
     """Handle ZOHO OAuth callback."""
     # Re-check if ZOHO OAuth is configured at runtime
     from app.auth.zoho_oauth import get_zoho_oauth
     current_zoho_oauth = get_zoho_oauth()
-    
+
     if not current_zoho_oauth:
         raise HTTPException(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail="ZOHO OAuth is not configured"
         )
-    
+
+    # Validate the OAuth `state` against the value set at /zoho/login (CSRF
+    # protection). Reject if missing or mismatched, then clear the cookie.
+    expected_state = request.cookies.get(_OAUTH_STATE_COOKIE)
+    # Compare as bytes: compare_digest raises TypeError on non-ASCII str, and
+    # `state` is attacker-controlled (would turn hostile input into a 500).
+    if not expected_state or not state or not secrets.compare_digest(
+        state.encode("utf-8"), expected_state.encode("utf-8")
+    ):
+        from urllib.parse import quote
+        msg = "OAuth state validation failed. Please try signing in again."
+        resp = RedirectResponse(url=f"/login?error={quote(msg)}", status_code=302)
+        resp.delete_cookie(key=_OAUTH_STATE_COOKIE)
+        return resp
+
     try:
         # Get user info from ZOHO
         user_info = await current_zoho_oauth.get_user_info(code, location)
@@ -673,7 +725,8 @@ async def zoho_callback(code: str, state: str = None, location: str = None,
                 last_name=user_info.last_name,
                 picture=user_info.picture,
                 raw_data=json.dumps(user_info.model_dump()),
-                is_pending=is_pending
+                is_pending=is_pending,
+                email_verified=bool(user_info.email_verified),
             )
 
             # Send signup webhook notification for new OAuth users
@@ -709,9 +762,11 @@ async def zoho_callback(code: str, state: str = None, location: str = None,
             value=access_token,
             max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
             httponly=True,
-            secure=False,  # Set to True in production with HTTPS
+            secure=_cookie_secure(),
             samesite="lax"
         )
+        # State validated; clear the one-time CSRF cookie.
+        redirect_response.delete_cookie(key=_OAUTH_STATE_COOKIE)
 
         return redirect_response
         
@@ -745,16 +800,23 @@ async def zoho_oauth_status():
 
 @router.get("/debug/auth-status")
 async def debug_auth_status(request: Request):
-    """Debug endpoint to check authentication status and cookies."""
+    """Debug endpoint to check authentication status and cookies.
+
+    Disabled by default: it reflects token internals (a token/account oracle),
+    so it is gated behind AUTH_DEBUG_ENDPOINT_ENABLED=true and returns 404
+    otherwise. The token preview is never returned.
+    """
+    if os.getenv("AUTH_DEBUG_ENDPOINT_ENABLED", "false").lower() != "true":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
     cookies = dict(request.cookies)
     access_token = cookies.get("access_token")
-    
+
     result = {
         "cookies": list(cookies.keys()),
         "has_access_token": bool(access_token),
-        "access_token_preview": access_token[:20] + "..." if access_token else None
     }
-    
+
     if access_token:
         try:
             from app.auth.auth import verify_token
@@ -762,8 +824,7 @@ async def debug_auth_status(request: Request):
             result["token_valid"] = True
             result["username"] = token_data.username
             result["is_admin"] = token_data.is_admin
-        except Exception as e:
+        except Exception:
             result["token_valid"] = False
-            result["token_error"] = str(e)
-    
+
     return result

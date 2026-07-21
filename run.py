@@ -12,53 +12,15 @@ LLM providers including Ollama, Azure OpenAI, AWS Bedrock, and GCP Gemini.
 # to prevent "Failed to detach context" errors in async code.
 import app.otel_patch  # noqa: F401
 
-# IMPORTANT: Monkey-patch json.dumps to handle Pydantic models
-# This must be done before any other imports that might use json.dumps
-import json
-from pydantic import BaseModel
-
-_original_json_dumps = json.dumps
-
-
-def _pydantic_default(o):
-    """Default handler for Pydantic models. Defined once at module level (no closure)."""
-    if isinstance(o, BaseModel):
-        if hasattr(o, 'model_dump'):
-            return o.model_dump()
-        elif hasattr(o, 'dict'):
-            return o.dict()
-    raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+# NOTE: We deliberately do NOT monkey-patch the stdlib json.dumps. Pydantic-aware
+# serialization is provided by app.serialization.safe_json_dumps, and every
+# first-party call site that emits a Pydantic model already converts it via
+# model_dump()/dict() before json.dumps(). Patching the global altered behavior
+# for every library in the process (and only dumps, not dump/JSONEncoder), which
+# is why it was removed.
 
 
-class _ChainedDefault:
-    """Callable that tries Pydantic serialization, then falls back to user default."""
-    __slots__ = ('_user_default',)
-
-    def __init__(self, user_default):
-        self._user_default = user_default
-
-    def __call__(self, o):
-        if isinstance(o, BaseModel):
-            if hasattr(o, 'model_dump'):
-                return o.model_dump()
-            elif hasattr(o, 'dict'):
-                return o.dict()
-        return self._user_default(o)
-
-
-def _patched_json_dumps(obj, *args, **kwargs):
-    """Patched json.dumps that handles Pydantic models."""
-    if 'default' not in kwargs:
-        kwargs['default'] = _pydantic_default
-    else:
-        kwargs['default'] = _ChainedDefault(kwargs['default'])
-    return _original_json_dumps(obj, *args, **kwargs)
-
-# Apply the monkey patch
-json.dumps = _patched_json_dumps
-
-
-# llm instrumentation packages 
+# llm instrumentation packages
 #from langtrace_python_sdk import langtrace
 from traceloop.sdk import Traceloop
 

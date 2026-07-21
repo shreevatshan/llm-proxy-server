@@ -18,32 +18,22 @@ document.addEventListener('DOMContentLoaded', function () {
 });
 
 async function checkAuthAndLoadData() {
-    const token = getAuthToken();
-    console.log('Token found:', token ? 'Yes' : 'No');
-
     try {
-        // Get current user info - this will work with both localStorage token and HTTP-only cookies
-        console.log('Making request to /auth/me');
+        // Get current user info — authenticated via the HttpOnly cookie.
         const response = await makeAuthenticatedRequest('/auth/me');
-        console.log('Response status:', response.status);
 
         if (response.ok) {
             currentUser = await response.json();
-            console.log('User authenticated:', currentUser.username);
             document.getElementById('welcomeMessage').textContent = `Welcome back, ${currentUser.username}!`;
 
             // Load API keys for regular users (admin users are redirected server-side)
             loadApiKeys();
         } else {
-            // Token is invalid, redirect to login
-            console.log('Token invalid, redirecting to login');
-            localStorage.removeItem('access_token');
+            // Not authenticated, redirect to login
             window.location.href = '/login';
         }
     } catch (error) {
-        // Network error or invalid token, redirect to login
-        console.log('Error during authentication:', error);
-        localStorage.removeItem('access_token');
+        // Network error or invalid session, redirect to login
         window.location.href = '/login';
     }
 }
@@ -71,10 +61,10 @@ async function loadApiKeys() {
             container.innerHTML = apiKeys.map((key, index) => `
                 <div class="d-flex justify-content-between align-items-center py-3" style="${index < apiKeys.length - 1 ? 'border-bottom: 1px solid var(--mono-4);' : ''}">
                     <div class="flex-grow-1">
-                        <strong>${key.name}</strong><br>
-                        <div class="api-key-display" id="api-key-${key.id}">
+                        <strong>${escapeHtml(key.name)}</strong><br>
+                        <div class="api-key-display" id="api-key-${escapeHtml(key.id)}">
                             <div class="mt-1" style="max-width: 400px;">
-                                <input type="text" class="form-control form-control-sm" id="full-api-key-${key.id}" value="${key.api_key_preview}" data-preview="${key.api_key_preview}" data-full-key="" readonly>
+                                <input type="text" class="form-control form-control-sm" id="full-api-key-${escapeHtml(key.id)}" value="${escapeHtml(key.api_key_preview)}" readonly>
                             </div>
                         </div>
                         <small class="text-muted">
@@ -83,18 +73,18 @@ async function loadApiKeys() {
                         </small>
                     </div>
                     <div class="btn-group btn-group-sm">
-                        <button class="btn btn-outline-secondary" onclick="copyApiKeyValue(${key.id})" id="copy-btn-${key.id}">
-                            <i class="fas fa-copy"></i>
-                        </button>
-                        <button class="btn btn-outline-primary" onclick="showApiKey(${key.id})" id="show-btn-${key.id}">
-                            <i class="fas fa-eye"></i>
-                        </button>
-                        <button class="btn btn-outline-danger" onclick="deleteApiKey(${key.id}, '${key.name}')">
+                        <button class="btn btn-outline-danger" data-action="delete-api-key" data-key-id="${escapeHtml(key.id)}" data-key-name="${escapeHtml(key.name)}">
                             <i class="fas fa-trash"></i>
                         </button>
                     </div>
                 </div>
             `).join('');
+
+            // Bind handlers via data-* so no dynamic value is ever interpolated
+            // into an inline handler.
+            container.querySelectorAll('[data-action="delete-api-key"]').forEach(el => {
+                el.addEventListener('click', () => deleteApiKey(el.dataset.keyId, el.dataset.keyName));
+            });
         }
     } catch (error) {
         document.getElementById('apiKeysContainer').innerHTML = `
@@ -141,141 +131,6 @@ function copyApiKey() {
     input.select();
     document.execCommand('copy');
     window.UIUtils.showToast('API key copied to clipboard!', 'success');
-}
-
-async function copyApiKeyValue(keyId) {
-    const input = document.getElementById(`full-api-key-${keyId}`);
-    if (input) {
-        // Check if we have the full key stored
-        let fullKey = input.getAttribute('data-full-key');
-        
-        // If we don't have the full key yet, fetch it
-        if (!fullKey) {
-            try {
-                const response = await makeAuthenticatedRequest(`/auth/api-keys/detail?api_key_id=${keyId}`);
-                if (response.ok) {
-                    const data = await response.json();
-                    fullKey = data.api_key;
-                    // Store it for future use
-                    input.setAttribute('data-full-key', fullKey);
-                } else {
-                    window.UIUtils.showToast('Failed to retrieve API key', 'error');
-                    return;
-                }
-            } catch (error) {
-                window.UIUtils.showToast('Network error. Please try again.', 'error');
-                return;
-            }
-        }
-        
-        // Copy the full key
-        if (fullKey) {
-            if (navigator.clipboard && window.isSecureContext) {
-                navigator.clipboard.writeText(fullKey).then(() => {
-                    window.UIUtils.showToast('API key copied to clipboard!', 'success');
-                }).catch(() => {
-                    fallbackCopyText(fullKey);
-                });
-            } else {
-                fallbackCopyText(fullKey);
-            }
-        }
-    }
-}
-
-function fallbackCopyText(text) {
-    try {
-        const textarea = document.createElement('textarea');
-        textarea.value = text;
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textarea);
-        window.UIUtils.showToast('API key copied to clipboard!', 'success');
-    } catch (error) {
-        window.UIUtils.showToast('Failed to copy. Please copy manually.', 'warning');
-    }
-}
-
-async function showApiKey(keyId) {
-    try {
-        // Show loading state
-        const showBtn = document.getElementById(`show-btn-${keyId}`);
-        const originalContent = showBtn.innerHTML;
-        showBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
-        showBtn.disabled = true;
-
-        // Fetch the full API key
-        const response = await makeAuthenticatedRequest(`/auth/api-keys/detail?api_key_id=${keyId}`);
-
-        if (response.ok) {
-            const data = await response.json();
-
-            // Update the input value with the full key and store it
-            const fullKeyInput = document.getElementById(`full-api-key-${keyId}`);
-            fullKeyInput.value = data.api_key;
-            fullKeyInput.setAttribute('data-full-key', data.api_key);
-
-            // Update button to show "Hide"
-            showBtn.innerHTML = '<i class="fas fa-eye-slash"></i>';
-            showBtn.onclick = () => hideApiKey(keyId);
-        } else {
-            const errorData = await response.json();
-            window.UIUtils.showToast(errorData.detail || 'Failed to retrieve API key', 'error');
-        }
-    } catch (error) {
-        window.UIUtils.showToast('Network error. Please try again.', 'error');
-    } finally {
-        // Reset button state
-        const showBtn = document.getElementById(`show-btn-${keyId}`);
-        showBtn.disabled = false;
-        if (showBtn.innerHTML.includes('spinner')) {
-            showBtn.innerHTML = '<i class="fas fa-eye"></i>';
-        }
-    }
-}
-
-function hideApiKey(keyId) {
-    // Restore the preview value
-    const fullKeyInput = document.getElementById(`full-api-key-${keyId}`);
-    const previewValue = fullKeyInput.getAttribute('data-preview');
-    fullKeyInput.value = previewValue;
-
-    // Update button to show "Show"
-    const showBtn = document.getElementById(`show-btn-${keyId}`);
-    showBtn.innerHTML = '<i class="fas fa-eye"></i>';
-    showBtn.onclick = () => showApiKey(keyId);
-}
-
-function copyFullApiKey(keyId) {
-    const input = document.getElementById(`full-api-key-${keyId}`);
-    if (input && input.value) {
-        // Use the modern clipboard API if available
-        if (navigator.clipboard && window.isSecureContext) {
-            navigator.clipboard.writeText(input.value).then(() => {
-                window.UIUtils.showToast('API key copied to clipboard!', 'success');
-            }).catch(() => {
-                // Fallback to the older method
-                fallbackCopy(input);
-            });
-        } else {
-            // Fallback for older browsers or non-secure contexts
-            fallbackCopy(input);
-        }
-    }
-}
-
-function fallbackCopy(input) {
-    try {
-        input.select();
-        input.setSelectionRange(0, 99999); // For mobile devices
-        document.execCommand('copy');
-        window.UIUtils.showToast('API key copied to clipboard!', 'success');
-    } catch (error) {
-        window.UIUtils.showToast('Failed to copy API key. Please copy manually.', 'warning');
-    }
 }
 
 async function deleteApiKey(keyId, keyName) {
@@ -548,8 +403,15 @@ function showDashboardToast(message, type) {
 // Shared helpers
 // ================================================================ //
 
+// Quote-safe HTML escaping (encodes " ' ` in addition to < > &) so output is
+// safe inside quoted attribute values as well as element text.
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = String(text);
-    return div.innerHTML;
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/`/g, '&#96;');
 }

@@ -61,8 +61,7 @@ data/
 docs/
 
 # Test files and results
-test/
-*.log
+tests/
 
 # Temporary files
 *.tmp

@@ -117,24 +117,39 @@ class RequestTracker:
         ]
 
         try:
-            from app.auth.database import flush_request_usage, flush_request_usage_hourly, prune_hourly_usage, rollup_to_monthly
+            from app.auth.database import (
+                flush_request_usage, flush_request_usage_hourly,
+                prune_hourly_usage, rollup_to_monthly,
+            )
+            # The two increment-on-conflict upserts are the only ops that consume
+            # the buffered counts. Run just those in the guarded block so a later
+            # failure in prune/rollup cannot leave the buffer uncleared and cause
+            # the next cycle to re-add the same counts (double-counting inflates
+            # usage and RPD decisions).
             await flush_request_usage_hourly(hourly_rows)
             await flush_request_usage(daily_rows)
-            await prune_hourly_usage()
+        except Exception as e:
+            logger.error(f"Usage flush failed, will retry next cycle: {e}")
+            return
 
-            # Throttle rollup to once per hour
+        # Both upserts committed — subtract exactly the flushed snapshot under the
+        # lock (increments that arrived during the write are preserved).
+        async with self._usage_lock:
+            for key, count in snapshot.items():
+                self._usage_buffer[key] -= count
+                if self._usage_buffer[key] <= 0:
+                    del self._usage_buffer[key]
+
+        # Maintenance (prune old hourly rows, throttled monthly rollup) is
+        # best-effort and independent of the buffer; its failure must not trigger
+        # a re-flush of already-committed usage.
+        try:
+            await prune_hourly_usage()
             if time.time() - self._last_rollup_at >= 3600:
                 await rollup_to_monthly()
                 self._last_rollup_at = time.time()
-
-            # Only clear after successful commit so get_today_count never sees a gap
-            async with self._usage_lock:
-                for key, count in snapshot.items():
-                    self._usage_buffer[key] -= count
-                    if self._usage_buffer[key] <= 0:
-                        del self._usage_buffer[key]
         except Exception as e:
-            logger.error(f"Usage flush failed, will retry next cycle: {e}")
+            logger.error(f"Usage maintenance (prune/rollup) failed: {e}")
 
     async def start_request(
         self,
@@ -323,6 +338,10 @@ class RequestTracker:
                 )
                 db_count = result.scalar() or 0
         except Exception:
+            logger.error(
+                "get_today_count DB read failed for %s; returning buffered-only count",
+                user_identity, exc_info=True,
+            )
             db_count = 0
 
         return buffered + db_count
@@ -355,6 +374,10 @@ class RequestTracker:
                 )
                 db_count = result.scalar() or 0
         except Exception:
+            logger.error(
+                "get_today_group_count DB read failed for %s; returning buffered-only count",
+                user_identity, exc_info=True,
+            )
             db_count = 0
 
         return buffered + db_count
@@ -398,6 +421,10 @@ class RequestTracker:
                 )
                 db_count = result.scalar() or 0
         except Exception:
+            logger.error(
+                "get_today_instance_group_count DB read failed for %s; returning buffered-only count",
+                user_identity, exc_info=True,
+            )
             db_count = 0
 
         return buffered + db_count
@@ -418,6 +445,17 @@ class RequestTracker:
                     dead.append(queue)
             for q in dead:
                 self._subscribers.discard(q)
+                # Signal end-of-stream so the consumer's queue.get() unblocks and
+                # the SSE handler closes, instead of hanging on keepalives forever
+                # (mirrors stop()). Best-effort: make room if the queue is full.
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    try:
+                        q.get_nowait()
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
 
     @staticmethod
     def _serialize(entry: ActiveRequest) -> dict:

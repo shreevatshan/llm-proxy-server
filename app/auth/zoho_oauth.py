@@ -1,12 +1,8 @@
 """ZOHO OAuth integration for authentication."""
 
-import os
-import base64
-import json
 import httpx
 from jose import jwt, JWTError
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
 from fastapi import HTTPException, status
 from urllib.parse import urlencode
 from pydantic import BaseModel
@@ -49,6 +45,7 @@ class ZohoOAuth:
         self.config = ZohoConfig()
         self._cached_base_url: Optional[str] = None
         self._cached_locations: Optional[Dict[str, str]] = None
+        self._cached_jwks: Optional[Dict[str, Any]] = None
         if not self.config.is_configured():
             raise ValueError("ZOHO OAuth is not properly configured. Please set ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET environment variables.")
     
@@ -102,6 +99,25 @@ class ZohoOAuth:
         
         return self._cached_base_url
     
+    async def _fetch_jwks(self, force_refresh: bool = False) -> Dict[str, Any]:
+        """Fetch (and cache) ZOHO's JWKS used to verify ID-token signatures.
+
+        Pass force_refresh=True to bypass the cache, e.g. when a token's ``kid``
+        is not in the cached set (ZOHO rotated its signing keys).
+        """
+        if self._cached_jwks and not force_refresh:
+            return self._cached_jwks
+
+        base_url = await self._get_base_url()
+        jwks_url = f"{base_url}/oauth/v2/keys"
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(jwks_url)
+            response.raise_for_status()
+            jwks = response.json()
+
+        self._cached_jwks = jwks
+        return jwks
+
     async def get_authorization_url(self, state: Optional[str] = None) -> str:
         """Generate ZOHO OAuth authorization URL."""
         base_url = await self._get_base_url()
@@ -161,39 +177,55 @@ class ZohoOAuth:
                 )
     
     async def decode_id_token(self, id_token: str) -> ZohoUserInfo:
-        """Decode and validate ZOHO ID token (JWT)."""
+        """Verify and decode a ZOHO ID token (JWT).
+
+        Verifies the RS256 signature against ZOHO's JWKS and enforces the
+        audience (client_id) and expiry via jose, then checks the issuer against
+        the fetched datacenter list.
+        """
         try:
-            # Manually decode JWT payload without verification
-            # JWT format: header.payload.signature
-            parts = id_token.split('.')
-            if len(parts) != 3:
-                raise ValueError("Invalid JWT format")
-            
-            # Decode the payload (second part)
-            payload = parts[1]
-            # Add padding if needed for base64 decoding
-            missing_padding = len(payload) % 4
-            if missing_padding:
-                payload += '=' * (4 - missing_padding)
-            
-            decoded_bytes = base64.urlsafe_b64decode(payload)
-            decoded_token = json.loads(decoded_bytes.decode('utf-8'))
-            
+            # Locate the signing key by 'kid' from the JWKS.
+            unverified_header = jwt.get_unverified_header(id_token)
+            kid = unverified_header.get("kid")
+
+            def _find_key(jwks: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+                for key in jwks.get("keys", []):
+                    if key.get("kid") == kid:
+                        return key
+                return None
+
+            signing_key = _find_key(await self._fetch_jwks())
+            if signing_key is None:
+                # Cached JWKS may be stale after a ZOHO key rotation — refetch
+                # once and retry before failing.
+                signing_key = _find_key(await self._fetch_jwks(force_refresh=True))
+            if signing_key is None:
+                raise ValueError("No matching signing key found in ZOHO JWKS for this token")
+
+            # Verify signature, audience and expiry.
+            decoded_token = jwt.decode(
+                id_token,
+                signing_key,
+                algorithms=["RS256"],
+                audience=self.config.client_id,
+                options={"verify_aud": True},
+            )
+
             # Validate required fields
             required_fields = ["sub", "email", "iss", "aud", "exp", "iat"]
             for field in required_fields:
                 if field not in decoded_token:
                     raise ValueError(f"Missing required field: {field}")
-            
+
             # Set default name if not present
             if "name" not in decoded_token:
                 decoded_token["name"] = decoded_token.get("email", "Unknown User")
-            
+
             # Validate issuer dynamically against fetched datacenters
             # The issuer can be in format "accounts.zoho.com" or "https://accounts.zoho.com"
             issuer = decoded_token["iss"]
             locations = await self._fetch_server_info()
-            
+
             # Build valid issuers from fetched locations (both with and without https://)
             valid_issuers = set()
             for base_url in locations.values():
@@ -201,30 +233,24 @@ class ZohoOAuth:
                 domain = base_url.replace("https://", "").replace("http://", "")
                 valid_issuers.add(domain)
                 valid_issuers.add(base_url)
-            
+
             if issuer not in valid_issuers:
                 raise ValueError(f"Invalid issuer: {issuer}")
-            
-            # Validate audience (client_id)
-            if decoded_token["aud"] != self.config.client_id:
-                raise ValueError(f"Invalid audience: {decoded_token['aud']}")
-            
-            # Check if token is expired
-            if decoded_token["exp"] < datetime.utcnow().timestamp():
-                raise ValueError("Token has expired")
-            
+
             return ZohoUserInfo(**decoded_token)
-            
+
         except JWTError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid ID token: {str(e)}"
+                detail=f"Invalid ID token signature/claims: {str(e)}"
             )
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Token validation failed: {str(e)}"
             )
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

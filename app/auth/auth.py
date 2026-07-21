@@ -8,7 +8,18 @@ from fastapi import HTTPException, status
 from .models import TokenData
 
 # JWT Configuration
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-this-in-production")
+# Fail fast if the signing key is unset or still a shipped placeholder: a known
+# key lets anyone forge admin tokens.
+_PLACEHOLDER_SECRETS = frozenset({
+    "your-secret-key-change-this-in-production",
+    "your-secret-key-here",  # shipped in .env.example
+})
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY or SECRET_KEY in _PLACEHOLDER_SECRETS:
+    raise RuntimeError(
+        "JWT_SECRET_KEY environment variable must be set to a strong, unique value. "
+        "Refusing to start with an unset or placeholder signing key."
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440
 

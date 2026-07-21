@@ -456,9 +456,10 @@
                 </button>
             </div>
             <div class="modal-body">
-                <div class="alert alert-info">
-                    <i class="fas fa-info-circle me-2"></i>
-                    <strong>API Key Created Successfully!</strong> You can copy it now or access it later from your dashboard.
+                <div class="alert alert-warning">
+                    <i class="fas fa-exclamation-triangle me-2"></i>
+                    <strong>Copy your API key now.</strong> For security, the full key is shown only
+                    once and cannot be displayed again. If you lose it, delete this key and create a new one.
                 </div>
                 <div class="mb-3">
                     <label class="form-label">Your new API key:</label>
@@ -514,6 +515,11 @@
     const _anthropicPort  = "{{ anthropic_port }}";
     const _azurePort      = "{{ azure_openai_port }}";
     const _managementPort = "{{ management_port }}";
+    {# SECURITY INVARIANT: the *_json context vars are pre-dumped by _safe_json
+       in app/routes/dashboard.py, which escapes `<`, `>`, `&` and U+2028/U+2029,
+       so the data cannot contain a literal `</script>` and `|safe` is safe here.
+       (`|tojson` would double-encode an already-dumped string.) Any new *_json
+       var rendered with `|safe` must also go through _safe_json. #}
     const endpointsData         = {{ openai_endpoints_json|safe }};
     const anthropicEndpointsData= {{ anthropic_endpoints_json|safe }};
     const azureEndpointsData    = {{ azure_endpoints_json|safe }};

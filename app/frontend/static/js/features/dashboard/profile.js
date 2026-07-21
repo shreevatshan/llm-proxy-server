@@ -74,32 +74,34 @@ document.getElementById('updateProfileForm')?.addEventListener('submit', async f
                 
                 // Set flag to prevent any other requests
                 window.profileUpdateSuccess = true;
-                
+
                 window.UIUtils.showToast('Username updated successfully! Redirecting to login...', 'success');
-                
-                // Clear authentication token to prevent unauthorized requests
-                localStorage.removeItem('access_token');
-                console.log('Cleared access_token from localStorage');
-                
-                // Clear any cookies that might contain auth tokens
-                document.cookie.split(";").forEach(function(c) { 
-                    document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/"); 
+
+                // The JWT lives in the HttpOnly cookie; clear any non-HttpOnly
+                // cookies so the stale session can't be reused before redirect.
+                document.cookie.split(";").forEach(function(c) {
+                    document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/");
                 });
-                console.log('Cleared all cookies');
-                
+
                 // Show message for 2 seconds before redirecting
                 setTimeout(() => {
                     // Stop all network requests
                     if (window.stop) {
                         window.stop();
                     }
-                    
+
                     // Force immediate redirect - multiple methods for redundancy
                     try {
                         window.location.replace('/login?updated=true&t=' + new Date().getTime());
                     } catch (e) {
-                        console.log('Replace failed, trying href:', e);
-                        window.location.href = '/login?updated=true&t=' + new Date().getTime();
+                        try {
+                            window.location.href = '/login?updated=true&t=' + new Date().getTime();
+                        } catch (e2) {
+                            // Redirect failed — clear the global block so the SPA
+                            // isn't permanently wedged with every request rejected.
+                            window.profileUpdateSuccess = false;
+                            window.UIUtils.showToast('Redirect failed. Please reload the page.', 'error');
+                        }
                     }
                 }, 2000);
             } else {

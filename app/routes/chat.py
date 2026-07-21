@@ -1,5 +1,3 @@
-import os
-import asyncio
 import json
 import time
 import logging
@@ -10,6 +8,8 @@ from fastapi.responses import StreamingResponse
 
 from app.openai_models import ChatCompletionRequest, ChatCompletionResponse
 from app.providers.provider_manager import provider_manager
+from app.providers.base import ProviderHTTPError
+from app.routes._errors import openai_provider_error_response
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
@@ -25,10 +25,8 @@ from app.tracing import (
 )
 from app.routes.stream_utils import (
     stream_with_context_and_timeout,
-    stream_with_context,
     STREAM_TIMEOUT_SECONDS,
     STREAM_CHUNK_TIMEOUT_SECONDS,
-    DISCONNECT_CHECK_INTERVAL
 )
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
@@ -78,7 +76,6 @@ async def chat_completions(
                 if x_transformation_context:
                     # Parse JSON context if provided
                     try:
-                        import json
                         additional_context = json.loads(x_transformation_context)
                         context.update(additional_context)
                     except json.JSONDecodeError:
@@ -149,9 +146,15 @@ async def chat_completions(
                 
         except (HTTPException, RateLimitExceeded, ModelAccessDenied):
             raise
+        except ProviderHTTPError as e:
+            # Preserve the upstream status (and Retry-After / rate-limit headers)
+            # instead of collapsing to a generic 500.
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Chat completion error: {str(e)}")
+            logger.error("Chat completion error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Chat completion error")

@@ -140,7 +140,7 @@ class StreamChunkTests(unittest.TestCase):
             }
         }
         resp, state = self.p._parse_stream_chunk(chunk, "id", "m", self.state)
-        self.assertEqual(resp["choices"][0]["delta"]["tool_calls"][0].index, 0)
+        self.assertEqual(resp["choices"][0]["delta"]["tool_calls"][0]["index"], 0)
         # The matching delta resolves to the same ordinal.
         delta_chunk = {
             "contentBlockDelta": {
@@ -149,7 +149,7 @@ class StreamChunkTests(unittest.TestCase):
             }
         }
         resp2, _ = self.p._parse_stream_chunk(delta_chunk, "id", "m", state)
-        self.assertEqual(resp2["choices"][0]["delta"]["tool_calls"][0].index, 0)
+        self.assertEqual(resp2["choices"][0]["delta"]["tool_calls"][0]["index"], 0)
 
     def test_reasoning_emits_reasoning_content(self):
         # A5: reasoning text on reasoning_content field, no <think> literals.
@@ -256,8 +256,11 @@ class BuildNativeSdkKwargsTests(unittest.TestCase):
             for m in kwargs["messages"] for b in (m.get("content") or [])
             if isinstance(b, dict)
         ]
-        self.assertIn("tool_result", types)
+        # web_search_tool_result is converted to a plain text block (not an
+        # orphan tool_result that would have no matching tool_use → API 400).
         self.assertNotIn("web_search_tool_result", types)
+        self.assertNotIn("tool_result", types)
+        self.assertIn("text", types)
 
     def test_skip_types_dropped(self):
         req = self._req(tools=[

@@ -109,15 +109,16 @@ class ProviderManager {
             }
             
             const enabledCount = typeProviders.filter(p => p.enabled).length;
+            const esc = window.UIUtils.escapeHtml;
 
             html += `
                 <div class="provider-type-section">
-                    <div class="provider-type-header" onclick="toggleProviderType('${groupKey}')">
-                        <i class="fas fa-chevron-down provider-type-icon" id="icon-${groupKey}"></i>
-                        <h3>${typeTitle}</h3>
+                    <div class="provider-type-header" data-action="toggle-type" data-group-key="${esc(groupKey)}">
+                        <i class="fas fa-chevron-down provider-type-icon" id="icon-${esc(groupKey)}"></i>
+                        <h3>${esc(typeTitle)}</h3>
                         <span class="provider-count">${enabledCount}/${typeProviders.length}</span>
                     </div>
-                    <div class="provider-type-content" id="content-${groupKey}">
+                    <div class="provider-type-content" id="content-${esc(groupKey)}">
             `;
 
             typeProviders.forEach(provider => {
@@ -137,18 +138,19 @@ class ProviderManager {
                 let apiBadges = '';
                 const supportedApis = provider.supported_apis || [];
                 if (supportedApis.length > 0) {
-                    apiBadges = supportedApis.map(api => 
-                        `<span class="badge bg-info ms-1" style="font-size: 0.65em;">${api}</span>`
+                    apiBadges = supportedApis.map(api =>
+                        `<span class="badge bg-info ms-1" style="font-size: 0.65em;">${esc(api)}</span>`
                     ).join('');
                 }
 
+                const pk = esc(provider.provider_key);
                 html += `
-                    <div class="unified-provider-card ${!provider.enabled ? 'disabled' : ''}" id="provider-${provider.provider_key}">
+                    <div class="unified-provider-card ${!provider.enabled ? 'disabled' : ''}" id="provider-${pk}">
                         <div class="provider-card-header">
                             <div class="provider-info">
                                 <div class="provider-title">
-                                    <h4>${provider.instance_name}</h4>
-                                    <span class="provider-type-badge">${badgeName}</span>${apiBadges}
+                                    <h4>${esc(provider.instance_name)}</h4>
+                                    <span class="provider-type-badge">${esc(badgeName)}</span>${apiBadges}
                                 </div>
                                 <div class="provider-status">
                                     <span class="status-badge ${statusClass}">${statusText}</span>
@@ -160,13 +162,13 @@ class ProviderManager {
                             <div class="provider-actions">
                                 <label class="toggle-switch">
                                     <input type="checkbox" ${provider.enabled ? 'checked' : ''}
-                                           onchange="window.ProviderManager.toggleProviderEnabled('${provider.provider_key}', this.checked)">
+                                           data-action="toggle-provider" data-provider-key="${pk}">
                                     <span class="toggle-slider"></span>
                                 </label>
-                                <button class="btn btn-sm btn-outline-primary" onclick="window.ProviderManager.editProvider('${provider.provider_key}')" title="Edit">
+                                <button class="btn btn-sm btn-outline-primary" data-action="edit-provider" data-provider-key="${pk}" title="Edit">
                                     <i class="fas fa-edit"></i>
                                 </button>
-                                <button class="btn btn-sm btn-outline-danger" onclick="window.ProviderManager.deleteProvider('${provider.provider_key}')" title="Delete">
+                                <button class="btn btn-sm btn-outline-danger" data-action="delete-provider" data-provider-key="${pk}" title="Delete">
                                     <i class="fas fa-trash"></i>
                                 </button>
                             </div>
@@ -182,6 +184,21 @@ class ProviderManager {
         });
 
         listContainer.innerHTML = html;
+
+        // Bind handlers via data-* attributes (avoids interpolating provider
+        // data into inline on* handlers, which is an XSS/quote-injection risk).
+        listContainer.querySelectorAll('[data-action="toggle-type"]').forEach(el => {
+            el.addEventListener('click', () => this.toggleProviderType(el.dataset.groupKey));
+        });
+        listContainer.querySelectorAll('[data-action="toggle-provider"]').forEach(el => {
+            el.addEventListener('change', () => this.toggleProviderEnabled(el.dataset.providerKey, el.checked));
+        });
+        listContainer.querySelectorAll('[data-action="edit-provider"]').forEach(el => {
+            el.addEventListener('click', () => this.editProvider(el.dataset.providerKey));
+        });
+        listContainer.querySelectorAll('[data-action="delete-provider"]').forEach(el => {
+            el.addEventListener('click', () => this.deleteProvider(el.dataset.providerKey));
+        });
 
         // Restore collapsed state
         collapsedSections.forEach(id => {
@@ -350,16 +367,21 @@ class ProviderManager {
             } else {
                 const error = await response.json();
                 window.UIUtils.showToast(`Failed to ${enabled ? 'enable' : 'disable'} provider: ${error.detail}`, 'error');
-                // Revert checkbox
-                const checkbox = document.querySelector(`input[onchange*="${providerKey}"]`);
-                if (checkbox) checkbox.checked = !enabled;
+                // Revert checkbox(es) — match on the stable data attribute
+                this._revertProviderCheckbox(providerKey, enabled);
             }
         } catch (error) {
             window.UIUtils.showToast(`Error: ${error.message}`, 'error');
-            // Revert checkbox
-            const checkbox = document.querySelector(`input[onchange*="${providerKey}"]`);
-            if (checkbox) checkbox.checked = !enabled;
+            // Revert checkbox(es) — match on the stable data attribute
+            this._revertProviderCheckbox(providerKey, enabled);
         }
+    }
+
+    _revertProviderCheckbox(providerKey, enabled) {
+        const checkboxes = document.querySelectorAll(
+            `input[data-provider-key="${CSS.escape(providerKey)}"]`
+        );
+        checkboxes.forEach(cb => { cb.checked = !enabled; });
     }
 
     async editProvider(providerKey) {

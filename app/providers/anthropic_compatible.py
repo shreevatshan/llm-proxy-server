@@ -118,6 +118,92 @@ def get_anthropic_post_terminal_drain_stop_reason(
     return None
 
 
+async def stream_anthropic_sdk_events(
+    stream,
+    *,
+    provider_label: str,
+    model: str,
+    log: Optional[logging.Logger] = None,
+) -> AsyncGenerator[str, None]:
+    """Yield Anthropic SSE frames from an opened Anthropic-SDK message stream.
+
+    Shared across every native Anthropic-SDK streaming path (Bedrock native,
+    Azure Foundry native, and this ``anthropic_compatible`` provider) so the
+    post-terminal drain policy and event serialization stay identical. The
+    caller owns the ``async with client.messages.stream(...) as stream`` context
+    and any provider-specific error translation; this generator consumes the
+    already-opened ``stream`` and emits ``event: <type>\\ndata: <json>\\n\\n``
+    frames, applying the bounded post-terminal drain budget.
+
+    ``provider_label`` appears in the log lines (e.g. "azure-foundry").
+    """
+    _log = log or logger
+    terminal_event_type = None
+    terminal_seen_at: Optional[float] = None
+    drained_event_count = 0
+
+    async for event in stream:
+        if terminal_event_type is not None:
+            # After a terminal event, briefly drain trailing events under a
+            # bounded budget, then stop — see get_anthropic_post_terminal_drain_stop_reason.
+            drained_event_count += 1
+            drain_stop_reason = get_anthropic_post_terminal_drain_stop_reason(
+                terminal_seen_at=terminal_seen_at,
+                drained_event_count=drained_event_count,
+            )
+            if drain_stop_reason is not None:
+                _log.warning(
+                    "Anthropic post-terminal drain budget reached for provider=%s model=%s terminal_event=%s drained_event_count=%s stop_reason=%s",
+                    provider_label,
+                    model,
+                    terminal_event_type,
+                    drained_event_count,
+                    drain_stop_reason,
+                )
+                break
+            continue
+
+        if hasattr(event, "model_dump_json"):
+            json_str = event.model_dump_json(exclude_none=True, warnings="none")
+            event_data = json.loads(json_str)
+        else:
+            event_data = event
+            json_str = json.dumps(event_data, ensure_ascii=False, separators=(",", ":"))
+        event_type = (
+            event_data.get("type", "unknown") if isinstance(event_data, dict) else "unknown"
+        )
+        yield f"event: {event_type}\ndata: {json_str}\n\n"
+
+        if is_anthropic_terminal_stream_event(event_type=event_type, event_data=event_data):
+            terminal_event_type = event_type
+            terminal_seen_at = time.monotonic()
+            _log.info(
+                "Anthropic upstream stream reached terminal event for provider=%s model=%s event_type=%s",
+                provider_label,
+                model,
+                event_type,
+            )
+
+    if terminal_event_type is not None:
+        drain_ms = 0.0
+        if terminal_seen_at is not None:
+            drain_ms = (time.monotonic() - terminal_seen_at) * 1000
+        _log.info(
+            "Anthropic stream completed after terminal event for provider=%s model=%s event_type=%s drained_event_count=%s post_terminal_drain_ms=%.1f",
+            provider_label,
+            model,
+            terminal_event_type,
+            drained_event_count,
+            drain_ms,
+        )
+    else:
+        _log.debug(
+            "Anthropic upstream stream ended without terminal event for provider=%s model=%s",
+            provider_label,
+            model,
+        )
+
+
 class AnthropicCompatibleProvider(BaseProvider):
     """
     Base class for providers that use the Anthropic SDK for API calls.
@@ -217,52 +303,14 @@ class AnthropicCompatibleProvider(BaseProvider):
                 "anthropic-beta": anthropic_beta,
             }
 
-        terminal_event_type = None
-        terminal_seen_at: Optional[float] = None
-        drained_event_count = 0
-        transport_eof_observed = False
-
         try:
             async with self._anthropic_client.messages.stream(**kwargs) as stream:
-                async for event in stream:
-                    if terminal_event_type is not None:
-                        drained_event_count += 1
-                        drain_stop_reason = get_anthropic_post_terminal_drain_stop_reason(
-                            terminal_seen_at=terminal_seen_at,
-                            drained_event_count=drained_event_count,
-                        )
-                        if drain_stop_reason is not None:
-                            logger.warning(
-                                "Anthropic post-terminal drain budget reached for provider=%s model=%s terminal_event=%s drained_event_count=%s stop_reason=%s",
-                                getattr(self, "full_provider_name", self.custom_provider_name),
-                                request.model,
-                                terminal_event_type,
-                                drained_event_count,
-                                drain_stop_reason,
-                            )
-                            break
-                        continue
-                    if hasattr(event, "model_dump_json"):
-                        json_str = event.model_dump_json(exclude_none=True, warnings="none")
-                        event_data = json.loads(json_str)
-                    else:
-                        event_data = event
-                        json_str = json.dumps(event_data, ensure_ascii=False, separators=(",", ":"))
-                    event_type = (
-                        event_data.get("type", "unknown") if isinstance(event_data, dict) else "unknown"
-                    )
-                    sse = f"event: {event_type}\ndata: {json_str}\n\n"
+                async for sse in stream_anthropic_sdk_events(
+                    stream,
+                    provider_label=getattr(self, "full_provider_name", self.custom_provider_name),
+                    model=request.model,
+                ):
                     yield sse
-
-                    if is_anthropic_terminal_stream_event(event_type=event_type, event_data=event_data):
-                        terminal_event_type = event_type
-                        terminal_seen_at = time.monotonic()
-                        logger.info(
-                            "Anthropic upstream stream reached terminal event for provider=%s model=%s event_type=%s",
-                            getattr(self, "full_provider_name", self.custom_provider_name),
-                            request.model,
-                            event_type,
-                        )
         except Exception as e:
             try:
                 import anthropic as _anthropic
@@ -271,25 +319,3 @@ class AnthropicCompatibleProvider(BaseProvider):
             except ImportError:
                 pass
             raise
-
-        if terminal_event_type is not None:
-            drain_ms = 0.0
-            if terminal_seen_at is not None:
-                drain_ms = (time.monotonic() - terminal_seen_at) * 1000
-            logger.info(
-                "Anthropic stream completed after terminal event for provider=%s model=%s event_type=%s drained_event_count=%s post_terminal_drain_ms=%.1f",
-                getattr(self, "full_provider_name", self.custom_provider_name),
-                request.model,
-                terminal_event_type,
-                drained_event_count,
-                drain_ms,
-            )
-
-        if terminal_event_type is None:
-            transport_eof_observed = True
-            logger.debug(
-                "Anthropic upstream stream ended without terminal event for provider=%s model=%s transport_eof_observed=%s",
-                getattr(self, "full_provider_name", self.custom_provider_name),
-                request.model,
-                transport_eof_observed,
-            )

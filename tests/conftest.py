@@ -15,6 +15,12 @@ pooled connection, which stops the worker thread.
 """
 
 import asyncio
+import os
+
+# The app now refuses to start without a JWT_SECRET_KEY (and rejects the old
+# placeholder). Set a non-placeholder value before any app module is imported
+# so the test suite is self-contained.
+os.environ.setdefault("JWT_SECRET_KEY", "test-secret-not-placeholder-abc123")
 
 import pytest
 

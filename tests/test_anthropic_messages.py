@@ -22,11 +22,16 @@ def _make_model_info(model_id: str) -> ModelInfo:
     return ModelInfo(id=model_id, created=0, owned_by="test", provider=model_id.split("/")[0])
 
 
+async def _noop_update_provider_models(provider_key, models):
+    return None
+
+
 def _fake_model_cache(model_id: str):
     """Return a SimpleNamespace that looks like ModelCache for the given model id."""
     return SimpleNamespace(
         get_enabled_models=lambda: [_make_model_info(model_id)],
         update_models=lambda models: None,
+        update_provider_models=_noop_update_provider_models,
     )
 
 
@@ -356,9 +361,14 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
             anthropic_messages,
             "add_span_attributes",
             side_effect=lambda span, attrs: span_attrs.append(dict(attrs)),
+        ), patch.object(
+            anthropic_messages, "enforce_group_rate_limit", AsyncMock(return_value=None)
+        ), patch.object(
+            anthropic_messages, "enforce_model_access", AsyncMock(return_value=None)
         ):
             response = asyncio.run(
                 anthropic_messages.count_message_tokens(
+                    request_obj=object(),
                     payload={
                     "model": "claude-sonnet-without-prefix",
                     "messages": [{"role": "user", "content": "hello world"}],
@@ -379,9 +389,14 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
             anthropic_messages.provider_manager,
             "get_anthropic_provider_for_model",
             AsyncMock(return_value=provider),
+        ), patch.object(
+            anthropic_messages, "enforce_group_rate_limit", AsyncMock(return_value=None)
+        ), patch.object(
+            anthropic_messages, "enforce_model_access", AsyncMock(return_value=None)
         ):
             response = asyncio.run(
                 anthropic_messages.count_message_tokens(
+                    request_obj=object(),
                     payload={
                         "model": "bedrock:test/claude-sonnet",
                         "messages": [{"role": "user", "content": "hello world"}],
@@ -861,9 +876,14 @@ class PreflightAndSdkErrorTests(unittest.TestCase):
         provider.get_available_models = AsyncMock(return_value=[_make_model_info(model_id)])
 
         updated = []
+
+        async def _update_provider_models(provider_key, models):
+            updated.extend(models)
+
         fake_cache = SimpleNamespace(
             get_enabled_models=lambda: [],
             update_models=lambda models: updated.extend(models),
+            update_provider_models=_update_provider_models,
         )
 
         request_id = f"req-{next(self._request_ids)}"

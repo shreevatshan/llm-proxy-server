@@ -156,6 +156,22 @@ class ModelCache:
         # Return a copy to prevent modification during iteration
         return list(self._models)
     
+    # ---------------------------------------------------------------------
+    # Concurrency model for the sync mutators below.
+    #
+    # These sync variants (used from provider_manager, auth.database, admin,
+    # auto_sync, etc.) intentionally take NO lock, while their *_async twins
+    # take _write_lock/_config_lock. This is safe because the whole app runs on
+    # a single asyncio event loop: a sync method contains no `await`, so it runs
+    # to completion within one event-loop tick and cannot interleave with any
+    # other coroutine (including an awaited async writer). Each mutation is a
+    # single atomic reference/dict swap; even the multi-step
+    # update_provider_and_models_config performs its read-modify-write without an
+    # await, so it too is atomic w.r.t. other loop tasks. The async variants
+    # exist only so async callers can await a consistent point; the locks guard
+    # against a hypothetical future multi-worker/threaded deployment. Do not add
+    # `await` inside a sync mutator without also introducing locking.
+    # ---------------------------------------------------------------------
     def update_models(self, models: List[ModelInfo]) -> None:
         """Update cached models (atomic assignment - thread-safe for simple reference swap)."""
         # Atomic reference swap is thread-safe in Python
@@ -223,6 +239,22 @@ class ModelCache:
             removed_count = initial_count - len(self._models)
             self._last_updated = time.time()
             print(f"Invalidated {removed_count} models for provider: {provider_key}")
+
+    async def update_provider_models(self, provider_key: str, models: List[ModelInfo]) -> None:
+        """Replace just one provider's slice of the cache under the write lock.
+
+        Unlike ``update_models``, the read-modify-write happens entirely inside
+        the lock against the *live* ``self._models`` — never a caller-held
+        pre-``await`` snapshot — so a concurrent writer cannot be clobbered.
+        ``provider_key`` is the id prefix before the first '/' (equal to a
+        provider's ``full_provider_name``); models for that prefix are dropped
+        and replaced with ``models``.
+        """
+        self._ensure_locks()
+        async with self._write_lock:
+            others = [m for m in self._models if not m.id.startswith(f"{provider_key}/")]
+            self._models = others + list(models)
+            self._last_updated = time.time()
     
     async def refresh_cache_from_database(self) -> None:
         """Refresh entire cache by fetching fresh data from providers."""

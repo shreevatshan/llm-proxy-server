@@ -51,6 +51,9 @@ from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.auth.database import get_api_key, AsyncSessionLocal
 from app.auth.cache import auth_cache
+from app.auth.middleware import get_owner_user_id, verify_response_ownership
+from app.providers.base import ProviderHTTPError
+from app.routes._errors import azure_provider_error_response
 from app.routes.stream_utils import (
     stream_with_context_and_timeout,
     STREAM_TIMEOUT_SECONDS,
@@ -237,7 +240,13 @@ async def azure_chat_completions(
     # Signal the provider to use the legacy deployment-style upstream call and
     # forward the inbound api-version.  Pre-validate so streaming responses get
     # a clean 400 before the StreamingResponse wrapper is returned.
-    if provider._is_foundry_backend() or not api_version:
+    # TODO: expose a public property on AzureProvider instead of reaching into
+    # the private _is_foundry_backend().
+    if provider._is_foundry_backend():
+        return _azure_error(400, "InvalidRequest",
+                            "Foundry-backed Azure providers do not support "
+                            "deployment-style calls; use the responses endpoint")
+    if not api_version:
         return _azure_error(400, "InvalidRequest",
                             "api-version is required for deployment-style calls")
     azure_call_style.set("deployment")
@@ -285,9 +294,13 @@ async def azure_chat_completions(
         except ValueError as e:
             set_span_error(span, e)
             return _azure_error(400, "InvalidRequest", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Chat completion error: {str(e)}")
+            logger.error("Chat completion error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Chat completion error")
 
 
 # ==================== Text Completions ====================
@@ -305,9 +318,16 @@ async def azure_completions(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI text completions endpoint."""
+    request_started_at = time.monotonic()
     provider = _get_azure_provider(provider_name)
 
-    if provider._is_foundry_backend() or not api_version:
+    # TODO: expose a public property on AzureProvider instead of reaching into
+    # the private _is_foundry_backend().
+    if provider._is_foundry_backend():
+        return _azure_error(400, "InvalidRequest",
+                            "Foundry-backed Azure providers do not support "
+                            "deployment-style calls; use the responses endpoint")
+    if not api_version:
         return _azure_error(400, "InvalidRequest",
                             "api-version is required for deployment-style calls")
     azure_call_style.set("deployment")
@@ -325,6 +345,7 @@ async def azure_completions(
         })
         try:
             if request.stream:
+                current_context = otel_context.get_current()
                 traceparent = get_w3c_traceparent()
                 headers = {
                     "Cache-Control": "no-cache",
@@ -335,7 +356,13 @@ async def azure_completions(
                     headers["traceparent"] = traceparent
 
                 return StreamingResponse(
-                    provider.completion_stream(request),
+                    stream_with_context_and_timeout(
+                        provider.completion_stream(request),
+                        current_context,
+                        request_obj,
+                        timeout=STREAM_TIMEOUT_SECONDS,
+                        request_started_at=request_started_at,
+                    ),
                     media_type="text/event-stream",
                     headers=headers,
                 )
@@ -347,9 +374,13 @@ async def azure_completions(
         except ValueError as e:
             set_span_error(span, e)
             return _azure_error(400, "InvalidRequest", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Completion error: {str(e)}")
+            logger.error("Completion error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Completion error")
 
 
 # ==================== Embeddings ====================
@@ -369,7 +400,13 @@ async def azure_embeddings(
     """Azure OpenAI embeddings endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    if provider._is_foundry_backend() or not api_version:
+    # TODO: expose a public property on AzureProvider instead of reaching into
+    # the private _is_foundry_backend().
+    if provider._is_foundry_backend():
+        return _azure_error(400, "InvalidRequest",
+                            "Foundry-backed Azure providers do not support "
+                            "deployment-style calls; use the responses endpoint")
+    if not api_version:
         return _azure_error(400, "InvalidRequest",
                             "api-version is required for deployment-style calls")
     azure_call_style.set("deployment")
@@ -391,9 +428,13 @@ async def azure_embeddings(
         except NotImplementedError as e:
             set_span_error(span, e)
             return _azure_error(400, "OperationNotSupported", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Embeddings error: {str(e)}")
+            logger.error("Embeddings error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Embeddings error")
 
 
 # ==================== Images ====================
@@ -413,7 +454,13 @@ async def azure_image_generation(
     """Azure OpenAI image generation endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    if provider._is_foundry_backend() or not api_version:
+    # TODO: expose a public property on AzureProvider instead of reaching into
+    # the private _is_foundry_backend().
+    if provider._is_foundry_backend():
+        return _azure_error(400, "InvalidRequest",
+                            "Foundry-backed Azure providers do not support "
+                            "deployment-style calls; use the responses endpoint")
+    if not api_version:
         return _azure_error(400, "InvalidRequest",
                             "api-version is required for deployment-style calls")
     azure_call_style.set("deployment")
@@ -435,9 +482,13 @@ async def azure_image_generation(
         except NotImplementedError as e:
             set_span_error(span, e)
             return _azure_error(400, "OperationNotSupported", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Image generation error: {str(e)}")
+            logger.error("Image generation error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Image generation error")
 
 
 # ==================== Audio ====================
@@ -447,6 +498,7 @@ async def azure_image_generation(
     tags=["azure_openai"],
 )
 async def azure_audio_speech(
+    request_obj: Request,
     provider_name: str,
     deployment: str,
     request: AudioSpeechRequest,
@@ -456,7 +508,13 @@ async def azure_audio_speech(
     """Azure OpenAI text-to-speech endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    if provider._is_foundry_backend() or not api_version:
+    # TODO: expose a public property on AzureProvider instead of reaching into
+    # the private _is_foundry_backend().
+    if provider._is_foundry_backend():
+        return _azure_error(400, "InvalidRequest",
+                            "Foundry-backed Azure providers do not support "
+                            "deployment-style calls; use the responses endpoint")
+    if not api_version:
         return _azure_error(400, "InvalidRequest",
                             "api-version is required for deployment-style calls")
     azure_call_style.set("deployment")
@@ -464,6 +522,26 @@ async def azure_audio_speech(
 
     model_name = _build_model_name(provider_name, deployment)
     request.model = model_name
+    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+
+    # Validate response_format before interpolating it into Content-Disposition
+    # (guards against header injection); reuse the same content-type map.
+    content_type_map = {
+        "mp3": "audio/mpeg",
+        "opus": "audio/opus",
+        "aac": "audio/aac",
+        "flac": "audio/flac",
+        "wav": "audio/wav",
+        "pcm": "audio/pcm",
+    }
+    response_format = request.response_format or "mp3"
+    if response_format not in content_type_map:
+        return _azure_error(
+            400, "InvalidRequest",
+            f"Invalid response_format: {response_format!r}. "
+            f"Must be one of {sorted(content_type_map)}",
+        )
 
     with create_span("azure_audio_speech", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -472,26 +550,22 @@ async def azure_audio_speech(
         })
         try:
             audio_data = await provider.audio_speech(request)
-            content_type_map = {
-                "mp3": "audio/mpeg",
-                "opus": "audio/opus",
-                "aac": "audio/aac",
-                "flac": "audio/flac",
-                "wav": "audio/wav",
-                "pcm": "audio/pcm",
-            }
-            content_type = content_type_map.get(request.response_format, "audio/mpeg")
+            content_type = content_type_map[response_format]
             return Response(
                 content=audio_data,
                 media_type=content_type,
-                headers={"Content-Disposition": f"attachment; filename=speech.{request.response_format}"},
+                headers={"Content-Disposition": f"attachment; filename=speech.{response_format}"},
             )
         except NotImplementedError as e:
             set_span_error(span, e)
             return _azure_error(501, "OperationNotSupported", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Audio speech error: {str(e)}")
+            logger.error("Audio speech error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Audio speech error")
 
 
 @router.post(
@@ -499,6 +573,7 @@ async def azure_audio_speech(
     tags=["azure_openai"],
 )
 async def azure_audio_transcription(
+    request_obj: Request,
     provider_name: str,
     deployment: str,
     file: UploadFile = File(...),
@@ -513,13 +588,21 @@ async def azure_audio_transcription(
     """Azure OpenAI audio transcription endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    if provider._is_foundry_backend() or not api_version:
+    # TODO: expose a public property on AzureProvider instead of reaching into
+    # the private _is_foundry_backend().
+    if provider._is_foundry_backend():
+        return _azure_error(400, "InvalidRequest",
+                            "Foundry-backed Azure providers do not support "
+                            "deployment-style calls; use the responses endpoint")
+    if not api_version:
         return _azure_error(400, "InvalidRequest",
                             "api-version is required for deployment-style calls")
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
     model_name = _build_model_name(provider_name, deployment)
+    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_audio_transcription", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -532,10 +615,7 @@ async def azure_audio_transcription(
 
             granularities = None
             if timestamp_granularities:
-                try:
-                    granularities = timestamp_granularities.split(",")
-                except Exception:
-                    granularities = [timestamp_granularities]
+                granularities = timestamp_granularities.split(",")
 
             req = AudioTranscriptionRequest(
                 file=file_b64,
@@ -554,9 +634,13 @@ async def azure_audio_transcription(
         except NotImplementedError as e:
             set_span_error(span, e)
             return _azure_error(501, "OperationNotSupported", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Audio transcription error: {str(e)}")
+            logger.error("Audio transcription error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Audio transcription error")
 
 
 @router.post(
@@ -564,6 +648,7 @@ async def azure_audio_transcription(
     tags=["azure_openai"],
 )
 async def azure_audio_translation(
+    request_obj: Request,
     provider_name: str,
     deployment: str,
     file: UploadFile = File(...),
@@ -576,13 +661,21 @@ async def azure_audio_translation(
     """Azure OpenAI audio translation endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    if provider._is_foundry_backend() or not api_version:
+    # TODO: expose a public property on AzureProvider instead of reaching into
+    # the private _is_foundry_backend().
+    if provider._is_foundry_backend():
+        return _azure_error(400, "InvalidRequest",
+                            "Foundry-backed Azure providers do not support "
+                            "deployment-style calls; use the responses endpoint")
+    if not api_version:
         return _azure_error(400, "InvalidRequest",
                             "api-version is required for deployment-style calls")
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
     model_name = _build_model_name(provider_name, deployment)
+    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_audio_translation", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -608,9 +701,13 @@ async def azure_audio_translation(
         except NotImplementedError as e:
             set_span_error(span, e)
             return _azure_error(501, "OperationNotSupported", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Audio translation error: {str(e)}")
+            logger.error("Audio translation error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Audio translation error")
 
 
 # ==================== Responses API ====================
@@ -633,6 +730,29 @@ async def azure_responses_create(
     # For Responses API, model is in the request body — prefix it with provider
     if request.model and "/" not in request.model:
         request.model = _build_model_name(provider_name, request.model)
+    elif request.model:
+        # Already prefixed: provider_manager routes by the model prefix, so a
+        # body model naming a DIFFERENT provider would silently execute there
+        # despite the URL scoping this call to `provider_name`. The URL
+        # provider is authoritative (matching the deployment-style siblings,
+        # where the URL fully determines the model) — reject mismatches.
+        model_prefix = request.model.split("/", 1)[0]
+        try:
+            resolved_provider = provider_manager._get_provider(model_prefix)
+        except Exception:
+            resolved_provider = None
+        if resolved_provider is not provider:
+            return _azure_error(
+                400,
+                "InvalidRequest",
+                f"Model '{request.model}' does not belong to provider "
+                f"'{provider_name}' named in the URL",
+            )
+
+    # Enforce group rate limit + per-user model access, mirroring the sibling
+    # azure_chat_completions handler.
+    await enforce_group_rate_limit(request_obj, auth, request.model, envelope_override="azure")
+    await enforce_model_access(request_obj, auth, request.model, envelope_override="azure")
 
     with create_span("azure_responses_create", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -651,9 +771,15 @@ async def azure_responses_create(
                 if traceparent:
                     headers["traceparent"] = traceparent
 
+                # Route through provider_manager (not the provider directly) so
+                # the response_id -> provider mapping is stored with the owning
+                # user_id — required for the ownership check on retrieve/delete/
+                # cancel/input_items below.
                 return StreamingResponse(
                     stream_with_context_and_timeout(
-                        provider.responses_create_stream(request),
+                        provider_manager.responses_create_stream(
+                            request, user_id=get_owner_user_id(auth)
+                        ),
                         current_context,
                         request_obj,
                         timeout=STREAM_TIMEOUT_SECONDS,
@@ -663,7 +789,9 @@ async def azure_responses_create(
                     headers=headers,
                 )
             else:
-                response = await provider.responses_create(request)
+                response = await provider_manager.responses_create(
+                    request, user_id=get_owner_user_id(auth)
+                )
                 return response
         except NotImplementedError as e:
             set_span_error(span, e)
@@ -671,9 +799,13 @@ async def azure_responses_create(
         except ValueError as e:
             set_span_error(span, e)
             return _azure_error(400, "InvalidRequest", str(e))
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Responses create error: {str(e)}")
+            logger.error("Responses create error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Responses create error")
 
 
 @router.get(
@@ -689,6 +821,9 @@ async def azure_responses_retrieve(
 ):
     """Azure OpenAI Responses API — retrieve a response."""
     _get_azure_provider(provider_name)  # validate provider
+    # Ownership check (IDOR guard): only the creating user (or an admin) may
+    # access a stored response.
+    await verify_response_ownership(response_id, auth)
 
     with create_span("azure_responses_retrieve", kind=trace.SpanKind.INTERNAL) as span:
         try:
@@ -697,9 +832,13 @@ async def azure_responses_retrieve(
                 kwargs["include"] = include
             response = await provider_manager.responses_retrieve(response_id, **kwargs)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Responses retrieve error: {str(e)}")
+            logger.error("Responses retrieve error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Responses retrieve error")
 
 
 @router.delete(
@@ -714,14 +853,20 @@ async def azure_responses_delete(
 ):
     """Azure OpenAI Responses API — delete a response."""
     _get_azure_provider(provider_name)  # validate provider
+    # Ownership check (IDOR guard): see azure_responses_retrieve.
+    await verify_response_ownership(response_id, auth)
 
     with create_span("azure_responses_delete", kind=trace.SpanKind.INTERNAL) as span:
         try:
             response = await provider_manager.responses_delete(response_id)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Responses delete error: {str(e)}")
+            logger.error("Responses delete error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Responses delete error")
 
 
 @router.post(
@@ -736,14 +881,20 @@ async def azure_responses_cancel(
 ):
     """Azure OpenAI Responses API — cancel a response."""
     _get_azure_provider(provider_name)  # validate provider
+    # Ownership check (IDOR guard): see azure_responses_retrieve.
+    await verify_response_ownership(response_id, auth)
 
     with create_span("azure_responses_cancel", kind=trace.SpanKind.INTERNAL) as span:
         try:
             response = await provider_manager.responses_cancel(response_id)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Responses cancel error: {str(e)}")
+            logger.error("Responses cancel error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Responses cancel error")
 
 
 @router.get(
@@ -762,6 +913,8 @@ async def azure_responses_list_input_items(
 ):
     """Azure OpenAI Responses API — list input items for a response."""
     _get_azure_provider(provider_name)  # validate provider
+    # Ownership check (IDOR guard): see azure_responses_retrieve.
+    await verify_response_ownership(response_id, auth)
 
     with create_span("azure_responses_list_input_items", kind=trace.SpanKind.INTERNAL) as span:
         try:
@@ -776,6 +929,10 @@ async def azure_responses_list_input_items(
                 kwargs["include"] = include
             response = await provider_manager.responses_list_input_items(response_id, **kwargs)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return azure_provider_error_response(e)
         except Exception as e:
             set_span_error(span, e)
-            return _azure_error(500, "InternalServerError", f"Responses list input items error: {str(e)}")
+            logger.error("Responses list input items error: %s", e, exc_info=True)
+            return _azure_error(500, "InternalServerError", "Responses list input items error")

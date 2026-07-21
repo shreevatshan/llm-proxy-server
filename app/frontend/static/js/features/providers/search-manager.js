@@ -182,14 +182,40 @@ class SearchManager {
 
         searchResultsContainer.innerHTML = html;
         searchResultsContainer.style.display = 'block';
+
+        this._bindResultHandlers(searchResultsContainer);
+    }
+
+    // Bind handlers via data-* attributes rather than interpolating provider/
+    // model ids into inline on* handlers (XSS/quote-injection risk).
+    _bindResultHandlers(container) {
+        container.querySelectorAll('[data-action="toggle-provider-models"]').forEach(el => {
+            el.addEventListener('click', () => window.ModelManager.toggleProviderModels(el.dataset.providerKey));
+        });
+        container.querySelectorAll('[data-action="toggle-provider"]').forEach(el => {
+            el.addEventListener('change', () => window.ProviderManager.toggleProviderEnabled(el.dataset.providerKey, el.checked));
+        });
+        container.querySelectorAll('[data-action="edit-provider"]').forEach(el => {
+            el.addEventListener('click', () => window.ProviderManager.editProvider(el.dataset.providerKey));
+        });
+        container.querySelectorAll('[data-action="delete-provider"]').forEach(el => {
+            el.addEventListener('click', () => window.ProviderManager.deleteProvider(el.dataset.providerKey));
+        });
+        container.querySelectorAll('[data-action="toggle-model"]').forEach(el => {
+            el.addEventListener('change', () => window.ModelManager.toggleIndividualModel(
+                el.dataset.modelId, el.checked, el.dataset.providerKey
+            ));
+        });
     }
 
     renderSearchResultProvider(provider, searchTerm) {
+        const esc = window.UIUtils.escapeHtml;
         const statusClass = provider.enabled ? 'status-active' : 'status-inactive';
         const statusText = provider.enabled ? 'Enabled' : 'Disabled';
+        const pk = esc(provider.provider_key);
 
         let html = `
-            <div class="unified-provider-card search-result ${!provider.enabled ? 'disabled' : ''}" id="search-provider-${provider.provider_key}">
+            <div class="unified-provider-card search-result ${!provider.enabled ? 'disabled' : ''}" id="search-provider-${pk}">
                 <div class="provider-card-header">
                     <div class="provider-info">
                         <div class="provider-title">
@@ -206,18 +232,18 @@ class SearchManager {
                         </div>
                     </div>
                     <div class="provider-actions">
-                        <button class="btn btn-sm btn-outline-info" onclick="window.ModelManager.toggleProviderModels('${provider.provider_key}')" title="Show/Hide Models" id="models-btn-${provider.provider_key}">
+                        <button class="btn btn-sm btn-outline-info" data-action="toggle-provider-models" data-provider-key="${pk}" title="Show/Hide Models" id="models-btn-${pk}">
                             <i class="fas fa-list"></i> Models (${provider.model_count || 0})
                         </button>
                         <label class="toggle-switch">
-                            <input type="checkbox" ${provider.enabled ? 'checked' : ''} 
-                                   onchange="window.ProviderManager.toggleProviderEnabled('${provider.provider_key}', this.checked)">
+                            <input type="checkbox" ${provider.enabled ? 'checked' : ''}
+                                   data-action="toggle-provider" data-provider-key="${pk}">
                             <span class="toggle-slider"></span>
                         </label>
-                        <button class="btn btn-sm btn-outline-primary" onclick="window.ProviderManager.editProvider('${provider.provider_key}')" title="Edit">
+                        <button class="btn btn-sm btn-outline-primary" data-action="edit-provider" data-provider-key="${pk}" title="Edit">
                             <i class="fas fa-edit"></i>
                         </button>
-                        <button class="btn btn-sm btn-outline-danger" onclick="window.ProviderManager.deleteProvider('${provider.provider_key}')" title="Delete">
+                        <button class="btn btn-sm btn-outline-danger" data-action="delete-provider" data-provider-key="${pk}" title="Delete">
                             <i class="fas fa-trash"></i>
                         </button>
                     </div>
@@ -255,10 +281,12 @@ class SearchManager {
                                 <span class="status-badge ${modelStatusClass}">${modelStatusText}</span>
                             </div>
                             <label class="model-toggle-switch">
-                                <input type="checkbox" ${model.is_enabled ? 'checked' : ''} 
-                                       onchange="window.ModelManager.toggleIndividualModel('${model.model_id}', this.checked, '${provider.provider_key}')"
-                                       id="search-toggle-${model.id}">
-                                <span class="model-toggle-slider" id="search-slider-${model.id}"></span>
+                                <input type="checkbox" ${model.is_enabled ? 'checked' : ''}
+                                       data-action="toggle-model"
+                                       data-model-id="${esc(model.model_id)}"
+                                       data-provider-key="${pk}"
+                                       id="search-toggle-${esc(model.id)}">
+                                <span class="model-toggle-slider" id="search-slider-${esc(model.id)}"></span>
                             </label>
                         </div>
                     </div>

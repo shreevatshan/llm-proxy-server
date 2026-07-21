@@ -1,0 +1,41 @@
+**/venv/**
+**/data/**
+**/logs/**
+*.log
+**/test_venv/**
+**/reference/**
+**/.github/**
+**/.claude/**
+**/.playwright-mcp/**
+**/migration_test/**
+**/reviews/**
+
+review.md
+azure-models-list
+redeploy.sh
+docker-image-push.sh
+start.sh
+stop.sh
+server.log
+startup.log
+docker-compose.yaml
+.aws
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test / tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets / local env
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+.jwt_secret

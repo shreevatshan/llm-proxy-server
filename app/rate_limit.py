@@ -19,6 +19,10 @@ logger = logging.getLogger(__name__)
 
 _REFRESH_INTERVAL = 30  # seconds — how often to reload DB config
 _RPD_TTL = 5           # seconds — local cache TTL for today-count DB reads
+# How long a stale (expired) RPD cache entry is retained after expiry so it can
+# be served as a last-known value on a transient DB failure, before eviction
+# reclaims it. Bounds per-identity memory growth in long-lived processes.
+_RPD_CACHE_RETENTION = 300  # seconds
 
 
 @dataclass
@@ -227,7 +231,7 @@ def _rl_headers(d: RateLimitDecision) -> dict:
     }
 
 
-def _seconds_until_utc_midnight() -> int:
+def _seconds_until_local_midnight() -> int:
     return max(1, int(time_utils.seconds_until_local_midnight()))
 
 
@@ -243,7 +247,6 @@ def _effective_limit(user_val: Optional[int], group_val: Optional[int]) -> Optio
 class RateLimitTracker:
     def __init__(self) -> None:
         self._lock: Optional[asyncio.Lock] = None
-        self._init_lock = asyncio.Lock.__new__(asyncio.Lock)  # placeholder; see _get_lock
         self._minute_buckets: Dict[int, _MinuteBucket] = {}
         # Group RPM buckets keyed by (user_id, group_id)
         self._group_minute_buckets: Dict[Tuple[int, int], _MinuteBucket] = {}
@@ -407,7 +410,8 @@ class RateLimitTracker:
             logger.warning(f"RateLimitTracker: config reload failed: {e}")
 
     def _evict_stale_buckets(self) -> None:
-        current_window = int(time.time() // 60)
+        now = time.time()
+        current_window = int(now // 60)
         stale = [uid for uid, b in self._minute_buckets.items() if b.window < current_window - 1]
         for uid in stale:
             del self._minute_buckets[uid]
@@ -417,6 +421,24 @@ class RateLimitTracker:
         stale_ig = [k for k, b in self._instance_group_minute_buckets.items() if b.window < current_window - 1]
         for k in stale_ig:
             del self._instance_group_minute_buckets[k]
+
+        # Sweep RPD cache entries whose last-known value has aged out past the
+        # retention window (these otherwise grow one entry per identity/group).
+        cutoff = now - _RPD_CACHE_RETENTION
+        for cache in (self._rpd_cache, self._group_rpd_cache, self._instance_group_rpd_cache):
+            expired = [k for k, e in cache.items() if e.expires_at < cutoff]
+            for k in expired:
+                del cache[k]
+
+        # Sweep idle per-user locks: no active RPM bucket and not currently held.
+        # Skipping locked() locks avoids evicting a lock a request is holding
+        # while suspended at an await inside `async with user_lock`.
+        idle_locks = [
+            uid for uid, lk in self._user_locks.items()
+            if uid not in self._minute_buckets and not lk.locked()
+        ]
+        for uid in idle_locks:
+            del self._user_locks[uid]
 
     def invalidate_user(self, user_id: int) -> None:
         self._overrides.pop(user_id, None)
@@ -584,7 +606,7 @@ class RateLimitTracker:
                         allowed=False,
                         rpm_limit=None, rpm_remaining=None,
                         rpd_limit=None, rpd_remaining=None,
-                        retry_after_seconds=_seconds_until_utc_midnight(),
+                        retry_after_seconds=_seconds_until_local_midnight(),
                         limited_by="group_rpd",
                         group_id=group.group_id,
                         group_name=group.name,
@@ -656,7 +678,7 @@ class RateLimitTracker:
                         allowed=False,
                         rpm_limit=None, rpm_remaining=None,
                         rpd_limit=None, rpd_remaining=None,
-                        retry_after_seconds=_seconds_until_utc_midnight(),
+                        retry_after_seconds=_seconds_until_local_midnight(),
                         limited_by="instance_group_rpd",
                         group_id=group.group_id,
                         group_name=group.name,
@@ -671,24 +693,22 @@ class RateLimitTracker:
         return None  # instance-group checks passed
 
     async def check_and_increment(
-        self, user_id: int, username: str, model_id: Optional[str] = None
+        self, user_id: int, username: str
     ) -> RateLimitDecision:
+        """Enforce the per-user overall (ungrouped) RPM/RPD limits and increment
+        the RPM bucket.
+
+        Model-group and instance-group limits are enforced separately by
+        check_group_limit / check_instance_group_limit from the route handlers.
+        The sole caller (auth middleware) passes no model, so this method
+        deliberately handles only the overall quota — the previous per-model
+        group branches here were unreachable dead code and have been removed.
+        """
         global_lock = await self._get_lock()
         async with global_lock:
             override = self._overrides.get(user_id)
             rpm = override.rpm_limit if (override and override.rpm_limit is not None) else self._defaults.rpm_default
             rpd = override.rpd_limit if (override and override.rpd_limit is not None) else self._defaults.rpd_default
-
-            # Resolve group limits (if model belongs to a group)
-            group: Optional[_ModelGroupSnapshot] = None
-            g_rpm: Optional[int] = None
-            g_rpd: Optional[int] = None
-            if model_id:
-                group_id = self._model_to_group.get(model_id)
-                if group_id is not None:
-                    group = self._groups.get(group_id)
-                    if group:
-                        g_rpm, g_rpd = self._resolve_group_limits(user_id, group)
 
         # Per-user lock serializes the RPM check + RPD check + increment for this user,
         # eliminating the TOCTOU race where two concurrent requests both pass RPD.
@@ -704,15 +724,6 @@ class RateLimitTracker:
                 bucket = _MinuteBucket(window=current_window, count=0)
                 self._minute_buckets[user_id] = bucket
 
-            # Maintain group RPM bucket
-            group_bucket: Optional[_MinuteBucket] = None
-            if group:
-                gk = (user_id, group.group_id)
-                group_bucket = self._group_minute_buckets.get(gk)
-                if group_bucket is None or group_bucket.window != current_window:
-                    group_bucket = _MinuteBucket(window=current_window, count=0)
-                    self._group_minute_buckets[gk] = group_bucket
-
             # 1) Request RPM check
             if rpm is not None and bucket.count >= rpm:
                 retry_after = max(1, 60 - int(now - current_window * 60))
@@ -722,29 +733,9 @@ class RateLimitTracker:
                     rpd_limit=rpd, rpd_remaining=None,
                     retry_after_seconds=retry_after,
                     limited_by="rpm",
-                    group_id=group.group_id if group else None,
-                    group_name=group.name if group else None,
-                    group_rpm_limit=g_rpm,
-                    group_rpd_limit=g_rpd,
                 )
 
-            # 2) Group RPM check
-            if group and group_bucket is not None and g_rpm is not None and group_bucket.count >= g_rpm:
-                retry_after = max(1, 60 - int(now - current_window * 60))
-                return RateLimitDecision(
-                    allowed=False,
-                    rpm_limit=rpm, rpm_remaining=None,
-                    rpd_limit=rpd, rpd_remaining=None,
-                    retry_after_seconds=retry_after,
-                    limited_by="group_rpm",
-                    group_id=group.group_id,
-                    group_name=group.name,
-                    group_rpm_limit=g_rpm,
-                    group_rpm_remaining=0,
-                    group_rpd_limit=g_rpd,
-                )
-
-            # 3) Request RPD check
+            # 2) Request RPD check
             if rpd is not None:
                 today_count = await self._get_today_count(username)
                 if today_count >= rpd:
@@ -752,45 +743,16 @@ class RateLimitTracker:
                         allowed=False,
                         rpm_limit=rpm, rpm_remaining=None,
                         rpd_limit=rpd, rpd_remaining=0,
-                        retry_after_seconds=_seconds_until_utc_midnight(),
+                        retry_after_seconds=_seconds_until_local_midnight(),
                         limited_by="rpd",
-                        group_id=group.group_id if group else None,
-                        group_name=group.name if group else None,
-                        group_rpm_limit=g_rpm,
-                        group_rpd_limit=g_rpd,
                     )
 
-            # 4) Group RPD check
-            if group and g_rpd is not None:
-                group_today_count = await self._get_today_group_count(username, group.model_ids, group.group_id)
-                if group_today_count >= g_rpd:
-                    return RateLimitDecision(
-                        allowed=False,
-                        rpm_limit=rpm, rpm_remaining=None,
-                        rpd_limit=rpd, rpd_remaining=None,
-                        retry_after_seconds=_seconds_until_utc_midnight(),
-                        limited_by="group_rpd",
-                        group_id=group.group_id,
-                        group_name=group.name,
-                        group_rpm_limit=g_rpm,
-                        group_rpd_limit=g_rpd,
-                        group_rpd_remaining=0,
-                    )
-
-            # All checks passed — increment both RPM buckets
+            # All checks passed — increment the RPM bucket
             bucket.count += 1
-            if group_bucket is not None:
-                group_bucket.count += 1
             rpm_remaining = (rpm - bucket.count) if rpm is not None else None
-            g_rpm_remaining = (g_rpm - group_bucket.count) if (g_rpm is not None and group_bucket is not None) else None
 
         rpd_count = await self._get_today_count(username)
         rpd_remaining = max(0, rpd - rpd_count) if rpd is not None else None
-
-        g_rpd_remaining: Optional[int] = None
-        if group and g_rpd is not None:
-            group_today_count = await self._get_today_group_count(username, group.model_ids, group.group_id)
-            g_rpd_remaining = max(0, g_rpd - group_today_count)
 
         return RateLimitDecision(
             allowed=True,
@@ -798,12 +760,6 @@ class RateLimitTracker:
             rpd_limit=rpd, rpd_remaining=rpd_remaining,
             retry_after_seconds=0,
             limited_by=None,
-            group_id=group.group_id if group else None,
-            group_name=group.name if group else None,
-            group_rpm_limit=g_rpm,
-            group_rpm_remaining=g_rpm_remaining,
-            group_rpd_limit=g_rpd,
-            group_rpd_remaining=g_rpd_remaining,
         )
 
     async def get_group_rpd_count(
@@ -819,7 +775,12 @@ class RateLimitTracker:
         return await self._get_today_instance_group_count(user_identity, provider_keys, group_id)
 
     async def _get_today_count(self, user_identity: str) -> int:
-        """Return today's total request count with a 5-second TTL cache."""
+        """Return today's total request count with a 5-second TTL cache.
+
+        On a DB/read failure we log and serve the last-known cached count (even
+        if expired) instead of caching a fabricated 0 — caching 0 would disable
+        the daily limit for the whole TTL on every transient error (fail-open).
+        """
         now = time.time()
         entry = self._rpd_cache.get(user_identity)
         if entry and entry.expires_at > now:
@@ -829,7 +790,13 @@ class RateLimitTracker:
             from app.request_tracker import request_tracker
             count = await request_tracker.get_today_count(user_identity)
         except Exception:
-            count = 0
+            logger.error(
+                "RPD count read failed for %s; serving last-known count",
+                user_identity, exc_info=True,
+            )
+            # Serve the stale cached value if present; otherwise 0 but do NOT
+            # cache it so the next request retries the DB immediately.
+            return entry.count if entry else 0
 
         self._rpd_cache[user_identity] = _RpdCacheEntry(
             count=count, expires_at=now + _RPD_TTL
@@ -850,7 +817,11 @@ class RateLimitTracker:
             from app.request_tracker import request_tracker
             count = await request_tracker.get_today_group_count(user_identity, model_ids)
         except Exception:
-            count = 0
+            logger.error(
+                "Group RPD count read failed for %s group %s; serving last-known count",
+                user_identity, group_id, exc_info=True,
+            )
+            return entry.count if entry else 0
 
         self._group_rpd_cache[cache_key] = _RpdCacheEntry(
             count=count, expires_at=now + _RPD_TTL
@@ -871,7 +842,11 @@ class RateLimitTracker:
             from app.request_tracker import request_tracker
             count = await request_tracker.get_today_instance_group_count(user_identity, provider_keys)
         except Exception:
-            count = 0
+            logger.error(
+                "Instance-group RPD count read failed for %s group %s; serving last-known count",
+                user_identity, group_id, exc_info=True,
+            )
+            return entry.count if entry else 0
 
         self._instance_group_rpd_cache[cache_key] = _RpdCacheEntry(
             count=count, expires_at=now + _RPD_TTL

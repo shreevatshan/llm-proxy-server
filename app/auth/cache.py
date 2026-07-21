@@ -35,6 +35,7 @@ class CachedAPIKey:
     cached_at: float = field(default_factory=time.time)
     last_used_updated: bool = False  # Track if last_used needs DB update
     username: Optional[str] = None   # Owner's username (for dashboard display)
+    user_is_active: bool = True      # Owning user's is_active (key is invalid if owner is inactive)
 
     # These properties make CachedAPIKey compatible with SQLAlchemy APIKey
     created_at: Optional[datetime] = None
@@ -196,12 +197,16 @@ class AuthCache:
                 async with self._db_session_factory() as db:
                     from sqlalchemy import update
                     from .models import APIKey
-                    
+                    from .database import hash_api_key
+
+                    # Keys are cached in plaintext but stored hashed - hash before matching.
+                    hashed_keys = [hash_api_key(k) for k in api_keys_to_update]
+
                     # Batch update all API keys at once
                     now = datetime.utcnow()
                     await db.execute(
                         update(APIKey)
-                        .where(APIKey.api_key.in_(api_keys_to_update))
+                        .where(APIKey.api_key.in_(hashed_keys))
                         .values(last_used=now)
                     )
                     await db.commit()
@@ -249,20 +254,31 @@ class AuthCache:
                 async with self._db_session_factory() as db:
                     from sqlalchemy import select
                     from .models import APIKey, User
-                    
+                    from .database import hash_api_key
+
                     # Check API keys validity
                     if cached_api_keys:
+                        # Cache is keyed by plaintext; DB stores hashes. Map hash -> plaintext
+                        # so we can reconcile results back to the cache entries.
+                        hash_to_plain = {hash_api_key(k): k for k in cached_api_keys}
                         result = await db.execute(
-                            select(APIKey.api_key, APIKey.is_active)
-                            .where(APIKey.api_key.in_(cached_api_keys))
+                            select(APIKey.api_key, APIKey.is_active, User.is_active.label("user_is_active"))
+                            .join(User, APIKey.user_id == User.id)
+                            .where(APIKey.api_key.in_(list(hash_to_plain.keys())))
                         )
-                        valid_keys = {row.api_key: row.is_active for row in result.fetchall()}
-                        
-                        # Invalidate keys that are no longer active or don't exist
+                        # plaintext -> (key_active, user_active)
+                        valid_keys = {
+                            hash_to_plain[row.api_key]: (row.is_active, row.user_is_active)
+                            for row in result.fetchall()
+                            if row.api_key in hash_to_plain
+                        }
+
+                        # Invalidate keys that don't exist, are inactive, or whose owner is inactive
                         self._ensure_lock()
                         async with self._lock:
                             for api_key in cached_api_keys:
-                                if api_key not in valid_keys or not valid_keys[api_key]:
+                                status_pair = valid_keys.get(api_key)
+                                if status_pair is None or not status_pair[0] or not status_pair[1]:
                                     if api_key in self._api_key_cache:
                                         del self._api_key_cache[api_key]
                                         self._api_keys_to_update.discard(api_key)
@@ -358,6 +374,22 @@ class AuthCache:
         # Atomic operations
         self._api_key_cache.pop(api_key, None)
         self._api_keys_to_update.discard(api_key)
+
+    def invalidate_api_key_by_hash(self, hashed_key: str):
+        """Remove an API key from cache given its stored SHA-256 hash.
+
+        The cache is keyed by the plaintext key, but the DB (and thus revocation
+        paths) only has the hash — so hash each cached key to find the match.
+        """
+        from .database import hash_api_key
+        # Take snapshot and iterate (matches invalidate_user_api_keys style)
+        keys_to_remove = [
+            key for key in list(self._api_key_cache.keys())
+            if hash_api_key(key) == hashed_key
+        ]
+        for key in keys_to_remove:
+            self._api_key_cache.pop(key, None)
+            self._api_keys_to_update.discard(key)
     
     def invalidate_user_api_keys(self, user_id: int):
         """Invalidate all cached API keys for a user."""

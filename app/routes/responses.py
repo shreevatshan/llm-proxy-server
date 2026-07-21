@@ -24,7 +24,13 @@ from app.openai_models import (
     ResponseItemList
 )
 from app.providers.provider_manager import provider_manager
-from app.auth.middleware import authenticate_jwt_or_api_key
+from app.providers.base import ProviderHTTPError
+from app.routes._errors import openai_provider_error_response
+from app.auth.middleware import (
+    authenticate_jwt_or_api_key,
+    get_owner_user_id,
+    verify_response_ownership,
+)
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
@@ -55,14 +61,24 @@ router = APIRouter()
 
 @router.post("/v1/responses/input_tokens", tags=["responses"])
 async def responses_input_tokens(
+    request_obj: Request,
     request: ResponsesInputTokensRequest,
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
     """Count input tokens for a Responses API request."""
     with create_span("responses_input_tokens", kind=trace.SpanKind.INTERNAL) as span:
         try:
+            # Group rate limit + per-user model access enforcement.
+            await enforce_group_rate_limit(request_obj, auth, request.model)
+            await enforce_model_access(request_obj, auth, request.model)
+
             response = await provider_manager.responses_input_tokens(request)
             return response
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+            raise
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=400, detail=str(e))
@@ -71,21 +87,33 @@ async def responses_input_tokens(
             raise HTTPException(status_code=501, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Responses input tokens error: {str(e)}")
+            logger.error("Responses input tokens error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Responses input tokens error")
 
 
 # ==================== POST /v1/responses/compact ====================
 
 @router.post("/v1/responses/compact", tags=["responses"])
 async def responses_compact(
+    request_obj: Request,
     request: ResponsesCompactRequest,
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
     """Compact a conversation to reduce token usage."""
     with create_span("responses_compact", kind=trace.SpanKind.INTERNAL) as span:
         try:
+            # Group rate limit + per-user model access enforcement. compact
+            # invokes the upstream model, so it must be gated like inference.
+            await enforce_group_rate_limit(request_obj, auth, request.model)
+            await enforce_model_access(request_obj, auth, request.model)
+
             response = await provider_manager.responses_compact(request)
             return response
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+            raise
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=400, detail=str(e))
@@ -94,7 +122,8 @@ async def responses_compact(
             raise HTTPException(status_code=501, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Responses compact error: {str(e)}")
+            logger.error("Responses compact error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Responses compact error")
 
 
 # ==================== POST /v1/responses ====================
@@ -140,7 +169,9 @@ async def responses_create(
                 
                 return StreamingResponse(
                     stream_with_context_and_timeout(
-                        provider_manager.responses_create_stream(request),
+                        provider_manager.responses_create_stream(
+                            request, user_id=get_owner_user_id(auth)
+                        ),
                         current_context,
                         request_obj,
                         timeout=STREAM_TIMEOUT_SECONDS,
@@ -150,11 +181,16 @@ async def responses_create(
                     headers=headers
                 )
             else:
-                response = await provider_manager.responses_create(request)
+                response = await provider_manager.responses_create(
+                    request, user_id=get_owner_user_id(auth)
+                )
                 return response
 
         except (HTTPException, RateLimitExceeded, ModelAccessDenied):
             raise
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=400, detail=str(e))
@@ -163,7 +199,8 @@ async def responses_create(
             raise HTTPException(status_code=501, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Responses create error: {str(e)}")
+            logger.error("Responses create error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Responses create error")
 
 
 # ==================== GET /v1/responses/{response_id} ====================
@@ -178,6 +215,9 @@ async def responses_retrieve(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
     """Retrieve a model response by ID."""
+    # Ownership check (IDOR guard): only the creating user (or an admin) may
+    # access a stored response.
+    await verify_response_ownership(response_id, auth)
     with create_span("responses_retrieve", kind=trace.SpanKind.INTERNAL) as span:
         try:
             kwargs = {}
@@ -187,6 +227,9 @@ async def responses_retrieve(
             
             response = await provider_manager.responses_retrieve(response_id, **kwargs)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=404, detail=str(e))
@@ -195,7 +238,8 @@ async def responses_retrieve(
             raise HTTPException(status_code=501, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Responses retrieve error: {str(e)}")
+            logger.error("Responses retrieve error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Responses retrieve error")
 
 
 # ==================== DELETE /v1/responses/{response_id} ====================
@@ -206,10 +250,15 @@ async def responses_delete(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
     """Delete a stored model response."""
+    # Ownership check (IDOR guard): see responses_retrieve.
+    await verify_response_ownership(response_id, auth)
     with create_span("responses_delete", kind=trace.SpanKind.INTERNAL) as span:
         try:
             response = await provider_manager.responses_delete(response_id)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=404, detail=str(e))
@@ -218,7 +267,8 @@ async def responses_delete(
             raise HTTPException(status_code=501, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Responses delete error: {str(e)}")
+            logger.error("Responses delete error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Responses delete error")
 
 
 # ==================== POST /v1/responses/{response_id}/cancel ====================
@@ -229,10 +279,15 @@ async def responses_cancel(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
     """Cancel a background response."""
+    # Ownership check (IDOR guard): see responses_retrieve.
+    await verify_response_ownership(response_id, auth)
     with create_span("responses_cancel", kind=trace.SpanKind.INTERNAL) as span:
         try:
             response = await provider_manager.responses_cancel(response_id)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=404, detail=str(e))
@@ -241,7 +296,8 @@ async def responses_cancel(
             raise HTTPException(status_code=501, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Responses cancel error: {str(e)}")
+            logger.error("Responses cancel error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Responses cancel error")
 
 
 # ==================== GET /v1/responses/{response_id}/input_items ====================
@@ -256,6 +312,8 @@ async def responses_list_input_items(
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_jwt_or_api_key)
 ):
     """List input items for a response."""
+    # Ownership check (IDOR guard): see responses_retrieve.
+    await verify_response_ownership(response_id, auth)
     with create_span("responses_list_input_items", kind=trace.SpanKind.INTERNAL) as span:
         try:
             kwargs = {}
@@ -270,6 +328,9 @@ async def responses_list_input_items(
             
             response = await provider_manager.responses_list_input_items(response_id, **kwargs)
             return response
+        except ProviderHTTPError as e:
+            set_span_error(span, e)
+            return openai_provider_error_response(e)
         except ValueError as e:
             set_span_error(span, e)
             raise HTTPException(status_code=404, detail=str(e))
@@ -278,4 +339,5 @@ async def responses_list_input_items(
             raise HTTPException(status_code=501, detail=str(e))
         except Exception as e:
             set_span_error(span, e)
-            raise HTTPException(status_code=500, detail=f"Responses list input items error: {str(e)}")
+            logger.error("Responses list input items error: %s", e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Responses list input items error")

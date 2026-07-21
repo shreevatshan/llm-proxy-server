@@ -9,12 +9,14 @@ from .example_processors import (
     CustomHeaderProcessor,
     TokenCountProcessor,
     ResponseTimestampProcessor,
-    ContentSanitizerProcessor
+    ContentSanitizerProcessor,
+    ModelOverrideProcessor,
 )
 
 __all__ = [
     "CustomHeaderProcessor",
-    "TokenCountProcessor", 
+    "TokenCountProcessor",
     "ResponseTimestampProcessor",
-    "ContentSanitizerProcessor"
+    "ContentSanitizerProcessor",
+    "ModelOverrideProcessor",
 ]

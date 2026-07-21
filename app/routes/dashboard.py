@@ -17,6 +17,29 @@ router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 templates = Jinja2Templates(directory="app/frontend/templates")
 
 
+def _safe_json(data) -> str:
+    """json.dumps for embedding inside an inline <script> block.
+
+    Escapes ``<``, ``>``, ``&`` and the U+2028/U+2029 line separators so a
+    value containing ``</script>`` cannot terminate the script element (XSS).
+    """
+    return (
+        json.dumps(data)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+
+
+def _caller_user_id(auth: Union[User, AdminUser]) -> Optional[int]:
+    """User id for per-user model filtering; None for admins (see full list)."""
+    if isinstance(auth, AdminUser):
+        return None
+    return getattr(auth, "user_id", None) or getattr(auth, "id", None)
+
+
 def _extract_endpoints_from_routers(routers, prefix: str = "", tag_suffix: str = "") -> List[Dict[str, str]]:
     """Extract endpoint metadata from FastAPI router objects.
 
@@ -93,8 +116,11 @@ async def dashboard_home(
         if ep["path"].startswith("/v1"):
             ep["path"] = ep["path"][3:]
 
-    # Get enabled models with supported_apis for badge rendering
-    enabled_models = provider_manager.model_cache.get_enabled_models()
+    # Get enabled models with supported_apis for badge rendering, filtered
+    # by the caller's per-user model access policy (mirrors /v1/models).
+    enabled_models = await provider_manager.get_all_models(
+        user_id=_caller_user_id(current_user_or_admin)
+    )
     models_list = []
     for model in enabled_models:
         provider = provider_manager.providers.get(model.provider)
@@ -120,10 +146,10 @@ async def dashboard_home(
             "anthropic_port": config.server.anthropic_port,
             "azure_openai_port": config.server.azure_openai_port,
             "management_port": config.server.management_port,
-            "openai_endpoints_json": json.dumps(openai_endpoints),
-            "anthropic_endpoints_json": json.dumps(anthropic_endpoints),
-            "azure_endpoints_json": json.dumps(azure_endpoints),
-            "models_json": json.dumps(models_list),
+            "openai_endpoints_json": _safe_json(openai_endpoints),
+            "anthropic_endpoints_json": _safe_json(anthropic_endpoints),
+            "azure_endpoints_json": _safe_json(azure_endpoints),
+            "models_json": _safe_json(models_list),
         }
     )
 
@@ -198,9 +224,9 @@ async def endpoints_page(
             "anthropic_port": config.server.anthropic_port,
             "azure_openai_port": config.server.azure_openai_port,
             "management_port": config.server.management_port,
-            "openai_endpoints_json": json.dumps(openai_endpoints),
-            "anthropic_endpoints_json": json.dumps(anthropic_endpoints),
-            "azure_openai_endpoints_json": json.dumps(azure_endpoints),
+            "openai_endpoints_json": _safe_json(openai_endpoints),
+            "anthropic_endpoints_json": _safe_json(anthropic_endpoints),
+            "azure_openai_endpoints_json": _safe_json(azure_endpoints),
         }
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -242,7 +268,10 @@ async def list_models_for_dashboard(
     """List all enabled models with supported API info for the dashboard."""
     from app.providers.provider_manager import provider_manager
 
-    models = provider_manager.model_cache.get_enabled_models()
+    # Filter by the caller's per-user model access policy (mirrors /v1/models).
+    models = await provider_manager.get_all_models(
+        user_id=_caller_user_id(current_user)
+    )
     result = []
     for model in models:
         provider = provider_manager.providers.get(model.provider)

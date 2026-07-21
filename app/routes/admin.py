@@ -6,6 +6,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from typing import List, Optional, Literal
+import os
 import json
 import urllib.parse
 import logging
@@ -56,6 +57,48 @@ import asyncio
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 templates = Jinja2Templates(directory="app/frontend/templates")
+
+logger = logging.getLogger(__name__)
+
+
+def _cookie_secure() -> bool:
+    """Whether auth cookies should carry the Secure flag.
+
+    Defaults to True (production-safe); set COOKIE_SECURE=false for local
+    plaintext-HTTP development.
+    """
+    return os.getenv("COOKIE_SECURE", "true").lower() != "false"
+
+
+# Placeholder returned instead of stored secrets (see _mask_secret).
+_SECRET_MASK = "********"
+
+# Secret fields that _mask_secret masks in read/detail responses. A client
+# echoing the mask back on update means "leave unchanged", so these values
+# must never be persisted (see _strip_masked_secrets).
+_MASKED_SECRET_FIELDS = ("api_key", "secret_access_key")
+
+
+def _mask_secret(value: Optional[str]) -> Optional[str]:
+    """Mask a stored secret for read/detail responses (write-only semantics).
+
+    Returns a fixed placeholder when a value is set (so the UI knows a secret
+    exists) and None when it is absent. The real value is never returned.
+    """
+    return _SECRET_MASK if value else None
+
+
+def _strip_masked_secrets(update_data: dict) -> dict:
+    """Drop secret fields whose submitted value is the mask placeholder.
+
+    Detail responses return secrets as ``_SECRET_MASK``; if a client round-trips
+    that literal on an update, persisting it would corrupt the stored credential.
+    Treat it as "unchanged" and strip it before writing.
+    """
+    for field in _MASKED_SECRET_FIELDS:
+        if update_data.get(field) == _SECRET_MASK:
+            update_data.pop(field)
+    return update_data
 
 
 def _parse_azure_deployment_fields(raw_deployments):
@@ -138,7 +181,7 @@ async def admin_login(
         value=access_token,
         max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         httponly=True,
-        secure=False,  # Set to True in production with HTTPS
+        secure=_cookie_secure(),
         samesite="lax"
     )
     
@@ -157,11 +200,17 @@ async def get_models_management(
         # Get all providers from the unified ProviderCredentials system
         provider_credentials = await get_all_provider_credentials(db)
         models = await get_all_model_configurations(db)
-        
+
+        # Index models by provider_key once (O(M)) instead of re-scanning the
+        # full model list per provider (O(P×M)).
+        models_by_provider: dict = {}
+        for m in models:
+            models_by_provider.setdefault(m.provider_key, []).append(m)
+
         # Build provider response with model counts
         provider_responses = []
         for provider in provider_credentials:
-            provider_models = [m for m in models if m.provider_key == provider.provider_key]
+            provider_models = models_by_provider.get(provider.provider_key, [])
             enabled_models = [m for m in provider_models if m.is_enabled]
             
             # Parse supported_apis for list view
@@ -233,7 +282,7 @@ async def sync_models_from_providers(
         valid_provider_keys = {p.provider_key for p in valid_providers}
         
         # Force a complete provider manager refresh to handle provider renames
-        print("Forcing complete provider manager refresh before sync...")
+        logger.info("Forcing complete provider manager refresh before sync...")
         await provider_manager.refresh_providers_from_database()
         
         # Get all models from provider manager (this will use the refreshed providers)
@@ -251,15 +300,15 @@ async def sync_models_from_providers(
             elif hasattr(model, 'provider') and model.provider:
                 provider_key = model.provider
             else:
-                print(f"Warning: Cannot determine provider for model {model.id}")
+                logger.warning(f"Cannot determine provider for model {model.id}")
                 continue
-            
+
             # Only include models from providers that exist in database
             if provider_key in valid_provider_keys:
                 valid_models.append(model)
                 synced_model_ids.append(model.id)
             else:
-                print(f"Debug: Skipping model {model.id} from provider {provider_key} (not in database)")
+                logger.debug(f"Skipping model {model.id} from provider {provider_key} (not in database)")
         
         # Track providers that actually had models synced
         synced_providers = set()
@@ -277,7 +326,7 @@ async def sync_models_from_providers(
                 provider_key = model.provider
                 model_name = model.id
             else:
-                print(f"Warning: Cannot determine provider for model {model.id}, skipping")
+                logger.warning(f"Cannot determine provider for model {model.id}, skipping")
                 continue
             
             # Track which provider this model belongs to
@@ -304,15 +353,15 @@ async def sync_models_from_providers(
         else:
             message = f"Synced {synced_models} models from {len(synced_providers)} providers"
         
-        print(f"Sync completed: {message}")
-        print(f"Total providers in DB: {len(valid_provider_keys)}")
-        print(f"Providers with models: {len(synced_providers)}")
-        print(f"Models synced: {synced_models}")
-        print(f"Stale models found: {len(stale_models)}")
-        
+        logger.info(f"Sync completed: {message}")
+        logger.info(f"Total providers in DB: {len(valid_provider_keys)}")
+        logger.info(f"Providers with models: {len(synced_providers)}")
+        logger.info(f"Models synced: {synced_models}")
+        logger.info(f"Stale models found: {len(stale_models)}")
+
         # Update the cache with all synced models
         provider_manager.model_cache.update_models(valid_models)
-        print(f"Cache updated with {len(valid_models)} models")
+        logger.info(f"Cache updated with {len(valid_models)} models")
         
         return {
             "message": message,
@@ -476,10 +525,7 @@ async def toggle_model(
         logging.info(f"Model lookup result for '{model_id}': {existing_model is not None}")
         
         if not existing_model:
-            # Let's also check what models are actually in the database with similar names
-            all_models = await get_all_model_configurations(db)
-            similar_models = [m.model_id for m in all_models if 'gemini' in m.model_id.lower()][:5]
-            logging.warning(f"Model not found: {model_id}. Similar models in DB: {similar_models}")
+            logging.warning(f"Model not found: {model_id}")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Model not found: {model_id}"
@@ -748,12 +794,20 @@ async def delete_user(
         user.is_active = False
         await db.commit()
         await db.refresh(user)
+
+        # Invalidate cached auth entries so the deactivated user's API keys stop
+        # working immediately (the cache would otherwise keep serving them).
+        from app.auth.cache import auth_cache
+        auth_cache.invalidate_user_api_keys(user.id)
+        auth_cache.invalidate_user_by_id(user.id)
+
         return {"message": f"User {user.username} has been deactivated"}
     except Exception as e:
         await db.rollback()
+        logger.error("Failed to deactivate user %s: %s", user_id, e, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete user: {str(e)}"
+            detail="Failed to deactivate user"
         )
 
 
@@ -962,7 +1016,9 @@ async def get_rate_limit_users(
 
     result = await db.execute(sa_select(User))
     users = result.scalars().all()
-    return list(await asyncio.gather(*[_build_response(u) for u in users]))
+    # Build sequentially: a single AsyncSession is not safe for concurrent use
+    # (asyncio.gather over the same session raises InvalidRequestError).
+    return [await _build_response(u) for u in users]
 
 
 @router.put("/rate-limits/users", response_model=UserRateLimitResponse)
@@ -1272,8 +1328,8 @@ async def get_model_group_user_overrides(
             effective_rpm=effective_rpm, effective_rpd=effective_rpd,
         )
 
-    import asyncio as _asyncio
-    results = await _asyncio.gather(*[_build(ov) for ov in overrides])
+    # Build sequentially: a single AsyncSession is not safe for concurrent use.
+    results = [await _build(ov) for ov in overrides]
     return [r for r in results if r is not None]
 
 
@@ -1786,8 +1842,8 @@ async def get_instance_group_user_overrides(
             effective_rpm=effective_rpm, effective_rpd=effective_rpd,
         )
 
-    import asyncio as _asyncio
-    results = await _asyncio.gather(*[_build(ov) for ov in overrides])
+    # Build sequentially: a single AsyncSession is not safe for concurrent use.
+    results = [await _build(ov) for ov in overrides]
     return [r for r in results if r is not None]
 
 
@@ -1864,9 +1920,11 @@ async def admin_logout():
     redirect_response.delete_cookie(
         key="access_token",
         httponly=True,
-        secure=False,  # Set to True in production with HTTPS
+        secure=_cookie_secure(),
         samesite="lax"
     )
+    from app.auth.csrf import clear_csrf_cookie
+    clear_csrf_cookie(redirect_response)
     
     return redirect_response
 
@@ -1880,21 +1938,27 @@ async def list_provider_credentials(
 ):
     """List all provider credentials with model counts."""
     try:
-        logging.info("🔍 Fetching all provider credentials...")
+        logging.debug("Fetching all provider credentials...")
         credentials = await get_all_provider_credentials(db)
-        logging.info(f"📋 Found {len(credentials)} provider credentials")
-        
+        logging.debug(f"Found {len(credentials)} provider credentials")
+
         models = await get_all_model_configurations(db)
-        logging.info(f"📋 Found {len(models)} model configurations")
-        
+        logging.debug(f"Found {len(models)} model configurations")
+
+        # Index models by provider_key once (O(M)) instead of re-scanning the
+        # full model list per provider (O(P×M)).
+        models_by_provider: dict = {}
+        for m in models:
+            models_by_provider.setdefault(m.provider_key, []).append(m)
+
         response_list = []
-        
+
         for cred in credentials:
             # Calculate model counts for this provider
-            provider_models = [m for m in models if m.provider_key == cred.provider_key]
+            provider_models = models_by_provider.get(cred.provider_key, [])
             enabled_models = [m for m in provider_models if m.is_enabled]
-            
-            logging.info(f"Provider {cred.provider_key}: {len(provider_models)} models, {len(enabled_models)} enabled")
+
+            logging.debug(f"Provider {cred.provider_key}: {len(provider_models)} models, {len(enabled_models)} enabled")
             
             # Parse deployments JSON if present
             deployments = None
@@ -1922,10 +1986,10 @@ async def list_provider_credentials(
         logging.info(f"📤 Returning {len(response_list)} providers to frontend")
         return response_list
     except Exception as e:
-        logging.error(f"❌ Failed to list provider credentials: {str(e)}")
+        logging.error(f"❌ Failed to list provider credentials: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list provider credentials: {str(e)}"
+            detail="Failed to list provider credentials"
         )
 
 
@@ -1972,12 +2036,12 @@ async def get_provider_credential(
             instance_name=credentials.instance_name,
             enabled=credentials.enabled,
             endpoint=credentials.endpoint,
-            api_key=credentials.api_key,
+            api_key=_mask_secret(credentials.api_key),
             discovery_api_version=credentials.discovery_api_version,
             azure_backend=credentials.azure_backend or ("openai" if credentials.provider_type == "azure" else None),
             region=credentials.region,
             access_key_id=credentials.access_key_id,
-            secret_access_key=credentials.secret_access_key,
+            secret_access_key=_mask_secret(credentials.secret_access_key),
             base_url=credentials.base_url,
             deployments=deployments,
             openai_deployments=deployment_groups.get("openai", []),
@@ -1991,9 +2055,10 @@ async def get_provider_credential(
     except HTTPException:
         raise
     except Exception as e:
+        logging.error(f"Failed to get provider credentials: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get provider credentials: {str(e)}"
+            detail="Failed to get provider credentials"
         )
 
 
@@ -2037,6 +2102,10 @@ async def create_provider_credential(
                 for field, value in provider_data.dict(exclude_unset=True).items():
                     if value is not None and field != "provider_type":  # Don't update provider_type
                         update_data[field] = value
+
+                # A masked secret round-tripped from a detail response means
+                # "leave unchanged" — never persist the placeholder itself.
+                _strip_masked_secrets(update_data)
 
                 credentials = await update_provider_credentials(db, provider_key, **update_data)
                 if not credentials:
@@ -2123,12 +2192,12 @@ async def create_provider_credential(
             provider_name=credentials.provider_name,
             enabled=credentials.enabled,
             endpoint=credentials.endpoint,
-            api_key=credentials.api_key,
+            api_key=_mask_secret(credentials.api_key),
             discovery_api_version=credentials.discovery_api_version,
             azure_backend=credentials.azure_backend or ("openai" if credentials.provider_type == "azure" else None),
             region=credentials.region,
             access_key_id=credentials.access_key_id,
-            secret_access_key=credentials.secret_access_key,
+            secret_access_key=_mask_secret(credentials.secret_access_key),
             base_url=credentials.base_url,
             deployments=deployments,
             openai_deployments=deployment_groups.get("openai", []),
@@ -2161,10 +2230,10 @@ async def create_provider_credential(
                 detail=f"Invalid input: {str(e)}"
             )
     except Exception as e:
-        logging.error(f"Unexpected error creating provider credentials: {str(e)}")
+        logging.error(f"Unexpected error creating provider credentials: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create provider credentials: {str(e)}"
+            detail="Failed to create provider credentials"
         )
 
 
@@ -2185,7 +2254,11 @@ async def update_provider_credential(
         for field, value in provider_data.dict(exclude_unset=True).items():
             if value is not None:
                 update_data[field] = value
-        
+
+        # A masked secret round-tripped from a detail response means
+        # "leave unchanged" — never persist the placeholder itself.
+        _strip_masked_secrets(update_data)
+
         # Serialize supported_apis list to JSON string for storage
         if 'supported_apis' in update_data and isinstance(update_data['supported_apis'], list):
             update_data['supported_apis'] = json.dumps(update_data['supported_apis'])
@@ -2220,12 +2293,12 @@ async def update_provider_credential(
             provider_name=credentials.provider_name,
             enabled=credentials.enabled,
             endpoint=credentials.endpoint,
-            api_key=credentials.api_key,
+            api_key=_mask_secret(credentials.api_key),
             discovery_api_version=credentials.discovery_api_version,
             azure_backend=credentials.azure_backend or ("openai" if credentials.provider_type == "azure" else None),
             region=credentials.region,
             access_key_id=credentials.access_key_id,
-            secret_access_key=credentials.secret_access_key,
+            secret_access_key=_mask_secret(credentials.secret_access_key),
             base_url=credentials.base_url,
             deployments=deployments,
             openai_deployments=deployment_groups.get("openai", []),
@@ -2246,9 +2319,10 @@ async def update_provider_credential(
     except HTTPException:
         raise
     except Exception as e:
+        logging.error(f"Failed to update provider credentials: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update provider credentials: {str(e)}"
+            detail="Failed to update provider credentials"
         )
 
 
@@ -2280,14 +2354,20 @@ async def delete_provider_credential(
     except HTTPException:
         raise
     except Exception as e:
+        logging.error(f"Failed to delete provider credentials: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete provider credentials: {str(e)}"
+            detail="Failed to delete provider credentials"
         )
 
 
 @router.get("/providers/export")
 async def export_provider_config(
+    include_secrets: bool = Query(
+        False,
+        description="Include plaintext api_key/secret_access_key in the export "
+                    "(opt-in). Defaults to False so secrets are not written to disk.",
+    ),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
@@ -2314,12 +2394,12 @@ async def export_provider_config(
                 "provider_name": cred.provider_name,
                 "enabled": cred.enabled,
                 "endpoint": cred.endpoint,
-                "api_key": cred.api_key,
+                "api_key": cred.api_key if include_secrets else None,
                 "discovery_api_version": cred.discovery_api_version,
                 "azure_backend": cred.azure_backend or ("openai" if cred.provider_type == "azure" else None),
                 "region": cred.region,
                 "access_key_id": cred.access_key_id,
-                "secret_access_key": cred.secret_access_key,
+                "secret_access_key": cred.secret_access_key if include_secrets else None,
                 "base_url": cred.base_url,
                 "deployments": deployments,
                 "openai_deployments": deployment_groups.get("openai", []),
@@ -2353,10 +2433,10 @@ async def export_provider_config(
             headers={"Content-Disposition": "attachment; filename=llm-proxy-config.json"},
         )
     except Exception as e:
-        logging.error(f"Failed to export provider config: {str(e)}")
+        logging.error(f"Failed to export provider config: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to export provider config: {str(e)}"
+            detail="Failed to export provider config"
         )
 
 
@@ -2446,14 +2526,8 @@ async def import_provider_config(
                         supported_apis_val.append("anthropic")
                 supported_apis_json = json.dumps(supported_apis_val) if supported_apis_val else None
 
-                if existing and overwrite:
-                    # Delete existing provider first so we can re-create cleanly
-                    await delete_provider_credentials(db, provider_key)
-
-                credentials = await create_provider_credentials(
-                    db=db,
-                    provider_type=provider_data["provider_type"],
-                    instance_name=provider_data["instance_name"],
+                # Shared field set for both create and update-in-place.
+                provider_kwargs = dict(
                     provider_name=provider_data["provider_name"],
                     enabled=provider_data.get("enabled", True),
                     endpoint=provider_data.get("endpoint"),
@@ -2472,6 +2546,25 @@ async def import_provider_config(
                     dynamic_discovery=provider_data.get("dynamic_discovery"),
                     supported_apis=supported_apis_json,
                 )
+
+                if existing and overwrite:
+                    # Update in place instead of delete+create. delete and create
+                    # commit in separate transactions, so a failed create after a
+                    # committed delete permanently loses the existing provider.
+                    # update_provider_credentials rolls back on failure.
+                    credentials = await update_provider_credentials(
+                        db, provider_key,
+                        provider_type=provider_data["provider_type"],
+                        instance_name=provider_data["instance_name"],
+                        **provider_kwargs,
+                    )
+                else:
+                    credentials = await create_provider_credentials(
+                        db=db,
+                        provider_type=provider_data["provider_type"],
+                        instance_name=provider_data["instance_name"],
+                        **provider_kwargs,
+                    )
 
                 if sync_models:
                     try:
@@ -2508,10 +2601,10 @@ async def import_provider_config(
     except HTTPException:
         raise
     except Exception as e:
-        logging.error(f"Failed to import provider config: {str(e)}")
+        logging.error(f"Failed to import provider config: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to import provider config: {str(e)}"
+            detail="Failed to import provider config"
         )
 
 

@@ -83,6 +83,11 @@ class GoogleProvider(OpenAICompatibleProvider):
         
         return filtered_dict
 
+    def _supports_stream_options(self) -> bool:
+        """Google's OpenAI-compatible API rejects stream_options, so the base
+        streaming paths must not inject the include_usage default."""
+        return False
+
     def get_model_id(self, model_name: str) -> str:
         """Get the model ID for Google models."""
         original_model: str = model_name

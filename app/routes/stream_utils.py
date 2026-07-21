@@ -236,6 +236,12 @@ async def stream_with_context_and_timeout(
                         "Stream exceeded timeout of %ss while emitting keepalives; terminating",
                         timeout,
                     )
+                    set_request_tracking_outcome(
+                        request,
+                        status="errored",
+                        termination_reason="stream_timeout",
+                        error=f"Stream timeout exceeded ({timeout}s)",
+                    )
                     error_data = {
                         "error": {
                             "message": f"Stream timeout exceeded ({timeout}s)",
@@ -265,6 +271,12 @@ async def stream_with_context_and_timeout(
             yield chunk
 
             if elapsed > timeout:
+                set_request_tracking_outcome(
+                    request,
+                    status="errored",
+                    termination_reason="stream_timeout",
+                    error=f"Stream timeout exceeded ({timeout}s)",
+                )
                 # Send error chunk before closing (OpenAI-compatible error format)
                 error_data = {
                     "error": {
@@ -277,11 +289,22 @@ async def stream_with_context_and_timeout(
                 yield f"data: {json.dumps(error_data)}\n\n"
                 yield "data: [DONE]\n\n"  # Proper stream termination
                 break
-                
+
     except asyncio.CancelledError:
+        set_request_tracking_outcome(
+            request,
+            status="cancelled",
+            termination_reason="cancelled",
+        )
         logger.info(f"Stream cancelled after {chunks_yielded} chunks")
         raise
     except Exception as e:
+        set_request_tracking_outcome(
+            request,
+            status="errored",
+            termination_reason="stream_error",
+            error=str(e),
+        )
         logger.error(f"Stream error after {chunks_yielded} chunks: {e}")
         raise
     finally:
@@ -325,6 +348,11 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                 or chunk_count % DISCONNECT_CHECK_INTERVAL == 0
             ):
                 if await _request_is_disconnected(request):
+                    set_request_tracking_outcome(
+                        request,
+                        status="cancelled",
+                        termination_reason="client_disconnect",
+                    )
                     logger.info(f"Client disconnected after {chunk_count} chunks, stopping stream")
                     break
 
@@ -341,7 +369,14 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
             remaining_chunk_budget = chunk_budget - elapsed_wait
             if remaining_chunk_budget <= 0:
                 budget_label = "first chunk (TTFT)" if chunks_yielded == 0 else "chunk"
+                budget_reason = "first_chunk_timeout" if chunks_yielded == 0 else "chunk_timeout"
                 logger.warning(f"{budget_label} timeout after {chunk_budget}s")
+                set_request_tracking_outcome(
+                    request,
+                    status="errored",
+                    termination_reason=budget_reason,
+                    error=f"Provider response timeout ({chunk_budget}s)",
+                )
                 await _cancel_pending_task(
                     next_chunk_task, task_name="next chunk task after chunk timeout"
                 )
@@ -366,6 +401,11 @@ async def _stream_with_timeout_and_disconnect(generator, request: Request, timeo
                 # Provider still producing the next chunk; check whether the
                 # client gave up before we burn the whole chunk budget waiting.
                 if await _request_is_disconnected(request):
+                    set_request_tracking_outcome(
+                        request,
+                        status="cancelled",
+                        termination_reason="client_disconnect",
+                    )
                     logger.info(
                         f"Client disconnected after {chunk_count} chunks while waiting for next chunk, stopping stream"
                     )

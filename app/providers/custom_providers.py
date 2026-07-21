@@ -36,9 +36,23 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
         if not self.base_url:
             raise ValueError(f"base_url is required for custom provider '{self.custom_provider_name}'")
 
+        # Reject non-http(s) base URLs up front (SSRF hardening): the URL is
+        # admin-supplied and used for outbound requests.
+        from urllib.parse import urlparse
+        _parsed = urlparse(self.base_url)
+        if _parsed.scheme not in ("http", "https") or not _parsed.hostname:
+            raise ValueError(
+                f"Invalid base_url for custom provider '{self.custom_provider_name}' "
+                f"(must be http(s) with a host): {self.base_url!r}"
+            )
+
         self.api_key = config.get('api_key')
         self._supported_apis = self._parse_supported_apis(config.get('supported_apis', ['openai']))
-        self.provider_type = config.get('name', self.custom_provider_name)
+        # Keep provider_type as the class-derived type ("custom"); the
+        # user-chosen instance name is exposed via instance_name /
+        # full_provider_name (set by BaseProvider.__init__). Overwriting
+        # provider_type with the instance name previously let an instance named
+        # "azure" trip Azure-only code paths that branched on provider_type.
 
         self._assert_anthropic_method_resolution()
         self._init_openai_client()
@@ -121,18 +135,6 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
         return []
 
     # ==================== Model discovery helpers ====================
-
-    # ==================== Lifecycle ====================
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Cleanup API clients."""
-        if getattr(self, 'client', None):
-            await self.client.close()
-        if self._anthropic_client:
-            await self._anthropic_client.close()
 
 
 def create_custom_provider(config: Dict[str, Any]) -> "CustomProvider":

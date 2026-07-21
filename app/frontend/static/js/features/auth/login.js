@@ -1,12 +1,10 @@
 
-function setAuthToken(token) {
-    localStorage.setItem('access_token', token);
-}
-
 function showAlert(message, type = 'info') {
     const alertDiv = document.createElement('div');
     alertDiv.className = `alert alert-${type}`;
-    alertDiv.innerHTML = message;
+    // Use textContent (not innerHTML): `message` can be a server detail or the
+    // decoded ?error= query param, which is attacker-influenceable (reflected XSS).
+    alertDiv.textContent = message;
     alertDiv.style.marginTop = '1rem';
 
     const container = document.querySelector('.auth-card') || document.querySelector('.login-container');
@@ -52,16 +50,13 @@ document.getElementById('loginForm').addEventListener('submit', async function (
         const data = await response.json();
 
         if (response.ok) {
-            console.log('Login successful, token received:', data.access_token ? 'Yes' : 'No');
-            setAuthToken(data.access_token);
-            console.log('Token stored in localStorage:', localStorage.getItem('access_token') ? 'Yes' : 'No');
+            // The server sets the JWT as an HttpOnly `access_token` cookie in the
+            // /auth/login response; no client-side token storage is needed.
             showAlert('Login successful! Redirecting...', 'success');
             setTimeout(() => {
-                console.log('Redirecting to dashboard...');
                 window.location.href = '/dashboard/';
             }, 1000);
         } else {
-            console.log('Login failed:', data.detail);
             const detail = data.detail || 'Login failed';
             // Show pending approval and deactivated messages as warnings for better visibility
             const alertType = (detail.includes('pending admin approval') || detail.includes('deactivated'))

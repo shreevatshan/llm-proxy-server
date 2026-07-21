@@ -84,6 +84,11 @@ class AnthropicToOpenAIConverter:
             "stream": request.stream or False,
         }
 
+        # Ask OpenAI backends to emit a final usage chunk when streaming;
+        # without this the converted Anthropic stream reports 0 output tokens.
+        if kwargs["stream"]:
+            kwargs["stream_options"] = {"include_usage": True}
+
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
         if request.top_p is not None:
@@ -166,13 +171,17 @@ class AnthropicToOpenAIConverter:
             else:
                 logger.warning("Dropping unknown user content block type: %s", block_type)
 
+        # Emit tool messages BEFORE the user content message so that an
+        # assistant(tool_calls) turn is immediately followed by the matching
+        # tool messages (OpenAI rejects assistant tool_calls not immediately
+        # followed by tool messages with a 400).
         result: List[Dict[str, Any]] = []
+        result.extend(tool_messages)
         if content_parts:
             if len(content_parts) == 1 and content_parts[0]["type"] == "text":
                 result.append({"role": "user", "content": content_parts[0]["text"]})
             else:
                 result.append({"role": "user", "content": content_parts})
-        result.extend(tool_messages)
         return result
 
     def _convert_image_block(self, block: Any, block_dict: dict) -> Dict[str, Any]:
@@ -326,6 +335,9 @@ class StreamConversionState:
     content_block_index: int = -1  # -1 means no block opened yet
     current_block_type: Optional[str] = None  # "text", "tool_use", "thinking"
     tool_call_indices: Dict[int, int] = field(default_factory=dict)  # OpenAI tc index → our block index
+    # Buffers id/name/args for tool calls whose id and name arrive across
+    # separate deltas, so a tool_use block is opened only once both are known.
+    pending_tool_calls: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     finish_reason: Optional[str] = None
     input_tokens: int = 0
     output_tokens: int = 0
@@ -341,7 +353,7 @@ STOP_REASON_MAP: Dict[str, str] = {
     "stop": "end_turn",
     "length": "max_tokens",
     "tool_calls": "tool_use",
-    "content_filter": "end_turn",
+    "content_filter": "refusal",
 }
 
 
@@ -478,26 +490,49 @@ class OpenAIToAnthropicConverter:
                 func = tc.get("function", {})
                 tc_id = tc.get("id")
                 tc_name = func.get("name")
+                args_chunk = func.get("arguments")
 
-                if tc_id and tc_name:
-                    # New tool call — close previous block, open tool_use block
+                pending = state.pending_tool_calls.setdefault(
+                    tc_index, {"id": None, "name": None, "buffered_args": ""}
+                )
+                if tc_id:
+                    pending["id"] = tc_id
+                if tc_name:
+                    pending["name"] = tc_name
+
+                # Open the tool_use block once both id and name are known.
+                # Backends may split them across deltas, so we buffer until then.
+                if tc_index not in state.tool_call_indices and pending["id"] and pending["name"]:
+                    state.had_tool_use = True
                     events.extend(self._open_block(state, "tool_use", {
                         "type": "tool_use",
-                        "id": tc_id,
-                        "name": tc_name,
+                        "id": pending["id"],
+                        "name": pending["name"],
                         "input": {},
                     }))
                     state.tool_call_indices[tc_index] = state.content_block_index
+                    # Flush any argument fragments buffered before the block opened.
+                    if pending["buffered_args"]:
+                        events.append(_format_sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": state.content_block_index,
+                            "delta": {"type": "input_json_delta", "partial_json": pending["buffered_args"]},
+                        }))
+                        pending["buffered_args"] = ""
 
                 # Argument fragments
-                args_chunk = func.get("arguments")
                 if args_chunk:
-                    block_idx = state.tool_call_indices.get(tc_index, state.content_block_index)
-                    events.append(_format_sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": block_idx,
-                        "delta": {"type": "input_json_delta", "partial_json": args_chunk},
-                    }))
+                    block_idx = state.tool_call_indices.get(tc_index)
+                    if block_idx is None:
+                        # Block not opened yet (id/name not both seen) — buffer,
+                        # never emit input_json_delta against an unopened index.
+                        pending["buffered_args"] += args_chunk
+                    else:
+                        events.append(_format_sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": block_idx,
+                            "delta": {"type": "input_json_delta", "partial_json": args_chunk},
+                        }))
 
         # Finish reason
         if finish_reason:
@@ -535,10 +570,17 @@ class OpenAIToAnthropicConverter:
             }))
 
         stop_reason = STOP_REASON_MAP.get(state.finish_reason or "stop", "end_turn")
+        # A backend may omit finish_reason or report "stop" even when it emitted
+        # tool calls; fall back to "tool_use" so the client executes the tools.
+        if state.had_tool_use and stop_reason not in ("max_tokens", "refusal"):
+            stop_reason = "tool_use"
         events.append(_format_sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": state.output_tokens},
+            "usage": {
+                "input_tokens": state.input_tokens,
+                "output_tokens": state.output_tokens,
+            },
         }))
         events.append(_format_sse("message_stop", {"type": "message_stop"}))
 
@@ -592,7 +634,7 @@ class AnthropicToResponsesConverter:
 
     def _ensure_fc_id(self, original_id: str) -> str:
         """Ensure an ID starts with 'fc_' for Responses API compatibility."""
-        if original_id.startswith("fc"):
+        if original_id.startswith("fc_"):
             return original_id
         if original_id in self._id_map:
             return self._id_map[original_id]
@@ -704,13 +746,16 @@ class AnthropicToResponsesConverter:
             elif block_type in ("thinking", "redacted_thinking"):
                 pass
 
+        # Emit function_call_output items BEFORE the user content message so a
+        # preceding assistant function_call turn is immediately followed by its
+        # matching outputs.
         result: List[Dict[str, Any]] = []
+        result.extend(extra_items)
         if content_parts:
             if len(content_parts) == 1 and content_parts[0].get("type") == "input_text":
                 result.append({"type": "message", "role": "user", "content": content_parts[0]["text"]})
             else:
                 result.append({"type": "message", "role": "user", "content": content_parts})
-        result.extend(extra_items)
         return result
 
     def _convert_image_block(self, block: Any, block_dict: dict) -> Dict[str, Any]:
@@ -1081,7 +1126,7 @@ class ResponsesToAnthropicConverter:
         has_tool_use = (
             state.had_tool_use
             or state.current_block_type == "tool_use"
-            or any(v for v in state.tool_call_indices.values())
+            or bool(state.tool_call_indices)
         )
         if has_tool_use and status == "completed":
             stop_reason = "tool_use"
@@ -1095,7 +1140,10 @@ class ResponsesToAnthropicConverter:
         events.append(_format_sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": state.output_tokens},
+            "usage": {
+                "input_tokens": state.input_tokens,
+                "output_tokens": state.output_tokens,
+            },
         }))
         events.append(_format_sse("message_stop", {"type": "message_stop"}))
 

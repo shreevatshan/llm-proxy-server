@@ -11,7 +11,7 @@ import os
 import re
 import logging
 from typing import List, Optional, Dict, Any, Union, Literal, Annotated, Tuple
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 _logger = logging.getLogger(__name__)
@@ -79,7 +79,9 @@ ANTHROPIC_SDK_TIMEOUT_SECONDS = _get_positive_float_env(
 class AnthropicCacheControl(BaseModel):
     """Cache control directive for prompt caching."""
     type: str = "ephemeral"
-    ttl: Optional[int] = None
+    # The Anthropic extended-cache-TTL feature sends string TTLs ("5m"/"1h"),
+    # not integers. Typed as str so those blocks validate instead of degrading.
+    ttl: Optional[str] = None
 
 
 class AnthropicTextBlock(BaseModel):
@@ -98,6 +100,19 @@ class AnthropicImageSource(BaseModel):
     media_type: Optional[str] = None  # e.g., "image/jpeg", "image/png"
     data: Optional[str] = None  # base64-encoded image data
     url: Optional[str] = None  # URL for url type
+
+    @model_validator(mode="after")
+    def _require_matching_field(self) -> "AnthropicImageSource":
+        """A base64 source needs data; a url source needs url.
+
+        Without this a base64 image with no data converts downstream to the
+        broken URL ``data:image/png;base64,`` (see anthropic_openai.py).
+        """
+        if self.type == "base64" and not self.data:
+            raise ValueError("image source of type 'base64' requires 'data'")
+        if self.type == "url" and not self.url:
+            raise ValueError("image source of type 'url' requires 'url'")
+        return self
 
 
 class AnthropicImageBlock(BaseModel):
@@ -235,7 +250,7 @@ class AnthropicToolChoice(BaseModel):
 class AnthropicThinkingConfig(BaseModel):
     """Extended thinking configuration."""
     type: str = "enabled"  # "enabled" or "disabled"
-    budget_tokens: Optional[int] = None
+    budget_tokens: Optional[int] = Field(default=None, ge=1)
 
 
 class AnthropicMetadata(BaseModel):
@@ -247,10 +262,10 @@ class AnthropicMessagesRequest(BaseModel):
     """Request body for POST /v1/messages."""
     model: str
     messages: List[AnthropicMessage]
-    max_tokens: int
+    max_tokens: int = Field(ge=1)
     system: Optional[Union[str, List[AnthropicTextBlock]]] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
+    temperature: Optional[float] = Field(default=None, ge=0, le=1)
+    top_p: Optional[float] = Field(default=None, ge=0, le=1)
     top_k: Optional[int] = None
     stop_sequences: Optional[List[str]] = None
     stream: Optional[bool] = False
@@ -661,9 +676,15 @@ def build_anthropic_sdk_kwargs(
     # compatibility for newer fields and third-party gateways.
     extra_fields = getattr(request, "model_extra", None) or {}
     if extra_fields:
-        # Avoid duplicating known fields already included in kwargs
-        filtered = {k: v for k, v in extra_fields.items() if k not in kwargs and v is not None}
+        # Only skip names that duplicate a declared request field; comparing
+        # against internal kwargs keys (e.g. "timeout") would wrongly drop a
+        # client extra field that happens to share that name.
+        known_field_names = set(type(request).model_fields)
+        filtered = {
+            k: v for k, v in extra_fields.items()
+            if k not in known_field_names and v is not None
+        }
         if filtered:
-            kwargs["extra_body"] = {**kwargs.get("extra_body", {}), **filtered}
+            kwargs["extra_body"] = filtered
 
     return kwargs

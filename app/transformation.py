@@ -5,6 +5,8 @@ This module provides a modular system for preprocessing requests and post-proces
 with easy-to-add and remove processors.
 """
 
+import logging
+import re
 from typing import Dict, Any, Optional, List, Type
 from abc import ABC, abstractmethod
 from pydantic import BaseModel
@@ -23,6 +25,8 @@ from app.openai_models import (
     AudioTranscriptionResponse,
     AudioTranslationResponse
 )
+
+logger = logging.getLogger(__name__)
 
 
 class ProcessorConfig(BaseModel):
@@ -132,8 +136,11 @@ class TransformationManager:
                 try:
                     processor = processor_class(processor_config)
                     self.request_processors.append(processor)
-                except Exception as e:
-                    print(f"Failed to initialize request processor '{processor_config.name}': {e}")
+                except Exception:
+                    logger.error(
+                        "Failed to initialize request processor '%s'",
+                        processor_config.name, exc_info=True,
+                    )
         
         # Sort by priority (lower numbers first)
         self.request_processors.sort(key=lambda p: p.priority)
@@ -148,8 +155,11 @@ class TransformationManager:
                 try:
                     processor = processor_class(processor_config)
                     self.response_processors.append(processor)
-                except Exception as e:
-                    print(f"Failed to initialize response processor '{processor_config.name}': {e}")
+                except Exception:
+                    logger.error(
+                        "Failed to initialize response processor '%s'",
+                        processor_config.name, exc_info=True,
+                    )
         
         # Sort by priority (lower numbers first)
         self.response_processors.sort(key=lambda p: p.priority)
@@ -202,8 +212,10 @@ class TransformationManager:
             
             try:
                 processed_request = await processor.process(processed_request, context)
-            except Exception as e:
-                print(f"Request processor '{processor.name}' failed: {e}")
+            except Exception:
+                logger.error(
+                    "Request processor '%s' failed", processor.name, exc_info=True,
+                )
                 # Continue with the current state if a processor fails
                 continue
         
@@ -224,8 +236,10 @@ class TransformationManager:
             
             try:
                 processed_response = await processor.process(processed_response, context)
-            except Exception as e:
-                print(f"Response processor '{processor.name}' failed: {e}")
+            except Exception:
+                logger.error(
+                    "Response processor '%s' failed", processor.name, exc_info=True,
+                )
                 # Continue with the current state if a processor fails
                 continue
         
@@ -296,24 +310,34 @@ class ResponseMetadataProcessor(ResponseProcessor):
 
 class ContentFilterProcessor(RequestProcessor):
     """Filters or modifies content based on rules."""
-    
+
+    def __init__(self, config: ProcessorConfig):
+        super().__init__(config)
+        # Compile replace-rule regexes once at init so a bad pattern surfaces
+        # immediately (and loudly) rather than silently failing per-request and
+        # letting content through unfiltered. A compile failure here propagates
+        # to TransformationManager._initialize_processors, which logs it.
+        self._compiled_rules: List[tuple] = []
+        for rule in self.processor_config.get("rules", []):
+            if rule.get("type") == "replace":
+                pattern = rule.get("pattern", "")
+                if pattern:
+                    self._compiled_rules.append(
+                        (re.compile(pattern), rule.get("replacement", ""))
+                    )
+
     def is_applicable(self, data: Any) -> bool:
         """Apply to chat completion requests."""
         return isinstance(data, ChatCompletionRequest)
-    
+
     async def process(self, request: ChatCompletionRequest, context: Dict[str, Any]) -> ChatCompletionRequest:
         """Filter content based on configuration."""
-        filter_rules = self.processor_config.get("rules", [])
-        
         for message in request.messages:
-            for rule in filter_rules:
-                if rule.get("type") == "replace":
-                    pattern = rule.get("pattern", "")
-                    replacement = rule.get("replacement", "")
-                    if pattern and isinstance(message.content, str):
-                        import re
-                        message.content = re.sub(pattern, replacement, message.content)
-        
+            if not isinstance(message.content, str):
+                continue
+            for compiled, replacement in self._compiled_rules:
+                message.content = compiled.sub(replacement, message.content)
+
         return request
 
 
