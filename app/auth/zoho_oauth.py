@@ -176,12 +176,17 @@ class ZohoOAuth:
                     detail=f"OAuth token exchange failed: {str(e)}"
                 )
     
-    async def decode_id_token(self, id_token: str) -> ZohoUserInfo:
+    async def decode_id_token(self, id_token: str, access_token: Optional[str] = None) -> ZohoUserInfo:
         """Verify and decode a ZOHO ID token (JWT).
 
         Verifies the RS256 signature against ZOHO's JWKS and enforces the
         audience (client_id) and expiry via jose, then checks the issuer against
         the fetched datacenter list.
+
+        When ``access_token`` is supplied, jose also verifies the token's
+        ``at_hash`` claim, binding the ID token to the access token. ZOHO always
+        includes ``at_hash``, so without the access token jose raises
+        "No access_token provided to compare against at_hash claim".
         """
         try:
             # Locate the signing key by 'kid' from the JWKS.
@@ -202,13 +207,16 @@ class ZohoOAuth:
             if signing_key is None:
                 raise ValueError("No matching signing key found in ZOHO JWKS for this token")
 
-            # Verify signature, audience and expiry.
+            # Verify signature, audience and expiry. Only verify at_hash when we
+            # actually have the access token to compare against; ZOHO includes
+            # the at_hash claim, so jose would otherwise refuse to decode.
             decoded_token = jwt.decode(
                 id_token,
                 signing_key,
                 algorithms=["RS256"],
                 audience=self.config.client_id,
-                options={"verify_aud": True},
+                access_token=access_token,
+                options={"verify_aud": True, "verify_at_hash": access_token is not None},
             )
 
             # Validate required fields
@@ -270,7 +278,7 @@ class ZohoOAuth:
                 detail="No ID token received from ZOHO"
             )
         
-        return await self.decode_id_token(id_token)
+        return await self.decode_id_token(id_token, token_response.get("access_token"))
 
 
 # Global ZOHO OAuth instance

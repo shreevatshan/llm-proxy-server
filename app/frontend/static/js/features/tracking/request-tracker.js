@@ -209,9 +209,9 @@ class RequestTrackerManager {
 
     _serverBadge(server) {
         const map = {
-            openai: { cls: 'primary', label: 'OpenAI' },
+            openai: { cls: 'info', label: 'OpenAI' },
             anthropic: { cls: 'info', label: 'Anthropic' },
-            azure_openai: { cls: 'warning', label: 'Azure' }
+            azure_openai: { cls: 'info', label: 'Azure' }
         };
         const s = map[server] || { cls: 'secondary', label: server };
         return '<span class="badge bg-' + s.cls + '">' + s.label + '</span>';
