@@ -20,7 +20,7 @@ from app.auth.models import (
     UserCreate, UserLogin, UserResponse, Token, APIKeyCreate,
     APIKeyResponse, APIKeyListResponse, UserUpdate, PasswordUpdate, AccountDelete,
     ZohoOAuthCallback,
-    MyQuotasResponse, QuotaOverallResponse, QuotaGroupResponse, QuotaInstanceGroupResponse,
+    MyQuotasResponse, QuotaSectionResponse,
 )
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin
@@ -546,79 +546,106 @@ async def get_my_quotas(
     current_user: Union[User, AdminUser] = Depends(get_current_active_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return the authenticated user's read-only quota information.
+    """Return the authenticated user's read-only quota information as a unified list of
+    sections, one quota bucket each.
 
-    - overall: effective RPM/RPD limits + current usage counts
-    - groups:  each model group's effective RPM/RPD limits (override or group default) + member models
-    - Admins are exempt from rate limits and receive is_admin=True with no quota data.
+    Every model the user can access is placed under exactly one section:
+      - Instance groups take precedence over model groups: a model whose instance
+        (provider_key) is in an instance group is listed under that instance group.
+      - Remaining models that belong to a model group are listed under it.
+      - Everything else falls under the ungrouped 'Other Models' section, governed by
+        the overall request quota.
+    Model groups and instance groups are not distinguished in the response — the UI
+    renders them identically. Admins are exempt and receive is_admin=True, sections=[].
     """
-    from app.auth.models import ModelGroup
     from app.auth.database import (
         list_model_groups, get_user_group_rate_limit,
         list_instance_groups, get_user_instance_group_rate_limit,
     )
     from app.rate_limit import rate_limit_tracker
+    from app.providers.provider_manager import provider_manager
 
     # Admins bypass all rate limits; AdminUser has no integer DB id
     if isinstance(current_user, AdminUser):
-        return MyQuotasResponse(is_admin=True, overall=None, groups=[], instance_groups=[])
+        return MyQuotasResponse(is_admin=True, sections=[])
 
-    # --- Overall request-level quota (read-only, no increment) ---
-    status_obj = await rate_limit_tracker.get_user_status(current_user.id, current_user.username)
-    overall = QuotaOverallResponse(
-        rpm_limit=status_obj.rpm_limit,
-        rpm_count=status_obj.rpm_count,
-        rpm_remaining=status_obj.rpm_remaining,
-        rpd_limit=status_obj.rpd_limit,
-        rpd_count=status_obj.rpd_count,
-        rpd_remaining=status_obj.rpd_remaining,
-    )
+    # Accessible models for this user (same filter as GET /v1/models and /auth/api/models).
+    accessible = await provider_manager.get_all_models(user_id=current_user.id)
+    accessible_ids = [m.id for m in accessible]
+    provider_key_of = {mid: (mid.split('/', 1)[0] if '/' in mid else mid) for mid in accessible_ids}
 
-    # --- Per-model-group quotas ---
-    group_rows = await list_model_groups(db)  # eager-loads .members
-    quota_groups: list[QuotaGroupResponse] = []
-    for group in group_rows:
-        # Resolve effective limit: per-user override if set, else group default
-        ov = await get_user_group_rate_limit(db, current_user.id, group.id)
+    claimed: set[str] = set()  # model ids already placed in a section (precedence tracking)
+    named_sections: list[QuotaSectionResponse] = []
+
+    def _effective(ov, group):
         eff_rpm = ov.rpm_limit if (ov and ov.rpm_limit is not None) else group.rpm_default
         eff_rpd = ov.rpd_limit if (ov and ov.rpd_limit is not None) else group.rpd_default
-        models = [m.model_id for m in group.members]
-        cnt = await rate_limit_tracker.get_group_rpd_count(current_user.username, models, group.id)
-        rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
-        quota_groups.append(QuotaGroupResponse(
-            name=group.name,
-            description=group.description,
-            rpm_limit=eff_rpm,
-            rpd_limit=eff_rpd,
-            rpd_count=cnt,
-            rpd_remaining=rpd_remaining,
-            models=models,
-        ))
+        return eff_rpm, eff_rpd
 
-    # --- Per-instance-group quotas ---
+    # --- Instance-group sections (highest precedence) ---
     instance_group_rows = await list_instance_groups(db)  # eager-loads .members
-    quota_instance_groups: list[QuotaInstanceGroupResponse] = []
     for group in instance_group_rows:
+        member_keys = {m.provider_key for m in group.members}
+        section_models = [mid for mid in accessible_ids if provider_key_of[mid] in member_keys]
+        if not section_models:
+            continue
+        claimed.update(section_models)
         ov = await get_user_instance_group_rate_limit(db, current_user.id, group.id)
-        eff_rpm = ov.rpm_limit if (ov and ov.rpm_limit is not None) else group.rpm_default
-        eff_rpd = ov.rpd_limit if (ov and ov.rpd_limit is not None) else group.rpd_default
-        instances = [m.provider_key for m in group.members]
-        cnt = await rate_limit_tracker.get_instance_group_rpd_count(current_user.username, instances, group.id)
+        eff_rpm, eff_rpd = _effective(ov, group)
+        # Count is enforced across the group's full member set (matches enforcement).
+        cnt = await rate_limit_tracker.get_instance_group_rpd_count(
+            current_user.username, [m.provider_key for m in group.members], group.id
+        )
         rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
-        quota_instance_groups.append(QuotaInstanceGroupResponse(
-            name=group.name,
-            description=group.description,
-            rpm_limit=eff_rpm,
-            rpd_limit=eff_rpd,
-            rpd_count=cnt,
-            rpd_remaining=rpd_remaining,
-            instances=instances,
+        named_sections.append(QuotaSectionResponse(
+            name=group.name, description=group.description,
+            rpm_limit=eff_rpm, rpd_limit=eff_rpd,
+            rpd_count=cnt, rpd_remaining=rpd_remaining,
+            models=section_models,
         ))
 
-    return MyQuotasResponse(
-        is_admin=False, overall=overall,
-        groups=quota_groups, instance_groups=quota_instance_groups,
-    )
+    # --- Model-group sections (exclude models already claimed by an instance group) ---
+    group_rows = await list_model_groups(db)  # eager-loads .members
+    for group in group_rows:
+        member_ids = {m.model_id for m in group.members}
+        section_models = [mid for mid in accessible_ids if mid in member_ids and mid not in claimed]
+        if not section_models:
+            continue
+        claimed.update(section_models)
+        ov = await get_user_group_rate_limit(db, current_user.id, group.id)
+        eff_rpm, eff_rpd = _effective(ov, group)
+        # Count is enforced across the group's full member set (matches enforcement).
+        cnt = await rate_limit_tracker.get_group_rpd_count(
+            current_user.username, [m.model_id for m in group.members], group.id
+        )
+        rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
+        named_sections.append(QuotaSectionResponse(
+            name=group.name, description=group.description,
+            rpm_limit=eff_rpm, rpd_limit=eff_rpd,
+            rpd_count=cnt, rpd_remaining=rpd_remaining,
+            models=section_models,
+        ))
+
+    # Named groups share one visual treatment; order alphabetically.
+    named_sections.sort(key=lambda s: s.name.lower())
+
+    # --- 'Other Models' section: everything ungrouped, under the overall quota ---
+    sections = list(named_sections)
+    other_models = [mid for mid in accessible_ids if mid not in claimed]
+    if other_models:
+        status_obj = await rate_limit_tracker.get_user_status(current_user.id, current_user.username)
+        sections.append(QuotaSectionResponse(
+            name="Other Models",
+            description="Models nost assigned to any group",
+            rpm_limit=status_obj.rpm_limit,
+            rpd_limit=status_obj.rpd_limit,
+            rpd_count=status_obj.rpd_count,
+            rpd_remaining=status_obj.rpd_remaining,
+            models=other_models,
+            is_other=True,
+        ))
+
+    return MyQuotasResponse(is_admin=False, sections=sections)
 
 
 # ZOHO OAuth Routes

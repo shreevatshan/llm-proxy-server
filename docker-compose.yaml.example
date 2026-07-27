@@ -52,7 +52,34 @@ services:
       - TIMEZONE=Asia/Kolkata
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; [requests.get('http://localhost:%d/health' % p).raise_for_status() for p in (8765, 11440, 2027, 11439)]"]
+      # A failing healthcheck only flips the container to "unhealthy" in plain
+      # Compose — it does NOT trigger `restart: unless-stopped` (that fires on
+      # process exit only; acting on health status is Swarm-only). So the probe
+      # itself SIGKILLs PID 1 after 3 consecutive failures, turning a hang into a
+      # process exit that the restart policy then restarts. The /tmp counter is
+      # reset on every success so a single transient blip won't trip it.
+      # timeout=5 + raise_for_status() make a slow or 5xx response count as a
+      # failure (bare requests.get() ignores status and can block forever).
+      test:
+        - CMD-SHELL
+        - |
+          python - <<'PY'
+          import requests, os, signal
+          f = '/tmp/health_fail'
+          try:
+              requests.get('http://localhost:8765/health', timeout=5).raise_for_status()
+              open(f, 'w').write('0')
+          except Exception:
+              try:
+                  n = int(open(f).read() or 0)
+              except Exception:
+                  n = 0
+              n += 1
+              open(f, 'w').write(str(n))
+              if n >= 3:
+                  os.kill(1, signal.SIGKILL)
+              raise SystemExit(1)
+          PY
       interval: 30s
       timeout: 10s
       retries: 3

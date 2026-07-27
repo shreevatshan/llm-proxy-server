@@ -617,40 +617,27 @@ class UserModelGroupRateLimitResponse(BaseModel):
 # User-facing quota response models (GET /auth/quotas)
 # ---------------------------------------------------------------------------
 
-class QuotaOverallResponse(BaseModel):
-    rpm_limit: Optional[int] = None      # null = unlimited
-    rpm_count: int = 0                   # requests used this minute
-    rpm_remaining: Optional[int] = None  # null = unlimited
-    rpd_limit: Optional[int] = None      # null = unlimited
-    rpd_count: int = 0                   # requests used today (UTC)
-    rpd_remaining: Optional[int] = None  # null = unlimited
+class QuotaSectionResponse(BaseModel):
+    """A single unified quota section for the user dashboard.
 
-
-class QuotaGroupResponse(BaseModel):
+    Model groups, instance groups and the ungrouped 'Other Models' bucket are all
+    represented the same way so the UI never has to distinguish them. `models` lists
+    the model ids governed by this section, with instance-group precedence already
+    applied — a model whose instance is in an instance group appears only there.
+    """
     name: str
     description: Optional[str] = None
-    rpm_limit: Optional[int] = None      # effective: override if set, else group default; null = unlimited
+    rpm_limit: Optional[int] = None      # effective; null = unlimited
     rpd_limit: Optional[int] = None      # effective; null = unlimited
-    rpd_count: int = 0                   # requests used today (UTC) across this group
+    rpd_count: int = 0                   # requests used today (local day) in this section
     rpd_remaining: Optional[int] = None  # null = unlimited
-    models: List[str] = []               # member model_ids in this group
-
-
-class QuotaInstanceGroupResponse(BaseModel):
-    name: str
-    description: Optional[str] = None
-    rpm_limit: Optional[int] = None      # effective: override if set, else group default; null = unlimited
-    rpd_limit: Optional[int] = None      # effective; null = unlimited
-    rpd_count: int = 0                   # requests used today (UTC) across this group
-    rpd_remaining: Optional[int] = None  # null = unlimited
-    instances: List[str] = []            # member provider_keys in this group
+    models: List[str] = []               # model ids listed under this section
+    is_other: bool = False               # true for the ungrouped 'Other Models' bucket
 
 
 class MyQuotasResponse(BaseModel):
-    is_admin: bool = False                             # true ⇒ exempt from all limits
-    overall: Optional[QuotaOverallResponse] = None    # null when is_admin
-    groups: List[QuotaGroupResponse] = []
-    instance_groups: List[QuotaInstanceGroupResponse] = []
+    is_admin: bool = False                     # true ⇒ exempt from all limits
+    sections: List[QuotaSectionResponse] = []  # unified list; empty when is_admin
 
 
 class UserModelGroupRateLimitUpdate(BaseModel):
