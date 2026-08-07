@@ -17,6 +17,7 @@ from app.anthropic_models import (
 )
 from app.openai_models import ModelInfo
 from app.providers.base import BaseProvider, ProviderHTTPError
+from app.model_alias import echo_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -308,7 +309,7 @@ class AnthropicCompatibleProvider(BaseProvider):
                 async for sse in stream_anthropic_sdk_events(
                     stream,
                     provider_label=getattr(self, "full_provider_name", self.custom_provider_name),
-                    model=request.model,
+                    model=echo_model_name(request),
                 ):
                     yield sse
         except Exception as e:

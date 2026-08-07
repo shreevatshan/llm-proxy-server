@@ -18,6 +18,7 @@ azure_call_style: ContextVar[str] = ContextVar("azure_call_style", default="v1")
 azure_api_version: ContextVar[Optional[str]] = ContextVar("azure_api_version", default=None)
 
 from app.providers.openai_compatible import OpenAICompatibleProvider
+from app.model_alias import echo_model_name
 from app.openai_models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -599,7 +600,7 @@ class AzureProvider(OpenAICompatibleProvider):
             except Exception as e:
                 raise _translate_anthropic_sdk_error(e, "azure-foundry") from e
             response_data = json.loads(response.model_dump_json(warnings="none"))
-            response_data["model"] = request.model
+            response_data["model"] = echo_model_name(request)
             return response_data
 
         transport = self._get_adapter_transport(request.model)
@@ -638,7 +639,7 @@ class AzureProvider(OpenAICompatibleProvider):
                     async for sse in stream_anthropic_sdk_events(
                         stream,
                         provider_label="azure-foundry",
-                        model=request.model,
+                        model=echo_model_name(request),
                     ):
                         yield sse
             except ProviderHTTPError:

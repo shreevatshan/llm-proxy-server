@@ -60,6 +60,7 @@ from app.routes.stream_utils import (
 )
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access
+from app.model_alias import apply_alias
 from app.tracing import (
     get_w3c_traceparent,
     create_span,
@@ -252,7 +253,7 @@ async def azure_chat_completions(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = _build_model_name(provider_name, deployment)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -333,7 +334,7 @@ async def azure_completions(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = _build_model_name(provider_name, deployment)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -412,7 +413,7 @@ async def azure_embeddings(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = _build_model_name(provider_name, deployment)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -466,7 +467,7 @@ async def azure_image_generation(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = _build_model_name(provider_name, deployment)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -520,7 +521,7 @@ async def azure_audio_speech(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = _build_model_name(provider_name, deployment)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -600,7 +601,7 @@ async def azure_audio_transcription(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = _build_model_name(provider_name, deployment)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
@@ -673,7 +674,7 @@ async def azure_audio_translation(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = _build_model_name(provider_name, deployment)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
@@ -748,6 +749,8 @@ async def azure_responses_create(
                 f"Model '{request.model}' does not belong to provider "
                 f"'{provider_name}' named in the URL",
             )
+
+    request.model = apply_alias(request.model)
 
     # Enforce group rate limit + per-user model access, mirroring the sibling
     # azure_chat_completions handler.

@@ -20,6 +20,7 @@ from app.conversion.anthropic_openai import (
     _is_server_tool,
 )
 from app.providers.base import AnthropicRequestMetadata
+from app.model_alias import echo_model_name
 
 _SPECIAL_ADAPTER_TOOL_TYPES = (
     "computer_",
@@ -226,7 +227,7 @@ async def anthropic_adapter_messages(
         response_obj = await provider.responses_create(adapted_request)
         if hasattr(response_obj, "model_dump"):
             response_obj = response_obj.model_dump(exclude_unset=True)
-        return converter_out.convert_response(response_obj, request.model)
+        return converter_out.convert_response(response_obj, echo_model_name(request))
 
     converter_in = AnthropicToOpenAIConverter()
     converter_out = OpenAIToAnthropicConverter()
@@ -235,7 +236,7 @@ async def anthropic_adapter_messages(
     response_obj = await provider.chat_completion(adapted_request)
     if hasattr(response_obj, "model_dump"):
         response_obj = response_obj.model_dump(exclude_unset=True)
-    return converter_out.convert_response(response_obj, request.model)
+    return converter_out.convert_response(response_obj, echo_model_name(request))
 
 
 async def anthropic_adapter_messages_stream(
@@ -256,7 +257,7 @@ async def anthropic_adapter_messages_stream(
     model_id = provider.get_model_id(sanitized_request.model)
     state = StreamConversionState(
         message_id=f"msg_{uuid.uuid4().hex}",
-        model=request.model,
+        model=echo_model_name(request),
     )
 
     if transport == "responses":

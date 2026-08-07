@@ -105,6 +105,10 @@ async def shared_startup():
                 rate_limit_tracker.set_db_session_factory(AsyncSessionLocal)
                 await rate_limit_tracker.start()
 
+            with create_span("app.startup.init_model_aliases"):
+                from app.model_alias import model_alias_resolver
+                await model_alias_resolver.load_from_database()
+
         _startup_complete = True
 
 
@@ -285,16 +289,25 @@ def _add_request_tracking(app: FastAPI, server_name: str):
 
     @app.middleware("http")
     async def track_requests(request: Request, call_next):
+        # Tag the API surface first, before the _TRACKED_PREFIXES gate: paths
+        # outside it (e.g. /openai/v1/audio/*, /openai/v1/images/*) skip the
+        # alias block below but still call apply_alias() inside their handlers.
+        from app.model_alias import current_api_surface
+        current_api_surface.set(server_name)
+
         path = request.url.path
         if not any(path.startswith(p) for p in _TRACKED_PREFIXES):
             return await call_next(request)
         if any(path == ep for ep in _EXCLUDED_PATHS):
             return await call_next(request)
 
+        from app.model_alias import original_model_name
+        original_model_name.set(None)
         request_id = uuid.uuid4().hex
 
         model = None
         is_streaming = False
+        body_json = None
         if request.method == "POST":
             body_bytes = b""  # keep buffered bytes even if JSON parsing fails
 
@@ -347,6 +360,26 @@ def _add_request_tracking(app: FastAPI, server_name: str):
             # to downstream handlers.  Replacing _receive breaks its
             # disconnect-detection protocol and causes:
             #   RuntimeError: Unexpected message received: http.request
+
+        if isinstance(model, str) and model:
+            from app.model_alias import apply_alias
+            azure_responses_model = (
+                path.startswith("/openai/deployments/")
+                and path.endswith("/responses")
+                and isinstance(body_json, dict)
+                and "/" not in model
+            )
+            client_model = model
+            if azure_responses_model:
+                model = f"{path.split('/')[3]}/{model}"
+            mapped = apply_alias(model)
+            if mapped != model:
+                if azure_responses_model:
+                    original_model_name.set(client_model)
+                model = mapped
+                if isinstance(body_json, dict):
+                    body_json["model"] = mapped
+                    request._body = json.dumps(body_json).encode("utf-8")
 
         request.state.tracking_request_id = request_id
         request.state.model = model

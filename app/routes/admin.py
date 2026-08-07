@@ -16,6 +16,7 @@ from app.auth.database import (
     get_db, get_user_by_username, get_user_by_email, create_user, get_user_by_id, permanently_delete_user,
     get_all_provider_configurations, get_all_model_configurations, get_models_by_provider,
     create_or_update_provider_configuration, create_or_update_model_configuration, get_model_configuration,
+    get_all_model_aliases, upsert_model_alias, delete_model_alias,
     toggle_provider_configuration, toggle_model_configuration, bulk_toggle_all_models,
     search_models_and_providers, get_all_provider_credentials, get_provider_credentials,
     create_provider_credentials, update_provider_credentials, delete_provider_credentials,
@@ -45,6 +46,7 @@ from app.auth.models import (
     ModelGroupResponse, UserModelGroupRateLimitResponse, UserModelGroupRateLimitUpdate,
     InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupLimitsUpdate, InstanceGroupMembersUpdate,
     InstanceGroupResponse, UserInstanceGroupRateLimitResponse, UserInstanceGroupRateLimitUpdate,
+    ModelAliasUpsert, ModelAliasResponse,
 )
 from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_admin_email
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -1090,6 +1092,49 @@ async def get_all_models(
     """Return all model configurations as a flat list."""
     models = await get_all_model_configurations(db)
     return [ModelConfigurationResponse.from_orm(m) for m in models]
+
+
+# ==================== Model Alias Management API Endpoints ====================
+
+@router.get("/model-aliases", response_model=List[ModelAliasResponse])
+async def list_model_aliases_endpoint(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List all configured aliases, including disabled aliases."""
+    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db)]
+
+
+@router.post("/model-aliases", response_model=ModelAliasResponse)
+async def upsert_model_alias_endpoint(
+    body: ModelAliasUpsert,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create or update an alias after validating its canonical target."""
+    if await get_model_configuration(db, body.target_model_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown target model: {body.target_model_id}",
+        )
+    row = await upsert_model_alias(db, body.alias, body.target_model_id, body.enabled, body.apis)
+    from app.model_alias import model_alias_resolver
+    await model_alias_resolver.load_from_database()
+    return ModelAliasResponse.model_validate(row)
+
+
+@router.delete("/model-aliases/{alias:path}")
+async def delete_model_alias_endpoint(
+    alias: str,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an alias and reload the in-memory resolver immediately."""
+    if not await delete_model_alias(db, alias):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
+    from app.model_alias import model_alias_resolver
+    await model_alias_resolver.load_from_database()
+    return {"message": f"Model alias '{alias}' deleted"}
 
 
 # ==================== Model Group Management API Endpoints ====================

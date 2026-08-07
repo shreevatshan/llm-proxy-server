@@ -11,6 +11,7 @@ from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.rate_limit import RateLimitExceeded
+from app.model_alias import apply_alias
 from typing import Union
 from app.tracing import create_span, add_span_attributes, set_span_error
 import logging
@@ -111,6 +112,7 @@ async def edit_image(
 
     with create_span("image_edit_request") as span:
         try:
+            model = apply_alias(model)
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, model)
             await enforce_model_access(request_obj, auth, model)
@@ -218,6 +220,7 @@ async def create_image_variation(
 
     with create_span("image_variation_request") as span:
         try:
+            model = apply_alias(model)
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, model)
             await enforce_model_access(request_obj, auth, model)

@@ -156,6 +156,10 @@ function showTab(tabName) {
         window.RateLimitManager?.stopAutoRefresh();
     }
 
+    if (tabName === 'model-mapping') {
+        window.ModelAliasManager?.load();
+    }
+
     // Load unified model management when switching to the models tab
     if (tabName === 'models') {
         window.ModelsManager?.load();

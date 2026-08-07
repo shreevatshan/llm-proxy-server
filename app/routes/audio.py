@@ -21,6 +21,7 @@ from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.rate_limit import RateLimitExceeded
+from app.model_alias import apply_alias
 from app.tracing import create_span, add_span_attributes, set_span_error
 import logging
 
@@ -113,6 +114,7 @@ async def create_transcription(
     Transcribe audio to text.
     """
     try:
+        model = apply_alias(model)
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, model)
         await enforce_model_access(request_obj, auth, model)
@@ -194,6 +196,7 @@ async def create_translation(
     Translate audio to English text.
     """
     try:
+        model = apply_alias(model)
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, model)
         await enforce_model_access(request_obj, auth, model)

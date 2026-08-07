@@ -4,6 +4,7 @@ import logging
 from typing import List, Dict, Any, AsyncGenerator
 from openai import AsyncOpenAI
 from app.providers.base import BaseProvider, ProviderHTTPError
+from app.model_alias import echo_model_name
 
 # When True, provider methods will NOT overwrite the upstream model name
 # in responses.  Set by the Azure OpenAI routes so the native model
@@ -315,7 +316,7 @@ class OpenAICompatibleProvider(BaseProvider):
             # extra null fields (e.g. reasoning_content, tool_call_id) not in the original.
             response_dict = response.model_dump(exclude_unset=True) if hasattr(response, 'model_dump') else response.dict()
             if not preserve_upstream_model.get():
-                response_dict["model"] = request.model  # Preserve original model name
+                response_dict["model"] = echo_model_name(request)
             
             return ChatCompletionResponse(**response_dict)
         except (ValueError, ProviderHTTPError):
@@ -357,7 +358,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 try:
                     chunk_dict = chunk.model_dump(exclude_unset=True) if hasattr(chunk, 'model_dump') else chunk.dict()
                     if not preserve_upstream_model.get():
-                        chunk_dict["model"] = request.model  # Use original model name
+                        chunk_dict["model"] = echo_model_name(request)
                     
                     # Yield as SSE format
                     yield self.format_sse_data(chunk_dict)
@@ -420,7 +421,7 @@ class OpenAICompatibleProvider(BaseProvider):
             # Convert OpenAI SDK response to our Pydantic model to ensure proper serialization
             response_dict = response.model_dump(exclude_unset=True) if hasattr(response, 'model_dump') else response.dict()
             if not preserve_upstream_model.get():
-                response_dict["model"] = request.model  # Preserve original model name
+                response_dict["model"] = echo_model_name(request)
 
             return CompletionResponse(**response_dict)
         except (ValueError, ProviderHTTPError):
@@ -459,7 +460,7 @@ class OpenAICompatibleProvider(BaseProvider):
                 try:
                     chunk_dict = chunk.model_dump(exclude_unset=True) if hasattr(chunk, 'model_dump') else chunk.dict()
                     if not preserve_upstream_model.get():
-                        chunk_dict["model"] = request.model  # Use original model name
+                        chunk_dict["model"] = echo_model_name(request)
                     
                     # Yield as SSE format
                     yield self.format_sse_data(chunk_dict)
@@ -516,7 +517,7 @@ class OpenAICompatibleProvider(BaseProvider):
             # Convert response and preserve model name
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
             if not preserve_upstream_model.get():
-                response_dict["model"] = request.model
+                response_dict["model"] = echo_model_name(request)
             
             return EmbeddingResponse(**response_dict)
         except (ValueError, ProviderHTTPError):
@@ -650,7 +651,7 @@ class OpenAICompatibleProvider(BaseProvider):
             
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
             if not preserve_upstream_model.get():
-                response_dict["model"] = request.model  # Preserve original model name
+                response_dict["model"] = echo_model_name(request)
             
             return ResponseObject(**response_dict)
         except Exception as e:
@@ -673,7 +674,7 @@ class OpenAICompatibleProvider(BaseProvider):
                     # Preserve original model name in response.created events
                     if not preserve_upstream_model.get():
                         if event_type == 'response.created' and 'response' in event_dict:
-                            event_dict['response']['model'] = request.model
+                            event_dict['response']['model'] = echo_model_name(request)
                     
                     yield self.format_sse_event(event_type, event_dict)
                 except Exception as e:

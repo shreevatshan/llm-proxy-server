@@ -1146,6 +1146,55 @@ input:checked + .model-toggle-slider:before {
     margin-left: 0.35rem;
 }
 
+/* API surface checkboxes — monochrome to match the flat dark theme instead of
+   the browser-default blue. */
+.ma-api-checks .form-check {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding-left: 0;
+    margin: 0;
+}
+
+.ma-api-checks .form-check-input {
+    appearance: none;
+    -webkit-appearance: none;
+    float: none;
+    margin: 0;
+    width: 1rem;
+    height: 1rem;
+    border: 1px solid var(--dark-border);
+    border-radius: 3px;
+    background-color: var(--dark-surface);
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.ma-api-checks .form-check-input:hover {
+    border-color: var(--mono-text-primary);
+}
+
+.ma-api-checks .form-check-input:focus-visible {
+    outline: none;
+    border-color: var(--accent-500);
+    box-shadow: 0 0 0 2px var(--accent-500-alpha);
+}
+
+.ma-api-checks .form-check-input:checked {
+    background-color: var(--mono-text-primary);
+    border-color: var(--mono-text-primary);
+    /* Dark checkmark on the white fill. */
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%230d0d0d' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round' d='M4 8.5l2.5 2.5L12 5'/%3e%3c/svg%3e");
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+    background-position: center;
+}
+
+.ma-api-checks .form-check-label {
+    cursor: pointer;
+    color: var(--dark-text-primary);
+}
+
 .ma-tag {
     display: inline-block;
     font-family: var(--font-family-mono);
@@ -1239,4 +1288,58 @@ input:checked + .model-toggle-slider:before {
     .ma-slider:before {
         transition: none;
     }
+}
+
+/* ================================
+   MODEL ALIAS SEARCHABLE COMBOBOX
+   ================================ */
+.alias-combobox {
+    position: relative;
+}
+
+.alias-combobox-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 1050;
+    margin: 0;
+    padding: 0.25rem;
+    list-style: none;
+    max-height: 280px;
+    overflow-y: auto;
+    background-color: var(--dark-bg-secondary);
+    border: 1px solid var(--dark-border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-md);
+    display: none;
+}
+
+.alias-combobox-menu.is-open {
+    display: block;
+}
+
+.alias-combobox-item {
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--radius-sm);
+    font-family: var(--font-family-mono);
+    font-size: var(--text-sm);
+    color: var(--dark-text-primary);
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background-color 0.12s ease;
+}
+
+.alias-combobox-item:hover,
+.alias-combobox-item.is-active {
+    background-color: var(--dark-bg-tertiary);
+}
+
+.alias-combobox-empty {
+    padding: 0.75rem;
+    text-align: center;
+    color: var(--dark-text-muted);
+    font-size: var(--text-sm);
 }

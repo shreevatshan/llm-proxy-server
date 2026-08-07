@@ -5,7 +5,8 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
 import re
-from pydantic import BaseModel, field_validator, model_validator
+import json
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List
 
 VALID_AZURE_BACKENDS = {"openai", "foundry"}
@@ -98,6 +99,26 @@ class ModelConfiguration(Base):
     
     # Relationship to provider
     provider = relationship("ProviderCredentials", back_populates="models")
+
+
+# API surfaces a model alias can be scoped to. These mirror the server_name
+# strings passed to _add_request_tracking in app/main.py.
+MODEL_ALIAS_API_SURFACES = ("openai", "anthropic", "azure_openai")
+
+
+class ModelAlias(Base):
+    """Admin-managed client-facing alias for a canonical model identifier."""
+    __tablename__ = "model_aliases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alias = Column(String(200), unique=True, index=True, nullable=False)
+    target_model_id = Column(String(200), nullable=False)
+    enabled = Column(Boolean, default=True, nullable=False)
+    # JSON array of API surfaces this alias applies to. NULL (legacy rows) means
+    # "all surfaces". Mirrors ProviderCredentials.supported_apis.
+    apis = Column(Text, nullable=True, default='["openai", "anthropic", "azure_openai"]')
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ResponseProviderMapping(Base):
@@ -769,6 +790,63 @@ class UserInstanceGroupRateLimitUpdate(BaseModel):
         if self.rpd_limit is not None and self.rpd_limit < 0:
             raise ValueError("rpd_limit must be >= 0")
         return self
+
+
+class ModelAliasUpsert(BaseModel):
+    alias: str
+    target_model_id: str
+    enabled: bool = True
+    apis: List[str] = Field(default_factory=lambda: list(MODEL_ALIAS_API_SURFACES))
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        self.alias = self.alias.strip()
+        self.target_model_id = self.target_model_id.strip()
+        if not self.alias or len(self.alias) > 200:
+            raise ValueError("alias must be 1–200 characters")
+        if not self.target_model_id or len(self.target_model_id) > 200:
+            raise ValueError("target_model_id must be 1–200 characters")
+        if self.alias == self.target_model_id:
+            raise ValueError("alias must differ from target_model_id")
+        # Normalise APIs: strip, dedupe, reject unknown, preserve canonical order.
+        seen = {a.strip() for a in self.apis}
+        unknown = seen - set(MODEL_ALIAS_API_SURFACES)
+        if unknown:
+            raise ValueError(f"unknown API surface(s): {', '.join(sorted(unknown))}")
+        self.apis = [a for a in MODEL_ALIAS_API_SURFACES if a in seen]
+        if not self.apis:
+            raise ValueError("at least one API surface must be selected")
+        return self
+
+
+class ModelAliasResponse(BaseModel):
+    id: int
+    alias: str
+    target_model_id: str
+    enabled: bool
+    apis: List[str]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+    @field_validator("apis", mode="before")
+    @classmethod
+    def _decode_apis(cls, value):
+        # from_attributes hands through the raw Text column (a JSON string) or
+        # None; NULL/empty/malformed all mean "all surfaces".
+        if isinstance(value, list):
+            return value
+        if not value:
+            return list(MODEL_ALIAS_API_SURFACES)
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError):
+            return list(MODEL_ALIAS_API_SURFACES)
+        if not isinstance(decoded, list) or not decoded:
+            return list(MODEL_ALIAS_API_SURFACES)
+        return [a for a in MODEL_ALIAS_API_SURFACES if a in set(decoded)] or list(MODEL_ALIAS_API_SURFACES)
 
 
 # Model Management Pydantic models (updated to use ProviderCredentials)

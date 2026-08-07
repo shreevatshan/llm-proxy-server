@@ -44,7 +44,8 @@ class AdminDashboard {
             UserManager: !!window.UserManager,
             AzureManager: !!window.AzureManager,
             RequestTracker: !!window.RequestTracker,
-            UsageManager: !!window.UsageManager
+            UsageManager: !!window.UsageManager,
+            ModelAliasManager: !!window.ModelAliasManager
         });
     }
 

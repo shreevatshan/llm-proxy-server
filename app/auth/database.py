@@ -1,6 +1,7 @@
 """Database connection and operations for authentication."""
 
 import os
+import json
 import secrets
 import hashlib
 import functools
@@ -13,7 +14,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -822,6 +823,45 @@ async def get_all_model_configurations(db: AsyncSession) -> List[ModelConfigurat
     """Get all model configurations."""
     result = await db.execute(select(ModelConfiguration))
     return result.scalars().all()
+
+
+async def get_all_model_aliases(db: AsyncSession) -> List[ModelAlias]:
+    """Return all model aliases in stable display order."""
+    result = await db.execute(select(ModelAlias).order_by(ModelAlias.alias))
+    return list(result.scalars().all())
+
+
+async def get_model_alias(db: AsyncSession, alias: str) -> Optional[ModelAlias]:
+    """Return an alias by its exact client-facing name."""
+    result = await db.execute(select(ModelAlias).where(ModelAlias.alias == alias))
+    return result.scalar_one_or_none()
+
+
+async def upsert_model_alias(
+    db: AsyncSession, alias: str, target_model_id: str, enabled: bool, apis
+) -> ModelAlias:
+    """Create or update a model alias."""
+    row = await get_model_alias(db, alias)
+    if row is None:
+        row = ModelAlias(alias=alias)
+        db.add(row)
+    row.target_model_id = target_model_id
+    row.enabled = enabled
+    row.apis = json.dumps(list(apis))
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def delete_model_alias(db: AsyncSession, alias: str) -> bool:
+    """Delete a model alias by name."""
+    row = await get_model_alias(db, alias)
+    if row is None:
+        return False
+    await db.delete(row)
+    await db.commit()
+    return True
 
 
 async def get_models_by_provider(db: AsyncSession, provider_key: str) -> List[ModelConfiguration]:
@@ -2340,6 +2380,21 @@ async def _run_auto_migrations():
                 logger.info("Auto-migration: 'supported_apis' column added successfully")
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add supported_apis column: {e}")
+
+        # Add 'apis' column to model_aliases so mappings can be scoped to
+        # specific API surfaces. NULL (legacy rows) means "all surfaces".
+        try:
+            result = await conn.execute(text("PRAGMA table_info(model_aliases)"))
+            columns = [row[1] for row in result.fetchall()]
+
+            if columns and 'apis' not in columns:
+                logger.info("Auto-migration: Adding 'apis' column to model_aliases")
+                await conn.execute(text(
+                    "ALTER TABLE model_aliases ADD COLUMN apis TEXT DEFAULT '[\"openai\", \"anthropic\", \"azure_openai\"]'"
+                ))
+                logger.info("Auto-migration: 'apis' column added successfully")
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not add apis column to model_aliases: {e}")
 
         try:
             result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))

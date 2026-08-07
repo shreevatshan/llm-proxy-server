@@ -30,6 +30,7 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
+from app.model_alias import echo_model_name
 
 
 # ---------------------------------------------------------------------------
@@ -1409,7 +1410,7 @@ class BedrockProvider(BaseProvider):
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             object="chat.completion",
             created=int(time.time()),
-            model=request.model,
+            model=echo_model_name(request),
             choices=[ChatCompletionChoice(
                 index=0,
                 message=message,
@@ -1577,7 +1578,7 @@ class BedrockProvider(BaseProvider):
 
             async for chunk in self._async_iterate(stream):
                 # Thread parser state through each chunk
-                stream_response, stream_state = self._parse_stream_chunk(chunk, message_id, request.model, stream_state, tool_name_mapping)
+                stream_response, stream_state = self._parse_stream_chunk(chunk, message_id, echo_model_name(request), stream_state, tool_name_mapping)
                 
                 if not stream_response:
                     continue
@@ -1913,7 +1914,7 @@ class BedrockProvider(BaseProvider):
         return EmbeddingResponse(
             object="list",
             data=data,
-            model=model_id,
+            model=echo_model_name(request),
             usage=EmbeddingUsage(
                 prompt_tokens=input_tokens,
                 total_tokens=input_tokens
@@ -2898,7 +2899,7 @@ class BedrockProvider(BaseProvider):
 
             result = json.loads(response.model_dump_json(warnings="none"))
             # Echo the client-facing model name; keep the real upstream message id.
-            result["model"] = request.model
+            result["model"] = echo_model_name(request)
             return result
 
         # ── Converse path for non-Claude models ────────────────────────────
@@ -2947,7 +2948,7 @@ class BedrockProvider(BaseProvider):
             "type": "message",
             "role": "assistant",
             "content": self._convert_bedrock_content_to_anthropic(output_message.get("content", [])),
-            "model": request.model,
+            "model": echo_model_name(request),
             "stop_reason": self._convert_bedrock_stop_reason(stop_reason_raw),
             "stop_sequence": stop_sequence,
             "usage": usage_data,
@@ -2999,7 +3000,7 @@ class BedrockProvider(BaseProvider):
                     async for sse in stream_anthropic_sdk_events(
                         stream,
                         provider_label=full_provider_name,
-                        model=request.model,
+                        model=echo_model_name(request),
                         log=logger,
                     ):
                         yield sse
@@ -3046,7 +3047,7 @@ class BedrockProvider(BaseProvider):
                         "type": "message",
                         "role": "assistant",
                         "content": [],
-                        "model": request.model,
+                        "model": echo_model_name(request),
                         "stop_reason": None,
                         "stop_sequence": None,
                         "usage": {"input_tokens": 0, "output_tokens": 0},
