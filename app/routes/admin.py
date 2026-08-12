@@ -20,7 +20,7 @@ from app.auth.database import (
     toggle_provider_configuration, toggle_model_configuration, bulk_toggle_all_models,
     search_models_and_providers, get_all_provider_credentials, get_provider_credentials,
     create_provider_credentials, update_provider_credentials, delete_provider_credentials,
-    clear_all_model_configurations, admin_reset_user_password, get_usage_aggregates, get_usage_years,
+    clear_all_model_configurations, admin_reset_user_password, update_user_profile, get_usage_aggregates, get_usage_years,
     get_global_rate_limit, upsert_global_rate_limit,
     get_user_rate_limit, upsert_user_rate_limit, delete_user_rate_limit,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
@@ -39,7 +39,7 @@ from app.auth.models import (
     User, UserCreate, UserResponse, ProviderConfigurationResponse, ModelConfigurationResponse,
     ModelManagementTree, ToggleRequest, BulkToggleRequest, ModelSearchResponse,
     ProviderCredentialsCreate, ProviderCredentialsUpdate, ProviderCredentialsResponse,
-    AdminPasswordReset, VALID_AZURE_BACKENDS,
+    AdminPasswordReset, AdminUserModify, VALID_AZURE_BACKENDS,
     GlobalRateLimitResponse, GlobalRateLimitUpdate,
     UserRateLimitResponse, UserRateLimitUpdate,
     ModelGroupCreate, ModelGroupUpdate, ModelGroupLimitsUpdate, ModelGroupMembersUpdate,
@@ -917,6 +917,83 @@ async def reset_user_password(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to reset password: {str(e)}"
+        )
+
+
+@router.put("/users/modify")
+async def modify_user(
+    modify_data: AdminUserModify,
+    user_id: int = Query(..., description="User ID to modify"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Modify a user's username, email, and/or password (admin only).
+
+    Username can be changed for any user. Email and password can only be
+    changed for non-OAuth users.
+    """
+    user = await get_user_by_id(db, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+
+    is_oauth = bool(user.oauth_provider)
+
+    # OAuth users may only have their username changed.
+    if is_oauth and (modify_data.email is not None or modify_data.new_password is not None):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot modify email or password for OAuth user (authenticated via {user.oauth_provider})"
+        )
+
+    # Validate new password length if provided.
+    if modify_data.new_password is not None:
+        if len(modify_data.new_password) < 6:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Password must be at least 6 characters long"
+            )
+
+    try:
+        # Update username/email via the existing helper (handles uniqueness).
+        if modify_data.username is not None or modify_data.email is not None:
+            await update_user_profile(
+                db, user_id,
+                username=modify_data.username,
+                email=modify_data.email
+            )
+
+        # Update password separately if provided.
+        if modify_data.new_password is not None:
+            success = await admin_reset_user_password(db, user_id, modify_data.new_password)
+            if not success:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to update password"
+                )
+
+        # Invalidate cached auth entries so renamed/re-emailed users aren't served stale.
+        from app.auth.cache import auth_cache
+        auth_cache.invalidate_user_api_keys(user.id)
+        auth_cache.invalidate_user_by_id(user.id)
+
+        await db.refresh(user)
+        return {"message": f"User {user.username} updated successfully"}
+    except ValueError as e:
+        # Uniqueness conflicts from update_user_profile.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Error modifying user {user_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to modify user: {str(e)}"
         )
 
 

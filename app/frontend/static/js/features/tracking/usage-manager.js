@@ -130,6 +130,7 @@ class UsageManager {
         this._lastDrilldown = { axis, id };
         this._setHeaderMode('back');
         this._renderChart(data.timeseries);
+        this._renderDrilldownStats(axis, data.breakdown);
         if (axis === 'user') {
             this._renderModelBreakdown(data.breakdown, id);
         } else {
@@ -142,6 +143,8 @@ class UsageManager {
         this.isDrilledIn = false;
         this._lastDrilldown = null;
         this._setHeaderMode('toggle');
+        this._restoreTopLevelStats();
+        this._renderStats(this._cache.totals);
         this._renderChart(this._cache.timeseries);
         this._renderTopLevel();
     }
@@ -191,12 +194,15 @@ class UsageManager {
             // mode so it doesn't flash to the user/model toggle in between.
             if (!deferBody) this._setHeaderMode('toggle');
         }
-        this._renderStats(this._cache.totals);
+        // While drilled in (e.g. during a silent refresh), the stat tiles are
+        // scoped to the selection — don't overwrite them with global totals.
+        if (!this.isDrilledIn) this._renderStats(this._cache.totals);
         this._renderEarliestDate(this._cache.earliest_date);
         // deferBody: a drill-down render follows immediately (e.g. a window change while
         // a user/model is selected), so skip the top-level chart+table to avoid flashing
         // the overall view before the scoped one paints.
         if (!this.isDrilledIn && !deferBody) {
+            this._restoreTopLevelStats();
             this._renderChart(this._cache.timeseries);
             this._updateToggle(this.currentView);
             this._renderTopLevel();
@@ -218,6 +224,7 @@ class UsageManager {
             if (!resp.ok) return;
             const data = await resp.json();
             this._renderChart(data.timeseries);
+            this._renderDrilldownStats(axis, data.breakdown);
             if (axis === 'user') {
                 this._renderModelBreakdown(data.breakdown, id);
             } else {
@@ -456,12 +463,64 @@ class UsageManager {
         set('usage-unique-models', totals.unique_models);
     }
 
+    // When a user or model is selected, collapse the three-tile overview into a
+    // two-tile layout scoped to the selection: total requests, plus the count of
+    // the opposite axis (models for a user, users for a model).
+    _renderDrilldownStats(axis, breakdown) {
+        const rows = Array.isArray(breakdown) ? breakdown : [];
+        const totalReqs = rows.reduce((s, r) => s + (r.request_count || 0), 0);
+
+        const totalEl = document.getElementById('usage-total-requests');
+        if (totalEl) totalEl.textContent = totalReqs.toLocaleString();
+
+        if (axis === 'user') {
+            // Selected a user → second tile shows how many models they used.
+            this._setStatTile('usage-unique-users', 'usage-unique-models',
+                'usage-stat-users', 'usage-stat-models', rows.length, 'Models Used');
+        } else {
+            // Selected a model → second tile shows how many users used it.
+            this._setStatTile('usage-unique-models', 'usage-unique-users',
+                'usage-stat-models', 'usage-stat-users', rows.length, 'Unique Users');
+        }
+    }
+
+    // Show `keepCardId` (with `keepNumId` value / `keepLabel`), hide `hideCardId`.
+    _setStatTile(hideNumId, keepNumId, hideCardId, keepCardId, value, keepLabel) {
+        const hideCard = document.getElementById(hideCardId);
+        const keepCard = document.getElementById(keepCardId);
+        if (hideCard) hideCard.style.display = 'none';
+        if (keepCard) {
+            keepCard.style.display = '';
+            const numEl = document.getElementById(keepNumId);
+            if (numEl) numEl.textContent = value.toLocaleString();
+            const labelEl = keepCard.querySelector('.stat-label');
+            if (labelEl) labelEl.textContent = keepLabel;
+        }
+    }
+
+    // Restore the full three-tile overview (both count tiles visible with their
+    // original labels) after leaving a drill-down.
+    _restoreTopLevelStats() {
+        const usersCard = document.getElementById('usage-stat-users');
+        const modelsCard = document.getElementById('usage-stat-models');
+        if (usersCard) {
+            usersCard.style.display = '';
+            const l = usersCard.querySelector('.stat-label');
+            if (l) l.textContent = 'Unique Users';
+        }
+        if (modelsCard) {
+            modelsCard.style.display = '';
+            const l = modelsCard.querySelector('.stat-label');
+            if (l) l.textContent = 'Models Used';
+        }
+    }
+
     _renderEarliestDate(dateStr) {
         const el = document.getElementById('usage-earliest-date');
         if (!el) return;
         if (dateStr) {
             const d = new Date(dateStr + 'T00:00:00');
-            const formatted = d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+            const formatted = d.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
             el.textContent = `since ${formatted}`;
         } else {
             el.textContent = '';

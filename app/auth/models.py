@@ -466,6 +466,12 @@ class AdminPasswordReset(BaseModel):
     new_password: str
 
 
+class AdminUserModify(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    new_password: Optional[str] = None
+
+
 class GlobalRateLimitResponse(BaseModel):
     rpm_default: Optional[int] = None
     rpd_default: Optional[int] = None

@@ -455,7 +455,7 @@ async def update_user_profile(db: AsyncSession, user_id: int, username: Optional
             # Check if email is already taken by another user
             existing_user = await get_user_by_email(db, email)
             if existing_user and existing_user.id != user_id:
-                raise ValueError("Email already taken")
+                raise ValueError("Email already in use")
             user.email = email
         
         await db.commit()
@@ -1693,24 +1693,40 @@ async def get_usage_earliest_date(db: AsyncSession, filter_user: Optional[str] =
     from datetime import date
 
     daily_q = select(func.min(RequestUsage.date))
-    monthly_q = select(func.min(RequestUsageMonthly.year), func.min(RequestUsageMonthly.month))
+    # Order by (year, month) rather than min(year)/min(month) independently —
+    # independent mins pick the wrong date across year boundaries.
+    monthly_q = select(RequestUsageMonthly.year, RequestUsageMonthly.month).order_by(
+        RequestUsageMonthly.year.asc(), RequestUsageMonthly.month.asc()
+    ).limit(1)
 
     if filter_user:
         daily_q = daily_q.where(RequestUsage.user_identity == filter_user)
-        monthly_q = select(
-            func.min(RequestUsageMonthly.year),
-            func.min(RequestUsageMonthly.month),
-        ).where(RequestUsageMonthly.user_identity == filter_user)
+        monthly_q = select(RequestUsageMonthly.year, RequestUsageMonthly.month).where(
+            RequestUsageMonthly.user_identity == filter_user
+        ).order_by(
+            RequestUsageMonthly.year.asc(), RequestUsageMonthly.month.asc()
+        ).limit(1)
+
+    # Compute earliest from both sources — the daily table may only hold recent
+    # rows while older data lives solely in the monthly rollup, so we must take
+    # the minimum across both rather than short-circuiting on the daily table.
+    candidates = []
 
     daily_min = (await db.execute(daily_q)).scalar()
     if daily_min:
-        return daily_min.isoformat() if hasattr(daily_min, 'isoformat') else str(daily_min)
+        candidates.append(
+            daily_min if hasattr(daily_min, 'isoformat')
+            else date.fromisoformat(str(daily_min))
+        )
 
     monthly_row = (await db.execute(monthly_q)).first()
     if monthly_row and monthly_row[0] is not None:
-        return date(int(monthly_row[0]), int(monthly_row[1]), 1).isoformat()
+        candidates.append(date(int(monthly_row[0]), int(monthly_row[1]), 1))
 
-    return None
+    if not candidates:
+        return None
+
+    return min(candidates).isoformat()
 
 
 async def get_usage_years(db: AsyncSession) -> list[int]:

@@ -120,9 +120,7 @@
                                 <button class="btn btn-success btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="activateUser(this)">Activate</button>
                             {% endif %}
                             <button class="btn btn-danger btn-sm btn-remove" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="removeUser(this)">Remove</button>
-                            {% if not user.oauth_provider %}
-                                <button class="btn btn-warning btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="resetPassword(this)">Reset Password</button>
-                            {% endif %}
+                            <button class="btn btn-warning btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" data-email="{{ user.email }}" data-oauth="{{ '1' if user.oauth_provider else '' }}" onclick="modifyUser(this)">Modify</button>
                         </div>
                     </td>
                 </tr>
@@ -349,15 +347,15 @@
 <!-- Usage Section -->
 <div class="section tab-content" id="usage-tab" style="display: none;">
     <div class="dashboard-stats mb-4">
-        <div class="stat-card">
+        <div class="stat-card" id="usage-stat-total">
             <div class="stat-number" id="usage-total-requests">-</div>
             <div class="stat-label">Total Requests</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" id="usage-stat-users">
             <div class="stat-number" id="usage-unique-users">-</div>
             <div class="stat-label">Unique Users</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" id="usage-stat-models">
             <div class="stat-number" id="usage-unique-models">-</div>
             <div class="stat-label">Models Used</div>
         </div>
@@ -968,38 +966,47 @@
     </div>
 </div>
 
-<!-- Password Reset Modal -->
-<div class="modal fade" id="passwordResetModal" tabindex="-1" aria-labelledby="passwordResetModalLabel" aria-hidden="true">
+<!-- Modify User Modal -->
+<div class="modal fade" id="modifyUserModal" tabindex="-1" aria-labelledby="modifyUserModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title" id="passwordResetModalLabel">
-                    <i class="fas fa-key text-warning me-2"></i>
-                    Reset Password
+                <h5 class="modal-title" id="modifyUserModalLabel">
+                    <i class="fas fa-user-pen text-primary me-2"></i>
+                    Modify User
                 </h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
-                <p class="mb-3">Enter new password for user: <strong id="passwordResetUsername"></strong></p>
                 <div class="mb-3">
-                    <label for="newPasswordInput" class="form-label">New Password</label>
-                    <input type="password" class="form-control" id="newPasswordInput" placeholder="Minimum 6 characters" autocomplete="new-password">
-                    <div class="form-text">Password must be at least 6 characters long</div>
+                    <label for="modifyUsernameInput" class="form-label">Username</label>
+                    <input type="text" class="form-control" id="modifyUsernameInput" placeholder="Username" autocomplete="off">
                 </div>
-                <div class="mb-3">
-                    <label for="confirmPasswordInput" class="form-label">Confirm Password</label>
-                    <input type="password" class="form-control" id="confirmPasswordInput" placeholder="Re-enter password" autocomplete="new-password">
+                <div id="modifyNonOauthFields">
+                    <div class="mb-3">
+                        <label for="modifyEmailInput" class="form-label">Email</label>
+                        <input type="email" class="form-control" id="modifyEmailInput" placeholder="Email" autocomplete="off">
+                    </div>
+                    <div class="mb-3">
+                        <label for="modifyPasswordInput" class="form-label">New Password</label>
+                        <input type="password" class="form-control" id="modifyPasswordInput" placeholder="Minimum 6 characters" autocomplete="new-password">
+                        <div class="form-text">Leave blank to keep the current password</div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="modifyConfirmPasswordInput" class="form-label">Confirm Password</label>
+                        <input type="password" class="form-control" id="modifyConfirmPasswordInput" placeholder="Re-enter password" autocomplete="new-password">
+                    </div>
                 </div>
-                <div id="passwordResetError" class="alert alert-danger d-none" role="alert"></div>
+                <div id="modifyUserError" class="alert alert-danger d-none" role="alert"></div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
                     <i class="fas fa-times me-1"></i>
                     Cancel
                 </button>
-                <button type="button" class="btn btn-warning" id="passwordResetConfirmBtn">
-                    <i class="fas fa-key me-1"></i>
-                    Reset Password
+                <button type="button" class="btn btn-primary" id="modifyUserConfirmBtn">
+                    <i class="fas fa-save me-1"></i>
+                    Save Changes
                 </button>
             </div>
         </div>

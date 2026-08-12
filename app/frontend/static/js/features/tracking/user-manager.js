@@ -144,107 +144,136 @@ class UserManager {
         }
     }
 
-    async resetPassword(button) {
+    async modifyUser(button) {
         const userId = button.getAttribute('data-user-id');
         const username = button.getAttribute('data-username');
+        const email = button.getAttribute('data-email') || '';
+        const isOauth = !!button.getAttribute('data-oauth');
 
-        // Show password reset modal
-        const modal = document.getElementById('passwordResetModal');
-        const usernameDisplay = document.getElementById('passwordResetUsername');
-        const newPasswordInput = document.getElementById('newPasswordInput');
-        const confirmPasswordInput = document.getElementById('confirmPasswordInput');
-        const errorDiv = document.getElementById('passwordResetError');
-        const confirmBtn = document.getElementById('passwordResetConfirmBtn');
+        // Grab modal elements
+        const modal = document.getElementById('modifyUserModal');
+        const usernameInput = document.getElementById('modifyUsernameInput');
+        const emailInput = document.getElementById('modifyEmailInput');
+        const passwordInput = document.getElementById('modifyPasswordInput');
+        const confirmPasswordInput = document.getElementById('modifyConfirmPasswordInput');
+        const nonOauthFields = document.getElementById('modifyNonOauthFields');
+        const errorDiv = document.getElementById('modifyUserError');
+        const confirmBtn = document.getElementById('modifyUserConfirmBtn');
 
-        // Set username
-        usernameDisplay.textContent = username;
-
-        // Clear previous values
-        newPasswordInput.value = '';
+        // Prefill current values
+        usernameInput.value = username;
+        emailInput.value = email;
+        passwordInput.value = '';
         confirmPasswordInput.value = '';
         errorDiv.classList.add('d-none');
+
+        // OAuth users may only change their username; hide email/password fields.
+        nonOauthFields.style.display = isOauth ? 'none' : '';
 
         // Show modal
         const bsModal = new bootstrap.Modal(modal);
         bsModal.show();
 
-        // Handle password reset confirmation
+        // Handle save confirmation
         const handleConfirm = async () => {
-            const newPassword = newPasswordInput.value;
-            const confirmPassword = confirmPasswordInput.value;
+            const newUsername = usernameInput.value.trim();
 
             // Clear previous errors
             errorDiv.classList.add('d-none');
 
-            // Validate password length
-            if (newPassword.length < 6) {
-                errorDiv.textContent = 'Password must be at least 6 characters long';
+            if (!newUsername) {
+                errorDiv.textContent = 'Username cannot be empty';
                 errorDiv.classList.remove('d-none');
                 return;
             }
 
-            // Validate passwords match
-            if (newPassword !== confirmPassword) {
-                errorDiv.textContent = 'Passwords do not match';
-                errorDiv.classList.remove('d-none');
-                return;
+            // Build request body with only the fields that apply.
+            const body = { username: newUsername };
+
+            if (!isOauth) {
+                const newEmail = emailInput.value.trim();
+                if (!newEmail) {
+                    errorDiv.textContent = 'Email cannot be empty';
+                    errorDiv.classList.remove('d-none');
+                    return;
+                }
+                body.email = newEmail;
+
+                const newPassword = passwordInput.value;
+                const confirmPassword = confirmPasswordInput.value;
+                if (newPassword || confirmPassword) {
+                    if (newPassword.length < 6) {
+                        errorDiv.textContent = 'Password must be at least 6 characters long';
+                        errorDiv.classList.remove('d-none');
+                        return;
+                    }
+                    if (newPassword !== confirmPassword) {
+                        errorDiv.textContent = 'Passwords do not match';
+                        errorDiv.classList.remove('d-none');
+                        return;
+                    }
+                    body.new_password = newPassword;
+                }
             }
 
             // Disable button during request
             confirmBtn.disabled = true;
-            confirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Resetting...';
+            confirmBtn.innerHTML = '<i class="fas fa-spinner fa-spin me-1"></i>Saving...';
 
             try {
-                const response = await fetch(`/admin/users/reset-password?user_id=${userId}`, {
+                const response = await fetch(`/admin/users/modify?user_id=${userId}`, {
                     method: 'PUT',
                     credentials: 'include',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        new_password: newPassword
-                    })
+                    body: JSON.stringify(body)
                 });
 
                 if (response.ok) {
-                    window.UIUtils.showToast('Password reset successfully!', 'success');
+                    window.UIUtils.showToast('User updated successfully!', 'success');
                     bsModal.hide();
+                    setTimeout(() => location.reload(), 1000);
                 } else {
                     const error = await response.json();
-                    errorDiv.textContent = error.detail || 'Failed to reset password';
+                    errorDiv.textContent = error.detail || 'Failed to modify user';
                     errorDiv.classList.remove('d-none');
                 }
             } catch (error) {
-                errorDiv.textContent = 'Error resetting password: ' + error.message;
+                errorDiv.textContent = 'Error modifying user: ' + error.message;
                 errorDiv.classList.remove('d-none');
             } finally {
                 // Re-enable button
                 confirmBtn.disabled = false;
-                confirmBtn.innerHTML = '<i class="fas fa-key me-1"></i>Reset Password';
+                confirmBtn.innerHTML = '<i class="fas fa-save me-1"></i>Save Changes';
             }
         };
 
         // Add event listener for confirm button
         confirmBtn.onclick = handleConfirm;
 
-        // Handle Enter key in password inputs
+        // Handle Enter key in inputs
         const handleEnter = (e) => {
             if (e.key === 'Enter') {
                 handleConfirm();
             }
         };
-        newPasswordInput.onkeypress = handleEnter;
+        usernameInput.onkeypress = handleEnter;
+        emailInput.onkeypress = handleEnter;
+        passwordInput.onkeypress = handleEnter;
         confirmPasswordInput.onkeypress = handleEnter;
 
         // Focus on first input when modal is shown
         modal.addEventListener('shown.bs.modal', () => {
-            newPasswordInput.focus();
+            usernameInput.focus();
         }, { once: true });
 
         // Clean up event listeners when modal is hidden
         modal.addEventListener('hidden.bs.modal', () => {
             confirmBtn.onclick = null;
-            newPasswordInput.onkeypress = null;
+            usernameInput.onkeypress = null;
+            emailInput.onkeypress = null;
+            passwordInput.onkeypress = null;
             confirmPasswordInput.onkeypress = null;
         }, { once: true });
     }
@@ -258,5 +287,5 @@ window.deactivateUser = (button) => window.UserManager.deactivateUser(button);
 window.activateUser = (button) => window.UserManager.activateUser(button);
 window.approveUser = (button) => window.UserManager.approveUser(button);
 window.removeUser = (button) => window.UserManager.removeUser(button);
-window.resetPassword = (button) => window.UserManager.resetPassword(button);
+window.modifyUser = (button) => window.UserManager.modifyUser(button);
 window.filterUsers = (query) => window.UserManager.filterUsers(query);

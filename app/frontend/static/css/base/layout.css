@@ -288,6 +288,7 @@ body {
 
 .footer-section:last-child {
     align-items: flex-end;
+    margin-left: auto;
 }
 
 .footer-title {
@@ -300,11 +301,20 @@ body {
 }
 
 .footer-description {
-    color: var(--dark-text-muted);
+    color: var(--dark-text-primary);
     font-size: 0.875rem;
     margin: 0;
     line-height: 1.5;
     font-family: var(--font-family-mono);
+    text-align: right;
+}
+
+.footer-section small {
+    color: var(--dark-text-muted);
+    font-size: 0.75rem;
+    line-height: 1.5;
+    font-family: var(--font-family-mono);
+    text-align: right;
 }
 
 .footer-meta {

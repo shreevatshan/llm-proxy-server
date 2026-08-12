@@ -133,7 +133,7 @@ class UserUsageManager {
             const dateStr = data.earliest_date;
             if (dateStr) {
                 const d = new Date(dateStr + 'T00:00:00');
-                const formatted = d.toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' });
+                const formatted = d.toLocaleDateString(undefined, { year: 'numeric', month: 'long' });
                 dateEl.textContent = `since ${formatted}`;
             } else {
                 dateEl.textContent = '';
