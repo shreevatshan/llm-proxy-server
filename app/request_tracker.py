@@ -10,12 +10,45 @@ import json
 import time
 import logging
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timezone
 from typing import Optional
 from app import time_utils
 
 logger = logging.getLogger(__name__)
+
+
+class _TaskReentrantLock:
+    """An asyncio.Lock that the task already holding it may re-acquire.
+
+    The usage flush and the operations that have to exclude it (rename, purge) are
+    each public coroutines that take this lock, and callers also hold it across
+    their own DB transaction via RequestTracker.pause_flush(). A plain Lock would
+    self-deadlock on that nesting.
+    """
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._owner = None
+        self._depth = 0
+
+    async def __aenter__(self):
+        task = asyncio.current_task()
+        if self._owner is not None and self._owner is task:
+            self._depth += 1
+            return self
+        await self._lock.acquire()
+        self._owner = task
+        self._depth = 1
+        return self
+
+    async def __aexit__(self, *exc_info):
+        self._depth -= 1
+        if self._depth == 0:
+            self._owner = None
+            self._lock.release()
+        return False
 
 
 @dataclass
@@ -42,6 +75,9 @@ class RequestTracker:
         self._running = False
         self._usage_buffer: dict[tuple, int] = defaultdict(int)
         self._usage_lock = asyncio.Lock()
+        # Serialises whole flushes. _usage_lock only guards the buffer itself and is
+        # released across the DB write; this one spans snapshot → write → subtract.
+        self._flush_mutex = _TaskReentrantLock()
         self._flush_task: Optional[asyncio.Task] = None
         self._last_rollup_at: float = 0.0
 
@@ -74,12 +110,37 @@ class RequestTracker:
         """Flush buffered usage counts to the DB immediately."""
         await self._do_flush()
 
+    @asynccontextmanager
+    async def pause_flush(self):
+        """Hold off the usage flush for the duration of the block.
+
+        Operations that rewrite usage in both places it lives — the DB rows and the
+        buffered counts that have not reached them yet — must run under this. A
+        flush is not atomic: it snapshots the buffer, writes it, then subtracts. One
+        landing between the two halves writes its pre-change snapshot under the old
+        identity, re-creating exactly the rows the caller just moved or purged.
+
+        Re-entrant, so flush_pending()/rename_identity()/drop_buffered_usage() can
+        still be called from inside the block.
+        """
+        async with self._flush_mutex:
+            yield
+
     async def _usage_flush_loop(self):
         while self._running:
             await asyncio.sleep(self.FLUSH_INTERVAL)
             await self._do_flush()
 
     async def _do_flush(self):
+        # Serialised against other flushes: the DB write happens outside
+        # _usage_lock, so two overlapping flushes would take the same snapshot and
+        # apply the increment-on-conflict upserts twice, inflating usage and the
+        # RPD counts derived from it.
+        async with self._flush_mutex:
+            await self._flush_locked()
+
+    async def _flush_locked(self):
+        """Flush body. Caller holds _flush_mutex."""
         async with self._usage_lock:
             if not self._usage_buffer:
                 return
@@ -239,6 +300,55 @@ class RequestTracker:
             entry.user_type = user_type
             data = self._serialize(entry)
         await self._broadcast_raw("request_updated", data)
+
+    async def rename_identity(self, old: str, new: str) -> None:
+        """Move buffered and in-flight usage from one user_identity to another.
+
+        Called after a username change has been committed. The DB rows are moved by
+        rename_usage_identity; this covers the counts that have not reached the DB
+        yet — anything buffered since the pre-rename flush, plus requests that were
+        already in flight when the rename happened. Without it those flush under the
+        old name and recreate the orphan row the rename just cleaned up.
+        """
+        if old == new:
+            return
+
+        # Excludes a concurrent flush: one caught mid-write would finish writing its
+        # pre-rename snapshot under `old` — the orphan rows the SQL rename just
+        # cleaned up — and then subtract that snapshot from buffer entries this
+        # method has already moved, leaving them to flush again under `new`.
+        async with self._flush_mutex:
+            async with self._usage_lock:
+                # Buffer key is (date, hour, user_identity, user_type, model, server).
+                stale = [key for key in self._usage_buffer if key[2] == old]
+                for key in stale:
+                    renamed = (key[0], key[1], new, key[3], key[4], key[5])
+                    # The new identity may already have a buffered count for this key.
+                    self._usage_buffer[renamed] += self._usage_buffer.pop(key)
+
+            async with self._lock:
+                for entry in self._active.values():
+                    if entry.user_identity == old:
+                        entry.user_identity = new
+
+    async def drop_buffered_usage(self, axis: str, value: str) -> int:
+        """Discard buffered counts for one user_identity (axis='user') or model.
+
+        Called after an admin purges a user's or model's usage rows. Counts buffered
+        since the last flush have not reached the DB yet, so without this they land
+        on the next cycle and recreate the rows that were just deleted.
+
+        Returns the number of requests dropped, for logging.
+        """
+        # Buffer key is (date, hour, user_identity, user_type, model, server).
+        slot = 2 if axis == "user" else 4
+
+        # Excludes a concurrent flush, which would otherwise write its pre-purge
+        # snapshot into the tables the caller just cleared.
+        async with self._flush_mutex:
+            async with self._usage_lock:
+                stale = [key for key in self._usage_buffer if key[slot] == value]
+                return sum(self._usage_buffer.pop(key) for key in stale)
 
     async def update_streaming(
         self,

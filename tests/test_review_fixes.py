@@ -88,6 +88,43 @@ class ProviderErrorResponseTests(unittest.TestCase):
         payload = json.loads(resp.body)
         self.assertEqual(payload["error"]["message"], "upstream down")
 
+    def test_openai_sdk_error_wraps_bare_upstream_error_body(self):
+        """Azure Foundry's /openai/v1/ surface returns the error object unwrapped.
+
+        The real message must survive instead of being replaced by a generic
+        "Upstream provider returned status 400".
+        """
+        import httpx, openai
+        from app.providers.openai_compatible import _translate_openai_sdk_error
+
+        bare = {
+            "message": "Unsupported parameter: 'top_p' is not supported with this model.",
+            "type": "invalid_request_error",
+            "param": "top_p",
+            "code": "unsupported_parameter",
+        }
+        request = httpx.Request("POST", "https://example.test/openai/v1/chat/completions")
+        response = httpx.Response(400, json=bare, request=request)
+        translated = _translate_openai_sdk_error(
+            openai.APIStatusError("400", response=response, body=bare), "azure"
+        )
+        self.assertEqual(translated.status_code, 400)
+        self.assertEqual(translated.body["error"], bare)
+
+    def test_openai_sdk_error_falls_back_for_non_dict_body(self):
+        import httpx, openai
+        from app.providers.openai_compatible import _translate_openai_sdk_error
+
+        request = httpx.Request("POST", "https://example.test/openai/v1/chat/completions")
+        response = httpx.Response(400, text="Bad Request", request=request)
+        translated = _translate_openai_sdk_error(
+            openai.APIStatusError("400", response=response, body="Bad Request"), "azure"
+        )
+        self.assertEqual(translated.body["error"]["type"], "upstream_error")
+        self.assertEqual(
+            translated.body["error"]["message"], "Upstream provider returned status 400"
+        )
+
     def test_azure_preserves_status(self):
         err = ProviderHTTPError(status_code=429, message="slow down", headers={"Retry-After": "3"})
         resp = azure_provider_error_response(err)

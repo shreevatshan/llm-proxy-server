@@ -11,7 +11,8 @@ import secrets
 
 from app.auth.database import (
     get_db, create_user, authenticate_user, get_user_by_username,
-    get_user_by_email, create_api_key, get_user_api_keys, delete_api_key,
+    get_user_by_email, is_reserved_username,
+    create_api_key, get_user_api_keys, delete_api_key,
     update_user_profile, update_user_password, permanently_delete_user, verify_password,
     get_oauth_user_by_provider_id, create_oauth_user, update_oauth_user
 )
@@ -55,14 +56,14 @@ async def signup(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     logger = logging.getLogger(__name__)
     
     try:
-        # Check if username already exists
-        existing_user = await get_user_by_username(db, user_data.username)
-        if existing_user:
+        # Check if username already exists. The config-based admin is not in the
+        # users table but owns its name for usage/quota purposes (is_reserved_username).
+        if await get_user_by_username(db, user_data.username) or is_reserved_username(user_data.username):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Username already registered"
             )
-        
+
         # Check if email already exists
         existing_email = await get_user_by_email(db, user_data.email)
         if existing_email:

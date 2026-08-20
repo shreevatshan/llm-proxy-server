@@ -380,15 +380,17 @@ class UsageManager {
                 <td><span class="badge bg-secondary">${this._esc(r.user_type)}</span></td>
                 <td>${r.request_count.toLocaleString()}</td>
                 <td class="text-end">${this._pct(r.request_count, total)}</td>
+                <td class="text-end">${this._deleteButton()}</td>
             </tr>`).join('');
         container.innerHTML = `
             <div class="table-responsive">
                 <table class="table table-hover mb-0">
-                    <thead><tr><th>User</th><th>Type</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
+                    <thead><tr><th>User</th><th>Type</th><th>Requests</th><th class="text-end">Percentage</th><th style="width:1%"></th></tr></thead>
                     <tbody>${rowsHtml}</tbody>
                 </table>
             </div>`;
         this._bindRowClicks(container);
+        this._bindDeleteButtons(container);
     }
 
     _renderModelTable(rows) {
@@ -400,15 +402,23 @@ class UsageManager {
                 <td>${this._esc(r.model)}</td>
                 <td>${r.request_count.toLocaleString()}</td>
                 <td class="text-end">${this._pct(r.request_count, total)}</td>
+                <td class="text-end">${this._deleteButton()}</td>
             </tr>`).join('');
         container.innerHTML = `
             <div class="table-responsive">
                 <table class="table table-hover mb-0">
-                    <thead><tr><th>Model</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
+                    <thead><tr><th>Model</th><th>Requests</th><th class="text-end">Percentage</th><th style="width:1%"></th></tr></thead>
                     <tbody>${rowsHtml}</tbody>
                 </table>
             </div>`;
         this._bindRowClicks(container);
+        this._bindDeleteButtons(container);
+    }
+
+    // The button carries no identity of its own — it reads the row's data-axis /
+    // data-id, which keeps the (unescaped-quote) identity out of a second attribute.
+    _deleteButton() {
+        return `<button class="btn btn-outline-danger btn-sm usage-delete-btn" title="Delete all usage data"><i class="fas fa-trash"></i></button>`;
     }
 
     _renderUserBreakdown(rows, id) {
@@ -659,6 +669,65 @@ class UsageManager {
         });
     }
 
+    _bindDeleteButtons(container) {
+        container.querySelectorAll('.usage-delete-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                // The whole row is a drill-down target; don't open it behind the dialog.
+                e.stopPropagation();
+                const row = btn.closest('tr');
+                if (row) this._deleteUsage(row.dataset.axis, row.dataset.id, btn);
+            });
+        });
+    }
+
+    async _deleteUsage(axis, id, btn) {
+        const label = axis === 'user' ? `user '${id}'` : `model '${id}'`;
+        const message =
+            `Permanently delete ALL usage data for ${label}?` +
+            (axis === 'user' ? " It also resets this user's request count for today." : '');
+        const confirmed = await window.UIUtils?.showConfirmModal('Delete Usage Data', message, 'danger');
+        if (!confirmed) return;
+
+        const original = btn.innerHTML;
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+        try {
+            const params = new URLSearchParams({ view: axis, id });
+            const resp = await fetch(`/admin/usage?${params}`, { method: 'DELETE', credentials: 'include' });
+            if (!resp.ok) {
+                const body = await resp.json().catch(() => ({}));
+                throw new Error(body.detail || `HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            const count = data.total || 0;
+            window.UIUtils?.showToast(
+                count ? `Deleted ${count.toLocaleString()} request${count === 1 ? '' : 's'} of usage for ${label}.`
+                      : `No usage data left to delete for ${label}.`,
+                'success');
+        } catch (e) {
+            console.error('UsageManager: delete failed', e);
+            window.UIUtils?.showToast(e.message || 'Failed to delete usage data.', 'error');
+            return;
+        } finally {
+            // On success the refresh below replaces this row, so restoring the button
+            // is a no-op; on any failure it must not be left a disabled spinner.
+            btn.disabled = false;
+            btn.innerHTML = original;
+        }
+
+        // A whole year can disappear from the "Older" popover along with the data.
+        // The delete already succeeded at this point, so a refresh failure is only
+        // a stale view — report it as such rather than letting it reject unhandled.
+        this._yearsLoaded = false;
+        try {
+            await this._fetchYears();
+            await this._fetchAndRender({ silent: false });
+        } catch (e) {
+            console.error('UsageManager: refresh after delete failed', e);
+            window.UIUtils?.showToast('Usage deleted, but the view could not be refreshed.', 'error');
+        }
+    }
+
     _emptyState() {
         return `
             <div class="empty-state">
@@ -681,10 +750,20 @@ class UsageManager {
         }
     }
 
+    // Encodes quotes and backticks as well as the angle brackets, because the
+    // result is interpolated into quoted attributes (data-id) and not just text.
+    // The textContent/innerHTML round-trip leaves " and ' alone, which would let a
+    // username containing a quote truncate data-id and aim the delete button at a
+    // different identity. Same semantics as UIUtils.escapeHtml.
     _esc(str) {
-        const d = document.createElement('div');
-        d.textContent = str || '';
-        return d.innerHTML;
+        if (str === null || str === undefined) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;')
+            .replace(/`/g, '&#96;');
     }
 }
 

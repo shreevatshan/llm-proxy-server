@@ -21,6 +21,8 @@ from app.auth.database import (
     search_models_and_providers, get_all_provider_credentials, get_provider_credentials,
     create_provider_credentials, update_provider_credentials, delete_provider_credentials,
     clear_all_model_configurations, admin_reset_user_password, update_user_profile, get_usage_aggregates, get_usage_years,
+    delete_usage_records,
+    count_usage_requests,
     get_global_rate_limit, upsert_global_rate_limit,
     get_user_rate_limit, upsert_user_rate_limit, delete_user_rate_limit,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
@@ -733,9 +735,11 @@ async def create_user_admin(
     db: AsyncSession = Depends(get_db)
 ):
     """Create a new user (admin only)."""
-    # Check if username already exists
-    existing_user = await get_user_by_username(db, user_data.username)
-    if existing_user:
+    from app.auth.database import is_reserved_username
+
+    # Check if username already exists. The config-based admin is not in the users
+    # table but owns its name for usage/quota purposes (is_reserved_username).
+    if await get_user_by_username(db, user_data.username) or is_reserved_username(user_data.username):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Username already registered"
@@ -2853,3 +2857,63 @@ async def get_usage(
     )
     result["earliest_date"] = await get_usage_earliest_date(db)
     return result
+
+
+@router.delete("/usage")
+async def delete_usage(
+    view: str = Query(..., description="'user' or 'model'"),
+    id: str = Query(..., description="Identity value to purge"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete all usage data, for all time, for one user or one model.
+
+    Removes the rows from the hourly, daily and monthly tables together — leaving any
+    of them behind would make the data reappear as soon as the time window changes.
+
+    The identity is passed as a query parameter rather than a path segment because
+    model ids contain slashes (e.g. 'openai/gpt-4o').
+    """
+    from app.request_tracker import request_tracker
+    from app.rate_limit import rate_limit_tracker
+
+    if view not in ("user", "model"):
+        raise HTTPException(status_code=400, detail="view must be 'user' or 'model'")
+    if not id or not id.strip():
+        raise HTTPException(status_code=400, detail="id is required")
+
+    # The purge spans both places usage lives — the DB rows and the counts still
+    # buffered in the tracker — so the flush is held off across the whole sequence.
+    # Otherwise one landing between the two writes its pre-purge snapshot straight
+    # back into the tables that were just cleared.
+    async with request_tracker.pause_flush():
+        # Drain the buffer first so counts recorded in the last minute are deleted too.
+        await request_tracker.flush_pending()
+
+        try:
+            # Counted before the delete: this is the request count the admin saw in
+            # the table, not the number of rows, which is spread over three tables
+            # holding the same traffic at different granularities.
+            total = await count_usage_requests(db, view, id)
+            deleted = await delete_usage_records(db, view, id)
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Failed to delete usage for {view} '{id}': {e}")
+            raise HTTPException(status_code=500, detail="Failed to delete usage data")
+
+        # Anything buffered between the flush and the commit would otherwise flush
+        # back into the tables we just cleared.
+        dropped = await request_tracker.drop_buffered_usage(view, id)
+
+    # RPD is a COUNT over today's rows, and the counts are cached per identity.
+    if view == "user":
+        rate_limit_tracker.invalidate_identity(id)
+    else:
+        rate_limit_tracker.invalidate_all_rpd()
+
+    logger.info(
+        f"Admin '{current_admin.username}' deleted usage for {view} '{id}': "
+        f"{deleted} (+{dropped} buffered requests dropped)"
+    )
+    return {"deleted": deleted, "total": total}

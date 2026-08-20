@@ -79,7 +79,14 @@ def _translate_openai_sdk_error(e: Exception, provider_name: str) -> ProviderHTT
         # provider's error message, not internal topology); otherwise synthesize
         # a generic envelope. Never embed str(e) (leaks the request URL).
         body = e.body if isinstance(getattr(e, "body", None), dict) else None
-        if body is None or "error" not in body:
+        if body is not None and "error" not in body and isinstance(body.get("message"), str):
+            # Azure AI Foundry's /openai/v1/ surface returns the error object
+            # *unwrapped* — {"message", "type", "param", "code"} with no top-level
+            # "error" key. Wrap it instead of discarding it, so an actionable
+            # message ("'top_p' is not supported with this model") reaches the
+            # client rather than a bare "Upstream provider returned status 400".
+            body = {"error": body}
+        elif body is None or "error" not in body:
             body = {
                 "error": {
                     "message": f"Upstream provider returned status {status}",
@@ -87,6 +94,10 @@ def _translate_openai_sdk_error(e: Exception, provider_name: str) -> ProviderHTT
                     "code": status,
                 }
             }
+        logger.warning(
+            "Upstream provider '%s' returned status %s: %s",
+            provider_name, status, body.get("error", {}).get("message"),
+        )
         return ProviderHTTPError(
             status_code=status,
             message=f"Upstream provider '{provider_name}' returned status {status}",

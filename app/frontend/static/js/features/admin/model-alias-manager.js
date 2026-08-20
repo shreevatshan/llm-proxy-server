@@ -7,6 +7,7 @@ class ModelAliasManager {
         this.models = [];
         this._comboInit = false;
         this._activeIndex = -1;
+        this._search = '';
     }
 
     async load() {
@@ -21,23 +22,47 @@ class ModelAliasManager {
             const response = await fetch('/admin/model-aliases', { credentials: 'include' });
             if (!response.ok) throw new Error('load failed');
             this.aliases = await response.json();
-            const esc = window.UIUtils?.escapeHtml || (value => value);
-            tbody.innerHTML = this.aliases.length ? this.aliases.map((row, index) => `
-                <tr><td>${esc(row.alias)}</td><td><code>${esc(row.target_model_id)}</code></td>
-                <td>${(row.apis || []).map(api => `<span class="ma-tag">${esc(ModelAliasManager.API_LABELS[api] || api)}</span>`).join('')}</td>
-                <td><span class="status-badge ${row.enabled ? 'status-active' : 'status-inactive'}">${row.enabled ? 'Enabled' : 'Disabled'}</span></td>
-                <td><div class="d-flex align-items-center gap-3">
-                    <label class="ma-switch" title="${row.enabled ? 'Disable' : 'Enable'} mapping">
-                        <input type="checkbox" ${row.enabled ? 'checked' : ''} onchange="window.ModelAliasManager?.toggle(${index})">
-                        <span class="ma-slider"></span>
-                    </label>
-                    <button class="btn btn-outline-secondary btn-sm" title="Edit mapping" onclick="window.ModelAliasManager?.edit(${index})"><i class="fas fa-pencil-alt"></i></button>
-                    <button class="btn btn-outline-danger btn-sm" onclick="window.ModelAliasManager?.remove(${index})"><i class="fas fa-trash"></i></button>
-                </div></td></tr>`).join('')
-                : '<tr><td colspan="5" class="text-center text-muted py-4">No mappings configured.</td></tr>';
+            this._render();
         } catch (_) {
             tbody.innerHTML = '<tr><td colspan="5" class="text-center text-danger py-4">Failed to load mappings.</td></tr>';
         }
+    }
+
+    filter(value) {
+        this._search = value || '';
+        this._render();
+    }
+
+    _render() {
+        const tbody = document.getElementById('model-aliases-tbody');
+        if (!tbody) return;
+        const esc = window.UIUtils?.escapeHtml || (value => value);
+        if (!this.aliases.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">No mappings configured.</td></tr>';
+            return;
+        }
+        const q = this._search.trim().toLowerCase();
+        const rows = this.aliases
+            .map((row, index) => ({ row, index }))
+            .filter(({ row }) => !q
+                || (row.alias || '').toLowerCase().includes(q)
+                || (row.target_model_id || '').toLowerCase().includes(q));
+        if (!rows.length) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">No mappings match your search.</td></tr>';
+            return;
+        }
+        tbody.innerHTML = rows.map(({ row, index }) => `
+            <tr><td>${esc(row.alias)}</td><td><code>${esc(row.target_model_id)}</code></td>
+            <td>${(row.apis || []).map(api => `<span class="ma-tag">${esc(ModelAliasManager.API_LABELS[api] || api)}</span>`).join('')}</td>
+            <td><span class="status-badge ${row.enabled ? 'status-active' : 'status-inactive'}">${row.enabled ? 'Enabled' : 'Disabled'}</span></td>
+            <td><div class="d-flex align-items-center gap-3">
+                <label class="ma-switch" title="${row.enabled ? 'Disable' : 'Enable'} mapping">
+                    <input type="checkbox" ${row.enabled ? 'checked' : ''} onchange="window.ModelAliasManager?.toggle(${index})">
+                    <span class="ma-slider"></span>
+                </label>
+                <button class="btn btn-outline-secondary btn-sm" title="Edit mapping" onclick="window.ModelAliasManager?.edit(${index})"><i class="fas fa-pencil-alt"></i></button>
+                <button class="btn btn-outline-danger btn-sm" onclick="window.ModelAliasManager?.remove(${index})"><i class="fas fa-trash"></i></button>
+            </div></td></tr>`).join('');
     }
 
     async _loadModels() {

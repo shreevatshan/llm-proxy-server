@@ -692,6 +692,29 @@ class RateLimitTracker:
 
         return None  # instance-group checks passed
 
+    def invalidate_identity(self, identity: str) -> None:
+        """Drop every cached RPD count for a user_identity.
+
+        Called on both sides of a username change. The RPD caches are keyed by the
+        username string, so without this the new name could serve a stale count for
+        the length of the TTL right after a rename.
+        """
+        self._rpd_cache.pop(identity, None)
+        for cache in (self._group_rpd_cache, self._instance_group_rpd_cache):
+            for key in [k for k in cache if k[0] == identity]:
+                cache.pop(key, None)
+
+    def invalidate_all_rpd(self) -> None:
+        """Drop every cached RPD count, for all identities.
+
+        Used when usage rows are deleted for a model: that touches the day counts of
+        every user who called it, and the caches are keyed by identity rather than by
+        model, so there is no narrower invalidation available.
+        """
+        self._rpd_cache.clear()
+        self._group_rpd_cache.clear()
+        self._instance_group_rpd_cache.clear()
+
     async def check_and_increment(
         self, user_id: int, username: str
     ) -> RateLimitDecision:

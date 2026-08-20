@@ -214,6 +214,21 @@ async def get_user_by_id(db: AsyncSession, user_id: int) -> Optional[User]:
     return result.scalar_one_or_none()
 
 
+def is_reserved_username(username: str) -> bool:
+    """True if the name belongs to the config-based admin account.
+
+    The admin is not a row in `users`, so uniqueness checks against that table miss
+    it entirely — but admin traffic *is* recorded under this name (see
+    _update_tracking_identity), and both usage and RPD are keyed by the username
+    string. A second account holding the name would share the admin's daily quota,
+    and a later rename would carry the admin's whole usage history away with it
+    (see rename_usage_identity). Every path that assigns a username must reject it.
+    """
+    # Imported lazily: app.auth.admin imports from this module.
+    from app.auth.admin import get_admin_username, is_admin_enabled
+    return is_admin_enabled() and username == get_admin_username()
+
+
 @with_db_retry()
 async def create_user(db: AsyncSession, username: str, email: str, password: str, is_pending: bool = False) -> User:
     """Create a new user. If is_pending=True, the account requires admin approval before it becomes active."""
@@ -269,10 +284,11 @@ async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: s
     # Generate a unique username from email or name
     username = email.split('@')[0] if '@' in email else name.lower().replace(' ', '_')
 
-    # Check if username exists and make it unique if needed
+    # Check if username exists and make it unique if needed. The admin name is not
+    # in `users` but is just as taken (see is_reserved_username), so suffix past it too.
     base_username = username
     counter = 1
-    while await get_user_by_username(db, username):
+    while is_reserved_username(username) or await get_user_by_username(db, username):
         username = f"{base_username}_{counter}"
         counter += 1
 
@@ -438,32 +454,93 @@ async def delete_api_key(db: AsyncSession, api_key_id: int, user_id: int) -> boo
 
 
 async def update_user_profile(db: AsyncSession, user_id: int, username: Optional[str] = None, email: Optional[str] = None) -> Optional[User]:
-    """Update user profile information."""
+    """Update user profile information.
+
+    A username change also moves that user's request usage (see
+    rename_usage_identity): usage is keyed by the username string, so leaving it
+    behind would both orphan the history and hand the user a fresh daily quota.
+    This is the single chokepoint for renames — both the admin path and the
+    self-service profile path go through here.
+    """
+    # Imported lazily: request_tracker and rate_limit import from this module.
+    from contextlib import AsyncExitStack
+    from app.request_tracker import request_tracker
+    from app.rate_limit import rate_limit_tracker
+    from app.auth.cache import auth_cache
+
     user = await get_user_by_id(db, user_id)
     if not user:
         return None
-    
-    try:
-        if username is not None:
-            # Check if username is already taken by another user
-            existing_user = await get_user_by_username(db, username)
-            if existing_user and existing_user.id != user_id:
-                raise ValueError("Username already taken")
-            user.username = username
-        
-        if email is not None:
-            # Check if email is already taken by another user
-            existing_user = await get_user_by_email(db, email)
-            if existing_user and existing_user.id != user_id:
-                raise ValueError("Email already in use")
-            user.email = email
-        
-        await db.commit()
-        await db.refresh(user)
-        return user
-    except Exception as e:
-        await db.rollback()
-        raise e
+
+    old_username = user.username
+    renaming = username is not None and username != old_username
+
+    async with AsyncExitStack() as stack:
+        if renaming:
+            # A rename rewrites usage in both places it lives — the DB rows and the
+            # counts still buffered in the tracker. Hold off the flush across the
+            # whole sequence: one landing between the two halves writes its
+            # pre-rename snapshot back under the old name, re-creating the orphan
+            # rows the SQL just cleaned up and double-billing those requests.
+            await stack.enter_async_context(request_tracker.pause_flush())
+
+        try:
+            if username is not None:
+                # Check if username is already taken by another user
+                existing_user = await get_user_by_username(db, username)
+                if existing_user and existing_user.id != user_id:
+                    raise ValueError("Username already taken")
+                # The check above cannot see the config-based admin; taking that
+                # name would merge the admin's usage history into this user's rows.
+                if is_reserved_username(username):
+                    raise ValueError("Username already taken")
+                if renaming:
+                    # Drain buffered counts into the DB first so the backfill below
+                    # covers them. Anything buffered after this point is relocated
+                    # in-memory once the transaction commits. Best-effort: on failure
+                    # the counts simply stay buffered and are moved by that later step.
+                    try:
+                        await request_tracker.flush_pending()
+                    except Exception as e:
+                        logger.warning(f"Usage flush before rename of '{old_username}' failed: {e}")
+                user.username = username
+
+            if email is not None:
+                # Check if email is already taken by another user
+                existing_user = await get_user_by_email(db, email)
+                if existing_user and existing_user.id != user_id:
+                    raise ValueError("Email already in use")
+                user.email = email
+
+            if renaming:
+                # Same transaction as the username change: both land or neither does.
+                await rename_usage_identity(db, old_username, username)
+
+            await db.commit()
+            await db.refresh(user)
+        except Exception as e:
+            await db.rollback()
+            raise e
+
+        if renaming:
+            # Post-commit, still inside the flush pause: relocate counts that never
+            # reached the DB, and drop cache entries keyed by either name.
+            try:
+                await request_tracker.rename_identity(old_username, username)
+            except Exception as e:
+                logger.warning(f"In-memory usage rename of '{old_username}' failed: {e}")
+            rate_limit_tracker.invalidate_identity(old_username)
+            rate_limit_tracker.invalidate_identity(username)
+            auth_cache.invalidate_user(old_username)
+            auth_cache.invalidate_user(username)
+            # Cached API keys carry the owner's username, and that is the identity
+            # recorded for API-key traffic (see _update_tracking_identity). The 30s
+            # validity refresh only re-checks is_active, so without this the old name
+            # keeps being written for the length of the key TTL — recreating the rows
+            # the rename just moved, and billing RPD to a name with no rows left.
+            auth_cache.invalidate_user_api_keys(user_id)
+
+    return user
 
 
 async def update_user_password(db: AsyncSession, user_id: int, current_password: str, new_password: str) -> bool:
@@ -1680,6 +1757,148 @@ async def rollup_to_monthly() -> None:
             await db.rollback()
             logger.error(f"Failed to roll up monthly usage: {e}")
             raise
+
+
+# Usage tables keyed by the username string (user_identity), with the time columns
+# that complete each one's uniqueness key. Renaming a user has to move rows in all
+# three; see rename_usage_identity below.
+_USAGE_IDENTITY_TABLES = (
+    ("request_usage", ("date",)),
+    ("request_usage_hourly", ("date", "hour")),
+    ("request_usage_monthly", ("year", "month")),
+)
+
+
+async def rename_usage_identity(db: AsyncSession, old: str, new: str) -> dict[str, int]:
+    """Move every usage row from user_identity ``old`` to ``new``.
+
+    Usage is keyed by username string rather than user_id, so a rename would
+    otherwise orphan the history *and* reset the daily quota (RPD is a COUNT over
+    rows matching the current username). This migrates the data with the name.
+
+    Runs in the caller's transaction and never commits, so the username change and
+    the usage move succeed or fail together. Takes the session as a parameter so the
+    audit script and the tests can drive it against any database.
+
+    Rows for ``new`` may already exist (e.g. the name was previously used), and the
+    uniqueness keys forbid duplicates, so conflicting rows are merged by summing
+    request_count. Each uniqueness key includes user_identity plus the table's time
+    columns, model and server, so at most one source row matches any destination row
+    and the merge subquery is single-valued by construction. user_type is not part of
+    any key; a merge keeps the destination row's value.
+
+    Returns a {table: rows_moved} map for logging.
+    """
+    from sqlalchemy import text
+
+    moved: dict[str, int] = {}
+    if old == new:
+        return moved
+
+    for table, time_cols in _USAGE_IDENTITY_TABLES:
+        cols = (*time_cols, "model", "server")
+        # Correlate a source row (old identity) with a destination row (new identity).
+        src_to_dst = " AND ".join(f"src.{c} = dst.{c}" for c in cols)
+        # Same correlation for the DELETE, where the target table cannot be aliased.
+        dst_to_target = " AND ".join(f"dst.{c} = {table}.{c}" for c in cols)
+        params = {"old": old, "new": new}
+
+        # 1. Fold conflicting source rows into the destination rows.
+        merged = await db.execute(
+            text(
+                f"UPDATE {table} AS dst "
+                f"   SET request_count = dst.request_count + ("
+                f"       SELECT src.request_count FROM {table} AS src"
+                f"        WHERE src.user_identity = :old AND {src_to_dst})"
+                f" WHERE dst.user_identity = :new"
+                f"   AND EXISTS (SELECT 1 FROM {table} AS src"
+                f"                WHERE src.user_identity = :old AND {src_to_dst})"
+            ),
+            params,
+        )
+
+        # 2. Drop the source rows that were just merged.
+        await db.execute(
+            text(
+                f"DELETE FROM {table}"
+                f" WHERE user_identity = :old"
+                f"   AND EXISTS (SELECT 1 FROM {table} AS dst"
+                f"                WHERE dst.user_identity = :new AND {dst_to_target})"
+            ),
+            params,
+        )
+
+        # 3. Rename the rows that had nothing to merge into.
+        renamed = await db.execute(
+            text(f"UPDATE {table} SET user_identity = :new WHERE user_identity = :old"),
+            params,
+        )
+
+        count = (merged.rowcount or 0) + (renamed.rowcount or 0)
+        if count:
+            moved[table] = count
+
+    if moved:
+        logger.info(f"Moved usage rows from '{old}' to '{new}': {moved}")
+    return moved
+
+
+async def delete_usage_records(db: AsyncSession, axis: str, value: str) -> dict[str, int]:
+    """Delete every usage row for one user_identity (axis='user') or model (axis='model').
+
+    Usage is spread across three tables with different retention — hourly (~48h),
+    daily, and the monthly rollup that is kept forever — so a purge has to hit all
+    three or the data reappears the moment the admin widens the time window.
+
+    Runs in the caller's transaction and never commits, matching rename_usage_identity
+    and letting the tests drive it against any database. Takes the axis rather than
+    two optional filters so the column name is always one of two literals; the value
+    itself is bound, never interpolated.
+
+    Note the two side effects: usage is keyed by the username string rather than
+    user_id (see the comment above _USAGE_IDENTITY_TABLES), so a purge by user is
+    keyed on the *current* name; and RPD is a COUNT over today's request_usage rows,
+    so deleting them resets that user's daily quota.
+
+    Returns a {table: rows_deleted} map for logging.
+    """
+    from sqlalchemy import text
+
+    column = "user_identity" if axis == "user" else "model"
+    deleted: dict[str, int] = {}
+
+    for table, _time_cols in _USAGE_IDENTITY_TABLES:
+        result = await db.execute(
+            text(f"DELETE FROM {table} WHERE {column} = :value"),
+            {"value": value},
+        )
+        deleted[table] = result.rowcount or 0
+
+    if any(deleted.values()):
+        logger.info(f"Deleted usage rows for {axis} '{value}': {deleted}")
+    return deleted
+
+
+async def count_usage_requests(db: AsyncSession, axis: str, value: str) -> int:
+    """Return how many requests are recorded for one user_identity or model.
+
+    Sums request_count over the daily and monthly tables only. rollup_to_monthly
+    deletes the daily rows it aggregates, so those two are disjoint and together
+    cover all of time; the hourly table is a second copy of the last ~48h of daily
+    and would double-count. Summing rowcounts across all three instead (as a delete
+    result does) counts the same traffic up to three times.
+    """
+    from sqlalchemy import text
+
+    column = "user_identity" if axis == "user" else "model"
+    total = 0
+    for table in ("request_usage", "request_usage_monthly"):
+        result = await db.execute(
+            text(f"SELECT COALESCE(SUM(request_count), 0) FROM {table} WHERE {column} = :value"),
+            {"value": value},
+        )
+        total += result.scalar_one() or 0
+    return total
 
 
 async def get_usage_earliest_date(db: AsyncSession, filter_user: Optional[str] = None) -> Optional[str]:
