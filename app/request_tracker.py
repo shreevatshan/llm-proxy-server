@@ -364,6 +364,28 @@ class RequestTracker:
             data = self._serialize(entry)
         await self._broadcast_raw("request_updated", data)
 
+    async def update_model(self, request_id: str, model: str) -> None:
+        """Correct the model on an in-flight request and notify subscribers.
+
+        The tracking middleware records the name the client sent; the route
+        resolves it to a canonical '{provider_key}/{name}' id after
+        authentication (app/model_resolution.py). entry.model is a component of
+        the usage key built in end_request, so without this the same logical
+        model would split across a bare row and a prefixed row.
+
+        Only _lock is needed: the usage key is built strictly later, and nothing
+        is buffered at this point.
+        """
+        if not model:
+            return
+        async with self._lock:
+            entry = self._active.get(request_id)
+            if entry is None or entry.model == model:
+                return
+            entry.model = model
+            data = self._serialize(entry)
+        await self._broadcast_raw("request_updated", data)
+
     def get_active_requests(self) -> list[dict]:
         snapshot = dict(self._active)
         return [self._serialize(r) for r in snapshot.values()]

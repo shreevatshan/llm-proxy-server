@@ -26,12 +26,24 @@ async def _noop_update_provider_models(provider_key, models):
     return None
 
 
+def _index_methods(model_ids):
+    """The prefix-less lookup surface of ModelCache (see app/cache.py)."""
+    ids = list(model_ids)
+    return {
+        "has_model_id": lambda candidate: candidate in ids,
+        "bare_model_candidates": lambda bare: sorted(
+            i for i in ids if '/' in i and i.split('/', 1)[1] == bare
+        ),
+    }
+
+
 def _fake_model_cache(model_id: str):
     """Return a SimpleNamespace that looks like ModelCache for the given model id."""
     return SimpleNamespace(
         get_enabled_models=lambda: [_make_model_info(model_id)],
         update_models=lambda models: None,
         update_provider_models=_noop_update_provider_models,
+        **_index_methods([model_id]),
     )
 
 
@@ -818,6 +830,7 @@ class PreflightAndSdkErrorTests(unittest.TestCase):
         fake_cache = SimpleNamespace(
             get_enabled_models=lambda: cache_models,
             update_models=lambda models: None,
+            **_index_methods([m.id for m in cache_models]),
         )
 
         with patch.object(
@@ -828,6 +841,10 @@ class PreflightAndSdkErrorTests(unittest.TestCase):
             anthropic_messages.provider_manager,
             "model_cache",
             fake_cache,
+        ), patch.object(
+            anthropic_messages.provider_manager,
+            "providers",
+            {payload["model"].split("/", 1)[0]: provider},
         ):
             response = asyncio.run(
                 anthropic_messages.create_message(
@@ -884,6 +901,7 @@ class PreflightAndSdkErrorTests(unittest.TestCase):
             get_enabled_models=lambda: [],
             update_models=lambda models: updated.extend(models),
             update_provider_models=_update_provider_models,
+            **_index_methods([]),
         )
 
         request_id = f"req-{next(self._request_ids)}"
@@ -909,6 +927,10 @@ class PreflightAndSdkErrorTests(unittest.TestCase):
             anthropic_messages.provider_manager,
             "model_cache",
             fake_cache,
+        ), patch.object(
+            anthropic_messages.provider_manager,
+            "providers",
+            {model_id.split("/", 1)[0]: provider},
         ):
             response = asyncio.run(
                 anthropic_messages.create_message(

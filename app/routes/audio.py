@@ -20,6 +20,7 @@ from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.model_alias import apply_alias
 from app.tracing import create_span, add_span_attributes, set_span_error
@@ -51,6 +52,7 @@ async def create_speech(
     Generate audio from text using text-to-speech.
     """
     try:
+        request.model = await resolve_model_for_request(request_obj, auth, request.model)
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, request.model)
         await enforce_model_access(request_obj, auth, request.model)
@@ -82,7 +84,7 @@ async def create_speech(
             }
         )
 
-    except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+    except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
         raise
     except ProviderHTTPError as e:
         return openai_provider_error_response(e)
@@ -115,6 +117,7 @@ async def create_transcription(
     """
     try:
         model = apply_alias(model)
+        model = await resolve_model_for_request(request_obj, auth, model)
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, model)
         await enforce_model_access(request_obj, auth, model)
@@ -163,7 +166,7 @@ async def create_transcription(
             # JSON format (default and verbose_json)
             return result
         
-    except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+    except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
         raise
     except ValidationError as e:
         # Invalid request parameters are a client 400, not a 500.
@@ -197,6 +200,7 @@ async def create_translation(
     """
     try:
         model = apply_alias(model)
+        model = await resolve_model_for_request(request_obj, auth, model)
         # Group rate limit check (request-level limits already handled in middleware)
         await enforce_group_rate_limit(request_obj, auth, model)
         await enforce_model_access(request_obj, auth, model)
@@ -238,7 +242,7 @@ async def create_translation(
             # JSON format (default and verbose_json)
             return result
         
-    except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+    except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
         raise
     except ValidationError as e:
         # Invalid request parameters are a client 400, not a 500.

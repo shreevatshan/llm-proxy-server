@@ -858,20 +858,90 @@ class ProviderManager:
             return None
     
     def _parse_model_name(self, model_name: str) -> tuple[str, str]:
-        """Parse provider and model from model name (e.g., 'ollama/llama2' -> ('ollama', 'llama2'))."""
+        """Parse provider and model from a model name.
+
+        Canonical names carry the provider prefix ('azure:primary/gpt-5.4' ->
+        ('azure:primary', 'gpt-5.4')). A prefix-less name ('gpt-5.4') is resolved
+        against the model cache instead, so callers need not know the proxy's
+        provider topology.
+
+        This is the defensive net for direct callers and the dispatch methods
+        below; routes resolve the name earlier (app/model_resolution.py) so that
+        rate limiting, access checks and usage attribution all see the canonical
+        id. Resolution here is deterministic (first candidate) -- it does not
+        round-robin, because it has no request context to key rotation on.
+        """
         with create_span("provider.parse_model_name") as span:
             try:
-                if '/' in model_name:
-                    provider_name, model_id = model_name.split('/', 1)
-                    return provider_name, model_id
-                else:
-                    # If no provider specified, try to find the model in available providers
-                    error_msg = f"Model name must include provider prefix (e.g., 'ollama/{model_name}')"
-                    raise ValueError(error_msg)
+                if not model_name:
+                    raise ValueError("Model name is required")
+
+                head, rest = model_name.split('/', 1) if '/' in model_name else ('', '')
+
+                # An explicit prefix naming an available provider is authoritative,
+                # even when the model itself is absent from the cache (Azure
+                # deployments are frequently not discoverable). An *ambiguous*
+                # prefix counts too, and is handed on so _get_provider can ask the
+                # caller to disambiguate -- falling through to the cache would
+                # silently route an explicit 'azure/...' to whichever provider
+                # happens to serve that bare name, possibly not an azure one.
+                if rest and self.has_provider_prefix(head):
+                    return head, rest
+
+                # Prefix-less, or a prefix whose provider is gone: fall back to the
+                # cache. The whole string is tried first -- a bare name may itself
+                # contain '/' (e.g. 'meta-llama/Llama-3.1-8B').
+                for candidate_name in (model_name, rest):
+                    if not candidate_name:
+                        continue
+                    candidates = self.model_cache.bare_model_candidates(candidate_name)
+                    for candidate in candidates:
+                        provider_key = candidate.split('/', 1)[0]
+                        if provider_key in self.providers:
+                            return provider_key, candidate_name
+
+                raise ValueError(
+                    f"Model '{model_name}' is not available on any configured provider"
+                )
             except Exception as e:
                 set_span_error(span, e)
                 raise
-    
+
+    def find_provider_key(self, provider_name: str) -> Optional[str]:
+        """Resolve `provider_name` to a registered provider key, or None.
+
+        Non-raising counterpart to _get_provider's lookup, for callers that need
+        to ask "is this prefix a live provider?" without handling an exception.
+        An ambiguous bare prefix returns None -- _get_provider stays the single
+        owner of the "ambiguous" / "not available" error messages.
+        """
+        if not provider_name:
+            return None
+        if provider_name in self.providers:
+            return provider_name
+        candidates = [
+            full_name for full_name in self.providers.keys()
+            if full_name.startswith(f"{provider_name}:")
+        ]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def has_provider_prefix(self, provider_name: str) -> bool:
+        """Whether `provider_name` names a registered provider or provider family.
+
+        Separates "ambiguous bare prefix" from "not a provider at all" -- both
+        make find_provider_key return None, but only the latter may fall through
+        to bare-name cache resolution. An ambiguous prefix must still be treated
+        as an explicit provider choice so the caller is asked to disambiguate
+        (_get_provider) rather than being routed somewhere it did not name.
+        """
+        if not provider_name:
+            return False
+        if provider_name in self.providers:
+            return True
+        return any(
+            full_name.startswith(f"{provider_name}:") for full_name in self.providers
+        )
+
     def _get_provider(self, provider_name: str) -> BaseProvider:
         """Get provider by name."""
         with create_span("provider.get_provider") as span:

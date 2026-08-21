@@ -42,6 +42,7 @@ from app.routes.stream_utils import (
 )
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from opentelemetry import trace
 from opentelemetry.context import get_current
@@ -207,7 +208,13 @@ async def create_message(
         kind=trace.SpanKind.INTERNAL
     ) as span:
         try:
-            model_name = request.model
+            # Resolve a prefix-less name before anything keys on the provider
+            # prefix: the provider lookup and preflight below, then the rate
+            # limit, access and usage layers.
+            model_name = await resolve_model_for_request(
+                request_obj, auth, request.model, envelope_override="anthropic"
+            )
+            request.model = model_name
             add_span_attributes(span, {
                 "anthropic.model": model_name,
                 "anthropic.max_tokens": request.max_tokens,
@@ -411,7 +418,7 @@ async def create_message(
                         str(e)
                     )
 
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except ValueError as e:
             logger.warning(f"Anthropic request validation error: {e}")
@@ -503,6 +510,16 @@ async def count_message_tokens(
             model_name = payload.get("model", "")
             provider = None
             if isinstance(model_name, str) and model_name:
+                # Best-effort resolution: this endpoint deliberately degrades to a
+                # local estimate for models it cannot route, so an unresolvable or
+                # forbidden name must keep its raw form rather than raise.
+                try:
+                    model_name = await resolve_model_for_request(
+                        request_obj, auth, model_name, envelope_override="anthropic"
+                    )
+                    payload["model"] = model_name
+                except (ModelUnavailable, ModelAccessDenied):
+                    pass
                 provider = await provider_manager.get_anthropic_provider_for_model(model_name)
 
             add_span_attributes(span, {
@@ -586,7 +603,7 @@ async def count_message_tokens(
                     model_name,
                 )
             return AnthropicCountTokensResponse(input_tokens=input_tokens)
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except Exception as e:
             logger.error(f"Anthropic count_tokens error: {e}", exc_info=True)

@@ -10,6 +10,7 @@ from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.model_alias import apply_alias
 from typing import Union
@@ -31,6 +32,7 @@ async def create_image(
 
     with create_span("image_generation_request") as span:
         try:
+            request.model = await resolve_model_for_request(request_obj, auth, request.model)
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, request.model)
             await enforce_model_access(request_obj, auth, request.model)
@@ -72,7 +74,7 @@ async def create_image(
             
             return response
             
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except ProviderHTTPError as e:
             set_span_error(span, e)
@@ -113,6 +115,7 @@ async def edit_image(
     with create_span("image_edit_request") as span:
         try:
             model = apply_alias(model)
+            model = await resolve_model_for_request(request_obj, auth, model)
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, model)
             await enforce_model_access(request_obj, auth, model)
@@ -176,7 +179,7 @@ async def edit_image(
             
             return response
             
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except ProviderHTTPError as e:
             set_span_error(span, e)
@@ -221,6 +224,7 @@ async def create_image_variation(
     with create_span("image_variation_request") as span:
         try:
             model = apply_alias(model)
+            model = await resolve_model_for_request(request_obj, auth, model)
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, model)
             await enforce_model_access(request_obj, auth, model)
@@ -274,7 +278,7 @@ async def create_image_variation(
             
             return response
             
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except ProviderHTTPError as e:
             set_span_error(span, e)

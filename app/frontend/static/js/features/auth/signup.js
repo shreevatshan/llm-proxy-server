@@ -1,4 +1,8 @@
 
+// Mirrors USERNAME_MIN_LENGTH / USERNAME_MAX_LENGTH in app/auth/models.py.
+const USERNAME_MIN_LENGTH = 3;
+const USERNAME_MAX_LENGTH = 50;
+
 // Quote-safe HTML escaping (ui-utils.js is not loaded on the signup page).
 function escapeHtml(text) {
     if (text === null || text === undefined) return '';
@@ -90,11 +94,16 @@ function validateUsername() {
         return true; // Show help but don't show error for empty field unless it's form submission
     }
     
-    if (username.length < 3) {
-        showFieldError('username', 'Username must be at least 3 characters long');
+    if (username.length < USERNAME_MIN_LENGTH) {
+        showFieldError('username', `Username must be at least ${USERNAME_MIN_LENGTH} characters long`);
         return false;
     }
-    
+
+    if (username.length > USERNAME_MAX_LENGTH) {
+        showFieldError('username', `Username must be at most ${USERNAME_MAX_LENGTH} characters long`);
+        return false;
+    }
+
     clearFieldError('username');
     return true;
 }
@@ -145,11 +154,16 @@ function validateUsernameForSubmission() {
         return false;
     }
     
-    if (username.length < 3) {
-        showFieldError('username', 'Username must be at least 3 characters long');
+    if (username.length < USERNAME_MIN_LENGTH) {
+        showFieldError('username', `Username must be at least ${USERNAME_MIN_LENGTH} characters long`);
         return false;
     }
-    
+
+    if (username.length > USERNAME_MAX_LENGTH) {
+        showFieldError('username', `Username must be at most ${USERNAME_MAX_LENGTH} characters long`);
+        return false;
+    }
+
     clearFieldError('username');
     return true;
 }

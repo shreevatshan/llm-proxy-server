@@ -39,6 +39,62 @@ class RequestTrackerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["error"], "upstream stalled")
 
 
+class UpdateModelTests(unittest.IsolatedAsyncioTestCase):
+    """Retagging an in-flight entry with the canonical model id.
+
+    end_request builds the usage key from entry.model, so without this a
+    prefix-less request would land on its own usage row instead of joining the
+    canonical one (see app/model_resolution.py).
+    """
+
+    def _tracker(self, model="gpt-5.4"):
+        tracker = RequestTracker()
+        tracker._broadcast_raw = AsyncMock()
+        tracker._active["req-1"] = ActiveRequest(
+            request_id="req-1",
+            server="openai",
+            endpoint="/v1/chat/completions",
+            method="POST",
+            model=model,
+            user_identity="alice",
+            user_type="user",
+            is_streaming=False,
+            start_time=0.0,
+        )
+        return tracker
+
+    async def test_mutates_the_entry_and_broadcasts(self):
+        tracker = self._tracker()
+        await tracker.update_model("req-1", "azure:foundry/gpt-5.4")
+
+        self.assertEqual(tracker._active["req-1"].model, "azure:foundry/gpt-5.4")
+        event_type, payload = tracker._broadcast_raw.await_args.args
+        self.assertEqual(event_type, "request_updated")
+        self.assertEqual(payload["model"], "azure:foundry/gpt-5.4")
+
+    async def test_no_ops_on_unknown_id_identical_model_and_empty_model(self):
+        for request_id, model in (
+            ("missing", "azure:foundry/gpt-5.4"),   # no such entry
+            ("req-1", "gpt-5.4"),                   # already this model
+            ("req-1", ""),                          # nothing to record
+        ):
+            with self.subTest(request_id=request_id, model=model):
+                tracker = self._tracker()
+                await tracker.update_model(request_id, model)
+                self.assertEqual(tracker._active["req-1"].model, "gpt-5.4")
+                tracker._broadcast_raw.assert_not_awaited()
+
+    async def test_usage_is_buffered_under_the_canonical_id(self):
+        tracker = self._tracker()
+        await tracker.update_model("req-1", "azure:foundry/gpt-5.4")
+        await tracker.end_request("req-1", status="completed")
+
+        keys = list(tracker._usage_buffer.keys())
+        self.assertEqual(len(keys), 1)
+        self.assertIn("azure:foundry/gpt-5.4", keys[0])
+        self.assertNotIn("|gpt-5.4|", keys[0])
+
+
 class RequestTrackingMiddlewareTests(unittest.TestCase):
     def test_streaming_response_uses_tracking_final_error_outcome(self):
         start_request = AsyncMock()

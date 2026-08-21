@@ -21,10 +21,12 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 
 from app.config import config
+from app.asgi_mount import MOUNTED_API_PREFIXES, CORSExceptPrefixes, MountedApp
 from app.auth.database import init_database
 from app.auth.middleware import get_current_user_optional
 from app.auth.models import User
@@ -168,7 +170,7 @@ async def shared_shutdown():
     print("Application shutdown complete")
 
 
-def _add_cors(app: FastAPI, *, allow_credentials: bool = False):
+def _add_cors(app: FastAPI, *, allow_credentials: bool = False, exempt_prefixes=()):
     """Add CORS middleware to an app.
 
     Bearer-token API apps (allow_credentials=False, the default) can safely use a
@@ -177,8 +179,25 @@ def _add_cors(app: FastAPI, *, allow_credentials: bool = False):
     origin allowlist (config.server.cors_allow_origins): browsers forbid
     credentialed requests against a wildcard, and reflecting any origin *with*
     credentials is the canonical credentialed-CORS vulnerability.
+
+    ``exempt_prefixes`` (management app only) skips this strict policy for the
+    mounted provider APIs, which keep the permissive non-credentialed CORS they
+    serve on their own ports — otherwise a browser API client that works against
+    :11440 would get a 400 "Disallowed CORS origin" on the management port.
     """
-    if allow_credentials:
+    if allow_credentials and exempt_prefixes:
+        app.add_middleware(
+            CORSExceptPrefixes,
+            cors_app_factory=lambda inner: CORSMiddleware(
+                inner,
+                allow_origins=config.server.cors_allow_origins,
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            ),
+            exempt_prefixes=exempt_prefixes,
+        )
+    elif allow_credentials:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=config.server.cors_allow_origins,
@@ -196,11 +215,24 @@ def _add_cors(app: FastAPI, *, allow_credentials: bool = False):
         )
 
 
-def _instrument_app(app: FastAPI, name: str):
-    """Instrument a FastAPI app with OpenTelemetry."""
+def _instrument_app(app: FastAPI, name: str, *, excluded_prefixes=()):
+    """Instrument a FastAPI app with OpenTelemetry.
+
+    ``excluded_prefixes`` (management app only) suppresses spans for the mounted
+    provider APIs, which the sub-apps already instrument themselves.
+    """
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     try:
-        FastAPIInstrumentor.instrument_app(app)
+        kwargs = {}
+        if excluded_prefixes:
+            # excluded_urls is a comma-separated list of regexes re.search'd
+            # against the *full* URL ("http://host:8765/openai/v1/..."), not the
+            # path. Anchor on the authority and require a segment boundary so
+            # /openai-evil isn't swept up too.
+            kwargs["excluded_urls"] = ",".join(
+                rf"^https?://[^/]*{re.escape(p)}([/?#]|$)" for p in excluded_prefixes
+            )
+        FastAPIInstrumentor.instrument_app(app, **kwargs)
         print(f"✓ FastAPI instrumentation enabled for {name}")
     except Exception as e:
         print(f"⚠ FastAPI instrumentation failed for {name}: {e}")
@@ -477,6 +509,12 @@ def create_openai_app() -> FastAPI:
     async def _openai_access_handler(req, exc: ModelAccessDenied):
         return _JSONResponse(status_code=exc.status_code, content=exc.body)
 
+    from app.model_resolution import ModelUnavailable
+
+    @openai_app.exception_handler(ModelUnavailable)
+    async def _openai_unavailable_handler(req, exc: ModelUnavailable):
+        return _JSONResponse(status_code=exc.status_code, content=exc.body)
+
     from app.routes import models, chat, completions, embeddings, images, audio, responses
     openai_app.include_router(models.router)
     openai_app.include_router(chat.router)
@@ -553,6 +591,12 @@ def create_anthropic_app() -> FastAPI:
     async def _anthropic_access_handler(req, exc: ModelAccessDenied):
         return _JSONResponse(status_code=exc.status_code, content=exc.body)
 
+    from app.model_resolution import ModelUnavailable
+
+    @anthropic_app.exception_handler(ModelUnavailable)
+    async def _anthropic_unavailable_handler(req, exc: ModelUnavailable):
+        return _JSONResponse(status_code=exc.status_code, content=exc.body)
+
     from app.routes import anthropic_messages, anthropic_models
     anthropic_app.include_router(anthropic_messages.router)
     anthropic_app.include_router(anthropic_models.router)
@@ -617,6 +661,12 @@ def create_azure_openai_app() -> FastAPI:
 
     @azure_openai_app.exception_handler(ModelAccessDenied)
     async def _azure_access_handler(req, exc: ModelAccessDenied):
+        return _JSONResponse(status_code=exc.status_code, content=exc.body)
+
+    from app.model_resolution import ModelUnavailable
+
+    @azure_openai_app.exception_handler(ModelUnavailable)
+    async def _azure_unavailable_handler(req, exc: ModelUnavailable):
         return _JSONResponse(status_code=exc.status_code, content=exc.body)
 
     from app.routes import azure_openai
@@ -725,10 +775,16 @@ def create_management_app(
       /anthropic/*     -> anthropic_app     (same as the Anthropic port)
       /azure-openai/*  -> azure_openai_app  (same as the Azure OpenAI port)
 
-    Starlette strips the mount prefix before dispatching, so each sub-app sees
-    its normal paths and all of its own middleware runs unchanged. The apps are
-    the same instances served by their own uvicorn servers, which own their
-    lifespans — the mounts intentionally add no lifespan wiring.
+    Note that Starlette's ``Mount`` does **not** strip the prefix from
+    ``scope["path"]`` — it only sets ``root_path``, and ``request.url.path`` is
+    built from ``scope["path"]`` alone. A plainly-mounted sub-app therefore sees
+    ``/openai/v1/chat/completions`` where it would see ``/v1/chat/completions``
+    on its own port, and every path-based decision it makes diverges. Each app
+    is wrapped in ``MountedApp`` (app/asgi_mount.py) to normalize the scope, so
+    the sub-app's middleware genuinely does run unchanged.
+
+    The apps are the same instances served by their own uvicorn servers, which
+    own their lifespans — the mounts intentionally add no lifespan wiring.
     """
 
     @asynccontextmanager
@@ -744,8 +800,10 @@ def create_management_app(
         lifespan=lifespan
     )
 
-    _add_cors(mgmt_app, allow_credentials=True)
-    _instrument_app(mgmt_app, "Management")
+    _add_cors(mgmt_app, allow_credentials=True, exempt_prefixes=MOUNTED_API_PREFIXES)
+    # The mounted apps are instrumented on their own; excluding them here keeps a
+    # request through this port from emitting two server spans.
+    _instrument_app(mgmt_app, "Management", excluded_prefixes=MOUNTED_API_PREFIXES)
 
     # CSRF protection (double-submit cookie) for the cookie-authenticated
     # management routes. Enforces on unsafe methods under /auth, /admin,
@@ -781,9 +839,10 @@ def create_management_app(
     mgmt_app.include_router(admin.router)
 
     # Unified entry point: expose every provider API under this port too.
-    mgmt_app.mount("/openai", openai_app)
-    mgmt_app.mount("/anthropic", anthropic_app)
-    mgmt_app.mount("/azure-openai", azure_openai_app)
+    # MountedApp hands each sub-app the same scope it gets on its own port.
+    sub_apps = (openai_app, anthropic_app, azure_openai_app)
+    for prefix, sub_app in zip(MOUNTED_API_PREFIXES, sub_apps, strict=True):
+        mgmt_app.mount(prefix, MountedApp(sub_app, prefix))
 
     @mgmt_app.get("/")
     async def root(

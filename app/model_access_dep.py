@@ -17,6 +17,7 @@ from typing import Optional, Union
 
 from fastapi import Request
 
+from app.api_envelope import envelope_for
 from app.auth.admin import AdminUser
 from app.auth.models import APIKey, User
 from app.providers.provider_manager import provider_manager
@@ -68,16 +69,6 @@ def _message(model_id: str) -> str:
     )
 
 
-def _envelope_for(path: str, override: Optional[str]) -> str:
-    if override:
-        return override
-    if path.startswith("/v1/messages"):
-        return "anthropic"
-    if path.startswith("/openai/"):
-        return "azure"
-    return "openai"
-
-
 async def enforce_model_access(
     request: Request,
     auth: Union[User, AdminUser, APIKey],
@@ -100,7 +91,7 @@ async def enforce_model_access(
     if provider_manager.model_cache.is_model_allowed_for_user(user_id, model_id):
         return
 
-    envelope = _envelope_for(request.url.path, envelope_override)
+    envelope = envelope_for(request.url.path, envelope_override)
     if envelope == "anthropic":
         raise ModelAccessDenied.anthropic(model_id)
     if envelope == "azure":

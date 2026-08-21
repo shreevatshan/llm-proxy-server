@@ -156,5 +156,101 @@ class ProviderRoutingTests(unittest.TestCase):
         )
 
 
+class ModelNameParsingTests(unittest.TestCase):
+    """_parse_model_name is the defensive net under the dispatch sites.
+
+    Route handlers canonicalise the name first (app/model_resolution.py); this
+    keeps the direct callers (audio.py) working on a prefix-less name too.
+    """
+
+    def _manager(self, model_ids=(), providers=()):
+        manager = ProviderManager()
+        manager.providers = {key: _ModelAwareProvider() for key in providers}
+        manager.model_cache.update_models([
+            ModelInfo(id=m, created=0, owned_by="t", provider="t") for m in model_ids
+        ])
+        return manager
+
+    def test_bare_name_resolves_via_the_cache(self):
+        manager = self._manager(["azure:primary/gpt-5.4"], ["azure:primary"])
+        self.assertEqual(manager._parse_model_name("gpt-5.4"),
+                         ("azure:primary", "gpt-5.4"))
+
+    def test_live_prefix_is_honoured_without_consulting_the_cache(self):
+        manager = self._manager([], ["azure:primary"])
+        self.assertEqual(manager._parse_model_name("azure:primary/anything"),
+                         ("azure:primary", "anything"))
+
+    def test_dead_prefix_falls_back_to_a_provider_that_has_the_model(self):
+        manager = self._manager(["azure:primary/gpt-5.4"], ["azure:primary"])
+        self.assertEqual(manager._parse_model_name("azure:gone/gpt-5.4"),
+                         ("azure:primary", "gpt-5.4"))
+
+    def test_bare_name_containing_a_slash_is_tried_whole_first(self):
+        manager = self._manager(["lmstudio:box/meta-llama/Llama-3.1-8B"], ["lmstudio:box"])
+        self.assertEqual(
+            manager._parse_model_name("meta-llama/Llama-3.1-8B"),
+            ("lmstudio:box", "meta-llama/Llama-3.1-8B"),
+        )
+
+    def test_ambiguous_prefix_is_handed_on_for_disambiguation(self):
+        """An explicit prefix must never be traded for some other provider.
+
+        'azure' matches two instances, so the name cannot be resolved here --
+        but falling back to the cache would route the request to whichever
+        provider serves the bare name, which need not be an azure one at all.
+        """
+        manager = self._manager(
+            ["azure:primary/gpt-5.4", "openai:main/gpt-5.4"],
+            ["azure:primary", "azure:foundry", "openai:main"],
+        )
+        self.assertEqual(manager._parse_model_name("azure/gpt-5.4"), ("azure", "gpt-5.4"))
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            manager._get_provider("azure")
+
+    def test_unresolvable_names_raise(self):
+        manager = self._manager(["azure:primary/gpt-5.4"], ["azure:primary"])
+        for name in ("", "nope", "azure:gone/nope"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    manager._parse_model_name(name)
+
+
+class FindProviderKeyTests(unittest.TestCase):
+    """The non-raising counterpart to _get_provider's lookup."""
+
+    def _manager(self, *keys):
+        manager = ProviderManager()
+        manager.providers = {key: _ModelAwareProvider() for key in keys}
+        return manager
+
+    def test_exact_key(self):
+        manager = self._manager("azure:primary")
+        self.assertEqual(manager.find_provider_key("azure:primary"), "azure:primary")
+
+    def test_unique_bare_prefix(self):
+        manager = self._manager("azure:primary")
+        self.assertEqual(manager.find_provider_key("azure"), "azure:primary")
+
+    def test_ambiguous_prefix_is_not_a_match(self):
+        manager = self._manager("azure:primary", "azure:foundry")
+        self.assertIsNone(manager.find_provider_key("azure"))
+
+    def test_unknown_and_empty(self):
+        manager = self._manager("azure:primary")
+        self.assertIsNone(manager.find_provider_key("openai"))
+        self.assertIsNone(manager.find_provider_key(""))
+        self.assertIsNone(manager.find_provider_key(None))
+
+    def test_has_provider_prefix_separates_ambiguous_from_unknown(self):
+        manager = self._manager("azure:primary", "azure:foundry")
+        self.assertTrue(manager.has_provider_prefix("azure:primary"))
+        self.assertTrue(manager.has_provider_prefix("azure"))  # ambiguous, still ours
+        self.assertFalse(manager.has_provider_prefix("openai"))
+        self.assertFalse(manager.has_provider_prefix("azure:gone"))
+        self.assertFalse(manager.has_provider_prefix(""))
+        self.assertFalse(manager.has_provider_prefix(None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,19 +11,10 @@ from typing import Optional, Union
 
 from fastapi import Request
 
+from app.api_envelope import envelope_for
 from app.auth.admin import AdminUser
 from app.auth.models import APIKey, User
 from app.rate_limit import RateLimitExceeded, rate_limit_tracker
-
-
-def _envelope_for(path: str, override: Optional[str]) -> str:
-    if override:
-        return override
-    if path.startswith("/v1/messages"):
-        return "anthropic"
-    if path.startswith("/openai/"):
-        return "azure"
-    return "openai"
 
 
 def _provider_key_of(model_id: str) -> Optional[str]:
@@ -70,7 +61,7 @@ async def enforce_group_rate_limit(
         decision = await rate_limit_tracker.check_group_limit(user_id, username, model_id)
 
     if decision is not None and not decision.allowed:
-        envelope = _envelope_for(request.url.path, envelope_override)
+        envelope = envelope_for(request.url.path, envelope_override)
         if envelope == "anthropic":
             raise RateLimitExceeded.anthropic(decision)
         if envelope == "azure":

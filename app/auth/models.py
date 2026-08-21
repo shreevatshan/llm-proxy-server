@@ -12,6 +12,15 @@ from typing import Optional, List
 VALID_AZURE_BACKENDS = {"openai", "foundry"}
 DEPLOYMENT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
 
+# Width of the users.username column. SQLite does not enforce VARCHAR limits, so
+# signup validates against this explicitly to keep names portable to backends
+# (Postgres/MySQL) that would reject an over-long value at INSERT time.
+USERNAME_MAX_LENGTH = 50
+
+# Shortest accepted username. Mirrored by the signup form's client-side check;
+# enforced server-side so direct API calls cannot bypass it.
+USERNAME_MIN_LENGTH = 3
+
 Base = declarative_base()
 
 
@@ -20,7 +29,7 @@ class User(Base):
     __tablename__ = "users"
     
     id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, index=True, nullable=False)
+    username = Column(String(USERNAME_MAX_LENGTH), unique=True, index=True, nullable=False)
     email = Column(String(100), unique=True, index=True, nullable=False)
     hashed_password = Column(String(255), nullable=True)  # Nullable for OAuth users
     created_at = Column(DateTime, default=datetime.utcnow)

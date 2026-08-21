@@ -35,6 +35,7 @@ from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from typing import Union
 from app.routes.stream_utils import (
@@ -68,13 +69,14 @@ async def responses_input_tokens(
     """Count input tokens for a Responses API request."""
     with create_span("responses_input_tokens", kind=trace.SpanKind.INTERNAL) as span:
         try:
+            request.model = await resolve_model_for_request(request_obj, auth, request.model)
             # Group rate limit + per-user model access enforcement.
             await enforce_group_rate_limit(request_obj, auth, request.model)
             await enforce_model_access(request_obj, auth, request.model)
 
             response = await provider_manager.responses_input_tokens(request)
             return response
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except ProviderHTTPError as e:
             set_span_error(span, e)
@@ -102,6 +104,7 @@ async def responses_compact(
     """Compact a conversation to reduce token usage."""
     with create_span("responses_compact", kind=trace.SpanKind.INTERNAL) as span:
         try:
+            request.model = await resolve_model_for_request(request_obj, auth, request.model)
             # Group rate limit + per-user model access enforcement. compact
             # invokes the upstream model, so it must be gated like inference.
             await enforce_group_rate_limit(request_obj, auth, request.model)
@@ -109,7 +112,7 @@ async def responses_compact(
 
             response = await provider_manager.responses_compact(request)
             return response
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except ProviderHTTPError as e:
             set_span_error(span, e)
@@ -138,6 +141,7 @@ async def responses_create(
     request_started_at = time.monotonic()
     with create_span("responses_create", kind=trace.SpanKind.INTERNAL) as span:
         try:
+            request.model = await resolve_model_for_request(request_obj, auth, request.model)
             # Group rate limit check (request-level limits already handled in middleware)
             await enforce_group_rate_limit(request_obj, auth, request.model)
             await enforce_model_access(request_obj, auth, request.model)
@@ -186,7 +190,7 @@ async def responses_create(
                 )
                 return response
 
-        except (HTTPException, RateLimitExceeded, ModelAccessDenied):
+        except (HTTPException, RateLimitExceeded, ModelAccessDenied, ModelUnavailable):
             raise
         except ProviderHTTPError as e:
             set_span_error(span, e)

@@ -9,6 +9,7 @@ from .models import User, APIKey
 from .auth import verify_token
 from .admin import AdminUser, authenticate_admin, get_admin_username
 from .cache import auth_cache, CachedAPIKey, CachedUser
+from app.api_envelope import envelope_for
 from app.rate_limit import RateLimitExceeded
 from app.tracing import (
     create_span, add_span_attributes, set_span_error,
@@ -26,16 +27,6 @@ RATE_LIMIT_SKIP_PATHS = frozenset({
     "/openai/models",
     "/openai/v1/models",
 })
-
-
-def _envelope_for(path: str, override: Optional[str]) -> str:
-    if override:
-        return override
-    if path.startswith("/v1/messages"):
-        return "anthropic"
-    if path.startswith("/openai/"):
-        return "azure"
-    return "openai"
 
 
 def get_owner_user_id(auth) -> Optional[int]:
@@ -104,9 +95,25 @@ async def _enforce_rate_limit(
         if (provider_key and rate_limit_tracker.instance_belongs_to_group(provider_key)) \
                 or rate_limit_tracker.model_belongs_to_group(model):
             return
+        # Prefix-less name: the canonical id is not chosen until the route
+        # resolves it (app/model_resolution.py), which runs after this. Skip the
+        # overall gate only when EVERY candidate it could resolve to is grouped.
+        # Deciding from a single provisional pick would be unsound: if the pick
+        # were grouped but the route landed on an ungrouped candidate,
+        # check_group_limit returns None and the request would be governed by no
+        # limit at all. A mixed pool falls through here and is group-checked
+        # again at the route -- double-governed, never ungoverned.
+        from app.model_resolution import candidate_ids  # local: keeps app.auth leaf-ward
+        candidates = candidate_ids(model)
+        if candidates and all(
+            rate_limit_tracker.instance_belongs_to_group(c.split("/", 1)[0])
+            or rate_limit_tracker.model_belongs_to_group(c)
+            for c in candidates
+        ):
+            return
     decision = await rate_limit_tracker.check_and_increment(user_id, username)
     if not decision.allowed:
-        envelope = _envelope_for(request.url.path, envelope_override)
+        envelope = envelope_for(request.url.path, envelope_override)
         if envelope == "anthropic":
             raise RateLimitExceeded.anthropic(decision)
         if envelope == "azure":

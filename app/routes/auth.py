@@ -22,6 +22,7 @@ from app.auth.models import (
     APIKeyResponse, APIKeyListResponse, UserUpdate, PasswordUpdate, AccountDelete,
     ZohoOAuthCallback,
     MyQuotasResponse, QuotaSectionResponse,
+    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH,
 )
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin
@@ -56,6 +57,25 @@ async def signup(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     logger = logging.getLogger(__name__)
     
     try:
+        # Normalize before anything reads the name: the form trims client-side, so
+        # validating, looking up and storing the stripped value is what keeps the
+        # length bound, the uniqueness checks and the stored name all talking about
+        # the same string. Validated before any lookup so a bad name fails fast
+        # rather than at INSERT time on a length-enforcing DB backend.
+        user_data.username = user_data.username.strip()
+        username_length = len(user_data.username)
+        if username_length < USERNAME_MIN_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Username must be at least {USERNAME_MIN_LENGTH} characters long"
+            )
+
+        if username_length > USERNAME_MAX_LENGTH:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Username must be at most {USERNAME_MAX_LENGTH} characters long"
+            )
+
         # Check if username already exists. The config-based admin is not in the
         # users table but owns its name for usage/quota purposes (is_reserved_username).
         if await get_user_by_username(db, user_data.username) or is_reserved_username(user_data.username):

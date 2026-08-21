@@ -40,7 +40,13 @@ class ModelCache:
         # Per-user model access cache (guarded by _config_lock)
         self._user_model_policies: Dict[int, str] = {}  # user_id -> mode (absent -> "default")
         self._user_model_exceptions: Dict[int, Dict[str, bool]] = {}  # user_id -> {model_id -> is_allowed}
-        
+
+        # Prefix-less lookup index, rebuilt lazily from _models (see _ensure_index).
+        self._bare_index: Dict[str, List[str]] = {}  # bare name -> sorted canonical ids
+        self._model_ids: Set[str] = set()
+        self._index_src: Optional[List[ModelInfo]] = None
+        self._index_stamp: float = -1.0
+
         # Threading lock for safe initialization of asyncio locks
         self._init_lock = threading.Lock()
         
@@ -155,7 +161,72 @@ class ModelCache:
         """Get cached models (returns snapshot - no lock held during iteration)."""
         # Return a copy to prevent modification during iteration
         return list(self._models)
-    
+
+    # ---------------------------------------------------------------------
+    # Prefix-less lookup index.
+    #
+    # Model ids are canonical: '{provider_key}/{bare_name}', where bare_name is
+    # everything after the FIRST '/' and may itself contain slashes (an
+    # OpenAI-compatible backend reporting 'meta-llama/Llama-3.1-8B' yields
+    # 'lmstudio:box/meta-llama/Llama-3.1-8B'). The index maps bare_name back to
+    # every canonical id serving it, so a client can name a model without
+    # knowing the proxy's provider topology.
+    #
+    # Rebuilt lazily rather than maintained by every writer: _models is always
+    # *reassigned* to a new list, never mutated in place, so comparing the list's
+    # identity is enough to detect a write. _last_updated is paired with it to
+    # catch a caller that re-submits the same list object. No write site needs to
+    # know this index exists.
+    # ---------------------------------------------------------------------
+    def _ensure_index(self) -> None:
+        """Rebuild the bare-name index if _models changed since the last build.
+
+        Contains no `await`, so it runs to completion within one event-loop tick
+        and needs no lock -- the same argument as the sync mutators below.
+        """
+        src = self._models  # single read: _models may be swapped between reads
+        stamp = self._last_updated
+        if self._index_src is src and self._index_stamp == stamp:
+            return
+
+        bare_index: Dict[str, List[str]] = {}
+        model_ids: Set[str] = set()
+        for model in src:
+            model_id = model.id
+            if not model_id:
+                continue
+            model_ids.add(model_id)
+            if '/' not in model_id:
+                continue
+            bare_name = model_id.split('/', 1)[1]
+            if not bare_name:
+                continue
+            bare_index.setdefault(bare_name, []).append(model_id)
+
+        # Sorted so a rebuild that leaves a bucket unchanged yields the identical
+        # list, which keeps round-robin rotation over it stable.
+        for ids in bare_index.values():
+            ids.sort()
+
+        self._bare_index = bare_index
+        self._model_ids = model_ids
+        self._index_stamp = stamp
+        self._index_src = src  # assigned last: a torn build is retried, not cached
+
+    def has_model_id(self, model_id: str) -> bool:
+        """True if `model_id` is a known canonical id, exactly as written."""
+        if not model_id:
+            return False
+        self._ensure_index()
+        return model_id in self._model_ids
+
+    def bare_model_candidates(self, bare_name: str) -> List[str]:
+        """Canonical ids whose bare name is `bare_name`, sorted. [] if none."""
+        if not bare_name:
+            return []
+        self._ensure_index()
+        return list(self._bare_index.get(bare_name, ()))
+
     # ---------------------------------------------------------------------
     # Concurrency model for the sync mutators below.
     #
