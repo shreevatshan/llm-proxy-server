@@ -39,7 +39,7 @@ from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
 from app.auth.models import (
     User, UserCreate, UserResponse, ProviderConfigurationResponse, ModelConfigurationResponse,
-    ModelManagementTree, ToggleRequest, BulkToggleRequest, ModelSearchResponse,
+    ModelManagementTree, ToggleRequest, BulkToggleRequest, BulkUserActionRequest, ModelSearchResponse,
     ProviderCredentialsCreate, ProviderCredentialsUpdate, ProviderCredentialsResponse,
     AdminPasswordReset, AdminUserModify, VALID_AZURE_BACKENDS,
     GlobalRateLimitResponse, GlobalRateLimitUpdate,
@@ -1030,6 +1030,140 @@ async def permanently_delete_user_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to permanently delete user: {str(e)}"
         )
+
+
+# Bounds the per-user delete loop below, which cannot run as a single transaction.
+MAX_BULK_USER_IDS = 200
+
+
+@router.post("/users/bulk-action")
+async def bulk_user_action(
+    bulk_data: BulkUserActionRequest,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Apply approve/deactivate/activate/delete to several users at once (admin only).
+
+    Mirrors the single-user endpoints above so bulk and single behaviour never
+    diverge. A well-formed request always returns 200: per-user problems are
+    reported in ``failed`` rather than failing the whole batch.
+    """
+    action = bulk_data.action
+    if action not in ("approve", "deactivate", "activate", "delete"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Action must be 'approve', 'deactivate', 'activate' or 'delete'"
+        )
+
+    # Dedupe while preserving the order the admin selected them in.
+    user_ids = list(dict.fromkeys(bulk_data.user_ids))
+    if not user_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No users selected"
+        )
+    if len(user_ids) > MAX_BULK_USER_IDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot process more than {MAX_BULK_USER_IDS} users at once"
+        )
+
+    from app.auth.cache import auth_cache
+
+    succeeded: List[dict] = []
+    failed: List[dict] = []
+
+    if action == "delete":
+        # permanently_delete_user commits internally, so this cannot be one
+        # transaction; partial completion is possible and is reported per user.
+        for user_id in user_ids:
+            user = await get_user_by_id(db, user_id)
+            if not user:
+                failed.append({"id": user_id, "username": None, "error": "User not found"})
+                continue
+
+            username = user.username
+            try:
+                if await permanently_delete_user(db, user_id):
+                    succeeded.append({"id": user_id, "username": username})
+                else:
+                    failed.append({"id": user_id, "username": username, "error": "User not found"})
+            except Exception as e:
+                logger.error("Failed to permanently delete user %s: %s", user_id, e, exc_info=True)
+                failed.append({"id": user_id, "username": username, "error": "Failed to delete user"})
+    else:
+        # Resolve everything first, then mutate and commit once.
+        targets: List[User] = []
+        for user_id in user_ids:
+            user = await get_user_by_id(db, user_id)
+            if not user:
+                failed.append({"id": user_id, "username": None, "error": "User not found"})
+                continue
+
+            awaiting_approval = getattr(user, "is_pending_approval", False)
+
+            if action == "activate" and awaiting_approval:
+                # is_pending_approval wins over is_active in the UI, so activating
+                # here would report success while the row still reads "Pending".
+                failed.append({
+                    "id": user_id,
+                    "username": user.username,
+                    "error": "User is pending approval — use Approve"
+                })
+                continue
+
+            if action == "approve" and not awaiting_approval:
+                # Same rejection the single-user endpoint gives, so a mixed
+                # selection reports exactly which users were not approvable.
+                failed.append({
+                    "id": user_id,
+                    "username": user.username,
+                    "error": "User is not pending approval"
+                })
+                continue
+
+            targets.append(user)
+
+        if targets:
+            try:
+                for user in targets:
+                    user.is_active = action in ("activate", "approve")
+                    if action == "approve":
+                        user.is_pending_approval = False
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.error("Failed to %s users in bulk: %s", action, e, exc_info=True)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to {action} users"
+                )
+
+            for user in targets:
+                succeeded.append({"id": user.id, "username": user.username})
+                if action == "deactivate":
+                    # Drop cached auth so the user's API keys stop working now.
+                    auth_cache.invalidate_user_api_keys(user.id)
+                    auth_cache.invalidate_user_by_id(user.id)
+
+    past_tense = {
+        "approve": "approved",
+        "deactivate": "deactivated",
+        "activate": "activated",
+        "delete": "deleted",
+    }[action]
+    message = f"{len(succeeded)} user{'' if len(succeeded) == 1 else 's'} {past_tense}"
+    if failed:
+        message += f", {len(failed)} failed"
+
+    return {
+        "message": message,
+        "action": action,
+        "succeeded": succeeded,
+        "failed": failed,
+        "succeeded_count": len(succeeded),
+        "failed_count": len(failed),
+    }
 
 
 # ==================== Rate Limit Management API Endpoints ====================

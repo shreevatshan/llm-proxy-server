@@ -71,6 +71,13 @@
                     oninput="window.UserManager?.filterUsers(this.value)">
             </div>
         </div>
+        <div class="section-actions" id="user-bulk-actions" style="display:none;">
+            <span class="bulk-selection-status" id="user-bulk-count"></span>
+            <button class="btn btn-primary btn-sm" onclick="window.UserManager?.bulkApprove()">Approve</button>
+            <button class="btn btn-success btn-sm" onclick="window.UserManager?.bulkActivate()">Activate</button>
+            <button class="btn btn-danger btn-sm" onclick="window.UserManager?.bulkDeactivate()">Deactivate</button>
+            <button class="btn btn-danger btn-sm btn-remove" onclick="window.UserManager?.bulkRemove()">Remove</button>
+        </div>
     </div>
 
     {% if users %}
@@ -78,6 +85,11 @@
         <table class="table table-hover mb-0">
             <thead>
                 <tr>
+                    <th class="col-select">
+                        <input type="checkbox" class="form-check-input" id="user-mgmt-select-all"
+                            aria-label="Select all users"
+                            onchange="window.UserManager?.toggleSelectAll(this)">
+                    </th>
                     <th>ID</th>
                     <th>Username</th>
                     <th>Email</th>
@@ -89,7 +101,13 @@
             </thead>
             <tbody id="users-mgmt-tbody">
                 {% for user in users %}
-                <tr class="user-mgmt-row" data-username="{{ user.username|lower }}" data-email="{{ user.email|lower }}">
+                <tr class="user-mgmt-row" data-user-id="{{ user.id }}" data-username="{{ user.username|lower }}" data-email="{{ user.email|lower }}">
+                    <td class="col-select">
+                        <input type="checkbox" class="form-check-input user-mgmt-check"
+                            data-user-id="{{ user.id }}" data-username="{{ user.username }}"
+                            aria-label="Select {{ user.username }}"
+                            onchange="window.UserManager?.toggleUserSelection(this)">
+                    </td>
                     <td>{{ user.id }}</td>
                     <td>{{ user.username }}</td>
                     <td>{{ user.email }}</td>
@@ -113,20 +131,20 @@
                     <td>
                         <div class="actions">
                             {% if user.is_pending_approval %}
-                                <button class="btn btn-primary btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="approveUser(this)">Approve</button>
+                                <button class="btn btn-primary btn-sm user-row-action" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="approveUser(this)">Approve</button>
                             {% elif user.is_active %}
-                                <button class="btn btn-danger btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="deactivateUser(this)">Deactivate</button>
+                                <button class="btn btn-danger btn-sm user-row-action" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="deactivateUser(this)">Deactivate</button>
                             {% else %}
-                                <button class="btn btn-success btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="activateUser(this)">Activate</button>
+                                <button class="btn btn-success btn-sm user-row-action" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="activateUser(this)">Activate</button>
                             {% endif %}
-                            <button class="btn btn-danger btn-sm btn-remove" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="removeUser(this)">Remove</button>
-                            <button class="btn btn-warning btn-sm" data-user-id="{{ user.id }}" data-username="{{ user.username }}" data-email="{{ user.email }}" data-oauth="{{ '1' if user.oauth_provider else '' }}" onclick="modifyUser(this)">Modify</button>
+                            <button class="btn btn-danger btn-sm btn-remove user-row-action" data-user-id="{{ user.id }}" data-username="{{ user.username }}" onclick="removeUser(this)">Remove</button>
+                            <button class="btn btn-warning btn-sm btn-modify-user user-row-action" data-user-id="{{ user.id }}" data-username="{{ user.username }}" data-email="{{ user.email }}" data-oauth="{{ '1' if user.oauth_provider else '' }}" onclick="modifyUser(this)">Modify</button>
                         </div>
                     </td>
                 </tr>
                 {% endfor %}
                 <tr id="user-mgmt-no-match" style="display:none;">
-                    <td colspan="7" class="text-center text-muted py-4">No users match your search.</td>
+                    <td colspan="8" class="text-center text-muted py-4">No users match your search.</td>
                 </tr>
             </tbody>
         </table>

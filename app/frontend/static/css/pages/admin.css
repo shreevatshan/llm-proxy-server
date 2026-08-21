@@ -1156,7 +1156,9 @@ input:checked + .model-toggle-slider:before {
     margin: 0;
 }
 
-.ma-api-checks .form-check-input {
+.ma-api-checks .form-check-input,
+#users-mgmt-tbody .form-check-input,
+#user-mgmt-select-all {
     appearance: none;
     -webkit-appearance: none;
     float: none;
@@ -1170,17 +1172,23 @@ input:checked + .model-toggle-slider:before {
     transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 
-.ma-api-checks .form-check-input:hover {
+.ma-api-checks .form-check-input:hover,
+#users-mgmt-tbody .form-check-input:hover,
+#user-mgmt-select-all:hover {
     border-color: var(--mono-text-primary);
 }
 
-.ma-api-checks .form-check-input:focus-visible {
+.ma-api-checks .form-check-input:focus-visible,
+#users-mgmt-tbody .form-check-input:focus-visible,
+#user-mgmt-select-all:focus-visible {
     outline: none;
     border-color: var(--accent-500);
     box-shadow: 0 0 0 2px var(--accent-500-alpha);
 }
 
-.ma-api-checks .form-check-input:checked {
+.ma-api-checks .form-check-input:checked,
+#users-mgmt-tbody .form-check-input:checked,
+#user-mgmt-select-all:checked {
     background-color: var(--mono-text-primary);
     border-color: var(--mono-text-primary);
     /* Dark checkmark on the white fill. */
@@ -1342,4 +1350,58 @@ input:checked + .model-toggle-slider:before {
     text-align: center;
     color: var(--dark-text-muted);
     font-size: var(--text-sm);
+}
+
+/* ================================
+   USER MANAGEMENT — BULK SELECTION
+   ================================ */
+
+/* Partial selection: a dash rather than a tick, on the same white fill as
+   :checked so the header box stays inside the monochrome system. */
+#user-mgmt-select-all:indeterminate {
+    background-color: var(--mono-text-primary);
+    border-color: var(--mono-text-primary);
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%230d0d0d' stroke-width='2.5' stroke-linecap='round' d='M4 8h8'/%3e%3c/svg%3e");
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+    background-position: center;
+}
+
+/* Table cells default to 1rem 1.5rem padding, which would make a checkbox
+   column ~84px wide. */
+.table th.col-select,
+.table td.col-select {
+    width: 1%;
+    padding-left: 1.25rem;
+    padding-right: 0.5rem;
+}
+
+/* tbody tr:hover already owns --dark-bg-secondary, so selection is marked with
+   an inset edge instead of a background it would fight with. */
+.user-mgmt-row.selected td:first-child {
+    box-shadow: inset 2px 0 0 var(--mono-text-primary);
+}
+
+/* Five actions plus the status line can outrun a narrow window before the
+   mobile breakpoint, so the group wraps rather than pushing past the header. */
+#user-bulk-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.bulk-selection-status {
+    align-self: center;
+    font-size: 0.8rem;
+    color: var(--dark-text-muted);
+    white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+    #user-bulk-actions {
+        flex-wrap: wrap;
+    }
+
+    .bulk-selection-status {
+        white-space: normal;
+    }
 }

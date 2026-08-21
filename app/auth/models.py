@@ -907,6 +907,11 @@ class BulkToggleRequest(BaseModel):
     action: str  # "enable_all" or "disable_all"
 
 
+class BulkUserActionRequest(BaseModel):
+    user_ids: List[int]
+    action: str  # "approve", "deactivate", "activate" or "delete"
+
+
 class ModelSearchResponse(BaseModel):
     models: List[ModelConfigurationResponse]
     providers: List[ProviderConfigurationResponse]
