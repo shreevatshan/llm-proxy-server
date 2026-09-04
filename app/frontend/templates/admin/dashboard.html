@@ -950,11 +950,16 @@
     </div>
     <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-            <h5 class="mb-0"><i class="fas fa-list me-2"></i>Configured Mappings</h5>
             <div class="d-flex align-items-center gap-2">
-                <input id="model-alias-search" type="search" class="form-control form-control-sm" placeholder="Search mappings…" aria-label="Search mappings" style="min-width:220px;" oninput="window.ModelAliasManager?.filter(this.value)">
-                <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelAliasManager?.load()"><i class="fas fa-sync-alt me-1"></i>Refresh</button>
+                <h5 class="mb-0 me-4"><i class="fas fa-list me-2"></i>Configured Mappings</h5>
+                <div class="position-relative flex-shrink-0" style="width: 240px;">
+                    <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                    <input type="text" id="model-alias-search" class="form-control form-control-sm ps-5"
+                        placeholder="Search mappings" aria-label="Search mappings"
+                        oninput="window.ModelAliasManager?.filter(this.value)">
+                </div>
             </div>
+            <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelAliasManager?.load()"><i class="fas fa-sync-alt me-1"></i>Refresh</button>
         </div>
         <div class="card-body p-0"><div class="table-responsive" style="max-height:60vh;overflow-y:auto;"><table class="table table-hover mb-0"><thead><tr><th>Friendly name</th><th>Canonical target</th><th>APIs</th><th>Status</th><th>Actions</th></tr></thead><tbody id="model-aliases-tbody"><tr><td colspan="5" class="text-center text-muted py-4">Open this tab to load mappings.</td></tr></tbody></table></div></div>
     </div>

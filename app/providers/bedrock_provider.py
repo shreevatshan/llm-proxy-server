@@ -1085,10 +1085,14 @@ class BedrockProvider(BaseProvider):
         if request.reasoning_effort:
             max_tokens = request.max_completion_tokens or request.max_tokens or 2048
             inference_config["maxTokens"] = max_tokens
+            if self._is_grok_model(request.model):
+                # Grok wants an effort string, not a token budget;
+                # _apply_grok_constraints validates/normalizes it below.
+                args.setdefault("additionalModelRequestFields", {})["reasoning_effort"] = request.reasoning_effort
             # Reasoning requires budget_tokens >= 1024 AND < max_tokens. If
             # max_tokens is too small to satisfy the floor, skip reasoning
             # rather than emit an invalid budget that Bedrock would reject.
-            if max_tokens <= self._MIN_BUDGET_TOKENS:
+            elif max_tokens <= self._MIN_BUDGET_TOKENS:
                 logger.warning(
                     f"[BEDROCK] max_tokens={max_tokens} too small for reasoning "
                     f"(needs > {self._MIN_BUDGET_TOKENS}); skipping reasoning_config"
@@ -1200,6 +1204,10 @@ class BedrockProvider(BaseProvider):
                 amrf.pop("top_k")
                 if self.debug:
                     logger.info(f"Removed top_k from additionalModelRequestFields for {request.model}")
+
+        # Grok rejects the sampling knobs entirely; scrub last so nothing above
+        # (extra fields, reasoning) can reintroduce them.
+        self._apply_grok_constraints(args)
 
         return args
 
@@ -1398,7 +1406,11 @@ class BedrockProvider(BaseProvider):
             elif "reasoningContent" in part:
                 # Emit reasoning on the dedicated reasoning_content field; keep
                 # content as the visible text only (no <think> injection).
-                message.reasoning_content = part["reasoningContent"]["reasoningText"].get("text", "")
+                # Encrypted reasoning (Grok returns redactedContent only) has no
+                # client-visible text, so skip it rather than KeyError.
+                reasoning_text = part["reasoningContent"].get("reasoningText")
+                if isinstance(reasoning_text, dict):
+                    message.reasoning_content = reasoning_text.get("text", "")
             elif "text" in part:
                 content += part["text"]
 
@@ -2030,6 +2042,68 @@ class BedrockProvider(BaseProvider):
         """True if model_id refers to a Moonshot Kimi model."""
         lower = model_id.lower()
         return "kimi" in lower or "moonshotai" in lower
+
+    def _is_grok_model(self, model_id: str) -> bool:
+        """True if model_id refers to an xAI Grok model on Bedrock."""
+        lower = model_id.lower()
+        return "xai." in lower or "grok" in lower
+
+    # Grok on Bedrock accepts only maxTokens in inferenceConfig; each of these
+    # is rejected with "This model doesn't support the <field> field".
+    _GROK_UNSUPPORTED_INFERENCE_FIELDS = ("temperature", "topP", "stopSequences")
+    # Grok takes reasoning as an effort string in additionalModelRequestFields.
+    # The Claude-style reasoning_config/thinking objects map onto reasoning.effort
+    # and are rejected ("Invalid type for 'reasoning.effort'").
+    _GROK_REASONING_EFFORTS = frozenset({"none", "low", "medium", "high", "xhigh", "max"})
+    _GROK_REASONING_EFFORT_ALIASES = {"minimal": "low"}
+
+    @staticmethod
+    def _budget_to_effort(budget_tokens: int) -> str:
+        """Map an Anthropic thinking budget onto a coarse reasoning effort."""
+        if budget_tokens > 10000:
+            return "high"
+        return "low" if budget_tokens < 1000 else "medium"
+
+    @classmethod
+    def _grok_reasoning_effort(cls, value: str) -> Optional[str]:
+        """Normalize an effort string to one Grok accepts, or None if unusable."""
+        normalized = value.strip().lower()
+        normalized = cls._GROK_REASONING_EFFORT_ALIASES.get(normalized, normalized)
+        return normalized if normalized in cls._GROK_REASONING_EFFORTS else None
+
+    def _apply_grok_constraints(self, args: Dict[str, Any]) -> None:
+        """Scrub Converse fields that Bedrock's xAI Grok models reject (in place)."""
+        if not self._is_grok_model(args.get("modelId", "")):
+            return
+
+        inference_config = args.get("inferenceConfig") or {}
+        removed = [
+            field for field in self._GROK_UNSUPPORTED_INFERENCE_FIELDS
+            if inference_config.pop(field, None) is not None
+        ]
+
+        additional_fields = args.get("additionalModelRequestFields")
+        if isinstance(additional_fields, dict):
+            # Collapse every reasoning spelling down to a single effort string.
+            effort = additional_fields.pop("reasoning_effort", None)
+            for key in ("reasoning_config", "thinking"):
+                value = additional_fields.pop(key, None)
+                if effort is not None:
+                    continue
+                if isinstance(value, dict) and value.get("type") != "disabled":
+                    effort = self._budget_to_effort(value.get("budget_tokens") or 0)
+                elif isinstance(value, str):
+                    effort = value
+            normalized = self._grok_reasoning_effort(str(effort)) if effort is not None else None
+            if normalized:
+                additional_fields["reasoning_effort"] = normalized
+            if not additional_fields:
+                args.pop("additionalModelRequestFields", None)
+
+        if removed and self.debug:
+            logger.info(
+                f"Removed {', '.join(removed)} for {args.get('modelId')} (not supported by Grok on Bedrock)"
+            )
 
     @staticmethod
     def _is_claude_at_least(model_id: str, min_major: int, min_minor: int) -> bool:
@@ -2686,14 +2760,21 @@ class BedrockProvider(BaseProvider):
                 # Nova 2 uses reasoningConfig with effort level; temperature and
                 # maxTokens must be removed from inferenceConfig when reasoning is on.
                 thinking_data = request.thinking.model_dump(exclude_none=True)
-                budget = thinking_data.get("budget_tokens", 0)
-                effort = "high" if budget > 10000 else ("low" if budget < 1000 else "medium")
+                effort = self._budget_to_effort(thinking_data.get("budget_tokens", 0))
                 additional_fields["reasoningConfig"] = {"type": "enabled", "maxReasoningEffort": effort}
                 inference_config.pop("temperature", None)
                 inference_config.pop("maxTokens", None)
             elif self._is_kimi_model(model_id):
                 # Kimi only supports reasoning_effort="high"
                 additional_fields["reasoning_effort"] = "high"
+            elif self._is_grok_model(model_id):
+                # Grok takes an effort string instead of a thinking block;
+                # a disabled block leaves the model on its own default.
+                thinking_data = request.thinking.model_dump(exclude_none=True)
+                if thinking_data.get("type") != "disabled":
+                    additional_fields["reasoning_effort"] = self._budget_to_effort(
+                        thinking_data.get("budget_tokens", 0)
+                    )
             else:
                 # Claude and others: pass thinking config directly
                 additional_fields["thinking"] = request.thinking.model_dump(exclude_none=True)
@@ -2778,6 +2859,8 @@ class BedrockProvider(BaseProvider):
                         tool_config["toolChoice"] = {"tool": {"name": tool_choice_data["name"]}}
 
             args["toolConfig"] = tool_config
+
+        self._apply_grok_constraints(args)
 
         return _sanitize_for_json(args)
 

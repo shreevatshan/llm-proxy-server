@@ -657,7 +657,7 @@ async def get_my_quotas(
         status_obj = await rate_limit_tracker.get_user_status(current_user.id, current_user.username)
         sections.append(QuotaSectionResponse(
             name="Other Models",
-            description="Models nost assigned to any group",
+            description="Models not assigned to any group",
             rpm_limit=status_obj.rpm_limit,
             rpd_limit=status_obj.rpd_limit,
             rpd_count=status_obj.rpd_count,

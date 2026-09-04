@@ -10,6 +10,7 @@ shaping, lazy client init, messages.create / messages.stream behavior, and SDK
 error translation to ProviderHTTPError.
 """
 
+import asyncio
 import json
 import unittest
 from types import SimpleNamespace
@@ -20,6 +21,8 @@ from app.providers.bedrock_provider import (
     _map_bedrock_error,
 )
 from app.providers.base import ProviderHTTPError
+from app.anthropic_models import AnthropicMessage, AnthropicMessagesRequest
+from app.openai_models import ChatCompletionRequest, ChatMessage
 
 
 def _provider() -> BedrockProvider:
@@ -454,6 +457,108 @@ class NativeMessagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("event: message_stop", joined)
         # post-terminal event within drain budget is consumed but not emitted
         self.assertNotIn("should_not_appear", joined)
+
+
+class GrokConverseConstraintTests(unittest.TestCase):
+    """Bedrock's xAI Grok models reject temperature/topP/stopSequences and take
+    reasoning as an effort string (verified against Converse in us-west-2)."""
+
+    def setUp(self):
+        self.p = _provider()
+        self.p.bedrock_model_list = []
+
+    def _chat_request(self, **kwargs):
+        kwargs.setdefault("model", "us.xai.grok-4.6")
+        return ChatCompletionRequest(
+            messages=[ChatMessage(role="user", content="hi")],
+            **kwargs,
+        )
+
+    def _anthropic_request(self, **kwargs):
+        kwargs.setdefault("model", "global.xai.grok-4.6")
+        kwargs.setdefault("max_tokens", 64)
+        return AnthropicMessagesRequest(
+            messages=[AnthropicMessage(role="user", content="hi")],
+            **kwargs,
+        )
+
+    def test_sampling_fields_stripped_on_chat_path(self):
+        args = self.p._parse_bedrock_request(
+            self._chat_request(temperature=0.7, top_p=0.9, stop=["END"], max_tokens=64)
+        )
+        self.assertEqual(args["inferenceConfig"], {"maxTokens": 64})
+
+    def test_sampling_fields_stripped_on_anthropic_path(self):
+        args = self.p._build_bedrock_anthropic_args(
+            self._anthropic_request(temperature=0.7, top_p=0.9, stop_sequences=["END"])
+        )
+        self.assertEqual(args["inferenceConfig"], {"maxTokens": 64})
+
+    def test_reasoning_effort_passed_as_string(self):
+        args = self.p._parse_bedrock_request(
+            self._chat_request(max_tokens=4096, reasoning_effort="high")
+        )
+        self.assertEqual(args["additionalModelRequestFields"], {"reasoning_effort": "high"})
+
+    def test_unsupported_effort_is_dropped(self):
+        # Grok's enum is none/low/medium/high/xhigh/max; anything else would 400.
+        args = self.p._parse_bedrock_request(
+            self._chat_request(max_tokens=4096, reasoning_effort="turbo")
+        )
+        self.assertNotIn("additionalModelRequestFields", args)
+
+    def test_minimal_effort_aliased_to_low(self):
+        args = self.p._parse_bedrock_request(
+            self._chat_request(max_tokens=4096, reasoning_effort="minimal")
+        )
+        self.assertEqual(args["additionalModelRequestFields"]["reasoning_effort"], "low")
+
+    def test_thinking_block_becomes_effort_string(self):
+        args = self.p._build_bedrock_anthropic_args(
+            self._anthropic_request(
+                max_tokens=32000,
+                thinking={"type": "enabled", "budget_tokens": 16000},
+            )
+        )
+        self.assertEqual(args["additionalModelRequestFields"]["reasoning_effort"], "high")
+        self.assertNotIn("thinking", args["additionalModelRequestFields"])
+
+    def test_extra_thinking_field_becomes_effort_string(self):
+        # A client passing Anthropic-style thinking through the OpenAI surface
+        # must not reach Grok as a reasoning_config object.
+        args = self.p._parse_bedrock_request(
+            self._chat_request(
+                max_tokens=32000,
+                temperature=0.5,
+                thinking={"type": "enabled", "budget_tokens": 500},
+            )
+        )
+        self.assertEqual(args["additionalModelRequestFields"], {"reasoning_effort": "low"})
+        self.assertNotIn("temperature", args["inferenceConfig"])
+
+    def test_redacted_reasoning_block_is_skipped(self):
+        # Grok returns reasoningContent with redactedContent only (no reasoningText).
+        response = {
+            "output": {"message": {"role": "assistant", "content": [
+                {"reasoningContent": {"redactedContent": b"rsn_encrypted"}},
+                {"text": "Hello there friend."},
+            ]}},
+            "usage": {"inputTokens": 35, "outputTokens": 203, "totalTokens": 238},
+            "stopReason": "end_turn",
+        }
+        with mock.patch.object(
+            BedrockProvider, "_invoke_bedrock", new=mock.AsyncMock(return_value=(response, {}))
+        ):
+            result = asyncio.run(self.p.chat_completion(self._chat_request(max_tokens=64)))
+        self.assertEqual(result.choices[0].message.content, "Hello there friend.")
+        self.assertIsNone(result.choices[0].message.reasoning_content)
+
+    def test_non_grok_model_keeps_sampling_fields(self):
+        args = self.p._parse_bedrock_request(
+            self._chat_request(model="us.amazon.nova-pro-v1:0", temperature=0.7, top_p=0.9, max_tokens=64)
+        )
+        self.assertEqual(args["inferenceConfig"]["temperature"], 0.7)
+        self.assertEqual(args["inferenceConfig"]["topP"], 0.9)
 
 
 if __name__ == "__main__":
