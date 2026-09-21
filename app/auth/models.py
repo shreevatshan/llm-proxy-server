@@ -1,6 +1,6 @@
 """Database models for authentication."""
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint, Index
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint, Index, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
@@ -399,6 +399,146 @@ class ProviderCredentials(Base):
     models = relationship("ModelConfiguration", back_populates="provider", cascade="all, delete-orphan")
 
 
+# ---------------------------------------------------------------------------
+# Request pooling: a group of users sharing one daily request quota (RPD only)
+# ---------------------------------------------------------------------------
+
+# Cap on pool size. Mirrors the MAX_BULK_USER_IDS precedent in app/routes/admin.py:
+# a bound that keeps a single settlement's apportionment loop (O(members^2) in the
+# worst case, when every member caps out) trivially cheap.
+MAX_POOL_MEMBERS = 25
+
+# Invitation states. 'superseded' is written when the invitee joins some other pool,
+# so a stale invite can never later move them silently.
+POOL_INVITE_STATUSES = frozenset({"pending", "accepted", "declined", "cancelled", "superseded"})
+
+# Scope kinds for the ledger/carry tables. Mirrors the three rate-limit tiers.
+POOL_SCOPE_OVERALL = "overall"
+POOL_SCOPE_MODEL_GROUP = "model_group"
+POOL_SCOPE_INSTANCE_GROUP = "instance_group"
+
+
+class RequestPool(Base):
+    """A group of users sharing one daily request quota (RPD only; RPM stays per-user).
+
+    Joining contributes the member's own RPD limit and their own consumption so far
+    today, and costs them nothing for what the pool spent before they arrived. Every
+    composition change settles the interval that just closed -- see settle_pool() in
+    app/auth/pools.py.
+    """
+    __tablename__ = "request_pools"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), unique=True, nullable=False)
+    description = Column(String(256), nullable=True)
+    owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    members = relationship("RequestPoolMember", back_populates="pool", cascade="all, delete-orphan")
+    invitations = relationship("RequestPoolInvitation", back_populates="pool", cascade="all, delete-orphan")
+
+
+class RequestPoolMember(Base):
+    """Membership of a user in a pool. At most one pool per user."""
+    __tablename__ = "request_pool_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pool_id = Column(Integer, ForeignKey("request_pools.id", ondelete="CASCADE"), nullable=False)
+    # UNIQUE enforces "one pool per user" at the schema level -- the same device
+    # ModelGroupMember.model_id uses for single-group membership.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
+    joined_at = Column(DateTime, default=datetime.utcnow)
+
+    pool = relationship("RequestPool", back_populates="members")
+
+    __table_args__ = (
+        Index("ix_request_pool_members_pool_id", "pool_id"),
+    )
+
+
+class RequestPoolInvitation(Base):
+    """An invitation for a user to join a pool. The invitee must accept."""
+    __tablename__ = "request_pool_invitations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pool_id = Column(Integer, ForeignKey("request_pools.id", ondelete="CASCADE"), nullable=False)
+    inviter_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    invitee_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    status = Column(String(16), default="pending", nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    responded_at = Column(DateTime, nullable=True)
+
+    pool = relationship("RequestPool", back_populates="invitations")
+
+    __table_args__ = (
+        # At most one *pending* invite per (pool, invitee); declined/cancelled rows are
+        # kept as history and must not block a re-invite.
+        Index("uq_pool_invite_pending", "pool_id", "invitee_user_id",
+              unique=True, sqlite_where=text("status = 'pending'")),
+    )
+
+
+class RequestPoolLedger(Base):
+    """Per-member, per-scope running charge for today, maintained by settlement accrual.
+
+    `charged` is how many of the pool's requests this member has been held responsible
+    for so far today: their baseline at join, plus their limit-share of each interval
+    that has closed since. It exists so a member is charged only for consumption that
+    happened while they were in the pool.
+
+    INVARIANT: after every composition change, SUM(charged) over current members equals
+    the pool's effective used. That is why the pool's "usage at last settlement" is
+    never stored -- it *is* SUM(charged).
+
+    Rows are day-scoped and die with the membership; a missing row reads as 0.
+    """
+    __tablename__ = "request_pool_ledger"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pool_id = Column(Integer, ForeignKey("request_pools.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    usage_date = Column(Date, index=True, nullable=False)    # time_utils.local_today()
+    scope_kind = Column(String(16), nullable=False)          # overall | model_group | instance_group
+    scope_id = Column(Integer, default=0, nullable=False)    # 0 for overall, else group id
+    charged = Column(Integer, default=0, nullable=False)     # whole requests, >= 0
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("pool_id", "user_id", "usage_date", "scope_kind", "scope_id",
+                         name="uq_pool_ledger"),
+    )
+
+
+class UserRpdCarry(Base):
+    """Day-scoped RPD adjustment written when pool composition changes.
+
+        effective_used(user, scope, today) = SUM(request_usage rows) + carry
+
+    `carry` is NEGATIVE for a member who consumed more than the share they were charged
+    and POSITIVE for one who consumed less. It is a RATE-LIMIT construct only: no usage
+    view ever adds it, so attribution and history stay exactly as recorded. Rows expire
+    at local midnight.
+
+    Unlike the ledger this lives on the USER, not the membership -- it must outlive the
+    pool the user just left, and it follows them into the next one.
+    """
+    __tablename__ = "user_rpd_carries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    usage_date = Column(Date, index=True, nullable=False)    # time_utils.local_today()
+    scope_kind = Column(String(16), nullable=False)          # overall | model_group | instance_group
+    scope_id = Column(Integer, default=0, nullable=False)    # 0 for overall, else group id
+    carry = Column(Integer, default=0, nullable=False)       # whole requests; may be negative
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "usage_date", "scope_kind", "scope_id",
+                         name="uq_rpd_carry"),
+    )
+
+
 # Pydantic models for API requests/responses
 class UserCreate(BaseModel):
     username: str
@@ -669,11 +809,145 @@ class QuotaSectionResponse(BaseModel):
     rpd_remaining: Optional[int] = None  # null = unlimited
     models: List[str] = []               # model ids listed under this section
     is_other: bool = False               # true for the ungrouped 'Other Models' bucket
+    # Pooling. rpm_limit above always stays the caller's OWN per-minute limit; only the
+    # daily numbers are shared, so the UI can say "shared across N members" against the
+    # daily figures without implying the per-minute one moved.
+    is_pooled: bool = False              # true when rpd_limit/rpd_count are pool-wide
+    pooled_from_members: int = 0         # how many members contribute; 0 when unpooled
+    carry_adjustment: int = 0            # this user's settlement adjustment inside rpd_count;
+                                         # explains a count that doesn't match their own history
+
+
+class PoolSummary(BaseModel):
+    """Identity of the pool a user belongs to, for headers and chips."""
+    id: int
+    name: str
+    member_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class PoolCreate(BaseModel):
+    """Create a pool. The creator becomes its owner and first member."""
+    name: str
+    description: Optional[str] = None
+
+
+class PoolUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class PoolInviteCreate(BaseModel):
+    username: str
+
+
+class PoolMemberScope(BaseModel):
+    """One member's position on one quota tier.
+
+    `sent` is what they actually consumed -- the number every usage view reports.
+    `charged` is what the pool has held them responsible for, and it is what governs
+    their quota. The two differ whenever the pool's composition changed today, which is
+    the whole reason both are surfaced rather than just one.
+    """
+    scope_kind: str                       # overall | model_group | instance_group
+    scope_id: int = 0
+    name: str = "Overall"
+    limit: Optional[int] = None           # this member's own RPD; null means unlimited
+    sent: int = 0                         # raw request_usage rows today
+    charged: int = 0                      # settled share of the pool's consumption
+    carry: int = 0                        # charged - sent; the adjustment the limiter applies
+    net_contribution: int = 0             # limit - charged; headroom this member still brings
+
+
+class PoolMemberResponse(BaseModel):
+    user_id: int
+    username: str
+    is_owner: bool = False
+    is_active: bool = True
+    joined_at: Optional[datetime] = None
+    scopes: List[PoolMemberScope] = []
+
+    class Config:
+        from_attributes = True
+
+
+class PoolScopeResponse(BaseModel):
+    """The pool's own numbers on one tier."""
+    scope_kind: str
+    scope_id: int = 0
+    name: str = "Overall"
+    limit: Optional[int] = None           # sum of member limits; null when any is unlimited
+    used: int = 0
+    remaining: Optional[int] = None
+    is_unlimited: bool = False
+
+
+class PoolInvitationResponse(BaseModel):
+    id: int
+    pool_id: int
+    pool_name: str
+    inviter_username: str
+    invitee_username: str
+    status: str
+    created_at: Optional[datetime] = None
+    responded_at: Optional[datetime] = None
+    pool_member_count: int = 0
+    pool_limit: Optional[int] = None      # overall tier, for the "you won't be charged" copy
+    pool_used: int = 0
+    counterparty_limit: Optional[int] = None
+    counterparty_used: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class PoolLeavePreview(BaseModel):
+    """What leaving right now would cost the caller, per tier.
+
+    Computed by running settlement and rolling it back, never derived in the frontend --
+    a leave dialog that disagrees with what actually happens is worse than no dialog.
+    """
+    scope_kind: str
+    scope_id: int = 0
+    name: str = "Overall"
+    limit: Optional[int] = None
+    sent: int = 0
+    charged: int = 0
+    remaining: Optional[int] = None
+
+
+class MyPoolResponse(BaseModel):
+    pool: Optional[PoolSummary] = None
+    description: Optional[str] = None
+    owner_username: Optional[str] = None
+    is_owner: bool = False
+    members: List[PoolMemberResponse] = []
+    scopes: List[PoolScopeResponse] = []
+    if_i_leave_now: List[PoolLeavePreview] = []
+    incoming_invites: List[PoolInvitationResponse] = []
+    outgoing_invites: List[PoolInvitationResponse] = []
+    max_members: int = MAX_POOL_MEMBERS
+
+
+class AdminPoolResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    owner_username: Optional[str] = None
+    created_at: Optional[datetime] = None
+    members: List[PoolMemberResponse] = []
+    scopes: List[PoolScopeResponse] = []
+
+    class Config:
+        from_attributes = True
 
 
 class MyQuotasResponse(BaseModel):
     is_admin: bool = False                     # true ⇒ exempt from all limits
     sections: List[QuotaSectionResponse] = []  # unified list; empty when is_admin
+    pool: Optional[PoolSummary] = None         # null when the user is not in a pool
 
 
 class UserModelGroupRateLimitUpdate(BaseModel):

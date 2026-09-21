@@ -531,6 +531,13 @@ async def update_user_profile(db: AsyncSession, user_id: int, username: Optional
                 logger.warning(f"In-memory usage rename of '{old_username}' failed: {e}")
             rate_limit_tracker.invalidate_identity(old_username)
             rate_limit_tracker.invalidate_identity(username)
+            # Usage rows are keyed by the username string, so a pool's snapshot holds
+            # the *old* name until it refreshes. Without this the pool would count
+            # against a name that no longer has rows for up to the refresh interval.
+            try:
+                await rate_limit_tracker.refresh_now()
+            except Exception as e:
+                logger.warning(f"Rate-limit snapshot refresh after rename failed: {e}")
             auth_cache.invalidate_user(old_username)
             auth_cache.invalidate_user(username)
             # Cached API keys carry the owner's username, and that is the identity
@@ -1669,6 +1676,28 @@ async def prune_hourly_usage() -> None:
             raise
 
 
+async def purge_stale_pool_rows() -> None:
+    """Delete request-pool ledger and carry rows from days before today.
+
+    Both tables are day-scoped and every read filters on usage_date == local_today(),
+    so stale rows are already inert; this only keeps them from growing without bound.
+    Runs on the same schedule as rollup_to_monthly().
+    """
+    from sqlalchemy import delete
+    from app import time_utils
+    from app.auth.models import RequestPoolLedger, UserRpdCarry
+
+    today = time_utils.local_today()
+    async with AsyncSessionLocal() as db:
+        try:
+            for model in (RequestPoolLedger, UserRpdCarry):
+                await db.execute(delete(model).where(model.usage_date < today))
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Pool ledger/carry purge failed: {e}")
+
+
 async def rollup_to_monthly() -> None:
     """Roll up fully-aged months from request_usage into request_usage_monthly.
 
@@ -2311,6 +2340,97 @@ async def get_usage_aggregates(
     }
 
 
+async def get_usage_by_user_and_model(
+    db: AsyncSession,
+    identities: list,
+    window: str = "30d",
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+) -> list[dict]:
+    """Return the user x model cross-product of request counts for a set of identities.
+
+    [{user_identity, user_type, model, request_count}], restricted to `identities`.
+    Mirrors the window/table selection of get_usage_aggregates (hourly for 24h/today/
+    yesterday, daily for 7d/30d, daily UNION monthly for month/all) so the pool views
+    and the usage views never disagree about what a window covers.
+
+    One query (two for the union windows) serves every pool view: per-member totals,
+    pool-wide per-model, per-member per-model and per-group are all folds of this one
+    result set in Python. Settlement (app/auth/pools.py) uses window="today" to get the
+    per-member, per-scope row counts it needs for every member and scope at once.
+    """
+    from sqlalchemy import func
+    from datetime import timedelta
+    from app import time_utils
+
+    identities = list(dict.fromkeys(identities or []))
+    if not identities:
+        return []
+
+    today = time_utils.local_today()
+
+    def _rows_q(tbl, where):
+        return (
+            select(
+                tbl.user_identity,
+                tbl.user_type,
+                tbl.model,
+                func.sum(tbl.request_count).label("rc"),
+            )
+            .where(tbl.user_identity.in_(identities), *where)
+            .group_by(tbl.user_identity, tbl.user_type, tbl.model)
+        )
+
+    combined: dict = {}
+
+    def _absorb(rows):
+        for r in rows:
+            key = (r.user_identity, r.user_type, r.model)
+            combined[key] = combined.get(key, 0) + r.rc
+
+    if window == "24h":
+        cutoff_dt = time_utils.local_now() - timedelta(hours=24)
+        cutoff_date, cutoff_hour = cutoff_dt.date(), cutoff_dt.hour
+        where = [
+            (RequestUsageHourly.date > cutoff_date)
+            | ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
+        ]
+        _absorb((await db.execute(_rows_q(RequestUsageHourly, where))).all())
+
+    elif window == "month" and year and month:
+        _absorb((await db.execute(_rows_q(RequestUsage, [
+            func.strftime('%Y', RequestUsage.date) == str(year),
+            func.strftime('%m', RequestUsage.date) == f"{month:02d}",
+        ]))).all())
+        _absorb((await db.execute(_rows_q(RequestUsageMonthly, [
+            RequestUsageMonthly.year == year,
+            RequestUsageMonthly.month == month,
+        ]))).all())
+
+    elif window == "all":
+        _absorb((await db.execute(_rows_q(RequestUsage, []))).all())
+        _absorb((await db.execute(_rows_q(RequestUsageMonthly, []))).all())
+
+    else:
+        if window == "today":
+            where = [RequestUsage.date == today]
+        elif window == "yesterday":
+            where = [RequestUsage.date == today - timedelta(days=1)]
+        elif window == "7d":
+            where = [RequestUsage.date >= today - timedelta(days=6)]
+        else:  # default 30d
+            where = [RequestUsage.date >= today - timedelta(days=29)]
+        _absorb((await db.execute(_rows_q(RequestUsage, where))).all())
+
+    return sorted(
+        [
+            {"user_identity": k[0], "user_type": k[1], "model": k[2], "request_count": int(v)}
+            for k, v in combined.items()
+        ],
+        key=lambda x: (-x["request_count"], x["user_identity"], x["model"]),
+    )
+
+
 async def get_usage_timeseries(
     db: AsyncSession,
     filter_user: Optional[str] = None,
@@ -2318,6 +2438,7 @@ async def get_usage_timeseries(
     window: str = "30d",
     year: Optional[int] = None,
     month: Optional[int] = None,
+    restrict_users: Optional[list] = None,
 ) -> list[dict]:
     """Return ordered, zero-filled time buckets of request counts for the window.
 
@@ -2333,6 +2454,8 @@ async def get_usage_timeseries(
       - all          -> one bucket per month (YYYY-MM), union of daily + monthly tables
 
     filter_user / filter_model scope the series to a single user or model (drill-down).
+    restrict_users limits the series to a set of identities (a pool's members) without
+    singling one out, and composes with filter_model.
     """
     from sqlalchemy import func
     from datetime import date, timedelta
@@ -2340,11 +2463,15 @@ async def get_usage_timeseries(
 
     today = time_utils.local_today()
 
+    identity_set = list(dict.fromkeys(restrict_users)) if restrict_users is not None else None
+
     def _apply_filters(q, tbl):
         if filter_user is not None:
             q = q.where(tbl.user_identity == filter_user)
         if filter_model is not None:
             q = q.where(tbl.model == filter_model)
+        if identity_set is not None:
+            q = q.where(tbl.user_identity.in_(identity_set))
         return q
 
     # ------------------------------------------------------------------ #

@@ -21,7 +21,7 @@ from app.auth.models import (
     UserCreate, UserLogin, UserResponse, Token, APIKeyCreate,
     APIKeyResponse, APIKeyListResponse, UserUpdate, PasswordUpdate, AccountDelete,
     ZohoOAuthCallback,
-    MyQuotasResponse, QuotaSectionResponse,
+    MyQuotasResponse, QuotaSectionResponse, PoolSummary,
     USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH,
 )
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -603,6 +603,26 @@ async def get_my_quotas(
         eff_rpd = ov.rpd_limit if (ov and ov.rpd_limit is not None) else group.rpd_default
         return eff_rpm, eff_rpd
 
+    # Pool membership, resolved once. When pooled, the daily limit of every section is
+    # the sum of the members' limits for that same section and the count covers them
+    # all; the per-minute limit stays the caller's own throughout.
+    pool_id, member_count, _ = rate_limit_tracker.pooled_rpd_limits(
+        current_user.id, current_user.username
+    )
+    is_pooled = pool_id is not None
+
+    def _pooled_rpd(own_rpd, group_id, instance):
+        """Replace a section's own daily limit with the pool's, when pooled.
+
+        An unlimited member makes the pool unlimited on that tier, which the tracker
+        reports as None — the same value an unlimited section already uses.
+        """
+        if not is_pooled:
+            return own_rpd
+        return rate_limit_tracker.pooled_group_rpd_limit(
+            current_user.id, group_id, instance=instance
+        )
+
     # --- Instance-group sections (highest precedence) ---
     instance_group_rows = await list_instance_groups(db)  # eager-loads .members
     for group in instance_group_rows:
@@ -615,14 +635,21 @@ async def get_my_quotas(
         eff_rpm, eff_rpd = _effective(ov, group)
         # Count is enforced across the group's full member set (matches enforcement).
         cnt = await rate_limit_tracker.get_instance_group_rpd_count(
-            current_user.username, [m.provider_key for m in group.members], group.id
+            current_user.id, current_user.username,
+            [m.provider_key for m in group.members], group.id,
         )
+        eff_rpd = _pooled_rpd(eff_rpd, group.id, instance=True)
         rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
         named_sections.append(QuotaSectionResponse(
             name=group.name, description=group.description,
             rpm_limit=eff_rpm, rpd_limit=eff_rpd,
             rpd_count=cnt, rpd_remaining=rpd_remaining,
             models=section_models,
+            is_pooled=is_pooled,
+            pooled_from_members=member_count if is_pooled else 0,
+            carry_adjustment=rate_limit_tracker.carry_for(
+                current_user.id, "instance_group", group.id
+            ),
         ))
 
     # --- Model-group sections (exclude models already claimed by an instance group) ---
@@ -637,14 +664,21 @@ async def get_my_quotas(
         eff_rpm, eff_rpd = _effective(ov, group)
         # Count is enforced across the group's full member set (matches enforcement).
         cnt = await rate_limit_tracker.get_group_rpd_count(
-            current_user.username, [m.model_id for m in group.members], group.id
+            current_user.id, current_user.username,
+            [m.model_id for m in group.members], group.id,
         )
+        eff_rpd = _pooled_rpd(eff_rpd, group.id, instance=False)
         rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
         named_sections.append(QuotaSectionResponse(
             name=group.name, description=group.description,
             rpm_limit=eff_rpm, rpd_limit=eff_rpd,
             rpd_count=cnt, rpd_remaining=rpd_remaining,
             models=section_models,
+            is_pooled=is_pooled,
+            pooled_from_members=member_count if is_pooled else 0,
+            carry_adjustment=rate_limit_tracker.carry_for(
+                current_user.id, "model_group", group.id
+            ),
         ))
 
     # Named groups share one visual treatment; order alphabetically.
@@ -664,9 +698,25 @@ async def get_my_quotas(
             rpd_remaining=status_obj.rpd_remaining,
             models=other_models,
             is_other=True,
+            is_pooled=is_pooled,
+            pooled_from_members=member_count if is_pooled else 0,
+            carry_adjustment=rate_limit_tracker.carry_for(current_user.id, "overall", 0),
         ))
 
-    return MyQuotasResponse(is_admin=False, sections=sections)
+    # The pool summary is a header chip, so only the name is needed beyond what the
+    # tracker snapshot already carries.
+    pool_summary = None
+    if is_pooled:
+        from app.auth.models import RequestPool
+        from sqlalchemy.future import select
+        row = await db.execute(select(RequestPool).where(RequestPool.id == pool_id))
+        pool_obj = row.scalar_one_or_none()
+        if pool_obj is not None:
+            pool_summary = PoolSummary(
+                id=pool_obj.id, name=pool_obj.name, member_count=member_count
+            )
+
+    return MyQuotasResponse(is_admin=False, sections=sections, pool=pool_summary)
 
 
 # ZOHO OAuth Routes

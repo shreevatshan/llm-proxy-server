@@ -125,5 +125,59 @@ class FlushVersusPurgeTests(SlowFlushTestCase):
         self.assertEqual(tracker._usage_buffer, {})
 
 
+class FlushInsideResettleTests(SlowFlushTestCase):
+    """The pool purge adds a third flush inside pause_flush(), and its position matters.
+
+    DELETE /admin/usage?view=pool ends by re-settling every affected pool, because the
+    ledger still charges members for the rows just deleted. settle_pool calls
+    flush_pending() itself, so that re-settle is a flush running after the purge has
+    already committed — and drop_buffered_usage only clears the in-memory buffer. Run it
+    before the drop and anything buffered since the purge's own flush is written to the
+    DB, where the drop can no longer reach it.
+    """
+
+    async def _purge(self, tracker, *, resettle_before_drop):
+        """The DELETE sequence, with the re-settle's flush on either side of the drop."""
+        from app.auth.database import delete_usage_records
+
+        async with tracker.pause_flush():
+            await tracker.flush_pending()
+            await delete_usage_records(self.db, "user", "alice")
+            await self.db.commit()
+
+            # A request lands between the purge's flush and the end of the block: the
+            # window the drop exists to close.
+            tracker._usage_buffer[KEY] = 4
+
+            if resettle_before_drop:
+                await tracker.flush_pending()   # what settle_pool does internally
+                return await tracker.drop_buffered_usage("user", "alice")
+            dropped = await tracker.drop_buffered_usage("user", "alice")
+            await tracker.flush_pending()
+            return dropped
+
+    async def test_the_resettle_flush_runs_after_the_drop(self):
+        await self._seed("alice", 11)
+        tracker = RequestTracker()
+
+        with self.slow_flush(delay=0):
+            dropped = await self._purge(tracker, resettle_before_drop=False)
+
+        self.assertEqual(dropped, 4)
+        self.assertEqual(await self._rows(RequestUsage, "alice"), (0, 0))
+        self.assertEqual(await self._rows(RequestUsageHourly, "alice"), (0, 0))
+
+    async def test_resettling_before_the_drop_would_resurrect_the_rows(self):
+        """Guards the ordering: this is what the sequence does if it is reversed."""
+        await self._seed("alice", 11)
+        tracker = RequestTracker()
+
+        with self.slow_flush(delay=0):
+            dropped = await self._purge(tracker, resettle_before_drop=True)
+
+        self.assertEqual(dropped, 0, "the flush already emptied the buffer")
+        self.assertEqual(await self._rows(RequestUsage, "alice"), (1, 4))
+
+
 if __name__ == "__main__":
     unittest.main()

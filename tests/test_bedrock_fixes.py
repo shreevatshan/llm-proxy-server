@@ -561,5 +561,177 @@ class GrokConverseConstraintTests(unittest.TestCase):
         self.assertEqual(args["inferenceConfig"]["topP"], 0.9)
 
 
+class ClaudeCapabilityScrubTests(unittest.TestCase):
+    """Both Bedrock surfaces now consult app.model_capabilities, so a model's
+    unsupported sampling params are stripped identically on each."""
+
+    def setUp(self):
+        self.p = _provider()
+        self.p.bedrock_model_list = []
+
+    def _chat_request(self, model, **kwargs):
+        kwargs.setdefault("max_tokens", 64)
+        return ChatCompletionRequest(
+            model=model,
+            messages=[ChatMessage(role="user", content="hi")],
+            **kwargs,
+        )
+
+    def _anthropic_request(self, model, **kwargs):
+        kwargs.setdefault("max_tokens", 64)
+        return AnthropicMessagesRequest(
+            model=model,
+            messages=[AnthropicMessage(role="user", content="hi")],
+            **kwargs,
+        )
+
+    # --- native (/v1/messages -> InvokeModel) -------------------------------
+
+    def test_native_drops_temperature_for_claude_5(self):
+        # The reported Copilot failure: temperature reached Opus 5 -> 400 ->
+        # a lone SSE error frame -> "Response contained no choices".
+        native = self.p._convert_to_anthropic_native_request(
+            self._anthropic_request(
+                "global.anthropic.claude-opus-5", temperature=0.1, top_p=0.9, top_k=5
+            )
+        )
+        for param in ("temperature", "top_p", "top_k"):
+            self.assertNotIn(param, native)
+
+    def test_native_drops_sampling_params_for_claude_4_8(self):
+        # 4.7 removed temperature along with top_p/top_k — forwarding it here
+        # was an upstream 400, not a determinism win.
+        native = self.p._convert_to_anthropic_native_request(
+            self._anthropic_request(
+                "global.anthropic.claude-opus-4-8", temperature=0.1, top_p=0.9, top_k=5
+            )
+        )
+        for param in ("temperature", "top_p", "top_k"):
+            self.assertNotIn(param, native)
+
+    def test_native_keeps_everything_for_older_claude(self):
+        native = self.p._convert_to_anthropic_native_request(
+            self._anthropic_request(
+                "anthropic.claude-sonnet-4-6", temperature=0.1, top_p=0.9, top_k=5
+            )
+        )
+        self.assertEqual(native["temperature"], 0.1)
+        self.assertEqual(native["top_p"], 0.9)
+        self.assertEqual(native["top_k"], 5)
+
+    def test_native_stop_sequences_survive(self):
+        native = self.p._convert_to_anthropic_native_request(
+            self._anthropic_request("claude-opus-5", stop_sequences=["END"])
+        )
+        self.assertEqual(native["stop_sequences"], ["END"])
+
+    def test_native_thinking_budget_becomes_adaptive_on_claude_5(self):
+        native = self.p._convert_to_anthropic_native_request(
+            self._anthropic_request(
+                "claude-opus-5",
+                max_tokens=32000,
+                thinking={"type": "enabled", "budget_tokens": 4096},
+            )
+        )
+        self.assertEqual(native["thinking"], {"type": "adaptive"})
+
+    def test_native_thinking_budget_becomes_adaptive_on_claude_4_8(self):
+        # budget_tokens was removed in 4.7, not 5.0.
+        native = self.p._convert_to_anthropic_native_request(
+            self._anthropic_request(
+                "claude-opus-4-8",
+                max_tokens=32000,
+                thinking={"type": "enabled", "budget_tokens": 4096},
+            )
+        )
+        self.assertEqual(native["thinking"], {"type": "adaptive"})
+
+    def test_native_thinking_budget_preserved_on_claude_4_6(self):
+        native = self.p._convert_to_anthropic_native_request(
+            self._anthropic_request(
+                "claude-sonnet-4-6",
+                max_tokens=32000,
+                thinking={"type": "enabled", "budget_tokens": 4096},
+            )
+        )
+        self.assertEqual(native["thinking"]["type"], "enabled")
+        self.assertEqual(native["thinking"]["budget_tokens"], 4096)
+
+    # --- converse (/v1/chat/completions) ------------------------------------
+
+    def test_converse_drops_sampling_params_for_claude_5(self):
+        args = self.p._parse_bedrock_request(
+            self._chat_request(
+                "global.anthropic.claude-opus-5", temperature=0.1, top_p=0.9
+            )
+        )
+        self.assertEqual(args["inferenceConfig"], {"maxTokens": 64})
+
+    def test_converse_drops_top_k_for_claude_5(self):
+        args = self.p._parse_bedrock_request(
+            self._chat_request("global.anthropic.claude-opus-5", top_k=5)
+        )
+        self.assertNotIn("top_k", args.get("additionalModelRequestFields") or {})
+
+    def test_converse_drops_temperature_for_claude_4_8(self):
+        # Same rule as the native surface now — 4.7 removed it everywhere.
+        args = self.p._parse_bedrock_request(
+            self._chat_request("global.anthropic.claude-opus-4-8", temperature=0.1, top_p=0.9)
+        )
+        self.assertEqual(args["inferenceConfig"], {"maxTokens": 64})
+
+    def test_converse_temperature_topp_conflict_rule_still_applies(self):
+        # Claude >= 4.5 (but < 4.7) reject both at once; temperature wins.
+        args = self.p._parse_bedrock_request(
+            self._chat_request("anthropic.claude-sonnet-4-5", temperature=0.1, top_p=0.9)
+        )
+        self.assertEqual(args["inferenceConfig"]["temperature"], 0.1)
+        self.assertNotIn("topP", args["inferenceConfig"])
+
+    def test_converse_omits_reasoning_config_for_claude_5(self):
+        # budget_tokens is rejected on adaptive-thinking models; thinking is on
+        # by default there, so omitting the field preserves the behaviour.
+        args = self.p._parse_bedrock_request(
+            self._chat_request(
+                "global.anthropic.claude-opus-5", max_tokens=32000, reasoning_effort="high"
+            )
+        )
+        self.assertNotIn("additionalModelRequestFields", args)
+
+    def test_converse_omits_reasoning_config_for_claude_4_8(self):
+        # 4.7/4.8 are adaptive-thinking too, so no budget_tokens can be emitted.
+        args = self.p._parse_bedrock_request(
+            self._chat_request(
+                "global.anthropic.claude-opus-4-8", max_tokens=32000, reasoning_effort="high"
+            )
+        )
+        self.assertNotIn("additionalModelRequestFields", args)
+
+    def test_converse_emits_reasoning_config_for_claude_4_6(self):
+        # 4.6 still takes an explicit budget.
+        args = self.p._parse_bedrock_request(
+            self._chat_request(
+                "anthropic.claude-sonnet-4-6", max_tokens=32000, reasoning_effort="high"
+            )
+        )
+        self.assertEqual(
+            args["additionalModelRequestFields"]["reasoning_config"]["type"], "enabled"
+        )
+
+    def test_converse_extra_body_thinking_is_normalized(self):
+        # A client-supplied thinking config in the extra body used to bypass
+        # normalize_thinking entirely and reach Bedrock with budget_tokens.
+        args = self.p._parse_bedrock_request(
+            self._chat_request(
+                "global.anthropic.claude-opus-5",
+                max_tokens=32000,
+                thinking={"type": "enabled", "budget_tokens": 4096},
+            )
+        )
+        self.assertEqual(
+            args["additionalModelRequestFields"]["thinking"], {"type": "adaptive"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

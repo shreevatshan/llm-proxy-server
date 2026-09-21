@@ -58,6 +58,7 @@ class QuotasManager {
         if (!container) return;
 
         if (data.is_admin) {
+            this._renderPoolChip(null);
             container.innerHTML = `
                 <div class="alert alert-info mb-0">
                     <i class="fas fa-shield-alt me-2"></i>
@@ -66,6 +67,8 @@ class QuotasManager {
             `;
             return;
         }
+
+        this._renderPoolChip(data.pool);
 
         const sections = data.sections || [];
         if (sections.length === 0) {
@@ -107,7 +110,11 @@ class QuotasManager {
     _renderSection(s, index) {
         const models = s.models || [];
         const count = models.length;
-        const eyebrow = `${count} ${count === 1 ? 'model' : 'models'}`;
+        let eyebrow = `${count} ${count === 1 ? 'model' : 'models'}`;
+        if (s.is_pooled) {
+            const n = s.pooled_from_members || 0;
+            eyebrow += ` · shared across ${n} ${n === 1 ? 'member' : 'members'}`;
+        }
         const desc = s.description
             ? `<span class="quota-desc">${this._escapeHtml(s.description)}</span>`
             : '';
@@ -148,10 +155,44 @@ class QuotasManager {
                 </div>
                 ${this._meterHtml(s)}
                 ${this._leftHtml(s)}
+                ${this._poolNoteHtml(s)}
                 <div class="quota-block__foot">
                     ${inlineModels}
                 </div>
                 ${dropdown}
+            </div>
+        `;
+    }
+
+    _renderPoolChip(pool) {
+        const chip = document.getElementById('quotaPoolChip');
+        if (!chip) return;
+        if (!pool) { chip.innerHTML = ''; return; }
+        const n = pool.member_count || 0;
+        chip.innerHTML = `
+            <span class="quota-chip ms-2" style="vertical-align:middle">
+                <i class="fas fa-users me-1" style="font-size:0.62rem"></i>
+                <span class="c-name">${this._escapeHtml(pool.name)}</span>
+                <span class="c-prefix"> · ${n} ${n === 1 ? 'member' : 'members'}</span>
+            </span>
+        `;
+    }
+
+    // A pooled count is the pool's, not the user's own request history, and the
+    // difference is exactly what makes pooling confusing. Say it in one line,
+    // under the meter, where the number that needs explaining is.
+    _poolNoteHtml(s) {
+        if (!s.is_pooled) return '';
+        const carry = Number(s.carry_adjustment || 0);
+        if (carry === 0) return '';
+        const n = Math.abs(carry).toLocaleString();
+        const text = carry > 0
+            ? `Includes ${n} requests charged to you as your share of what the pool spent.`
+            : `Excludes ${n} of your requests that the pool charged to other members.`;
+        return `
+            <div class="quota-left" style="padding-top:4px">
+                ${text}
+                <a href="#" onclick="showTab('pool');return false;">See the pool</a>
             </div>
         `;
     }

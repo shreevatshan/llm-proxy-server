@@ -1,0 +1,456 @@
+/* ── Request pools ─────────────────────────────────────────────────────────
+   Shared by the user dashboard's Pool tab and the admin dashboard's Pools tab.
+
+   The user tab answers two questions. The Pool tab's card is WHO IS IN THIS POOL —
+   identity, the pool's own actions behind a menu, and two panes behind a switch:
+   Members (the roster) and Invite (a searchable directory of everyone, each row
+   labelled Member / Invited / Invite). The Usage tab's pool panel is WHAT THE POOL
+   SPENT; it is laid out like the admin Usage tab and borrows that tab's .table, so
+   only its two controls live here.
+
+   The admin tab keeps the older per-scope block — a quota bucket rendered in the
+   Quotas tab's vocabulary: socket, name, eyebrow, right-corner readout, 3px
+   hairline meter, "N left today", member table underneath. Those classes live
+   here for that reason and are not dead code.
+
+   The roster and quota rows are monospace grid rows rather than tables: the numbers
+   align on their own, and the same row can restack on a phone without a colspan in
+   sight. Hue carries no meaning anywhere in this system, so emphasis is luminance. */
+
+.pool-block {
+    border: 1px solid var(--dark-border);
+    border-radius: var(--radius-md);
+    background-color: var(--dark-surface);
+    margin-bottom: 14px;
+    overflow: hidden;
+    transition: border-color 0.2s;
+}
+.pool-block:hover { border-color: var(--mono-5); }
+.pool-block:last-child { margin-bottom: 0; }
+
+/* ── Identity ──────────────────────────────────────────────────────────── */
+/* .pool-head is the user tab's bare identity row; .pool-block__head is the
+   admin tab's, which sits inside a bordered block and carries a readout. */
+.pool-head,
+.pool-block__head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 8px 20px; flex-wrap: wrap;
+}
+.pool-head { padding: 0 2px 14px; }
+.pool-block__head { padding: 15px 18px 13px; }
+
+.pool-ident { display: flex; align-items: baseline; gap: 11px; min-width: 0; }
+.pool-socket {
+    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+    background: var(--mono-text-primary); box-shadow: 0 0 0 3px rgba(250, 250, 250, 0.08);
+    transform: translateY(-1px);
+}
+.pool-heading { min-width: 0; }
+.pool-name {
+    font-family: var(--font-family-display); font-weight: var(--font-semibold);
+    font-size: 0.95rem; letter-spacing: 0.02em; color: var(--mono-text-primary);
+}
+.pool-eyebrow {
+    display: block; margin-top: 3px;
+    font-size: 0.6rem; letter-spacing: var(--tracking-wide); text-transform: uppercase;
+    color: var(--mono-text-muted);
+}
+.pool-desc {
+    display: block; margin-top: 5px; max-width: 52ch;
+    font-size: 0.74rem; line-height: 1.45; color: var(--mono-text-muted);
+}
+
+.pool-readout {
+    font-family: var(--font-family-mono); white-space: nowrap; text-align: right; line-height: 1.3;
+}
+.pool-readout .q-day { font-size: 0.82rem; }
+.pool-readout .q-used  { color: var(--mono-text-primary); font-weight: var(--font-semibold); }
+.pool-readout .q-limit { color: var(--mono-text-secondary); }
+.pool-readout .q-inf   { color: var(--mono-text-secondary); font-size: 0.95rem; }
+.pool-readout .q-unit {
+    color: var(--mono-text-muted); font-size: 0.62rem;
+    letter-spacing: var(--tracking-wide); text-transform: uppercase;
+}
+
+/* Rename / Leave / Delete: three actions that are rare, one of them destructive.
+   They belong behind a menu in the header, not as a bar of buttons at the foot
+   of a page you have to scroll past the content to reach. */
+.pool-menu { align-self: center; }
+.pool-menu__btn {
+    background: none; border: 1px solid transparent; border-radius: var(--radius-md);
+    padding: 4px 9px; cursor: pointer; line-height: 1;
+    color: var(--mono-text-secondary); font-size: 0.9rem;
+    transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}
+.pool-menu__btn:hover,
+.pool-menu__btn[aria-expanded="true"] {
+    color: var(--mono-text-primary); border-color: var(--mono-5); background-color: var(--mono-2);
+}
+.pool-menu__btn:focus-visible { outline: 2px solid var(--mono-text-primary); outline-offset: 2px; }
+
+/* ── Meter (admin scope blocks) ────────────────────────────────────────── */
+.pool-meter { height: 3px; background: var(--mono-4); width: 100%; }
+.pool-meter__fill {
+    height: 100%; width: 0;
+    background: var(--mono-text-primary);
+    transition: width 0.45s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.pool-left {
+    padding: 9px 18px 0; font-family: var(--font-family-mono);
+    font-size: 0.68rem; color: var(--mono-text-muted);
+}
+.pool-left.is-critical { color: var(--mono-text-primary); font-weight: var(--font-semibold); }
+.pool-left.is-critical i { margin-right: 5px; font-size: 0.62rem; }
+
+/* ── Member table (admin scope blocks) ─────────────────────────────────── */
+.pool-members { padding: 11px 0 4px; }
+.pool-member-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 68px 68px 74px 68px 26px;
+    align-items: baseline; gap: 10px;
+    padding: 6px 18px;
+    font-family: var(--font-family-mono); font-size: 0.78rem;
+    transition: background-color 0.15s ease;
+}
+.pool-member-row.is-head {
+    font-size: 0.6rem; letter-spacing: var(--tracking-wide); text-transform: uppercase;
+    color: var(--mono-text-muted); padding-bottom: 8px;
+    border-bottom: 1px solid var(--mono-3);
+}
+.pool-member-row:not(.is-head):hover { background-color: var(--mono-2); }
+
+.pool-member-row .m-name {
+    color: var(--mono-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pool-member-row .m-num { text-align: right; }
+/* `sent` recedes; `charged` is what governs the member's quota, so it leads. */
+.pool-member-row .m-sent    { color: var(--mono-text-secondary); }
+.pool-member-row .m-charged { color: var(--mono-text-primary); font-weight: var(--font-semibold); }
+.pool-member-row .m-limit   { color: var(--mono-text-secondary); }
+
+/* Shared by both tabs: the name tag and the signed carry. */
+.m-tag {
+    margin-left: 7px; font-size: 0.58rem; letter-spacing: var(--tracking-wide);
+    text-transform: uppercase; color: var(--mono-text-muted);
+}
+.m-delta { color: var(--mono-text-muted); font-size: 0.72rem; }
+
+.m-act {
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: var(--mono-text-muted); font-size: 0.7rem; font-family: var(--font-family-mono);
+    transition: color 0.15s ease;
+}
+.m-act:hover { color: var(--mono-text-primary); }
+.m-act:focus-visible { outline: 2px solid var(--mono-text-primary); outline-offset: 2px; }
+
+/* ── Roster (user tab) ─────────────────────────────────────────────────── */
+/* Who is in this pool, with nothing about quota in it. The numbers all live one
+   card down, so this row only ever answers "who, in what role, since when". */
+.pool-roster { padding: 12px 0 0; }
+/* Every row is its own grid container, so the action column has to be a fixed width
+   rather than `auto`: sized to content it would be 0px on the rows that cannot be
+   kicked and a button wide on the rows that can, and Role and Joined would step left
+   on those rows alone. 62px is the Kick button at its widest. */
+.pool-roster-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 76px 84px 62px;
+    align-items: baseline; gap: 10px;
+    padding: 7px 18px;
+    font-family: var(--font-family-mono); font-size: 0.8rem;
+    transition: background-color 0.15s ease;
+}
+.pool-roster-row.is-head {
+    font-size: 0.6rem; letter-spacing: var(--tracking-wide); text-transform: uppercase;
+    color: var(--mono-text-muted); padding-bottom: 9px;
+    border-bottom: 1px solid var(--mono-3);
+}
+.pool-roster-row:not(.is-head):hover { background-color: var(--mono-2); }
+/* A deactivated account still counts toward the pool's limit, so it stays on the
+   roster — dimmed, not hidden. */
+.pool-roster-row.is-off .m-name { color: var(--mono-text-muted); }
+
+.pool-roster-row .m-name {
+    color: var(--mono-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pool-roster-row .r-role,
+.pool-roster-row .r-joined { color: var(--mono-text-secondary); font-size: 0.74rem; }
+.pool-roster-row .m-act { justify-self: end; }
+
+/* ── Sub-tabs (user tab) ───────────────────────────────────────────────── */
+/* Members and Invite are two lists of people, not two lenses on one list, so they
+   get real panes. The track is the usage panel's .pool-view-switch unchanged — one
+   control language per card — and the capacity readout sits opposite it, carrying
+   "N of 25" continuously where the old footer only spoke at the limit. */
+.pool-panelbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 9px 18px; flex-wrap: wrap;
+    padding: 13px 18px;
+    border-bottom: 1px solid var(--mono-3);
+}
+.pool-panelbar .pool-eyebrow { margin-top: 0; white-space: nowrap; }
+#poolPaneMembers[hidden],
+#poolPaneInvite[hidden] { display: none; }
+
+/* ── Invite directory ──────────────────────────────────────────────────── */
+.pool-invite-pane { padding: 13px 0 4px; }
+
+/* Local rather than the shared .search-container, which bakes in a 1.5rem bottom
+   margin; this box has to sit on the roster's 18px gutter. */
+.pool-search { position: relative; margin: 0 18px; }
+.pool-search__icon {
+    position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+    font-size: 0.72rem; color: var(--mono-text-muted); pointer-events: none;
+}
+.pool-search__input {
+    width: 100%; padding: 8px 11px 8px 31px;
+    background-color: var(--mono-1); border: 1px solid var(--mono-4);
+    border-radius: var(--radius-md);
+    font-family: var(--font-family-mono); font-size: 0.8rem;
+    color: var(--mono-text-primary);
+    transition: border-color 0.15s ease;
+}
+.pool-search__input::placeholder { color: var(--mono-text-muted); }
+.pool-search__input:focus { outline: none; border-color: var(--mono-text-primary); }
+
+.pool-search__note {
+    margin: 9px 18px 0; max-width: 52ch;
+    font-size: 0.74rem; line-height: 1.45; color: var(--mono-text-muted);
+}
+/* The result count is screen-reader-only, so the list carries the whole gap between the
+   search box and the first row — enough of one that the box reads as a control over the
+   list rather than the first item in it. */
+.pool-dir { margin-top: 17px; }
+
+/* Two columns, not the roster's four: this row answers "who" and "can I act". Every
+   other property is the roster's, so the two lists read as one table. */
+.pool-dir-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: baseline; gap: 10px;
+    padding: 7px 18px;
+    font-family: var(--font-family-mono); font-size: 0.8rem;
+    transition: background-color 0.15s ease;
+}
+.pool-dir-row:hover { background-color: var(--mono-2); }
+.pool-dir-row .m-name {
+    color: var(--mono-text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* One slot, one box. Every state wears the same chip at the same metrics, so the column
+   is a single column of identical shapes and a row flipping between them doesn't move
+   anything. What separates a fact from an action is not the shape: it is the border's
+   luminance, the cursor, and whether the box answers a pointer. */
+.pool-state {
+    justify-self: end; white-space: nowrap;
+    background: transparent; border: 1px solid var(--mono-4);
+    border-radius: var(--radius-md); padding: 3px 11px; line-height: 1.5;
+    font-family: var(--font-family-display); font-size: 0.62rem; font-weight: var(--font-semibold);
+    letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--mono-text-secondary);
+    transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}
+
+/* Member and Invited state a fact, and they are <span>s rather than disabled buttons:
+   there is nothing to press, and a box that announces itself to a screen reader as a
+   button and then refuses is worse than one that never claimed to be one. Sighted
+   readers get the same message from the dimmer border and the unchanged cursor — the
+   box holds the column, it doesn't offer anything. */
+.pool-state.is-member,
+.pool-state.is-invited {
+    border-color: var(--mono-3); color: var(--mono-text-muted); cursor: default;
+}
+/* Invited is a state someone in this pool caused, so its word steps one stop brighter. */
+.pool-state.is-invited { color: var(--mono-text-secondary); }
+
+/* Invite, Cancel and Kick are the three real controls. Cancel and Kick rest one stop
+   quieter than Invite because they undo rather than do, and hue carries no meaning
+   here, so that is the whole of the distinction: the word does the rest. */
+.pool-state.is-invite,
+.pool-state.is-cancel,
+.pool-state.is-kick { cursor: pointer; }
+.pool-state.is-cancel,
+.pool-state.is-kick { color: var(--mono-text-muted); }
+
+.pool-state.is-invite:hover:not(:disabled),
+.pool-state.is-cancel:hover,
+.pool-state.is-kick:hover {
+    color: var(--mono-0); background: var(--mono-text-primary);
+    border-color: var(--mono-text-primary);
+}
+.pool-state.is-invite:focus-visible,
+.pool-state.is-cancel:focus-visible,
+.pool-state.is-kick:focus-visible {
+    outline: 2px solid var(--mono-text-primary); outline-offset: 2px;
+}
+/* Cancel and Kick are never disabled by a full pool — either one is what unfills it. */
+.pool-state.is-invite:disabled {
+    color: var(--mono-text-muted); border-color: var(--mono-3); cursor: not-allowed;
+}
+
+.pool-dir-empty {
+    margin: 0; padding: 22px 18px; max-width: 52ch;
+    font-size: 0.78rem; line-height: 1.5; color: var(--mono-text-muted);
+}
+.pool-dir-retry {
+    background: none; border: none; padding: 0; margin-left: 5px; cursor: pointer;
+    font-family: inherit; font-size: inherit; color: var(--mono-text-primary);
+    text-decoration: underline;
+}
+.pool-dir-retry:focus-visible {
+    outline: 2px solid var(--mono-text-primary); outline-offset: 2px;
+}
+
+/* The skeleton stands in for rows, so it sits on the list's gutter, not the
+   container-level .skeleton-stack's. */
+#poolDirList .skeleton-stack { padding: 13px 18px; gap: var(--space-2); }
+
+/* ── Notices, empty states, invitations ────────────────────────────────── */
+.pool-notice {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 11px 18px; margin-bottom: 14px;
+    border: 1px solid var(--mono-5); border-left-width: 2px;
+    border-left-color: var(--mono-text-primary);
+    border-radius: var(--radius-md); background-color: var(--mono-2);
+    font-size: 0.78rem; line-height: 1.5; color: var(--mono-text-secondary);
+}
+.pool-notice i { margin-top: 3px; font-size: 0.72rem; color: var(--mono-text-primary); }
+.pool-notice strong { color: var(--mono-text-primary); font-weight: var(--font-semibold); }
+.pool-notice .pool-notice__act { margin-left: auto; white-space: nowrap; }
+
+.pool-empty {
+    max-width: 58ch; padding: 26px 0;
+}
+.pool-empty h6 {
+    font-family: var(--font-family-display); font-weight: var(--font-semibold);
+    font-size: 1rem; color: var(--mono-text-primary); margin-bottom: 9px;
+}
+.pool-empty p { font-size: 0.82rem; line-height: 1.6; color: var(--mono-text-secondary); }
+
+/* An incoming invite leads the no-pool state — someone is waiting on an answer. */
+.pool-invite {
+    border: 1px solid var(--dark-border); border-radius: var(--radius-md);
+    background-color: var(--dark-surface); padding: 16px 18px; margin-bottom: 14px;
+}
+.pool-invite__title {
+    font-family: var(--font-family-display); font-weight: var(--font-semibold);
+    font-size: 0.95rem; color: var(--mono-text-primary);
+}
+.pool-invite__body {
+    margin: 9px 0 14px; max-width: 62ch;
+    font-size: 0.8rem; line-height: 1.6; color: var(--mono-text-secondary);
+}
+.pool-invite__body strong { color: var(--mono-text-primary); font-weight: var(--font-semibold); }
+.pool-invite__acts { display: flex; gap: 9px; flex-wrap: wrap; }
+
+/* ── Usage panel ───────────────────────────────────────────────────────── */
+/* The panel is the admin Usage tab's layout: tiles, a .section-header carrying the
+   controls, the chart, then a plain .table. Only the controls are local to pools.
+
+   One control language per panel — the view switch is the same sliding track as the
+   window picker sharing its header row. The active button paints itself as well as
+   sitting under the indicator: the indicator is positioned in pixels from JS and
+   measures 0 until the tab is visible. */
+.pool-view-switch {
+    position: relative; display: inline-flex; align-items: center;
+    background: var(--mono-1); border: 1px solid var(--mono-4);
+    border-radius: var(--radius-md); padding: 2px;
+}
+.pool-view-switch .pool-view-btn {
+    position: relative; z-index: 1;
+    background: transparent; border: none;
+    color: var(--mono-text-secondary);
+    font-family: var(--font-family-display); font-size: 0.7rem; font-weight: var(--font-semibold);
+    letter-spacing: 0.1em; text-transform: uppercase;
+    padding: 4px 12px; border-radius: calc(var(--radius-md) - 1px);
+    cursor: pointer; transition: color 0.15s ease; white-space: nowrap; line-height: 1.4;
+}
+.pool-view-switch .pool-view-btn:hover:not(.is-active) { color: var(--mono-text-primary); }
+.pool-view-switch .pool-view-btn.is-active {
+    color: var(--mono-0); background: var(--mono-text-primary);
+}
+.pool-view-switch .pool-view-btn:focus-visible {
+    outline: 2px solid var(--mono-text-primary); outline-offset: 2px;
+}
+.pool-view-switch__indicator {
+    position: absolute; top: 2px; bottom: 2px; left: 2px;
+    width: var(--tw-w, 0px); transform: translateX(var(--tw-x, 0px));
+    background: var(--mono-text-primary);
+    border-radius: calc(var(--radius-md) - 2px);
+    transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), width 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none; z-index: 0;
+}
+
+/* Back takes the switch's slot while a row is drilled into, so it borrows the track's
+   metrics rather than arriving as Bootstrap furniture: same type, same height, and the
+   header row doesn't shift when the two swap. */
+.pool-usage-back {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: transparent; border: 1px solid var(--mono-4);
+    color: var(--mono-text-secondary);
+    font-family: var(--font-family-display); font-size: 0.7rem; font-weight: var(--font-semibold);
+    letter-spacing: 0.1em; text-transform: uppercase;
+    padding: 5px 12px; border-radius: var(--radius-md); line-height: 1.4;
+    cursor: pointer; transition: color 0.15s ease, border-color 0.15s ease;
+}
+.pool-usage-back:hover { color: var(--mono-text-primary); border-color: var(--mono-text-primary); }
+.pool-usage-back:focus-visible {
+    outline: 2px solid var(--mono-text-primary); outline-offset: 2px;
+}
+
+/* ── Admin list ────────────────────────────────────────────────────────── */
+.pool-admin-item { margin-bottom: 18px; }
+.pool-admin-item:last-child { margin-bottom: 0; }
+
+@media (max-width: 640px) {
+    .pool-head,
+    .pool-block__head { flex-direction: column; align-items: stretch; gap: 12px; }
+    .pool-readout { text-align: left; }
+    .pool-menu { align-self: flex-start; }
+}
+@media (max-width: 480px) {
+    /* Six columns don't fit a phone, so a row becomes a name with its numbers
+       stacked beneath it. The column header disappears and each number carries
+       its own label, which is why every numeric cell ships a data-label. */
+    .pool-member-row.is-head,
+    .pool-roster-row.is-head { display: none; }
+
+    .pool-member-row {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        row-gap: 4px; padding: 10px 18px;
+    }
+    .pool-member-row .m-name    { grid-area: 1 / 1 / 2 / -1; }
+    .pool-member-row .m-limit   { grid-area: 2 / 1; }
+    .pool-member-row .m-sent    { grid-area: 2 / 2; }
+    .pool-member-row .m-charged { grid-area: 2 / 3; }
+    .pool-member-row .m-delta   { grid-area: 3 / 1 / 4 / -1; }
+    .pool-member-row .m-act     { grid-area: 4 / 1 / 5 / -1; justify-self: start; }
+    .pool-member-row .m-num { text-align: left; }
+
+    .pool-roster-row {
+        grid-template-columns: minmax(0, 1fr) 62px;
+        row-gap: 3px; padding: 10px 18px;
+    }
+    .pool-roster-row .m-name     { grid-area: 1 / 1; }
+    .pool-roster-row .m-act,
+    .pool-roster-row .pool-state { grid-area: 1 / 2; }
+    .pool-roster-row .r-role   { grid-area: 2 / 1 / 3 / -1; }
+    .pool-roster-row .r-joined { grid-area: 3 / 1 / 4 / -1; }
+
+    /* The directory row already fits — it is two columns, and the name ellipses.
+       Stacking the control under the name would double the list's height to buy
+       nothing, so the row only takes the roster's taller phone padding so the
+       Invite button is a real tap target. */
+    .pool-dir-row { padding: 10px 18px; }
+
+    .pool-member-row .m-num[data-label]::before,
+    .pool-roster-row [data-label]::before {
+        content: attr(data-label) " ";
+        color: var(--mono-text-muted); font-size: 0.58rem;
+        letter-spacing: var(--tracking-wide); text-transform: uppercase;
+    }
+}
+@media (prefers-reduced-motion: reduce) {
+    .pool-meter__fill,
+    .pool-view-switch__indicator { transition: none; }
+}

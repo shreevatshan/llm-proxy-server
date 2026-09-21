@@ -10,12 +10,15 @@ const MONTH_NAMES = [
 
 class UsageManager {
     constructor() {
-        this.currentView = 'user'; // 'user' | 'model'
-        this.isDrilledIn = false;
+        this.currentView = 'user'; // 'user' | 'model' | 'pool'
         this._cache = null;
         this._refreshTimer = null;
         this._refreshIntervalMs = 60_000;
-        this._lastDrilldown = null;
+        // The drill-down path, deepest last: [{axis, id, label}]. By Pool goes two
+        // levels (pool -> member -> that member's models), so a single "last drilldown"
+        // can't describe where we are. `label` is the raw display string for the
+        // breadcrumb; it is escaped at render, never stored escaped.
+        this._drillStack = [];
         this._tabIsActive = false;
         this._chart = null; // Chart.js instance for the usage timeseries graph
 
@@ -27,6 +30,13 @@ class UsageManager {
         this._yearsLoaded = false;
         this._popoverDismiss = null; // stored outside-click handler
         this._resizeObserver = null;
+    }
+
+    // Derived, never assigned: keeping a flag in sync with the stack is how the Back
+    // button ends up stranded over a top-level table. Class bodies are strict mode, so
+    // a leftover `this.isDrilledIn = ...` throws here instead of silently disagreeing.
+    get isDrilledIn() {
+        return this._drillStack.length > 0;
     }
 
     // ------------------------------------------------------------------ //
@@ -72,20 +82,19 @@ class UsageManager {
 
     async setWindow(win) {
         // Preserve any active drill-down so the new window stays scoped to the
-        // selected user/model instead of reverting to overall usage.
-        const prevDrilldown = this._lastDrilldown;
+        // selected user/model/pool instead of reverting to overall usage.
+        const saved = this._drillStack.slice();
         this._window = win;
         this._year = null;
         this._month = null;
         this._closeOlderPopover();
         this._updateWindowButtons(win);
-        this.isDrilledIn = false;
-        this._lastDrilldown = null;
+        this._drillStack = [];
         // Keep the header in 'back' mode when a drill-down will be re-applied, so the
-        // Back button doesn't flash to the user/model toggle and back again.
-        if (!prevDrilldown) this._setHeaderMode('toggle');
-        await this._fetchAndRender({ silent: false, deferBody: !!prevDrilldown });
-        if (prevDrilldown) await this.drillDown(prevDrilldown.axis, prevDrilldown.id);
+        // Back button doesn't flash to the view toggle and back again.
+        if (!saved.length) this._setHeaderMode('toggle');
+        await this._fetchAndRender({ silent: false, deferBody: saved.length > 0 });
+        await this._replayStack(saved);
         this._clearTimer('window changed');
         this._startRefreshIfLive();
     }
@@ -114,39 +123,100 @@ class UsageManager {
         if (this._cache) this._renderTopLevel();
     }
 
-    async drillDown(axis, id) {
-        const url = this._buildUrl({ view: axis, id });
-        let data;
-        try {
-            const resp = await fetch(url, { credentials: 'include', cache: 'no-store' });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            data = await resp.json();
-        } catch (e) {
-            console.error('UsageManager: drill-down failed', e);
-            window.UIUtils?.showToast('Failed to load breakdown.', 'error');
-            return;
-        }
-        this.isDrilledIn = true;
-        this._lastDrilldown = { axis, id };
-        this._setHeaderMode('back');
-        this._renderChart(data.timeseries);
-        this._renderDrilldownStats(axis, data.breakdown);
-        if (axis === 'user') {
-            this._renderModelBreakdown(data.breakdown, id);
-        } else {
-            this._renderUserBreakdown(data.breakdown, id);
+    /**
+     * Descend one level. `label` is what the breadcrumb shows; it defaults to the id,
+     * which is the right display string for a user or a model but not for a pool, whose
+     * id is a number.
+     */
+    async drillDown(axis, id, label) {
+        this._drillStack.push({ axis, id, label: label ?? String(id) });
+        if (!await this._renderLevel(this._peek())) {
+            // Nothing painted, so don't leave a Back button pointing at this level.
+            this._drillStack.pop();
+            if (!this.isDrilledIn) this._setHeaderMode('toggle');
         }
     }
 
     back() {
+        this._goToDepth(this._drillStack.length - 1);
+    }
+
+    /**
+     * Jump to a given stack depth — 0 is the top-level table, 1 the first drill-down.
+     * Back is just depth-1, and a breadcrumb segment is its own index.
+     */
+    _goToDepth(depth) {
+        if (depth < 0 || depth >= this._drillStack.length) return;
+        this._drillStack.length = depth;
+        if (this.isDrilledIn) {
+            // Refetched rather than replayed from a per-level cache: caching each level's
+            // payload would need invalidating in setWindow, _selectMonth, _deleteUsage and
+            // every silent-refresh tick — stale in exactly the case the refresh exists for.
+            this._renderLevel(this._peek());
+        } else {
+            this._returnToTopLevel();
+        }
+    }
+
+    _returnToTopLevel() {
         if (!this._cache) return;
-        this.isDrilledIn = false;
-        this._lastDrilldown = null;
+        this._drillStack = [];
         this._setHeaderMode('toggle');
         this._restoreTopLevelStats();
         this._renderStats(this._cache.totals);
         this._renderChart(this._cache.timeseries);
         this._renderTopLevel();
+    }
+
+    _peek() {
+        return this._drillStack[this._drillStack.length - 1];
+    }
+
+    /**
+     * Fetch and paint one stack entry. Reads the stack (for the breadcrumb) but never
+     * mutates it, so back(), _goToDepth() and the silent refresh can all reuse it.
+     * Returns false if the fetch failed; when silent, it fails without a toast and the
+     * current view is left alone for the next tick to retry.
+     */
+    async _renderLevel(entry, { silent = false } = {}) {
+        if (!entry) return false;
+        let data;
+        try {
+            const resp = await fetch(this._buildUrl({ view: entry.axis, id: entry.id }), {
+                credentials: 'include', cache: 'no-store',
+            });
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            data = await resp.json();
+        } catch (e) {
+            if (!silent) {
+                console.error('UsageManager: drill-down failed', e);
+                window.UIUtils?.showToast('Failed to load breakdown.', 'error');
+            }
+            return false;
+        }
+        this._setHeaderMode('back');
+        this._renderChart(data.timeseries);
+        this._renderDrilldownStats(entry.axis, data.breakdown);
+        if (entry.axis === 'user') {
+            this._renderModelBreakdown(data.breakdown);
+        } else if (entry.axis === 'pool') {
+            this._renderPoolMemberBreakdown(data.breakdown);
+        } else {
+            this._renderUserBreakdown(data.breakdown);
+        }
+        return true;
+    }
+
+    /**
+     * Re-apply a saved drill path after the window changed. Only the deepest level is
+     * fetched: walking down from the top would fire one request per level and paint
+     * tables the user never sees. If that level can't load under the new window, drop
+     * one level rather than scoping stale numbers under it.
+     */
+    async _replayStack(saved) {
+        if (!saved.length) return;
+        this._drillStack = saved;
+        if (!await this._renderLevel(this._peek())) this.back();
     }
 
     // ------------------------------------------------------------------ //
@@ -188,10 +258,9 @@ class UsageManager {
             return;
         }
         if (!silent) {
-            this.isDrilledIn = false;
-            this._lastDrilldown = null;
+            this._drillStack = [];
             // deferBody implies a drill-down render follows; leave the header in 'back'
-            // mode so it doesn't flash to the user/model toggle in between.
+            // mode so it doesn't flash to the view toggle in between.
             if (!deferBody) this._setHeaderMode('toggle');
         }
         // While drilled in (e.g. during a silent refresh), the stat tiles are
@@ -211,28 +280,9 @@ class UsageManager {
 
     async _silentRefresh() {
         await this._fetchAndRender({ silent: true });
-        if (this.isDrilledIn && this._lastDrilldown) {
-            await this._refreshDrilldown();
-        }
-    }
-
-    async _refreshDrilldown() {
-        const { axis, id } = this._lastDrilldown;
-        const url = this._buildUrl({ view: axis, id });
-        try {
-            const resp = await fetch(url, { credentials: 'include', cache: 'no-store' });
-            if (!resp.ok) return;
-            const data = await resp.json();
-            this._renderChart(data.timeseries);
-            this._renderDrilldownStats(axis, data.breakdown);
-            if (axis === 'user') {
-                this._renderModelBreakdown(data.breakdown, id);
-            } else {
-                this._renderUserBreakdown(data.breakdown, id);
-            }
-        } catch (e) {
-            // silent — keep existing view; next tick will retry
-        }
+        // Repaint only the level actually on screen, in place: the stack is untouched,
+        // so the header stays in 'back' mode and the user keeps their position.
+        if (this.isDrilledIn) await this._renderLevel(this._peek(), { silent: true });
     }
 
     _startRefreshIfLive() {
@@ -310,7 +360,7 @@ class UsageManager {
     async _selectMonth(m) {
         if (!this._year) return;
         // Preserve any active drill-down across the window change (see setWindow).
-        const prevDrilldown = this._lastDrilldown;
+        const saved = this._drillStack.slice();
         this._month = m;
         this._window = 'month';
 
@@ -333,11 +383,10 @@ class UsageManager {
         document.querySelectorAll('.time-window__preset').forEach(b => b.classList.remove('is-active'));
 
         this._closeOlderPopover();
-        this.isDrilledIn = false;
-        this._lastDrilldown = null;
-        if (!prevDrilldown) this._setHeaderMode('toggle');
-        await this._fetchAndRender({ silent: false, deferBody: !!prevDrilldown });
-        if (prevDrilldown) await this.drillDown(prevDrilldown.axis, prevDrilldown.id);
+        this._drillStack = [];
+        if (!saved.length) this._setHeaderMode('toggle');
+        await this._fetchAndRender({ silent: false, deferBody: saved.length > 0 });
+        await this._replayStack(saved);
         this._clearTimer('historical window');
     }
 
@@ -356,13 +405,41 @@ class UsageManager {
         this._updateToggle(this.currentView);
         if (this.currentView === 'user') {
             this._renderUserTable(this._cache.per_user);
+        } else if (this.currentView === 'pool') {
+            // `|| []` covers a deploy where this script is newer than a cached payload.
+            this._renderPoolTable(this._cache.per_pool || []);
         } else {
             this._renderModelTable(this._cache.per_model);
         }
     }
 
-    _drilldownHeader(name) {
-        return `<div class="fw-semibold mb-3">${name}</div>`;
+    /**
+     * The drill path as a trail — `By Pool › shared-usage › test321`. Ancestors are
+     * clickable so a two-level path doesn't need two presses of Back to escape; the
+     * deepest segment is where you already are, so it isn't.
+     */
+    _drilldownHeader() {
+        const root = { user: 'By User', model: 'By Model', pool: 'By Pool' }[this.currentView] || 'Overall';
+        const crumb = (text, depth) =>
+            `<span class="usage-crumb" data-depth="${depth}" role="button" tabindex="0" ` +
+            `style="cursor:pointer;text-decoration:underline;text-underline-offset:3px;color:var(--mono-text-muted);">${this._esc(text)}</span>`;
+
+        const parts = [crumb(root, 0)];
+        this._drillStack.forEach((entry, i) => {
+            const last = i === this._drillStack.length - 1;
+            parts.push(last
+                ? `<span class="fw-semibold">${this._esc(entry.label)}</span>`
+                : crumb(entry.label, i + 1));
+        });
+
+        return `<div class="mb-3 d-flex align-items-center flex-wrap" style="gap:.5rem;">` +
+            parts.join('<span class="text-muted">&rsaquo;</span>') + `</div>`;
+    }
+
+    _bindBreadcrumb(container) {
+        container.querySelectorAll('.usage-crumb').forEach(el => {
+            el.addEventListener('click', () => this._goToDepth(Number(el.dataset.depth)));
+        });
     }
 
     _pct(count, total) {
@@ -415,37 +492,90 @@ class UsageManager {
         this._bindDeleteButtons(container);
     }
 
+    _renderPoolTable(rows) {
+        const container = document.getElementById('usage-table-container');
+        if (!rows || rows.length === 0) { container.innerHTML = this._emptyState(); return; }
+        // Against all traffic, not the pooled subtotal — the same denominator the other
+        // two tables use. With unpooled users active these won't sum to 100%, which is
+        // the honest reading: it's each pool's share of everything.
+        const total = this._cache?.totals?.requests || rows.reduce((s, r) => s + r.request_count, 0);
+        const rowsHtml = rows.map(r => `
+            <tr class="usage-drilldown-row" data-axis="pool" data-id="${r.pool_id}" data-label="${this._esc(r.name)}" style="cursor:pointer;" title="Click to see breakdown by member">
+                <td>${this._esc(r.name)}</td>
+                <td>${(r.member_count || 0).toLocaleString()}</td>
+                <td>${r.request_count.toLocaleString()}</td>
+                <td class="text-end">${this._pct(r.request_count, total)}</td>
+                <td class="text-end">${this._deleteButton()}</td>
+            </tr>`).join('');
+        container.innerHTML = `
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead><tr><th>Pool</th><th>Members</th><th>Requests</th><th class="text-end">Percentage</th><th style="width:1%"></th></tr></thead>
+                    <tbody>${rowsHtml}</tbody>
+                </table>
+            </div>`;
+        this._bindRowClicks(container);
+        this._bindDeleteButtons(container);
+    }
+
     // The button carries no identity of its own — it reads the row's data-axis /
     // data-id, which keeps the (unescaped-quote) identity out of a second attribute.
     _deleteButton() {
         return `<button class="btn btn-outline-danger btn-sm usage-delete-btn" title="Delete all usage data"><i class="fas fa-trash"></i></button>`;
     }
 
-    _renderUserBreakdown(rows, id) {
+    // Both per-user breakdowns — a model's users and a pool's members — share this
+    // shape. Rows drill one more level into that user's own model split; there is no
+    // delete button on them, because _bindDeleteButtons reads row.dataset.axis and a
+    // trash icon here would silently be a per-user purge launched from inside another
+    // view. Per-user deletes stay on the By User table.
+    _renderUserRowsBreakdown(rows, headerCols) {
         const container = document.getElementById('usage-table-container');
-        const header = this._drilldownHeader(this._esc(id));
-        if (!rows || rows.length === 0) { container.innerHTML = header + this._emptyState(); return; }
+        const header = this._drilldownHeader();
+        if (!rows || rows.length === 0) {
+            container.innerHTML = header + this._emptyState();
+            this._bindBreadcrumb(container);
+            return;
+        }
         const total = rows.reduce((s, r) => s + r.request_count, 0);
         const rowsHtml = rows.map(r => `
-            <tr>
+            <tr class="usage-drilldown-row" data-axis="user" data-id="${this._esc(r.user_identity)}" data-label="${this._esc(r.user_identity)}" style="cursor:pointer;" title="Click to see breakdown by model">
                 <td>${this._esc(r.user_identity)}</td>
-                <td><span class="badge bg-secondary">${this._esc(r.user_type)}</span></td>
+                <td>${r.user_type ? `<span class="badge bg-secondary">${this._esc(r.user_type)}</span>` : '<span class="text-muted">—</span>'}</td>
                 <td>${r.request_count.toLocaleString()}</td>
                 <td class="text-end">${this._pct(r.request_count, total)}</td>
             </tr>`).join('');
         container.innerHTML = header + `
             <div class="table-responsive">
                 <table class="table table-hover mb-0">
-                    <thead><tr><th>User</th><th>Type</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
+                    <thead><tr>${headerCols}</tr></thead>
                     <tbody>${rowsHtml}</tbody>
                 </table>
             </div>`;
+        this._bindBreadcrumb(container);
+        this._bindRowClicks(container);
     }
 
-    _renderModelBreakdown(rows, id) {
+    _renderUserBreakdown(rows) {
+        this._renderUserRowsBreakdown(rows,
+            '<th>User</th><th>Type</th><th>Requests</th><th class="text-end">Percentage</th>');
+    }
+
+    // Zero-filled by the backend, so a member with no traffic in this window still gets
+    // a row — an absent one would read as "not in the pool".
+    _renderPoolMemberBreakdown(rows) {
+        this._renderUserRowsBreakdown(rows,
+            '<th>Member</th><th>Type</th><th>Requests</th><th class="text-end">Percentage</th>');
+    }
+
+    _renderModelBreakdown(rows) {
         const container = document.getElementById('usage-table-container');
-        const header = this._drilldownHeader(this._esc(id));
-        if (!rows || rows.length === 0) { container.innerHTML = header + this._emptyState(); return; }
+        const header = this._drilldownHeader();
+        if (!rows || rows.length === 0) {
+            container.innerHTML = header + this._emptyState();
+            this._bindBreadcrumb(container);
+            return;
+        }
         const total = rows.reduce((s, r) => s + r.request_count, 0);
         const rowsHtml = rows.map(r => `
             <tr>
@@ -460,6 +590,7 @@ class UsageManager {
                     <tbody>${rowsHtml}</tbody>
                 </table>
             </div>`;
+        this._bindBreadcrumb(container);
     }
 
     _renderStats(totals) {
@@ -473,9 +604,11 @@ class UsageManager {
         set('usage-unique-models', totals.unique_models);
     }
 
-    // When a user or model is selected, collapse the three-tile overview into a
-    // two-tile layout scoped to the selection: total requests, plus the count of
-    // the opposite axis (models for a user, users for a model).
+    // When something is selected, collapse the three-tile overview into a two-tile
+    // layout scoped to the selection: total requests, plus the count of the other axis
+    // (models for a user, users for a model, members for a pool). _setStatTile always
+    // shows one card and hides the other, so walking pool -> member -> back needs no
+    // restore in between; only _returnToTopLevel calls _restoreTopLevelStats.
     _renderDrilldownStats(axis, breakdown) {
         const rows = Array.isArray(breakdown) ? breakdown : [];
         const totalReqs = rows.reduce((s, r) => s + (r.request_count || 0), 0);
@@ -487,6 +620,11 @@ class UsageManager {
             // Selected a user → second tile shows how many models they used.
             this._setStatTile('usage-unique-users', 'usage-unique-models',
                 'usage-stat-users', 'usage-stat-models', rows.length, 'Models Used');
+        } else if (axis === 'pool') {
+            // Selected a pool → second tile shows its size. The breakdown is zero-filled,
+            // so its length is the true member count, not just the members with traffic.
+            this._setStatTile('usage-unique-models', 'usage-unique-users',
+                'usage-stat-models', 'usage-stat-users', rows.length, 'Pool Members');
         } else {
             // Selected a model → second tile shows how many users used it.
             this._setStatTile('usage-unique-models', 'usage-unique-users',
@@ -645,10 +783,8 @@ class UsageManager {
     }
 
     _updateToggle(view) {
-        const btnUser = document.getElementById('usage-toggle-user');
-        const btnModel = document.getElementById('usage-toggle-model');
-        if (!btnUser || !btnModel) return;
         const apply = (btn, selected) => {
+            if (!btn) return;
             if (selected) {
                 btn.style.cssText = 'background-color: var(--mono-text-primary); border-color: var(--mono-text-primary); color: var(--mono-0);';
                 btn.classList.add('active');
@@ -657,15 +793,18 @@ class UsageManager {
                 btn.classList.remove('active');
             }
         };
-        apply(btnUser, view === 'user');
-        apply(btnModel, view === 'model');
+        ['user', 'model', 'pool'].forEach(key => {
+            apply(document.getElementById(`usage-toggle-${key}`), view === key);
+        });
         // Ensure indicator is positioned when toggle re-renders (view switch doesn't change window)
         if (this._window !== 'month') this._positionIndicator(this._window);
     }
 
     _bindRowClicks(container) {
         container.querySelectorAll('.usage-drilldown-row').forEach(row => {
-            row.addEventListener('click', () => this.drillDown(row.dataset.axis, row.dataset.id));
+            // data-label is only set where the id isn't a display string (a pool id);
+            // drillDown falls back to the id everywhere else.
+            row.addEventListener('click', () => this.drillDown(row.dataset.axis, row.dataset.id, row.dataset.label));
         });
     }
 
@@ -681,10 +820,25 @@ class UsageManager {
     }
 
     async _deleteUsage(axis, id, btn) {
-        const label = axis === 'user' ? `user '${id}'` : `model '${id}'`;
-        const message =
-            `Permanently delete ALL usage data for ${label}?` +
-            (axis === 'user' ? " It also resets this user's request count for today." : '');
+        let label, message;
+        if (axis === 'pool') {
+            // Names looked up from the cached payload rather than carried in a data-*
+            // attribute — that is the escaping hazard _deleteButton exists to avoid, and
+            // it would be a list of them here.
+            const pool = (this._cache?.per_pool || []).find(p => String(p.pool_id) === String(id));
+            const members = pool?.members || [];
+            label = `pool '${pool?.name ?? id}'`;
+            const who = members.length
+                ? `the ${members.length} member${members.length === 1 ? '' : 's'} of ${label} (${members.join(', ')})`
+                : label;
+            message = `Permanently delete ALL usage data for ${who}? ` +
+                'It also resets their request counts for today.';
+        } else {
+            label = axis === 'user' ? `user '${id}'` : `model '${id}'`;
+            message =
+                `Permanently delete ALL usage data for ${label}?` +
+                (axis === 'user' ? " It also resets this user's request count for today." : '');
+        }
         const confirmed = await window.UIUtils?.showConfirmModal('Delete Usage Data', message, 'danger');
         if (!confirmed) return;
 

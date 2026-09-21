@@ -8,39 +8,23 @@ These models mirror the Anthropic API specification for:
 
 import math
 import os
-import re
 import logging
 from typing import List, Optional, Dict, Any, Union, Literal, Annotated, Tuple
 from pydantic import BaseModel, Field, model_validator
+
+# Re-exported: is_claude_at_least lives in model_capabilities (alongside the
+# rules that use it) so that module can be imported here without a cycle.
+from app.model_capabilities import (
+    SURFACE_NATIVE,
+    is_claude_at_least,
+    normalize_thinking,
+    scrub as scrub_unsupported_params,
+)
 
 
 _logger = logging.getLogger(__name__)
 _ANTHROPIC_SDK_TIMEOUT_ENV = "ANTHROPIC_SDK_TIMEOUT_SECONDS"
 _DEFAULT_ANTHROPIC_SDK_TIMEOUT_SECONDS = 900.0
-
-_CLAUDE_VERSION_RE = re.compile(r'claude-(?:sonnet|opus|haiku)-(\d+)(?:-(\d+))?')
-
-
-def is_claude_at_least(model_id: str, min_major: int, min_minor: int) -> bool:
-    """True if ``model_id`` is a Claude model at or above ``min_major.min_minor``.
-
-    Handles both the "major-minor" naming (e.g. "claude-sonnet-4-5") and the
-    newer "major only" naming (e.g. "claude-sonnet-5"), and ignores any trailing
-    date snapshot (e.g. "claude-sonnet-5-20250101") — an 8-digit segment is a
-    date, not a minor version. A missing minor is treated as 0.
-    """
-    if not model_id:
-        return False
-    lower = model_id.lower()
-    if "claude" not in lower:
-        return False
-    match = _CLAUDE_VERSION_RE.search(lower)
-    if not match:
-        return False
-    major = int(match.group(1))
-    minor_raw = match.group(2)
-    minor = int(minor_raw) if (minor_raw is not None and len(minor_raw) <= 2) else 0
-    return (major, minor) >= (min_major, min_minor)
 
 
 def _get_positive_float_env(name: str, default: float) -> float:
@@ -249,8 +233,15 @@ class AnthropicToolChoice(BaseModel):
 
 class AnthropicThinkingConfig(BaseModel):
     """Extended thinking configuration."""
-    type: str = "enabled"  # "enabled" or "disabled"
+    type: str = "enabled"  # "enabled", "adaptive" or "disabled"
     budget_tokens: Optional[int] = Field(default=None, ge=1)
+
+    class Config:
+        # Forward compat, matching AnthropicMessagesRequest. Without it the
+        # closed schema silently dropped every key but these two — notably
+        # `display`, so a client asking for "summarized" got the `omitted`
+        # default (empty thinking blocks) with nothing reported as dropped.
+        extra = "allow"
 
 
 class AnthropicMetadata(BaseModel):
@@ -643,11 +634,17 @@ def build_anthropic_sdk_kwargs(
         if value is not None:
             kwargs[param] = value
 
-    # Claude >= 4.7 deprecated top_p; forwarding it makes the model reject the
-    # request with "top_p is deprecated for this model". Drop it here so every
-    # Anthropic-SDK provider (direct Anthropic, Azure Foundry, ...) is covered.
-    if kwargs.get("top_p") is not None and is_claude_at_least(model_id, 4, 7):
-        kwargs.pop("top_p", None)
+    # Drop the sampling params this model rejects ("top_p is deprecated for this
+    # model", "This model doesn't support the temperature field", ...). Done here
+    # so every Anthropic-SDK provider (direct Anthropic, Azure Foundry, ...) is
+    # covered by the one table in app.model_capabilities.
+    dropped = scrub_unsupported_params(kwargs, model_id, SURFACE_NATIVE)
+    if dropped:
+        _logger.debug(
+            "Dropped %s for %s (not supported by this model)",
+            ", ".join(dropped),
+            model_id,
+        )
 
     # Complex model parameters
     if request.tools:
@@ -664,7 +661,18 @@ def build_anthropic_sdk_kwargs(
     if request.metadata is not None:
         kwargs["metadata"] = request.metadata.model_dump(exclude_none=True)
     if request.thinking is not None:
-        kwargs["thinking"] = request.thinking.model_dump(exclude_none=True)
+        # Adaptive-thinking models reject an explicit token budget; normalize
+        # {"type": "enabled", "budget_tokens": N} to {"type": "adaptive"}.
+        thinking, thinking_dropped = normalize_thinking(
+            request.thinking.model_dump(exclude_none=True), model_id
+        )
+        kwargs["thinking"] = thinking
+        if thinking_dropped:
+            _logger.debug(
+                "Dropped %s for %s (not supported by this model)",
+                ", ".join(thinking_dropped),
+                model_id,
+            )
 
     # Apply an explicit timeout to every SDK call. Besides bounding the request,
     # this disables the SDK's client-side non-streaming guard that would

@@ -1,6 +1,10 @@
 {% extends "layouts/base.html" %}
 
 {% block extra_css %}
+<!-- Shared with the admin dashboard so an admin sees a pool exactly as its members do.
+     Versioned link, not an @import from main.css: an unversioned @import can serve a
+     stale copy after a deploy (same reason admin.css is linked this way). -->
+<link rel="stylesheet" href="/static/css/components/pool.css?v={{ cache_version }}">
 <style>
     /* ── Quota tooltips ────────────────────────────────────────────── */
     .quota-tooltip .tooltip-inner {
@@ -258,6 +262,9 @@
         transition: transform 0.25s cubic-bezier(0.4,0,0.2,1), width 0.25s cubic-bezier(0.4,0,0.2,1), opacity 0.15s ease;
         pointer-events: none; z-index: 0;
     }
+    @media (prefers-reduced-motion: reduce) {
+        .time-window__indicator { transition: none; }
+    }
 
     /* ── Toast (shared) ────────────────────────────────────────────── */
     .toast {
@@ -298,6 +305,9 @@
     </button>
     <button class="tab-button" onclick="showTab('quotas')">
         <i class="fas fa-gauge-high"></i> Quotas
+    </button>
+    <button class="tab-button" onclick="showTab('pool')">
+        <i class="fas fa-users"></i> Pool
     </button>
 </div>
 
@@ -430,40 +440,140 @@
 
 <!-- ══════════════════════════════════════════════════════ Usage -->
 <div class="section tab-content" id="usage-tab">
-    <div class="dashboard-stats mb-4">
-        <div class="stat-card">
-            <div class="stat-number" id="totalRequests">—</div>
-            <div class="stat-label">Total Requests</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-number" id="uniqueModels">—</div>
-            <div class="stat-label">Models Used</div>
-        </div>
+    <!-- Scope toggle: usage analytics for one person or for the whole pool, in the
+         same sliding-track language as the pool card's by-member/by-model switch.
+         It sits above the tiles because the tiles change with it. -->
+    <div class="pool-view-switch mb-4" id="usageScopeSwitch" role="group" aria-label="Usage scope">
+        <div class="pool-view-switch__indicator" aria-hidden="true"></div>
+        <button type="button" class="pool-view-btn is-active" data-scope="my" aria-pressed="true"
+                onclick="window.UserUsageManager?.setScope('my')">My usage</button>
+        <button type="button" class="pool-view-btn" data-scope="pool" aria-pressed="false"
+                onclick="window.UserUsageManager?.setScope('pool')">Pool usage</button>
     </div>
-    <div class="card">
-        <div class="card-header">
-            <div class="d-flex align-items-center gap-3 flex-wrap w-100">
-                <h5 class="mb-0"><i class="fas fa-chart-bar me-2"></i>Usage by Model</h5>
-                <span id="user-usage-earliest-date" style="font-size:0.75rem; color:var(--mono-text-muted); font-family:var(--font-family-mono); margin-left:0.5rem;"></span>
-                <div class="time-window ms-auto" id="usage-window-container" data-window-mode="preset">
-                    <div class="time-window__track" id="usage-window-btns" role="group" aria-label="Time window">
-                        <div class="time-window__indicator" id="usage-window-indicator" aria-hidden="true"></div>
-                        <button type="button" class="time-window__preset" data-window="24h" onclick="window.UserUsageManager?.setWindow('24h')">24h</button>
-                        <button type="button" class="time-window__preset" data-window="today" onclick="window.UserUsageManager?.setWindow('today')">Today</button>
-                        <button type="button" class="time-window__preset" data-window="yesterday" onclick="window.UserUsageManager?.setWindow('yesterday')">Yesterday</button>
-                        <button type="button" class="time-window__preset" data-window="7d" onclick="window.UserUsageManager?.setWindow('7d')">7d</button>
-                        <button type="button" class="time-window__preset is-active" data-window="30d" onclick="window.UserUsageManager?.setWindow('30d')">30d</button>
-                        <button type="button" class="time-window__preset" data-window="all" onclick="window.UserUsageManager?.setWindow('all')">All Time</button>
+
+    <div id="usageMyPanel">
+        <div class="dashboard-stats mb-4">
+            <div class="stat-card">
+                <div class="stat-number" id="totalRequests">—</div>
+                <div class="stat-label">Total Requests</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="uniqueModels">—</div>
+                <div class="stat-label">Models Used</div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <div class="d-flex align-items-center gap-3 flex-wrap w-100">
+                    <h5 class="mb-0"><i class="fas fa-chart-bar me-2"></i>Usage by Model</h5>
+                    <span id="user-usage-earliest-date" style="font-size:0.75rem; color:var(--mono-text-muted); font-family:var(--font-family-mono); margin-left:0.5rem;"></span>
+                    <div class="time-window ms-auto" id="usage-window-container" data-window-mode="preset">
+                        <div class="time-window__track" id="usage-window-btns" role="group" aria-label="Time window">
+                            <div class="time-window__indicator" id="usage-window-indicator" aria-hidden="true"></div>
+                            <button type="button" class="time-window__preset" data-window="24h" onclick="window.UserUsageManager?.setWindow('24h')">24h</button>
+                            <button type="button" class="time-window__preset" data-window="today" onclick="window.UserUsageManager?.setWindow('today')">Today</button>
+                            <button type="button" class="time-window__preset" data-window="yesterday" onclick="window.UserUsageManager?.setWindow('yesterday')">Yesterday</button>
+                            <button type="button" class="time-window__preset" data-window="7d" onclick="window.UserUsageManager?.setWindow('7d')">7d</button>
+                            <button type="button" class="time-window__preset is-active" data-window="30d" onclick="window.UserUsageManager?.setWindow('30d')">30d</button>
+                            <button type="button" class="time-window__preset" data-window="all" onclick="window.UserUsageManager?.setWindow('all')">All Time</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="card-body">
+                <div class="usage-chart-card" id="user-usage-chart-card">
+                    <canvas id="user-usage-chart" height="240" role="img" aria-label="Requests over time for the selected window"></canvas>
+                </div>
+                <div id="usageContainer">
+                    <div class="skeleton-stack" aria-busy="true" aria-label="Loading usage data">
+                        <div class="skeleton skeleton-row"></div>
+                        <div class="skeleton skeleton-row"></div>
+                        <div class="skeleton skeleton-row"></div>
                     </div>
                 </div>
             </div>
         </div>
-        <div class="card-body">
-            <div class="usage-chart-card" id="user-usage-chart-card">
-                <canvas id="user-usage-chart" height="240" role="img" aria-label="Requests over time for the selected window"></canvas>
+    </div>
+
+    <div id="usagePoolPanel" style="display:none">
+        <!-- Until /auth/pools/me answers we don't know whether there is a pool, and
+             both the tiles and the empty state would be a guess. This slot holds the
+             space instead: _render empties it whichever way the answer goes, and a
+             failed fetch leaves its error here rather than a skeleton that never ends. -->
+        <div class="skeleton-stack" id="poolUsageStatus" aria-busy="true" aria-label="Loading pool usage">
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+            <div class="skeleton skeleton-row"></div>
+        </div>
+        <!-- Shown in place of the panel when /auth/pools/me comes back without a
+             pool. The toggle stays put either way, so nothing shifts once it lands. -->
+        <div class="pool-empty" id="poolUsageEmpty" style="display:none">
+            <h6>You're not in a pool yet</h6>
+            <p>Pool usage shows what every member of your pool sent. Create one or accept
+               an invite from the <a href="#" onclick="showTab('pool'); return false;">Pool tab</a>.</p>
+        </div>
+        <!-- The pool's headline numbers, in the same three-tile language as the admin
+             Usage tab — and collapsing to two the same way when a row is drilled into.
+             Hidden alongside the usage card when the user has no pool — the empty state
+             above stands in, because a tile reading 0 would claim a pool that doesn't
+             exist. -->
+        <div class="dashboard-stats mb-4" id="poolUsageStats" style="display:none">
+            <div class="stat-card" id="pool-stat-total">
+                <div class="stat-number" id="poolTotalRequests">—</div>
+                <div class="stat-label">Total Requests</div>
             </div>
-            <div id="usageContainer">
-                <div class="skeleton-stack" aria-busy="true" aria-label="Loading usage data">
+            <div class="stat-card" id="pool-stat-members">
+                <div class="stat-number" id="poolUniqueMembers">—</div>
+                <div class="stat-label">Members</div>
+            </div>
+            <div class="stat-card" id="pool-stat-models">
+                <div class="stat-number" id="poolUniqueModels">—</div>
+                <div class="stat-label">Models Used</div>
+            </div>
+        </div>
+
+        <!-- What members actually SENT. Carries never reach this panel; only the
+             quota numbers above reflect settlement.
+
+             Flat, like the admin Usage tab: no card wrapper. One .section-header
+             carries the controls, the chart sits under it, the table under that.
+             No heading either — the scope switch above already says POOL USAGE. -->
+        <div id="poolUsageCard" style="display:none">
+            <div class="section-header">
+                <div class="d-flex align-items-center gap-3 flex-wrap w-100">
+                    <!-- Same sliding-track language as the scope switch above and the
+                         window picker opposite. -->
+                    <div class="pool-view-switch" id="poolViewSwitch" role="group" aria-label="Break usage down by">
+                        <div class="pool-view-switch__indicator" aria-hidden="true"></div>
+                        <button type="button" class="pool-view-btn is-active" data-view="member" aria-pressed="true" onclick="window.PoolManager?.setView('member')">By member</button>
+                        <button type="button" class="pool-view-btn" data-view="model" aria-pressed="false" onclick="window.PoolManager?.setView('model')">By model</button>
+                    </div>
+                    <!-- Stands in for the switch while a row is drilled into: one slot,
+                         one control, so the row never changes height when they swap. -->
+                    <button type="button" class="pool-usage-back" id="poolUsageBack"
+                            style="display:none" onclick="window.PoolManager?.back()">
+                        <i class="fas fa-arrow-left"></i> Back
+                    </button>
+                    <div class="time-window ms-auto" id="pool-window-container" data-window-mode="preset">
+                        <div class="time-window__track" id="pool-window-btns" role="group" aria-label="Time window">
+                            <div class="time-window__indicator" id="pool-window-indicator" aria-hidden="true"></div>
+                            <button type="button" class="time-window__preset" data-window="24h" aria-pressed="false" onclick="window.PoolManager?.setWindow('24h')">24h</button>
+                            <button type="button" class="time-window__preset is-active" data-window="today" aria-pressed="true" onclick="window.PoolManager?.setWindow('today')">Today</button>
+                            <button type="button" class="time-window__preset" data-window="yesterday" aria-pressed="false" onclick="window.PoolManager?.setWindow('yesterday')">Yesterday</button>
+                            <button type="button" class="time-window__preset" data-window="7d" aria-pressed="false" onclick="window.PoolManager?.setWindow('7d')">7d</button>
+                            <button type="button" class="time-window__preset" data-window="30d" aria-pressed="false" onclick="window.PoolManager?.setWindow('30d')">30d</button>
+                            <button type="button" class="time-window__preset" data-window="all" aria-pressed="false" onclick="window.PoolManager?.setWindow('all')">All Time</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="usage-chart-card" id="pool-usage-chart-card">
+                <canvas id="pool-usage-chart" height="240" role="img" aria-label="Pool requests over time for the selected window"></canvas>
+            </div>
+
+            <div id="poolUsageContainer">
+                <div class="skeleton-stack" aria-busy="true" aria-label="Loading pool usage">
                     <div class="skeleton skeleton-row"></div>
                     <div class="skeleton skeleton-row"></div>
                     <div class="skeleton skeleton-row"></div>
@@ -482,6 +592,7 @@
                 <i class="fas fa-info-circle text-muted ms-1 quota-info" style="font-size:0.8rem;cursor:help;"
                    data-bs-toggle="tooltip" data-bs-placement="top"
                    title="Each section is a quota bucket shared by the models listed under it. The header shows today's requests used, the daily limit (RPD), and how many remain; RPM is your per-minute limit. Models are grouped so that any group sharing one quota is shown together; models not in any group appear under 'Other Models'. ∞ means unlimited."></i>
+            <span id="quotaPoolChip"></span>
             </h5>
         </div>
         <div class="card-body">
@@ -557,6 +668,76 @@
     </div>
 </div>
 
+<!-- ══════════════════════════════════════════════════════ Pool -->
+<div class="section tab-content" id="pool-tab">
+    <div class="card mb-4">
+        <div class="card-header">
+            <h5 class="mb-0"><i class="fas fa-users me-2"></i>Request Pool</h5>
+        </div>
+        <div class="card-body">
+            <div id="poolContainer">
+                <div class="skeleton-stack" aria-busy="true" aria-label="Loading your pool">
+                    <div class="skeleton skeleton-row"></div>
+                    <div class="skeleton skeleton-row"></div>
+                    <div class="skeleton skeleton-row"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Leaving is the one decision that needs real numbers, and showConfirmModal is
+     textContent-only. This dialog renders if_i_leave_now: a real settlement run,
+     computed and rolled back, never numbers the frontend derives for itself. -->
+<div class="modal fade" id="poolRenameModal" tabindex="-1" aria-labelledby="poolRenameTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <form id="poolRenameForm">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="poolRenameTitle">Rename pool</h5>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label" for="poolRenameName">Pool name</label>
+                        <input type="text" class="form-control" id="poolRenameName" maxlength="64" required>
+                    </div>
+                    <div class="mb-0">
+                        <label class="form-label" for="poolRenameDesc">Description <span class="text-muted">(optional)</span></label>
+                        <input type="text" class="form-control" id="poolRenameDesc" maxlength="256">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                        <i class="fas fa-times me-1"></i>Cancel
+                    </button>
+                    <button type="submit" class="btn btn-primary">
+                        <i class="fas fa-save me-1"></i>Save changes
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="poolLeaveModal" tabindex="-1" aria-labelledby="poolLeaveTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="poolLeaveTitle">Leave pool?</h5>
+            </div>
+            <div class="modal-body" id="poolLeaveBody"></div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">
+                    <i class="fas fa-times me-1"></i>Cancel
+                </button>
+                <button type="button" class="btn btn-danger" id="poolLeaveConfirm">
+                    <i class="fas fa-right-from-bracket me-1"></i>Leave pool
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Confirmation Modal -->
 <div class="modal fade" id="confirmModal" tabindex="-1" aria-labelledby="confirmModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
@@ -608,4 +789,5 @@
 <script src="/static/js/features/dashboard/authenticated_dashboard.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/user-usage-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/quotas-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/dashboard/pool-manager.js?v={{ cache_version }}"></script>
 {% endblock %}

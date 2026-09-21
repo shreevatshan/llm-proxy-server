@@ -111,7 +111,16 @@ from app.anthropic_models import (
     _extract_system_messages_from_messages,
     _merge_system_fields,
     is_anthropic_terminal_stream_event,
+)
+from app.model_capabilities import (
+    CONVERSE_SPELLINGS,
+    SURFACE_CONVERSE,
+    SURFACE_NATIVE,
+    THINKING_ADAPTIVE,
     is_claude_at_least,
+    normalize_thinking,
+    scrub as scrub_unsupported_params,
+    thinking_style,
 )
 from app.providers.anthropic_compatible import (
     # Bedrock native Anthropic streams share the same bounded post-terminal
@@ -1054,14 +1063,21 @@ class BedrockProvider(BaseProvider):
         if request.top_p is not None:
             inference_config["topP"] = request.top_p
         
-        # Claude >= 4.7 don't support temperature or topP in inferenceConfig.
-        # (topK was never placed in inferenceConfig — it lives in
-        # additionalModelRequestFields and is scrubbed separately below.)
-        if self._is_claude_at_least(request.model, 4, 7):
-            inference_config.pop("temperature", None)
-            inference_config.pop("topP", None)
+        # Drop whichever sampling params this model rejects. (topK is never
+        # placed in inferenceConfig — it lives in additionalModelRequestFields
+        # and is scrubbed separately below.)
+        removed = scrub_unsupported_params(
+            inference_config,
+            request.model,
+            SURFACE_CONVERSE,
+            spellings=CONVERSE_SPELLINGS,
+            only=frozenset({"temperature", "top_p"}),
+        )
+        if removed:
             if self.debug:
-                logger.info(f"Removed temperature and topP for {request.model} (not supported in Claude >= 4.7)")
+                logger.info(
+                    f"Removed {', '.join(removed)} for {request.model} (not supported by this model)"
+                )
         # Claude >= 4.5 don't support both temperature and topP simultaneously
         # When both are provided, temperature takes precedence and topP is removed
         elif "temperature" in inference_config and "topP" in inference_config:
@@ -1089,6 +1105,21 @@ class BedrockProvider(BaseProvider):
                 # Grok wants an effort string, not a token budget;
                 # _apply_grok_constraints validates/normalizes it below.
                 args.setdefault("additionalModelRequestFields", {})["reasoning_effort"] = request.reasoning_effort
+            # Adaptive-thinking models (Claude >= 4.7) reject an explicit token
+            # budget, so no reasoning_config can be emitted for them. Thinking is
+            # on by default there, so omitting it cannot trigger a 400 — but the
+            # requested effort has nowhere to go on this surface and is lost.
+            # Warn rather than swallow it silently; on Converse the only
+            # candidate carrier is additionalModelRequestFields["output_config"],
+            # which is unverified against Bedrock (see note in the module docs).
+            elif thinking_style(request.model) == THINKING_ADAPTIVE:
+                logger.warning(
+                    "[BEDROCK] reasoning_effort=%r cannot be forwarded for %s on the "
+                    "Converse path (adaptive thinking rejects budget_tokens); the "
+                    "request will run at the model's default effort",
+                    request.reasoning_effort,
+                    request.model,
+                )
             # Reasoning requires budget_tokens >= 1024 AND < max_tokens. If
             # max_tokens is too small to satisfy the floor, skip reasoning
             # rather than emit an invalid budget that Bedrock would reject.
@@ -1173,7 +1204,11 @@ class BedrockProvider(BaseProvider):
                 if k not in bedrock_unsupported_params
             }
 
-            # Strip effort from output_config — Converse path is non-Claude only
+            # Strip effort from output_config. Claude *does* reach this builder
+            # (/v1/chat/completions routes every model through Converse; only
+            # /v1/messages has a Claude-native branch), so the old "non-Claude
+            # only" reasoning was wrong — but Converse has no verified carrier
+            # for output_config, so effort still cannot be forwarded here.
             if "output_config" in filtered_extra_fields:
                 oc = filtered_extra_fields["output_config"]
                 if isinstance(oc, dict) and "effort" in oc:
@@ -1183,6 +1218,21 @@ class BedrockProvider(BaseProvider):
                     else:
                         del filtered_extra_fields["output_config"]
             
+            # A client-supplied thinking config in the extra body has to go
+            # through the same normalization as every other request builder —
+            # otherwise budget_tokens reaches an adaptive-thinking model verbatim
+            # and 400s. This was the one builder the capability table missed.
+            if isinstance(filtered_extra_fields.get("thinking"), dict):
+                normalized_thinking, thinking_dropped = normalize_thinking(
+                    filtered_extra_fields["thinking"], request.model
+                )
+                filtered_extra_fields["thinking"] = normalized_thinking
+                if thinking_dropped and self.debug:
+                    logger.info(
+                        f"Removed {', '.join(thinking_dropped)} from extra fields "
+                        f"for {request.model} (adaptive thinking)"
+                    )
+
             if filtered_extra_fields:
                 # Merge into (not overwrite) additionalModelRequestFields so a
                 # reasoning_config set from request.reasoning_effort above is
@@ -1197,13 +1247,21 @@ class BedrockProvider(BaseProvider):
                     inference_config.pop("temperature", None)
                     existing_amrf.pop("top_k", None)
 
-        # Claude >= 4.7 doesn't support top_k in additionalModelRequestFields either
-        if self._is_claude_at_least(request.model, 4, 7):
-            amrf = args.get("additionalModelRequestFields")
-            if amrf and "top_k" in amrf:
-                amrf.pop("top_k")
-                if self.debug:
-                    logger.info(f"Removed top_k from additionalModelRequestFields for {request.model}")
+        # top_k rides in additionalModelRequestFields rather than inferenceConfig,
+        # so it needs its own scrub against the same table.
+        amrf = args.get("additionalModelRequestFields")
+        if amrf:
+            removed_amrf = scrub_unsupported_params(
+                amrf,
+                request.model,
+                SURFACE_CONVERSE,
+                only=frozenset({"top_k"}),
+            )
+            if removed_amrf and self.debug:
+                logger.info(
+                    f"Removed {', '.join(removed_amrf)} from additionalModelRequestFields "
+                    f"for {request.model}"
+                )
 
         # Grok rejects the sampling knobs entirely; scrub last so nothing above
         # (extra fields, reasoning) can reintroduce them.
@@ -2048,9 +2106,6 @@ class BedrockProvider(BaseProvider):
         lower = model_id.lower()
         return "xai." in lower or "grok" in lower
 
-    # Grok on Bedrock accepts only maxTokens in inferenceConfig; each of these
-    # is rejected with "This model doesn't support the <field> field".
-    _GROK_UNSUPPORTED_INFERENCE_FIELDS = ("temperature", "topP", "stopSequences")
     # Grok takes reasoning as an effort string in additionalModelRequestFields.
     # The Claude-style reasoning_config/thinking objects map onto reasoning.effort
     # and are rejected ("Invalid type for 'reasoning.effort'").
@@ -2073,14 +2128,18 @@ class BedrockProvider(BaseProvider):
 
     def _apply_grok_constraints(self, args: Dict[str, Any]) -> None:
         """Scrub Converse fields that Bedrock's xAI Grok models reject (in place)."""
-        if not self._is_grok_model(args.get("modelId", "")):
+        model_id = args.get("modelId", "")
+        if not self._is_grok_model(model_id):
             return
 
-        inference_config = args.get("inferenceConfig") or {}
-        removed = [
-            field for field in self._GROK_UNSUPPORTED_INFERENCE_FIELDS
-            if inference_config.pop(field, None) is not None
-        ]
+        # Grok accepts only maxTokens in inferenceConfig; the rejected field list
+        # lives with every other model's in app.model_capabilities.
+        removed = scrub_unsupported_params(
+            args.get("inferenceConfig") or {},
+            model_id,
+            SURFACE_CONVERSE,
+            spellings=CONVERSE_SPELLINGS,
+        )
 
         additional_fields = args.get("additionalModelRequestFields")
         if isinstance(additional_fields, dict):
@@ -2262,16 +2321,20 @@ class BedrockProvider(BaseProvider):
         # --- scalar params -----------------------------------------------------
         if request.temperature is not None:
             native["temperature"] = request.temperature
-        # Claude >= 4.7 deprecated top_p — passing it triggers a
-        # "top_p is deprecated for this model" error. Drop it for those models.
-        if request.top_p is not None and not self._is_claude_at_least(request.model, 4, 7):
+        if request.top_p is not None:
             native["top_p"] = request.top_p
-        # Claude >= 4.7 deprecated top_k as well; the Converse path strips it, so
-        # apply the same guard here to keep the native path consistent.
-        if request.top_k is not None and not self._is_claude_at_least(request.model, 4, 7):
+        if request.top_k is not None:
             native["top_k"] = request.top_k
         if request.stop_sequences:
             native["stop_sequences"] = request.stop_sequences
+
+        # Drop whichever of those this model rejects ("top_p is deprecated for
+        # this model", "This model doesn't support the temperature field", ...).
+        removed = scrub_unsupported_params(native, request.model, SURFACE_NATIVE)
+        if removed and self.debug:
+            logger.info(
+                f"Removed {', '.join(removed)} for {request.model} (not supported by this model)"
+            )
 
         # --- tools -------------------------------------------------------------
         if request.tools:
@@ -2355,11 +2418,19 @@ class BedrockProvider(BaseProvider):
 
         # --- thinking / extended thinking --------------------------------------
         if request.thinking is not None:
-            native["thinking"] = (
+            thinking = (
                 request.thinking.model_dump(exclude_none=True)
                 if hasattr(request.thinking, "model_dump")
                 else request.thinking
             )
+            # Adaptive-thinking models reject an explicit token budget.
+            thinking, thinking_dropped = normalize_thinking(thinking, request.model)
+            native["thinking"] = thinking
+            if thinking_dropped and self.debug:
+                logger.info(
+                    f"Removed {', '.join(thinking_dropped)} for {request.model} "
+                    f"(adaptive thinking)"
+                )
 
         # --- metadata ----------------------------------------------------------
         if request.metadata is not None:

@@ -203,16 +203,16 @@ class UpdateUserProfileTests(UsageDBTestCase):
         await self._assert_moved("old.name", "new.name", 12)
 
     async def test_rename_drops_the_stale_rpd_cache_entry(self):
-        from app.rate_limit import rate_limit_tracker, _RpdCacheEntry
+        from app.rate_limit import rate_limit_tracker, _RpdCacheEntry, _user_scope_key
 
         user = await self._add_user("old.name")
-        rate_limit_tracker._rpd_cache["old.name"] = _RpdCacheEntry(count=9, expires_at=1e12)
+        rate_limit_tracker._rpd_cache[_user_scope_key("old.name")] = _RpdCacheEntry(count=9, expires_at=1e12)
         try:
             await update_user_profile(self.db, user.id, username="new.name")
-            self.assertNotIn("old.name", rate_limit_tracker._rpd_cache)
-            self.assertNotIn("new.name", rate_limit_tracker._rpd_cache)
+            self.assertNotIn(_user_scope_key("old.name"), rate_limit_tracker._rpd_cache)
+            self.assertNotIn(_user_scope_key("new.name"), rate_limit_tracker._rpd_cache)
         finally:
-            rate_limit_tracker._rpd_cache.pop("old.name", None)
+            rate_limit_tracker._rpd_cache.pop(_user_scope_key("old.name"), None)
 
     async def test_rename_drops_the_owners_cached_api_keys(self):
         """API-key traffic is recorded under the username cached on the key.
@@ -394,23 +394,24 @@ class TrackerRenameIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 class RateLimitInvalidateIdentityTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_rpd_caches_are_dropped_for_the_identity(self):
-        from app.rate_limit import RateLimitTracker, _RpdCacheEntry
+        from app.rate_limit import RateLimitTracker, _RpdCacheEntry, _user_scope_key
 
         tracker = RateLimitTracker()
         entry = _RpdCacheEntry(count=5, expires_at=1e12)
-        tracker._rpd_cache["old.name"] = entry
-        tracker._rpd_cache["bystander"] = entry
-        tracker._group_rpd_cache[("old.name", 1)] = entry
-        tracker._group_rpd_cache[("bystander", 1)] = entry
-        tracker._instance_group_rpd_cache[("old.name", 2)] = entry
+        old, bystander = _user_scope_key("old.name"), _user_scope_key("bystander")
+        tracker._rpd_cache[old] = entry
+        tracker._rpd_cache[bystander] = entry
+        tracker._group_rpd_cache[(old, 1)] = entry
+        tracker._group_rpd_cache[(bystander, 1)] = entry
+        tracker._instance_group_rpd_cache[(old, 2)] = entry
 
         tracker.invalidate_identity("old.name")
 
-        self.assertNotIn("old.name", tracker._rpd_cache)
-        self.assertNotIn(("old.name", 1), tracker._group_rpd_cache)
-        self.assertNotIn(("old.name", 2), tracker._instance_group_rpd_cache)
-        self.assertIn("bystander", tracker._rpd_cache)
-        self.assertIn(("bystander", 1), tracker._group_rpd_cache)
+        self.assertNotIn(old, tracker._rpd_cache)
+        self.assertNotIn((old, 1), tracker._group_rpd_cache)
+        self.assertNotIn((old, 2), tracker._instance_group_rpd_cache)
+        self.assertIn(bystander, tracker._rpd_cache)
+        self.assertIn((bystander, 1), tracker._group_rpd_cache)
 
 
 if __name__ == "__main__":

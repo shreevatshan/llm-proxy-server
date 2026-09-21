@@ -49,6 +49,7 @@ from app.auth.models import (
     InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupLimitsUpdate, InstanceGroupMembersUpdate,
     InstanceGroupResponse, UserInstanceGroupRateLimitResponse, UserInstanceGroupRateLimitUpdate,
     ModelAliasUpsert, ModelAliasResponse,
+    AdminPoolResponse,
 )
 from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_admin_email
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -1016,8 +1017,17 @@ async def permanently_delete_user_endpoint(
         )
     
     try:
+        # The FK cascade drops the pool membership silently, so the pool's interval has
+        # to be closed explicitly first — otherwise the remaining members keep the
+        # departed user's limit-share as free headroom for the rest of the day. The
+        # tracker is invalidated only after the delete commits, since a refresh before
+        # that would read the membership row straight back.
+        from app.routes.pools import invalidate_after_user_delete, settle_before_user_delete
+        pool_id, pooled_usernames = await settle_before_user_delete(db, user_id)
+
         success = await permanently_delete_user(db, user_id)
         if success:
+            await invalidate_after_user_delete(pool_id, pooled_usernames)
             return {"message": f"User {user.username} has been permanently deleted"}
         else:
             raise HTTPException(
@@ -1076,6 +1086,8 @@ async def bulk_user_action(
     if action == "delete":
         # permanently_delete_user commits internally, so this cannot be one
         # transaction; partial completion is possible and is reported per user.
+        from app.routes.pools import invalidate_after_user_delete, settle_before_user_delete
+
         for user_id in user_ids:
             user = await get_user_by_id(db, user_id)
             if not user:
@@ -1084,7 +1096,12 @@ async def bulk_user_action(
 
             username = user.username
             try:
+                # Same two steps as the single-user endpoint above, for the same
+                # reasons: settle the pool inside the delete's transaction, invalidate
+                # the tracker only once it has committed.
+                pool_id, pooled_usernames = await settle_before_user_delete(db, user_id)
                 if await permanently_delete_user(db, user_id):
+                    await invalidate_after_user_delete(pool_id, pooled_usernames)
                     succeeded.append({"id": user_id, "username": username})
                 else:
                     failed.append({"id": user_id, "username": username, "error": "User not found"})
@@ -2944,7 +2961,7 @@ async def get_usage_years_endpoint(
 
 @router.get("/usage")
 async def get_usage(
-    view: Optional[str] = Query(None, description="'user' or 'model' for drill-down"),
+    view: Optional[str] = Query(None, description="'user', 'model' or 'pool' for drill-down"),
     id: Optional[str] = Query(None, description="Identity value to drill into"),
     window: str = Query("30d", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
     year: Optional[int] = Query(None, description="Year (required when window=month)"),
@@ -2954,15 +2971,65 @@ async def get_usage(
 ):
     """Return aggregated usage for the requested time window.
 
-    - No view/id: top-level per_user + per_model + totals.
+    - No view/id: top-level per_user + per_model + per_pool + totals.
     - ?view=user&id=alice: breakdown by model for alice.
     - ?view=model&id=gpt-4: breakdown by user for gpt-4.
+    - ?view=pool&id=3: breakdown by member for pool 3.
     - window=24h|today|yesterday|7d|30d|month
     - window=month requires year and month params.
     """
     from app.request_tracker import request_tracker
-    from app.auth.database import get_usage_earliest_date, get_usage_timeseries
+    from app.auth.database import (
+        get_usage_by_user_and_model, get_usage_earliest_date, get_usage_timeseries,
+    )
+    from app.routes.pools import pool_membership_map
     await request_tracker.flush_pending()
+
+    # Pool drill-down: the members' own per-user split, scoped to one pool.
+    #
+    # Built from the same two primitives build_pool_usage folds rather than by calling
+    # it, because that function returns per_model / per_group / per_member_per_model
+    # too — the full user x model cross product, all of which would be discarded here —
+    # and it flushes and resolves the group tables to do it. Its drill-down path also
+    # 403s on non-membership, which is not the right answer for an admin.
+    if view == "pool":
+        pool_id = _parse_pool_id(id)
+        membership = await pool_membership_map(db)
+        if pool_id not in membership:
+            raise HTTPException(status_code=404, detail="Pool not found")
+        pool = membership[pool_id]
+        identities = pool["members"]
+
+        cross = await get_usage_by_user_and_model(
+            db, identities, window=window, year=year, month=month,
+        )
+        folded: dict = {}
+        for r in cross:
+            name = r["user_identity"]
+            prev = folded.get(name)
+            folded[name] = (r["user_type"], (prev[1] if prev else 0) + r["request_count"])
+
+        # Zero-filled from the membership map, so every member of the pool shows up even
+        # with no traffic in this window — an absent row reads as "not in the pool".
+        breakdown = [
+            {
+                "user_identity": name,
+                "user_type": folded.get(name, (None, 0))[0],
+                "request_count": folded.get(name, (None, 0))[1],
+            }
+            for name in identities
+        ]
+        breakdown.sort(key=lambda r: (-r["request_count"], r["user_identity"]))
+
+        return {
+            "window": window,
+            "pool": {"id": pool_id, "name": pool["name"], "member_count": len(identities)},
+            "breakdown": breakdown,
+            "timeseries": await get_usage_timeseries(
+                db, window=window, year=year, month=month, restrict_users=identities,
+            ),
+            "earliest_date": await get_usage_earliest_date(db),
+        }
 
     filter_user: Optional[str] = None
     filter_model: Optional[str] = None
@@ -2990,31 +3057,93 @@ async def get_usage(
         month=month,
     )
     result["earliest_date"] = await get_usage_earliest_date(db)
+
+    # Pools are a third axis over the same traffic, so per_pool rides along in the same
+    # payload as per_user / per_model and the By Pool toggle costs no extra request. It
+    # is a pure fold of the per_user rows already in `result` through the membership
+    # map, so the only added cost is that one membership query.
+    if view is None:
+        membership = await pool_membership_map(db)
+        pool_of = {
+            name: pool_id
+            for pool_id, pool in membership.items()
+            for name in pool["members"]
+        }
+        counts = {pool_id: 0 for pool_id in membership}
+        for row in result.get("per_user", []):
+            pool_id = pool_of.get(row["user_identity"])
+            if pool_id is not None:
+                # Accumulated, not assigned: get_usage_aggregates groups by
+                # (user_identity, user_type), so one username can arrive on two rows.
+                counts[pool_id] += row["request_count"]
+
+        result["per_pool"] = sorted(
+            (
+                {
+                    "pool_id": pool_id,
+                    "name": pool["name"],
+                    "member_count": len(pool["members"]),
+                    # Carried so the delete confirm can name who it is about to purge.
+                    # Bounded by MAX_POOL_MEMBERS (25), so this is a handful of strings.
+                    "members": pool["members"],
+                    "request_count": counts[pool_id],
+                }
+                for pool_id, pool in membership.items()
+            ),
+            key=lambda p: (-p["request_count"], p["name"]),
+        )
+
     return result
+
+
+def _parse_pool_id(raw: Optional[str]) -> int:
+    """Pool ids arrive as strings on a query string shared with user/model identities."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="id must be a pool id when view=pool")
 
 
 @router.delete("/usage")
 async def delete_usage(
-    view: str = Query(..., description="'user' or 'model'"),
-    id: str = Query(..., description="Identity value to purge"),
+    view: str = Query(..., description="'user', 'model' or 'pool'"),
+    id: str = Query(..., description="Identity value, or pool id when view=pool"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete all usage data, for all time, for one user or one model.
+    """Delete all usage data, for all time, for one user, one model or a whole pool.
 
     Removes the rows from the hourly, daily and monthly tables together — leaving any
     of them behind would make the data reappear as soon as the time window changes.
+
+    view=pool expands to its members and runs the per-user purge for each of them inside
+    the one flush boundary; a flush landing between two members would write pre-purge
+    counts straight back.
 
     The identity is passed as a query parameter rather than a path segment because
     model ids contain slashes (e.g. 'openai/gpt-4o').
     """
     from app.request_tracker import request_tracker
     from app.rate_limit import rate_limit_tracker
+    from app.routes.pools import pool_membership_map, resettle_after_usage_purge
 
-    if view not in ("user", "model"):
-        raise HTTPException(status_code=400, detail="view must be 'user' or 'model'")
+    if view not in ("user", "model", "pool"):
+        raise HTTPException(status_code=400, detail="view must be 'user', 'model' or 'pool'")
     if not id or not id.strip():
         raise HTTPException(status_code=400, detail="id is required")
+
+    # One purge per member for a pool, one for the identity itself otherwise. Members
+    # are disjoint by identity, so counting and deleting them in turn is safe.
+    members: List[str] = []
+    if view == "pool":
+        pool_id = _parse_pool_id(id)
+        membership = await pool_membership_map(db)
+        if pool_id not in membership:
+            raise HTTPException(status_code=404, detail="Pool not found")
+        members = membership[pool_id]["members"]
+        targets = [("user", name) for name in members]
+    else:
+        targets = [(view, id)]
 
     # The purge spans both places usage lives — the DB rows and the counts still
     # buffered in the tracker — so the flush is held off across the whole sequence.
@@ -3024,12 +3153,16 @@ async def delete_usage(
         # Drain the buffer first so counts recorded in the last minute are deleted too.
         await request_tracker.flush_pending()
 
+        total = 0
+        deleted: dict = {}
         try:
-            # Counted before the delete: this is the request count the admin saw in
-            # the table, not the number of rows, which is spread over three tables
-            # holding the same traffic at different granularities.
-            total = await count_usage_requests(db, view, id)
-            deleted = await delete_usage_records(db, view, id)
+            for t_view, t_id in targets:
+                # Counted before the delete: this is the request count the admin saw in
+                # the table, not the number of rows, which is spread over three tables
+                # holding the same traffic at different granularities.
+                total += await count_usage_requests(db, t_view, t_id)
+                for table, n in (await delete_usage_records(db, t_view, t_id)).items():
+                    deleted[table] = deleted.get(table, 0) + n
             await db.commit()
         except Exception as e:
             await db.rollback()
@@ -3038,16 +3171,117 @@ async def delete_usage(
 
         # Anything buffered between the flush and the commit would otherwise flush
         # back into the tables we just cleared.
-        dropped = await request_tracker.drop_buffered_usage(view, id)
+        dropped = 0
+        for t_view, t_id in targets:
+            dropped += await request_tracker.drop_buffered_usage(t_view, t_id)
+
+        # Strictly after the drop above: settle_pool flushes the tracker itself, so
+        # running it first would write those buffered counts back to the DB, where
+        # drop_buffered_usage can no longer reach them.
+        if view == "user":
+            # A pooled user's ledger charges them for traffic that no longer exists.
+            # Pre-existing gap, fixed here rather than only on the new pool path.
+            await resettle_after_usage_purge(db, [id])
+        elif view == "pool":
+            await resettle_after_usage_purge(db, members)
 
     # RPD is a COUNT over today's rows, and the counts are cached per identity.
-    if view == "user":
-        rate_limit_tracker.invalidate_identity(id)
-    else:
+    # resettle_after_usage_purge already invalidated and re-snapshotted the pool paths.
+    if view == "model":
+        # The same settlement staleness exists here in principle, but a model's traffic
+        # spans an unbounded set of pools; dropping every RPD count is the accepted
+        # answer, and the numbers converge on the next settle.
         rate_limit_tracker.invalidate_all_rpd()
+    elif view == "user":
+        rate_limit_tracker.invalidate_identity(id)
 
     logger.info(
         f"Admin '{current_admin.username}' deleted usage for {view} '{id}': "
         f"{deleted} (+{dropped} buffered requests dropped)"
     )
-    return {"deleted": deleted, "total": total}
+    return {"deleted": deleted, "total": total, "members": members}
+
+
+# =========================================================================== #
+# Request pools — read-only visibility plus two force actions
+#
+# Everything a pool member can see about their own pool, an admin can see about
+# every pool. The payloads come from app/routes/pools.py so the admin's picture
+# cannot drift from the members'; only the authorization step differs.
+# =========================================================================== #
+
+
+@router.get("/pools", response_model=List[AdminPoolResponse])
+async def admin_get_pools(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every pool with its owner, members, and per-tier limit / used / charged / carry."""
+    from app.routes.pools import admin_list_pools
+    try:
+        return await admin_list_pools(db)
+    except Exception as e:
+        logger.error(f"Admin pool listing failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load pools")
+
+
+@router.get("/pools/usage")
+async def admin_get_pool_usage(
+    pool_id: int = Query(..., description="Pool ID"),
+    window: str = Query("30d", pattern="^(24h|today|yesterday|7d|30d|month|all)$"),
+    view: Optional[str] = Query(None, pattern="^(user|model|group)$"),
+    id: Optional[str] = Query(None),
+    year: Optional[int] = Query(None),
+    month: Optional[int] = Query(None),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The same payload a member sees, for any pool. The admin skips the membership check."""
+    from app.routes.pools import build_pool_usage
+    try:
+        return await build_pool_usage(
+            db, pool_id, window=window, view=view, target=id, year=year, month=month,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin pool usage read failed for pool {pool_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load pool usage")
+
+
+@router.delete("/pools")
+async def admin_delete_pool_endpoint(
+    pool_id: int = Query(..., description="Pool ID to delete"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Settle every member, then force-delete the pool."""
+    from app.routes.pools import admin_delete_pool
+    try:
+        name = await admin_delete_pool(db, pool_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin pool delete failed for pool {pool_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to delete pool")
+    logger.info(f"Admin '{current_admin.username}' deleted pool '{name}'")
+    return {"message": f"Deleted {name}"}
+
+
+@router.delete("/pools/members")
+async def admin_remove_pool_member(
+    user_id: int = Query(..., description="User ID to remove from their pool"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Settle, then force-remove a user from whatever pool they are in."""
+    from app.routes.pools import admin_remove_member
+    try:
+        username = await admin_remove_member(db, user_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin pool member removal failed for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to remove pool member")
+    logger.info(f"Admin '{current_admin.username}' removed '{username}' from their pool")
+    return {"message": f"Removed {username}"}

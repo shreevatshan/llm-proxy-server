@@ -181,6 +181,7 @@ class RequestTracker:
             from app.auth.database import (
                 flush_request_usage, flush_request_usage_hourly,
                 prune_hourly_usage, rollup_to_monthly,
+                purge_stale_pool_rows,
             )
             # The two increment-on-conflict upserts are the only ops that consume
             # the buffered counts. Run just those in the guarded block so a later
@@ -208,6 +209,7 @@ class RequestTracker:
             await prune_hourly_usage()
             if time.time() - self._last_rollup_at >= 3600:
                 await rollup_to_monthly()
+                await purge_stale_pool_rows()
                 self._last_rollup_at = time.time()
         except Exception as e:
             logger.error(f"Usage maintenance (prune/rollup) failed: {e}")
@@ -414,14 +416,32 @@ class RequestTracker:
         async with self._lock:
             self._subscribers.discard(queue)
 
-    async def get_today_count(self, user_identity: str) -> int:
+    @staticmethod
+    def _identity_set(user_identity) -> set:
+        """Normalise a single identity or a sequence of them into a set.
+
+        Request pools count several usernames against one shared daily quota, so the
+        today-count readers take either form. Accepting a bare string keeps every
+        pre-pool caller working unchanged.
+        """
+        if isinstance(user_identity, str):
+            return {user_identity}
+        return set(user_identity)
+
+    async def get_today_count(self, user_identity) -> int:
         """Return total ungrouped requests today for user_identity (buffer + DB).
+
+        `user_identity` is a username or, for a pooled user, the sequence of usernames
+        sharing the pool's quota — counted in one query rather than one per member.
 
         Requests whose model belongs to a model group, or whose instance (provider_key
         prefix) belongs to an instance group, are excluded — those are governed by the
         group's own limit and never counted against the overall quota, matching the
         auth middleware's overall-gate skip.
         """
+        identities = self._identity_set(user_identity)
+        if not identities:
+            return 0
         today = time_utils.local_today()
 
         # Grouped model_ids and provider_keys to exclude from the overall count.
@@ -443,7 +463,7 @@ class RequestTracker:
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
                 # key = (date, hour, user_identity, user_type, model, server)
-                if key[0] == today and key[2] == user_identity and not _is_grouped(key[4]):
+                if key[0] == today and key[2] in identities and not _is_grouped(key[4]):
                     buffered += count
 
         try:
@@ -454,7 +474,7 @@ class RequestTracker:
             async with AsyncSessionLocal() as db:
                 conditions = [
                     RequestUsage.date == today,
-                    RequestUsage.user_identity == user_identity,
+                    RequestUsage.user_identity.in_(identities),
                 ]
                 # Exclude grouped models (exact match) and grouped instances (prefix match).
                 exclude = []
@@ -478,9 +498,16 @@ class RequestTracker:
 
         return buffered + db_count
 
-    async def get_today_group_count(self, user_identity: str, model_ids: list) -> int:
-        """Return total requests today across all model_ids in a group (buffer + DB)."""
+    async def get_today_group_count(self, user_identity, model_ids: list) -> int:
+        """Return total requests today across all model_ids in a group (buffer + DB).
+
+        `user_identity` is a username or, for a pooled user, the sequence of usernames
+        sharing the pool's quota.
+        """
         if not model_ids:
+            return 0
+        identities = self._identity_set(user_identity)
+        if not identities:
             return 0
         today = time_utils.local_today()
         model_set = set(model_ids)
@@ -488,7 +515,7 @@ class RequestTracker:
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
                 # key = (date, hour, user_identity, user_type, model, server)
-                if key[0] == today and key[2] == user_identity and key[4] in model_set:
+                if key[0] == today and key[2] in identities and key[4] in model_set:
                     buffered += count
 
         try:
@@ -500,7 +527,7 @@ class RequestTracker:
                 result = await db.execute(
                     select(func.sum(RequestUsage.request_count)).where(
                         RequestUsage.date == today,
-                        RequestUsage.user_identity == user_identity,
+                        RequestUsage.user_identity.in_(identities),
                         RequestUsage.model.in_(model_ids),
                     )
                 )
@@ -514,14 +541,20 @@ class RequestTracker:
 
         return buffered + db_count
 
-    async def get_today_instance_group_count(self, user_identity: str, provider_keys: list) -> int:
+    async def get_today_instance_group_count(self, user_identity, provider_keys: list) -> int:
         """Return total requests today across all instances (provider_keys) in a group (buffer + DB).
 
         Instance membership matches the stored full model id by prefix: a model id is
         '{provider_key}/{model_name}', so membership is tested against the part before
         the first '/'.
+
+        `user_identity` is a username or, for a pooled user, the sequence of usernames
+        sharing the pool's quota.
         """
         if not provider_keys:
+            return 0
+        identities = self._identity_set(user_identity)
+        if not identities:
             return 0
         today = time_utils.local_today()
         pk_set = set(provider_keys)
@@ -530,7 +563,7 @@ class RequestTracker:
             for key, count in self._usage_buffer.items():
                 # key = (date, hour, user_identity, user_type, model, server)
                 model = key[4]
-                if key[0] == today and key[2] == user_identity and model:
+                if key[0] == today and key[2] in identities and model:
                     prefix = model.split('/', 1)[0] if '/' in model else model
                     if prefix in pk_set:
                         buffered += count
@@ -547,7 +580,7 @@ class RequestTracker:
                 result = await db.execute(
                     select(func.sum(RequestUsage.request_count)).where(
                         RequestUsage.date == today,
-                        RequestUsage.user_identity == user_identity,
+                        RequestUsage.user_identity.in_(identities),
                         or_(*conditions),
                     )
                 )

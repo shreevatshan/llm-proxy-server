@@ -42,7 +42,12 @@ from app.anthropic_models import (
     ANTHROPIC_SDK_TIMEOUT_SECONDS,
     build_anthropic_sdk_kwargs,
     is_anthropic_terminal_stream_event,
-    is_claude_at_least,
+)
+from app.model_capabilities import (
+    SURFACE_NATIVE,
+    normalize_thinking,
+    scrub as scrub_unsupported_params,
+    warn_if_version_unparseable,
 )
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
 from app.conversion.anthropic_openai import _is_codex_model
@@ -167,6 +172,21 @@ class AzureProvider(OpenAICompatibleProvider):
         self.client = self._v1_client
         if self.azure_backend == "foundry":
             self._init_foundry_anthropic_client()
+            self._warn_unparseable_anthropic_deployments()
+
+    def _warn_unparseable_anthropic_deployments(self) -> None:
+        """Flag Claude deployments whose name hides the model version.
+
+        Per-model parameter restrictions are keyed off the version parsed out of
+        the model string, which on Foundry is the operator-chosen deployment
+        name. A deployment named "opus5-prod" matches no rule, so the params the
+        model rejects are forwarded and every request 400s. Warn at startup
+        rather than leaving it to be diagnosed per request.
+        """
+        for deployment in self.anthropic_deployments or []:
+            warn_if_version_unparseable(
+                deployment, f"Azure Foundry provider {self.full_provider_name}"
+            )
 
     def _init_foundry_anthropic_client(self) -> None:
         try:
@@ -333,11 +353,22 @@ class AzureProvider(OpenAICompatibleProvider):
         payload["stream"] = stream
         dropped_fields: List[str] = []
 
-        # Claude >= 4.7 deprecated top_p; forwarding it triggers a
-        # "top_p is deprecated for this model" error.
-        if payload.get("top_p") is not None and is_claude_at_least(payload["model"], 4, 7):
-            payload.pop("top_p", None)
-            dropped_fields.append("top_p")
+        # Drop the sampling params this model rejects (e.g. "top_p is deprecated
+        # for this model"); see app.model_capabilities for the table.
+        dropped_fields.extend(
+            scrub_unsupported_params(payload, payload["model"], SURFACE_NATIVE)
+        )
+
+        # Assign unconditionally: normalize_thinking also reshapes configs that
+        # drop nothing (an "enabled" with no budget still has to become
+        # "adaptive"), so gating the write-back on thinking_dropped would leave
+        # type="enabled" on the wire and 400.
+        if payload.get("thinking") is not None:
+            thinking, thinking_dropped = normalize_thinking(
+                payload["thinking"], payload["model"]
+            )
+            payload["thinking"] = thinking
+            dropped_fields.extend(thinking_dropped)
 
         if self._strip_cache_control_scope(payload.get("system")):
             dropped_fields.append("system.cache_control.scope")

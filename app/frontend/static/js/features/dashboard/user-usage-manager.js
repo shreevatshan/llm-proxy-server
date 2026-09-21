@@ -1,7 +1,16 @@
 /**
- * User Usage Manager — per-user usage view
- * Displays the authenticated user's request counts by model over selectable time windows.
- * Mirrors admin UsageManager but simplified: no per-user drill-down, no year picker.
+ * User Usage Manager — the Usage tab.
+ *
+ * Owns two panels and the toggle between them. "My usage" is this manager's own
+ * view: the caller's request counts by model over selectable time windows
+ * (mirrors admin UsageManager, minus the per-user drill-down and year picker).
+ * "Pool usage" is PoolManager's panel, which lives in this tab but is rendered
+ * and fetched entirely by PoolManager — this manager only shows it, hides it,
+ * and makes sure it has loaded.
+ *
+ * The two panels keep separate windows on purpose (30d here, today there): the
+ * question "what did I send this month" and "what is the pool burning today" are
+ * asked at different cadences, and forcing one picker on both answers neither.
  */
 
 class UserUsageManager {
@@ -13,10 +22,25 @@ class UserUsageManager {
         this._tabIsActive = false;
         this._chart = null; // Chart.js instance for the usage timeseries graph
 
+        // Which panel the tab is showing: 'my' (this manager) | 'pool' (PoolManager).
+        this._scope = 'my';
+
         // Window state
         this._window = '30d';   // active window key
         this._year = null;      // set when _window === 'month'
         this._month = null;
+
+        // Both sliding tracks are fluid and their indicators are positioned in pixels,
+        // so a resize would leave them behind their buttons. (PoolManager re-places its
+        // own two the same way.)
+        let raf = 0;
+        window.addEventListener('resize', () => {
+            cancelAnimationFrame(raf);
+            raf = requestAnimationFrame(() => {
+                this._positionScopeIndicator();
+                this._positionIndicator(this._window);
+            });
+        });
     }
 
     // ------------------------------------------------------------------ //
@@ -33,6 +57,62 @@ class UserUsageManager {
     stopAutoRefresh() {
         this._tabIsActive = false;
         this._clearTimer('stopped');
+    }
+
+    // ------------------------------------------------------------------ //
+    // Scope selector — my usage vs pool usage
+    // ------------------------------------------------------------------ //
+
+    /**
+     * Show one of the two panels. Idempotent, so the showTab wrapper can call it
+     * on every open to re-measure the sliding indicators: a hidden tab measures
+     * offsetWidth 0, and neither pill can be placed until its panel is visible.
+     */
+    setScope(scope) {
+        this._scope = scope === 'pool' ? 'pool' : 'my';
+
+        document.querySelectorAll('#usageScopeSwitch .pool-view-btn').forEach(b => {
+            const on = b.dataset.scope === this._scope;
+            b.classList.toggle('is-active', on);
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        });
+
+        const myPanel = document.getElementById('usageMyPanel');
+        const poolPanel = document.getElementById('usagePoolPanel');
+        if (myPanel) myPanel.style.display = this._scope === 'my' ? '' : 'none';
+        if (poolPanel) poolPanel.style.display = this._scope === 'pool' ? '' : 'none';
+
+        if (this._scope === 'my') {
+            if (!this._cache || this._loadError) {
+                this.load().catch(err => console.error('[UserUsageManager] load failed:', err));
+            } else {
+                this._tabIsActive = true;
+                this._startRefreshIfLive();
+            }
+            requestAnimationFrame(() => {
+                this._positionScopeIndicator();
+                this._positionIndicator(this._window);
+            });
+        } else {
+            // Only one panel is on screen, so only one of them should be polling.
+            this.stopAutoRefresh();
+            const mgr = window.PoolManager;
+            if (mgr && (!mgr._cache || mgr._loadError)) {
+                mgr.load().catch(err => console.error('[UserUsageManager] pool load failed:', err));
+            }
+            requestAnimationFrame(() => {
+                this._positionScopeIndicator();
+                mgr?._positionIndicator();
+            });
+        }
+    }
+
+    _positionScopeIndicator() {
+        const track = document.getElementById('usageScopeSwitch');
+        const active = track?.querySelector(`[data-scope="${this._scope}"]`);
+        if (!track || !active || !active.offsetWidth) return;
+        track.style.setProperty('--tw-x', `${active.offsetLeft}px`);
+        track.style.setProperty('--tw-w', `${active.offsetWidth}px`);
     }
 
     // ------------------------------------------------------------------ //
@@ -264,7 +344,11 @@ class UserUsageManager {
     }
 
     _positionIndicator(activeKey) {
-        const activeBtn = document.querySelector(`[data-window="${activeKey}"]`);
+        // Scoped to this panel's picker: the pool panel's window buttons now live in
+        // the same tab and carry the same data-window keys, so a document-wide lookup
+        // would measure this pill against whichever picker comes first in the DOM.
+        const scope = document.getElementById('usage-window-container');
+        const activeBtn = scope?.querySelector(`[data-window="${activeKey}"]`);
         const indicator = document.getElementById('usage-window-indicator');
         const container = document.getElementById('usage-window-btns');
 
@@ -295,11 +379,15 @@ document.addEventListener('DOMContentLoaded', function () {
     const originalShowTab = window.showTab;
     window.showTab = function(tabName) {
         originalShowTab(tabName);
+        const mgr = window.UserUsageManager;
         if (tabName === 'usage') {
-            const mgr = window.UserUsageManager;
-            if (!mgr._cache || mgr._loadError) {
-                mgr.load().catch(err => console.error('Failed to load usage:', err));
-            }
+            // setScope re-applies the current scope: it loads whichever panel is
+            // showing if it hasn't loaded, and re-measures both pills now that the
+            // tab is visible. ui-utils.js only stops the admin UsageManager, so the
+            // 24h/today poller is stopped here instead of running in a hidden tab.
+            mgr.setScope(mgr._scope);
+        } else {
+            mgr.stopAutoRefresh();
         }
     };
 });
