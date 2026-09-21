@@ -49,7 +49,7 @@ from app.providers.openai_compatible import preserve_upstream_model
 from app.providers.azure_provider import azure_call_style, azure_api_version
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
-from app.auth.database import get_api_key, AsyncSessionLocal
+from app.auth.database import get_api_key, get_user_by_id, AsyncSessionLocal
 from app.auth.cache import auth_cache
 from app.auth.middleware import get_owner_user_id, verify_response_ownership
 from app.providers.base import ProviderHTTPError
@@ -121,15 +121,27 @@ async def _authenticate_azure(
         return cached
 
     # Slow-path: look up in the database
+    owner_username = None
     async with AsyncSessionLocal() as db:
         api_key_obj = await get_api_key(db, token)
+        if api_key_obj:
+            owner = await get_user_by_id(db, api_key_obj.user_id)
+            owner_username = owner.username if owner else None
     if api_key_obj:
-        cached_key = auth_cache.cache_api_key(token, api_key_obj)
+        # Cache with the owner's username, mirroring authenticate_jwt_or_api_key.
+        # cache_api_key() replaces the entry outright rather than updating it, so
+        # omitting the username here would wipe the one the /v1 path stored and
+        # leave *both* surfaces reporting "key:<id>" for the rest of the TTL.
+        cached_key = auth_cache.cache_api_key(token, api_key_obj, username=owner_username)
         auth_cache.mark_api_key_used(token)
         from app.auth.middleware import _update_tracking_identity, _enforce_rate_limit
         await _update_tracking_identity(request, cached_key)
         await _enforce_rate_limit(request, cached_key, envelope_override="azure")
-        return api_key_obj
+        # Return the *cached* object, not the ORM row: enforce_group_rate_limit
+        # derives its own identity from what we return here, and APIKey has no
+        # username column, so returning api_key_obj would make the group limiter
+        # query "key:<id>" while the rest of the request uses the username.
+        return cached_key
 
     raise HTTPException(
         status_code=401,

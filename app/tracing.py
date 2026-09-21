@@ -10,10 +10,15 @@ imported BEFORE any OpenTelemetry instrumentation libraries. See run.py.
 """
 
 import os
+from contextvars import ContextVar
 from typing import Optional, Union
 from opentelemetry import trace
 from pydantic import BaseModel
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+try:
+    from opentelemetry.semconv._incubating.attributes.user_attributes import USER_ID
+except ImportError:  # _incubating moves between 0.xxbN releases; this module
+    USER_ID = "user.id"  # is imported unconditionally, even with tracing off
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from opentelemetry.propagate import set_global_textmap
@@ -39,6 +44,144 @@ def get_tracer() -> trace.Tracer:
     return tracer
 
 
+# ---------------------------------------------------------------------------
+# user.id span attribute
+# ---------------------------------------------------------------------------
+#
+# Traceloop's instrumentation creates the LLM spans (openai.chat,
+# anthropic.messages, bedrock) deep inside the provider call and fills them with
+# the gen_ai.* token usage. Nothing in the route layer can reach those spans --
+# chat_completion_request is their *parent*, and OTel attributes do not inherit
+# downward. The only hook is SpanProcessor.on_start, which runs as each span is
+# created and can still mutate it (a span refuses set_attribute only after
+# _end_time is set).
+
+# The identity is carried in a *mutable dict*, not a plain string, on purpose.
+# Starlette's BaseHTTPMiddleware runs routing, the dependencies, the endpoint and
+# the response body iteration in one inner task spawned via task_group.start_soon(),
+# which COPIES the contextvars context. A plain ContextVar.set() inside the auth
+# dependency therefore never flows back out to the middleware task, and the spans
+# created there -- the ASGI "http send" spans and end_request()'s DB work in
+# tracking_iterator (app/main.py) -- would miss the attribute. Handing the inner
+# task a dict that the outer task created and mutating it in place makes the value
+# visible in both directions, because the object is shared by reference across the
+# context copy.
+trace_identity: ContextVar[Optional[dict]] = ContextVar("trace_identity", default=None)
+
+
+def begin_trace_identity(server_span: Optional[trace.Span] = None) -> None:
+    """Start a fresh identity holder for this request.
+
+    Called from the outermost request middleware, before authentication has run.
+    ``server_span`` is the FastAPI HTTP span, kept so set_trace_user() can backfill
+    it: it was started before the username was known, so on_start already fired for
+    it with an empty holder.
+    """
+    trace_identity.set({"server_span": server_span})
+
+
+def set_trace_user(username: str) -> None:
+    """Record the authenticated username for the rest of this request's spans.
+
+    Every span started from here on gets ``user.id`` via UserIdSpanProcessor. The
+    two spans that were already open when authentication finished -- the HTTP
+    server span and the auth span -- are backfilled directly.
+
+    Note the deliberate divergence from the semantic conventions: ``user.id`` is
+    specified as the *unique* identifier and ``user.name`` as the login name, but
+    this proxy reports the username in ``user.id``. The numeric id remains
+    available as ``auth.user_id`` on the auth span, so the two attributes carry
+    different values by design.
+    """
+    try:
+        if not username:
+            return
+
+        holder = trace_identity.get()
+        if holder is None:
+            # No tracking middleware on this app (e.g. the management server).
+            # A fresh holder still covers everything started inward from here.
+            holder = {}
+            trace_identity.set(holder)
+        holder["id"] = username
+
+        # Backfill the spans that started before the username was known.
+        backfilled = set()
+        for span in (holder.get("server_span"), trace.get_current_span()):
+            # On the Azure path _authenticate_azure creates no auth span, so
+            # get_current_span() *is* the server span -- don't set it twice.
+            if span is None or id(span) in backfilled:
+                continue
+            backfilled.add(id(span))
+            if span.is_recording():
+                span.set_attribute(USER_ID, username)
+    except Exception:  # noqa: BLE001 - tracing must never fail a request
+        logger.debug("set_trace_user failed", exc_info=True)
+
+
+class UserIdSpanProcessor(SpanProcessor):
+    """Stamps ``user.id`` onto every span in an authenticated request.
+
+    on_start is the only place this can happen: it runs while the span is still
+    mutable, so traceloop fills in the gen_ai.* usage attributes afterwards and
+    both land on the same span.
+
+    The body MUST NOT raise. SynchronousMultiSpanProcessor.on_start fans out to
+    the registered processors with no try/except of its own, so an exception here
+    propagates out of Span.start() and fails the call that was creating the span --
+    i.e. the LLM request itself.
+
+    Re-entering the span's lock is safe: Span.start() releases self._lock before
+    dispatching to on_start (opentelemetry/sdk/trace/__init__.py:967-977), and
+    set_attribute re-acquires it. If upstream ever moved that dispatch inside the
+    `with self._lock` block this would deadlock.
+
+    This runs off the event loop thread too -- Bedrock's boto3 calls go through
+    run_in_threadpool and SQLAlchemy's async work runs in a greenlet, both of
+    which carry the context across. Keep it allocation-light and free of I/O.
+    """
+
+    def on_start(self, span, parent_context=None) -> None:
+        try:
+            holder = trace_identity.get()
+            if holder:
+                username = holder.get("id")
+                if username is not None:
+                    span.set_attribute(USER_ID, username)
+        except Exception:  # noqa: BLE001 - see the docstring; must never raise
+            pass
+
+
+_user_id_processor_registered = False
+
+
+def _register_user_id_processor() -> None:
+    """Attach UserIdSpanProcessor to the TracerProvider OpenLit/Traceloop set up.
+
+    Must run *after* Traceloop.init(). Passing our processor to Traceloop.init via
+    its ``processor=`` argument would replace its default exporting processor
+    instead of joining it, which would silently stop OTLP export.
+    """
+    global _user_id_processor_registered
+    if _user_id_processor_registered:
+        return
+
+    provider = trace.get_tracer_provider()
+    if not hasattr(provider, "add_span_processor"):
+        # Traceloop.init() never ran (no OTEL_EXPORTER_OTLP_ENDPOINT) or was
+        # short-circuited, so the global provider is still a ProxyTracerProvider.
+        # Warn rather than pass silently: otherwise the feature disappears with
+        # no signal at all.
+        logger.warning(
+            "TracerProvider does not support span processors; user.id attribute disabled"
+        )
+        return
+
+    provider.add_span_processor(UserIdSpanProcessor())
+    _user_id_processor_registered = True
+    logger.info("user.id span processor registered")
+
+
 def init_tracing() -> None:
     """
     Initialize OpenTelemetry tracing utilities.
@@ -58,7 +201,11 @@ def init_tracing() -> None:
     # Get tracer from the existing TracerProvider (set up by OpenLit)
     global tracer
     tracer = trace.get_tracer(__name__)
-    
+
+    # Stamp user.id onto every span, including the LLM spans that traceloop's
+    # instrumentation creates and fills with gen_ai.* usage.
+    _register_user_id_processor()
+
     logger.info("OpenTelemetry tracing utilities initialized (using OpenLit TracerProvider)")
 
 

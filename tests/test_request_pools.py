@@ -342,6 +342,32 @@ class PoolUserDeletionTests(PoolTestCase):
             select(RequestPool).where(RequestPool.id == pool.id)
         )).scalar_one_or_none())
 
+    async def test_self_service_delete_settles_the_pool_too(self):
+        """The endpoint a user reaches, not just the sequence _delete performs by hand.
+
+        Every test above drives the two steps directly, so they pass whether or not a
+        given delete path actually calls them -- which is how DELETE /account came to
+        skip settlement entirely. This one goes through the route.
+        """
+        from app.auth.models import AccountDelete
+        from app.routes import auth as auth_routes
+
+        alice = await self.make_user("alice", rpd_limit=100)
+        bob = await self.make_user("bob", rpd_limit=100)
+        await self.make_pool("team", alice, [bob])
+        self.assertEqual(
+            (await self.tracker.get_user_status(alice.id, "alice")).rpd_limit, 200,
+        )
+
+        await auth_routes.delete_account(
+            AccountDelete(confirmation="DELETE"), bob, None, self.db,
+        )
+
+        after = await self.tracker.get_user_status(alice.id, "alice")
+        self.assertEqual(after.rpd_limit, 100,
+                         "bob's share must leave with him, exactly as an admin delete "
+                         "or a voluntary leave would take it")
+
 
 class DirectoryTests(PoolTestCase):
     """The Invite pane's people list.

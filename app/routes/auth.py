@@ -495,6 +495,15 @@ async def delete_account(
         )
 
     try:
+        # The FK cascade drops the pool membership silently, so the pool's interval has
+        # to be closed explicitly first — otherwise the remaining members keep the
+        # departed user's limit-share as free headroom for the rest of the day. Same two
+        # steps, and the same ordering, as the admin delete endpoints: settle inside the
+        # delete's transaction, invalidate the tracker only once it has committed, since
+        # a refresh before that would read the membership row straight back.
+        from app.routes.pools import invalidate_after_user_delete, settle_before_user_delete
+        pool_id, pooled_usernames = await settle_before_user_delete(db, current_user.id)
+
         success = await permanently_delete_user(db, current_user.id)
 
         if not success:
@@ -502,6 +511,8 @@ async def delete_account(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
+
+        await invalidate_after_user_delete(pool_id, pooled_usernames)
 
         # Clear authentication cookie
         if response:

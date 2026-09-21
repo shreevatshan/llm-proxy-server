@@ -18,9 +18,11 @@ from sqlalchemy.orm import sessionmaker
 
 from app import time_utils
 from app.auth import database
-from app.auth.database import rename_usage_identity, update_user_profile
+from app.auth.database import (
+    migrate_api_key_usage_identities, rename_usage_identity, update_user_profile,
+)
 from app.auth.models import (
-    Base, RequestUsage, RequestUsageHourly, RequestUsageMonthly, User,
+    APIKey, Base, RequestUsage, RequestUsageHourly, RequestUsageMonthly, User,
 )
 from app.request_tracker import ActiveRequest, RequestTracker
 
@@ -412,6 +414,76 @@ class RateLimitInvalidateIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn((old, 2), tracker._instance_group_rpd_cache)
         self.assertIn(bystander, tracker._rpd_cache)
         self.assertIn((bystander, 1), tracker._group_rpd_cache)
+
+
+class ApiKeyUsageIdentityMigrationTests(UsageDBTestCase):
+    """Exercises the startup migration that folds "key:<id>" rows onto usernames.
+
+    Azure requests used to be recorded under the API key id because the key was
+    cached without its owner's username, splitting one person's history — and
+    their daily quota — across two buckets.
+    """
+
+    async def _seed_key(self, key_id, username, *, user_id=None):
+        user_id = user_id if user_id is not None else key_id
+        self.db.add_all([
+            User(id=user_id, username=username, email=f"{username}@example.com"),
+            APIKey(id=key_id, user_id=user_id, api_key=f"hash{key_id}", name="k"),
+        ])
+        await self.db.commit()
+
+    async def test_moves_rows_onto_the_owner_username(self):
+        await self._seed_key(7, "alice")
+        await self._seed("key:7", 5, user_type="api_key")
+
+        moved = await migrate_api_key_usage_identities(self.db)
+        await self.db.commit()
+
+        self.assertTrue(moved)
+        await self._assert_moved("key:7", "alice", 5)
+
+    async def test_merges_into_existing_username_rows(self):
+        """The user already has traffic from the other surfaces; sum, don't collide."""
+        await self._seed_key(7, "alice")
+        await self._seed("alice", 4)
+        await self._seed("key:7", 5, user_type="api_key")
+
+        await migrate_api_key_usage_identities(self.db)
+        await self.db.commit()
+
+        await self._assert_moved("key:7", "alice", 9)
+
+    async def test_is_idempotent(self):
+        await self._seed_key(7, "alice")
+        await self._seed("key:7", 5, user_type="api_key")
+
+        await migrate_api_key_usage_identities(self.db)
+        await self.db.commit()
+        second = await migrate_api_key_usage_identities(self.db)
+        await self.db.commit()
+
+        self.assertEqual(second, {})
+        await self._assert_moved("key:7", "alice", 5)
+
+    async def test_orphaned_key_rows_are_left_alone(self):
+        """No key 99 in the database — don't guess at an owner."""
+        await self._seed("key:99", 3, user_type="api_key")
+
+        moved = await migrate_api_key_usage_identities(self.db)
+        await self.db.commit()
+
+        self.assertEqual(moved, {})
+        self.assertEqual(await self._rows(RequestUsage, "key:99"), (1, 3))
+
+    async def test_other_identities_are_untouched(self):
+        await self._seed_key(7, "alice")
+        await self._seed("key:7", 5, user_type="api_key")
+        await self._seed("bystander", 2)
+
+        await migrate_api_key_usage_identities(self.db)
+        await self.db.commit()
+
+        self.assertEqual(await self._rows(RequestUsage, "bystander"), (1, 2))
 
 
 if __name__ == "__main__":

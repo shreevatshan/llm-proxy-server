@@ -36,7 +36,8 @@ from app.tracing import (
     instrument_database,
     create_span,
     add_span_attributes,
-    set_span_error
+    set_span_error,
+    begin_trace_identity
 )
 
 logger = logging.getLogger(__name__)
@@ -326,6 +327,17 @@ def _add_request_tracking(app: FastAPI, server_name: str):
         # alias block below but still call apply_alias() inside their handlers.
         from app.model_alias import current_api_surface
         current_api_surface.set(server_name)
+
+        # Open the request's identity holder here, in the *outer* middleware task,
+        # before the _TRACKED_PREFIXES gate below and long before auth has run.
+        # The auth dependency mutates this same dict from the inner task, which is
+        # what makes the username visible to spans started on both sides of that
+        # boundary. The FastAPI server span is captured so it can be backfilled:
+        # it started before the username existed. It is reliably the current span
+        # here because FastAPIInstrumentor wraps the entire user middleware stack
+        # rather than registering a middleware of its own.
+        from opentelemetry import trace as _trace
+        begin_trace_identity(_trace.get_current_span())
 
         path = request.url.path
         if not any(path.startswith(p) for p in _TRACKED_PREFIXES):
@@ -647,6 +659,42 @@ def create_azure_openai_app() -> FastAPI:
     )
 
     _add_cors(azure_openai_app)
+
+    # Registered before _add_request_tracking on purpose. add_middleware inserts at
+    # index 0, so the LAST middleware registered is the OUTERMOST -- and the tracking
+    # middleware has to stay outside every other BaseHTTPMiddleware on this app. Each
+    # of those spawns its own task for the downstream call, and a task *outside* the
+    # tracking middleware only ever sees a pre-begin_trace_identity() copy of the
+    # context, so spans it creates -- the ASGI "http send" spans among them -- would
+    # miss user.id. tests/test_user_id_span_attribute.py pins the resulting order.
+    @azure_openai_app.middleware("http")
+    async def v1_api_middleware(request: Request, call_next):
+        """Middleware for /openai/v1/ requests on the Azure server.
+
+        Handles two v1-specific behaviors:
+        1. Sets preserve_upstream_model so model names from Azure pass through
+           untouched (e.g. "gpt-4.1-2025-04-14").
+        2. Extracts aoai-* preview feature headers and stashes them in a
+           ContextVar for the provider layer to forward to Azure.
+        """
+        if request.url.path.startswith("/openai/v1/"):
+            from app.providers.openai_compatible import (
+                preserve_upstream_model,
+                extra_request_headers,
+            )
+            preserve_upstream_model.set(True)
+
+            # Extract Azure-specific preview headers (e.g. "aoai-evals: preview")
+            preview_headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower().startswith("aoai-")
+            }
+            if preview_headers:
+                extra_request_headers.set(preview_headers)
+
+        response = await call_next(request)
+        return response
+
     _add_request_tracking(azure_openai_app, "azure_openai")
     _instrument_app(azure_openai_app, "Azure OpenAI API")
 
@@ -685,34 +733,6 @@ def create_azure_openai_app() -> FastAPI:
     azure_openai_app.include_router(images.router, prefix="/openai", tags=["azure_openai_v1"])
     azure_openai_app.include_router(audio.router, prefix="/openai", tags=["azure_openai_v1"])
     azure_openai_app.include_router(responses.router, prefix="/openai", tags=["azure_openai_v1"])
-
-    @azure_openai_app.middleware("http")
-    async def v1_api_middleware(request: Request, call_next):
-        """Middleware for /openai/v1/ requests on the Azure server.
-
-        Handles two v1-specific behaviors:
-        1. Sets preserve_upstream_model so model names from Azure pass through
-           untouched (e.g. "gpt-4.1-2025-04-14").
-        2. Extracts aoai-* preview feature headers and stashes them in a
-           ContextVar for the provider layer to forward to Azure.
-        """
-        if request.url.path.startswith("/openai/v1/"):
-            from app.providers.openai_compatible import (
-                preserve_upstream_model,
-                extra_request_headers,
-            )
-            preserve_upstream_model.set(True)
-
-            # Extract Azure-specific preview headers (e.g. "aoai-evals: preview")
-            preview_headers = {
-                k: v for k, v in request.headers.items()
-                if k.lower().startswith("aoai-")
-            }
-            if preview_headers:
-                extra_request_headers.set(preview_headers)
-
-        response = await call_next(request)
-        return response
 
     @azure_openai_app.get("/health")
     async def health_check():

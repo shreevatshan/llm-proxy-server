@@ -14,7 +14,7 @@ from app.rate_limit import RateLimitExceeded
 from app.tracing import (
     create_span, add_span_attributes, set_span_error,
     create_http_attributes, create_auth_attributes,
-    AuthAttributes
+    AuthAttributes, set_trace_user
 )
 from opentelemetry import trace
 
@@ -121,22 +121,55 @@ async def _enforce_rate_limit(
         raise RateLimitExceeded.openai(decision)
 
 
+def _resolve_identity(auth_result) -> tuple[Optional[str], Optional[str]]:
+    """Normalise an auth result to the ``(identity, kind)`` pair we report it under.
+
+    The isinstance order is load-bearing: AdminUser is checked first because its
+    ``id`` is None, so the APIKey branch would render it as "key:None". An
+    unrecognised auth object yields ``(None, None)`` and is reported nowhere.
+    """
+    if isinstance(auth_result, AdminUser):
+        return auth_result.username, "admin"
+    if isinstance(auth_result, (APIKey, CachedAPIKey)):
+        return getattr(auth_result, 'username', None) or f"key:{auth_result.id}", "api_key"
+    if isinstance(auth_result, (User, CachedUser)):
+        return auth_result.username, "user"
+    return None, None
+
+
 async def _update_tracking_identity(request: Request, auth_result) -> None:
-    """Update the request tracker with the authenticated user's identity."""
+    """Update the request tracker with the authenticated user's identity.
+
+    Doubles as the single choke point that publishes the username to the tracing
+    layer: every successful auth path in this module, plus _authenticate_azure,
+    calls this, so the OTel spans and the usage rows can never disagree.
+    """
+    try:
+        identity, kind = _resolve_identity(auth_result)
+    except Exception:
+        # Reading .username/.id can raise on a detached ORM object
+        # (DetachedInstanceError / MissingGreenlet) -- the JWT cache-miss path
+        # hands us a User whose session is already closed. Identity reporting is
+        # best-effort and must never turn a successful auth into a 500.
+        identity, kind = None, None
+
+    # Deliberately above the tracking_request_id guard: requests outside
+    # _TRACKED_PREFIXES -- notably the OpenAI routers re-mounted under /openai on
+    # the Azure port -- never get a tracking id, but they do reach providers and
+    # still need user.id on their spans. set_trace_user() swallows its own errors,
+    # so this cannot fail the request.
+    if identity is not None:
+        set_trace_user(identity)
+
     if not hasattr(request, "state") or not hasattr(request.state, "tracking_request_id"):
         return
     try:
         from app.request_tracker import request_tracker
-        from .admin import AdminUser
 
-        request_id = request.state.tracking_request_id
-        if isinstance(auth_result, AdminUser):
-            await request_tracker.update_identity(request_id, auth_result.username, "admin")
-        elif isinstance(auth_result, (APIKey, CachedAPIKey)):
-            identity = getattr(auth_result, 'username', None) or f"key:{auth_result.id}"
-            await request_tracker.update_identity(request_id, identity, "api_key")
-        elif isinstance(auth_result, (User, CachedUser)):
-            await request_tracker.update_identity(request_id, auth_result.username, "user")
+        if identity is not None:
+            await request_tracker.update_identity(
+                request.state.tracking_request_id, identity, kind
+            )
     except Exception:
         pass
 
@@ -149,95 +182,6 @@ async def get_api_key_from_request(request: Request) -> Optional[str]:
         return auth_header[7:]  # Remove "Bearer " prefix
     
     return None
-
-
-async def authenticate_api_key(
-    request: Request,
-) -> Union[APIKey, CachedAPIKey]:
-    """Authenticate request using API key."""
-    # Create initial attributes using semantic conventions
-    initial_attributes = create_http_attributes(request.method, str(request.url))
-    initial_attributes.update(create_auth_attributes("api_key", "pending"))
-    
-    with create_span(
-        "auth.authenticate_api_key",
-        kind=trace.SpanKind.INTERNAL,
-        attributes=initial_attributes
-    ) as span:
-        try:
-            api_key = await get_api_key_from_request(request)
-            
-            if not api_key:
-                add_span_attributes(span, create_auth_attributes("api_key", "missing_key"))
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="API key required. Provide it in Authorization header as 'Bearer <key>'.",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            
-            # Add masked API key to span (first 8 chars + "...")
-            masked_key = api_key[:8] + "..." if len(api_key) > 8 else "***"
-            
-            # Try to get from cache first
-            cached = auth_cache.get_cached_api_key(api_key)
-            if cached and cached.is_active and cached.user_is_active:
-                # Cache hit - mark as used (batched update) and return cached object
-                # No DB query needed - the cached object has all required attributes
-                auth_cache.mark_api_key_used(api_key)
-                
-                add_span_attributes(span, create_auth_attributes(
-                    method="api_key",
-                    result="success",
-                    api_key_prefix=masked_key,
-                    api_key_id=str(cached.id),
-                    user_id=str(cached.user_id),
-                    api_key_name=cached.name
-                ))
-                add_span_attributes(span, {"auth.cache_hit": True})
-                
-                # Return cached object directly - it's compatible with APIKey interface
-                return cached
-            
-            # Cache miss - fetch from database
-            async with AsyncSessionLocal() as db:
-                db_api_key = await get_api_key(db, api_key)
-            if not db_api_key:
-                add_span_attributes(span, create_auth_attributes(
-                    "api_key", "invalid_key", api_key_prefix=masked_key
-                ))
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Invalid API key",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-            
-            # Cache the API key for future requests
-            auth_cache.cache_api_key(api_key, db_api_key)
-            auth_cache.mark_api_key_used(api_key)
-            
-            # Add successful authentication details using semantic conventions
-            add_span_attributes(span, create_auth_attributes(
-                method="api_key",
-                result="success",
-                api_key_prefix=masked_key,
-                api_key_id=str(db_api_key.id),
-                user_id=str(db_api_key.user_id),
-                api_key_name=db_api_key.name
-            ))
-            add_span_attributes(span, {"auth.cache_hit": False})
-            
-            return db_api_key
-            
-        except HTTPException as e:
-            set_span_error(span, e)
-            raise
-        except Exception as e:
-            set_span_error(span, e)
-            add_span_attributes(span, create_auth_attributes("api_key", "error"))
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Authentication error"
-            )
 
 
 async def get_current_user_from_token(

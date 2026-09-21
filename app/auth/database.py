@@ -1873,6 +1873,61 @@ async def rename_usage_identity(db: AsyncSession, old: str, new: str) -> dict[st
     return moved
 
 
+async def migrate_api_key_usage_identities(db: AsyncSession) -> dict[str, int]:
+    """Move usage rows recorded under ``key:<id>`` onto the owning user's username.
+
+    _authenticate_azure used to cache API keys without the owner's username, so
+    Azure traffic was recorded under "key:<id>" while the same person's traffic on
+    every other surface went under their username. That is two buckets in the usage
+    tables — and since RPD is a COUNT over rows matching the *current* username,
+    two separate daily quotas. Both surfaces now report the username, so the old
+    rows are moved across to keep the history and the quota continuous.
+
+    Idempotent, and cheap when there is nothing to do: it starts by asking which
+    "key:<id>" identities still have rows, so on an already-migrated database this is
+    three empty index probes and no writes. Rows whose owning key or user has been
+    deleted are left alone rather than guessed at.
+
+    Runs in the caller's transaction and never commits, matching
+    rename_usage_identity, so the tests and the startup migration can both drive it.
+
+    Returns a {table: rows_moved} map for logging.
+    """
+    from sqlalchemy import text
+
+    stale: set[str] = set()
+    for table, _time_cols in _USAGE_IDENTITY_TABLES:
+        # A half-open range rather than LIKE 'key:%' (';' is the byte after ':'):
+        # both hit the same rows, but only the range uses the user_identity index.
+        # SQLite's default case_sensitive_like=OFF disables its LIKE-prefix
+        # optimization, and Postgres needs text_pattern_ops for it -- so LIKE would
+        # full-scan all three tables, including the monthly rollup that is retained
+        # forever, on every startup.
+        rows = await db.execute(text(
+            f"SELECT DISTINCT user_identity FROM {table} "
+            f"WHERE user_identity >= 'key:' AND user_identity < 'key;'"
+        ))
+        stale.update(r[0] for r in rows if r[0])
+
+    moved: dict[str, int] = {}
+    for identity in stale:
+        try:
+            key_id = int(identity.split(":", 1)[1])
+        except (IndexError, ValueError):
+            continue  # not one of ours — leave it untouched
+        owner = (await db.execute(
+            select(User.username)
+            .join(APIKey, APIKey.user_id == User.id)
+            .where(APIKey.id == key_id)
+        )).scalar_one_or_none()
+        if not owner:
+            continue
+        for table, count in (await rename_usage_identity(db, identity, owner)).items():
+            moved[table] = moved.get(table, 0) + count
+
+    return moved
+
+
 async def delete_usage_records(db: AsyncSession, axis: str, value: str) -> dict[str, int]:
     """Delete every usage row for one user_identity (axis='user') or model (axis='model').
 
@@ -3074,6 +3129,22 @@ async def _run_auto_migrations():
                 "oauth_users(provider, provider_user_id) — likely duplicate rows "
                 "exist; deduplicate them manually to enforce uniqueness: %s", e
             )
+
+    # Fold historical "key:<id>" usage rows onto the owning user's username.
+    # Runs outside the schema block above because it works on a session.
+    try:
+        async with AsyncSessionLocal() as db:
+            moved = await migrate_api_key_usage_identities(db)
+            if moved:
+                await db.commit()
+                logger.info(
+                    "Auto-migration: Moved API-key usage rows to owner usernames: %s",
+                    moved,
+                )
+    except Exception as e:
+        logger.warning(
+            f"Auto-migration: Could not move API-key usage rows to usernames: {e}"
+        )
 
 
 def init_database_sync():
