@@ -2963,7 +2963,7 @@ async def get_usage_years_endpoint(
 async def get_usage(
     view: Optional[str] = Query(None, description="'user', 'model' or 'pool' for drill-down"),
     id: Optional[str] = Query(None, description="Identity value to drill into"),
-    window: str = Query("30d", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
+    window: str = Query("30d", pattern="^(24h|today|yesterday|7d|30d|month|all)$", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
     year: Optional[int] = Query(None, description="Year (required when window=month)"),
     month: Optional[int] = Query(None, description="Month 1-12 (required when window=month)"),
     current_admin: AdminUser = Depends(get_current_admin),
@@ -2982,7 +2982,7 @@ async def get_usage(
     from app.auth.database import (
         get_usage_by_user_and_model, get_usage_earliest_date, get_usage_timeseries,
     )
-    from app.routes.pools import pool_membership_map
+    from app.routes.pools import member_spans, pool_membership_map, window_bounds
     await request_tracker.flush_pending()
 
     # Pool drill-down: the members' own per-user split, scoped to one pool.
@@ -2992,6 +2992,9 @@ async def get_usage(
     # too — the full user x model cross product, all of which would be discarded here —
     # and it flushes and resolves the group tables to do it. Its drill-down path also
     # 403s on non-membership, which is not the right answer for an admin.
+    #
+    # Scoped by membership interval, like build_pool_usage: a member's rows count only
+    # for the days they were in the pool.
     if view == "pool":
         pool_id = _parse_pool_id(id)
         membership = await pool_membership_map(db)
@@ -3000,8 +3003,11 @@ async def get_usage(
         pool = membership[pool_id]
         identities = pool["members"]
 
+        lo, hi = window_bounds(window, year, month)
+        spans = await member_spans(db, pool_id, lo=lo, hi=hi)
+
         cross = await get_usage_by_user_and_model(
-            db, identities, window=window, year=year, month=month,
+            db, [], window=window, year=year, month=month, restrict_spans=spans,
         )
         folded: dict = {}
         for r in cross:
@@ -3009,15 +3015,17 @@ async def get_usage(
             prev = folded.get(name)
             folded[name] = (r["user_type"], (prev[1] if prev else 0) + r["request_count"])
 
-        # Zero-filled from the membership map, so every member of the pool shows up even
-        # with no traffic in this window — an absent row reads as "not in the pool".
+        # Zero-filled from the current roster *plus* anyone whose stint overlaps the
+        # window, so every member shows up even with no traffic (an absent row reads as
+        # "not in the pool") and a leaver's contribution has a row to land in.
+        listed = list(dict.fromkeys(identities + [s[0] for s in spans]))
         breakdown = [
             {
                 "user_identity": name,
                 "user_type": folded.get(name, (None, 0))[0],
                 "request_count": folded.get(name, (None, 0))[1],
             }
-            for name in identities
+            for name in listed
         ]
         breakdown.sort(key=lambda r: (-r["request_count"], r["user_identity"]))
 
@@ -3026,7 +3034,7 @@ async def get_usage(
             "pool": {"id": pool_id, "name": pool["name"], "member_count": len(identities)},
             "breakdown": breakdown,
             "timeseries": await get_usage_timeseries(
-                db, window=window, year=year, month=month, restrict_users=identities,
+                db, window=window, year=year, month=month, restrict_spans=spans,
             ),
             "earliest_date": await get_usage_earliest_date(db),
         }
@@ -3041,7 +3049,6 @@ async def get_usage(
 
     result = await get_usage_aggregates(
         db,
-        group_by="user",
         filter_user=filter_user,
         filter_model=filter_model,
         window=window,
@@ -3059,23 +3066,22 @@ async def get_usage(
     result["earliest_date"] = await get_usage_earliest_date(db)
 
     # Pools are a third axis over the same traffic, so per_pool rides along in the same
-    # payload as per_user / per_model and the By Pool toggle costs no extra request. It
-    # is a pure fold of the per_user rows already in `result` through the membership
-    # map, so the only added cost is that one membership query.
+    # payload as per_user / per_model and the By Pool toggle costs no extra request.
+    #
+    # Not a fold of the per_user rows: those are each member's *whole* total for the
+    # window, which would credit a pool with everything its members sent before they
+    # joined. One spans query per pool is the honest way to get the same number the
+    # pool's own drill-down shows, so the two views cannot disagree.
     if view is None:
         membership = await pool_membership_map(db)
-        pool_of = {
-            name: pool_id
-            for pool_id, pool in membership.items()
-            for name in pool["members"]
-        }
-        counts = {pool_id: 0 for pool_id in membership}
-        for row in result.get("per_user", []):
-            pool_id = pool_of.get(row["user_identity"])
-            if pool_id is not None:
-                # Accumulated, not assigned: get_usage_aggregates groups by
-                # (user_identity, user_type), so one username can arrive on two rows.
-                counts[pool_id] += row["request_count"]
+        lo, hi = window_bounds(window, year, month)
+        counts = {}
+        for pool_id in membership:
+            spans = await member_spans(db, pool_id, lo=lo, hi=hi)
+            rows = await get_usage_by_user_and_model(
+                db, [], window=window, year=year, month=month, restrict_spans=spans,
+            )
+            counts[pool_id] = sum(r["request_count"] for r in rows)
 
         result["per_pool"] = sorted(
             (

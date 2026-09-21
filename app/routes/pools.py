@@ -19,11 +19,11 @@ check in build_pool_usage() is a security boundary and is tested as one.
 """
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional, Tuple, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import delete as sa_delete, or_, select
+from sqlalchemy import and_, delete as sa_delete, or_, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -34,11 +34,12 @@ from app.auth.models import (
     MAX_POOL_MEMBERS,
     AdminPoolResponse, MyPoolResponse, PoolCreate, PoolInvitationResponse,
     PoolInviteCreate, PoolLeavePreview, PoolMemberResponse, PoolMemberScope,
-    PoolScopeResponse, PoolSummary, PoolUpdate,
+    PoolMembershipInterval, PoolScopeResponse, PoolSummary, PoolUpdate,
     RequestPool, RequestPoolInvitation, RequestPoolLedger, RequestPoolMember,
     User, UserRpdCarry,
 )
 from app.auth import pools as pool_settlement
+from app import time_utils
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,130 @@ POOL_DESCRIPTION_MAX_LENGTH = 256
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Membership intervals
+#
+# RequestPoolMember says who is in the pool now; PoolMembershipInterval says who was
+# in it when, which is what pool *usage* needs -- see the model's docstring. The three
+# helpers below are the only writers, so the day-boundary rule (both ends inclusive,
+# in local usage dates) lives in exactly one place.
+# --------------------------------------------------------------------------- #
+
+
+async def _open_interval(db: AsyncSession, pool_id: int, user_id: int) -> None:
+    """Start a stint today. Called wherever a RequestPoolMember row is created."""
+    db.add(PoolMembershipInterval(
+        pool_id=pool_id, user_id=user_id, joined_on=time_utils.local_today(),
+    ))
+    await db.flush()
+
+
+async def _close_interval(db: AsyncSession, pool_id: int, user_id: int) -> None:
+    """End this member's open stint today, inclusive.
+
+    Idempotent via `left_on IS NULL`: closing twice is a no-op, and a member who
+    rejoins the same day simply gets a second interval rather than reopening this one.
+    """
+    await db.execute(
+        sa_update(PoolMembershipInterval)
+        .where(
+            PoolMembershipInterval.pool_id == pool_id,
+            PoolMembershipInterval.user_id == user_id,
+            PoolMembershipInterval.left_on.is_(None),
+        )
+        .values(left_on=time_utils.local_today())
+    )
+    await db.flush()
+
+
+async def _close_all_intervals(db: AsyncSession, pool_id: int) -> None:
+    """End every open stint in a pool that is about to be deleted.
+
+    The rows go away with the pool via ON DELETE CASCADE, so this is only meaningful
+    for the transaction's own reads before the delete lands.
+    """
+    await db.execute(
+        sa_update(PoolMembershipInterval)
+        .where(
+            PoolMembershipInterval.pool_id == pool_id,
+            PoolMembershipInterval.left_on.is_(None),
+        )
+        .values(left_on=time_utils.local_today())
+    )
+    await db.flush()
+
+
+def window_bounds(
+    window: str, year: Optional[int] = None, month: Optional[int] = None,
+) -> Tuple[Optional[date], Optional[date]]:
+    """The inclusive local-date range a usage window covers, for clipping spans.
+
+    Mirrors the window handling in get_usage_aggregates / get_usage_timeseries. Only
+    used to trim membership stints, so "all" is unbounded on both ends and a stint that
+    starts before the window simply starts at the window instead.
+    """
+    from datetime import timedelta
+
+    today = time_utils.local_today()
+    if window == "24h":
+        return (time_utils.local_now() - timedelta(hours=24)).date(), today
+    if window == "today":
+        return today, today
+    if window == "yesterday":
+        y = today - timedelta(days=1)
+        return y, y
+    if window == "7d":
+        return today - timedelta(days=6), today
+    if window == "month" and year and month:
+        first = date(year, month, 1)
+        nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+        return first, nxt - timedelta(days=1)
+    if window == "all":
+        return None, None
+    return today - timedelta(days=29), today      # default 30d
+
+
+async def member_spans(
+    db: AsyncSession,
+    pool_id: int,
+    *,
+    lo: Optional[date] = None,
+    hi: Optional[date] = None,
+) -> List[Tuple[str, date, date]]:
+    """[(username, first_day, last_day)] for every stint overlapping [lo, hi].
+
+    One tuple per stint, so a user who left and rejoined yields two and the gap between
+    them is excluded. An open stint ends today. `lo`/`hi` clip each span to the caller's
+    window; omitting one leaves that end of the span unclipped.
+
+    Usernames, not ids, because the usage tables are keyed by identity string -- the
+    resolution happens here so a rename cannot orphan the interval rows themselves.
+    """
+    today = time_utils.local_today()
+    rows = (await db.execute(
+        select(
+            User.username,
+            PoolMembershipInterval.joined_on,
+            PoolMembershipInterval.left_on,
+        )
+        .join(User, User.id == PoolMembershipInterval.user_id)
+        .where(PoolMembershipInterval.pool_id == pool_id)
+    )).all()
+
+    spans: List[Tuple[str, date, date]] = []
+    for username, joined_on, left_on in rows:
+        start = joined_on
+        end = left_on or today
+        if lo is not None and start < lo:
+            start = lo
+        if hi is not None and end > hi:
+            end = hi
+        if start > end:
+            continue        # the stint falls entirely outside the window
+        spans.append((username, start, end))
+    return spans
 
 
 def _require_user(current_user) -> User:
@@ -314,6 +439,7 @@ async def create_pool(
         await db.flush()
         db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
         await db.flush()
+        await _open_interval(db, pool.id, user.id)
         # The creator is the only member, so there is no interval to close; their own
         # usage enters the pool through the admission clamp like any other joiner.
         await pool_settlement.admit_member(db, pool.id, user.id, user.username)
@@ -413,8 +539,10 @@ async def _dissolve(db: AsyncSession, pool: RequestPool) -> List[str]:
     rows = await _member_rows(db, pool.id)
     users = await _users_by_id(db, [r.user_id for r in rows])
     usernames = [users[r.user_id].username for r in rows if r.user_id in users]
-    # Members, invitations and ledger rows go with the pool via ON DELETE CASCADE.
+    # Members, invitations, ledger rows and membership intervals go with the pool via
+    # ON DELETE CASCADE -- a dissolved pool has no usage view left to feed.
     # Carries deliberately survive: they are what each member walks out carrying.
+    await _close_all_intervals(db, pool.id)
     await db.delete(pool)
     await db.flush()
     return usernames
@@ -761,6 +889,7 @@ async def accept_invite(
 
         db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
         await db.flush()
+        await _open_interval(db, pool.id, user.id)
         await pool_settlement.admit_member(db, pool.id, user.id, user.username)
 
         invite.status = "accepted"
@@ -877,10 +1006,14 @@ async def _remove_member(db: AsyncSession, pool: RequestPool, user_id: int, user
             RequestPoolMember.user_id == user_id,
         )
     )
+    # The membership row goes; the stint stays, so what this member spent while they
+    # were here remains part of the pool's history.
+    await _close_interval(db, pool.id, user_id)
     await db.flush()
 
     remaining = await _member_rows(db, pool.id)
     if not remaining:
+        await _close_all_intervals(db, pool.id)
         await db.delete(pool)
     elif pool.owner_user_id == user_id:
         pool.owner_user_id = remaining[0].user_id
@@ -1088,9 +1221,14 @@ async def build_pool_usage(
 
     Carries are never applied here. This reports what each member really sent; only the
     quota numbers reflect settlement.
+
+    Every number below is bounded by membership *intervals*, not by the current roster:
+    a member's traffic counts only for the days they were actually in the pool. Without
+    that, a heavy user joining today would drag their whole history in, and a member
+    leaving would retroactively erase spending that really was the pool's.
     """
     from app.auth.database import (
-        get_usage_aggregates, get_usage_by_user_and_model, get_usage_timeseries,
+        get_usage_by_user_and_model, get_usage_timeseries,
         list_instance_groups, list_model_groups,
     )
     from app.request_tracker import request_tracker
@@ -1102,25 +1240,38 @@ async def build_pool_usage(
     users = await _users_by_id(db, [r.user_id for r in rows])
     identities = [users[r.user_id].username for r in rows if r.user_id in users]
 
+    lo, hi = window_bounds(window, year, month)
+    spans = await member_spans(db, pool.id, lo=lo, hi=hi)
+
+    # member_count is deliberately the *current* roster: it answers "how many people
+    # share this quota now", which is a fact about the pool, not about the window.
     pool_obj = {"id": pool.id, "name": pool.name, "member_count": len(identities)}
 
     # Drill-down into one member: the membership check is the security boundary. This is
     # the one place a user reads another user's usage, and it is allowed only inside the
-    # pool they share.
+    # pool they share. Anyone with a stint overlapping the window qualifies -- a former
+    # member appears in the breakdown, so 403-ing their row would be a dead link.
     if view == "user" and target:
-        if target not in identities:
+        target_spans = [s for s in spans if s[0] == target]
+        if not target_spans:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="That user isn't in this pool",
             )
-        detail = await get_usage_aggregates(
-            db, filter_user=target, window=window, year=year, month=month,
+        detail = await get_usage_by_user_and_model(
+            db, [], window=window, year=year, month=month, restrict_spans=target_spans,
         )
+        by_model: dict = {}
+        for r in detail:
+            by_model[r["model"]] = by_model.get(r["model"], 0) + r["request_count"]
         return {
             "window": window, "pool": pool_obj, "view": "user", "id": target,
-            "breakdown": detail.get("breakdown", []),
+            "breakdown": sorted(
+                [{"model": m, "request_count": c} for m, c in by_model.items()],
+                key=lambda x: (-x["request_count"], x["model"]),
+            ),
             "timeseries": await get_usage_timeseries(
-                db, filter_user=target, window=window, year=year, month=month,
+                db, window=window, year=year, month=month, restrict_spans=target_spans,
             ),
         }
 
@@ -1130,18 +1281,18 @@ async def build_pool_usage(
             "breakdown": [
                 {"user_identity": r["user_identity"], "request_count": r["request_count"]}
                 for r in await get_usage_by_user_and_model(
-                    db, identities, window=window, year=year, month=month,
+                    db, [], window=window, year=year, month=month, restrict_spans=spans,
                 )
                 if r["model"] == target
             ],
             "timeseries": await get_usage_timeseries(
                 db, filter_model=target, window=window, year=year, month=month,
-                restrict_users=identities,
+                restrict_spans=spans,
             ),
         }
 
     cross = await get_usage_by_user_and_model(
-        db, identities, window=window, year=year, month=month,
+        db, [], window=window, year=year, month=month, restrict_spans=spans,
     )
 
     # Every view below is a fold of that one result set.
@@ -1216,11 +1367,13 @@ async def build_pool_usage(
         "per_group": per_group,
         "per_member_per_model": cross,
         "timeseries": await get_usage_timeseries(
-            db, window=window, year=year, month=month, restrict_users=identities,
+            db, window=window, year=year, month=month, restrict_spans=spans,
         ),
         "totals": {
             "requests": sum(per_member_totals.values()),
-            "unique_members": len(identities),
+            # Everyone who was in the pool at some point in the window, so the count
+            # matches the number of rows in per_member rather than the live roster.
+            "unique_members": len({s[0] for s in spans}),
             "unique_models": len(per_model_totals),
         },
     }

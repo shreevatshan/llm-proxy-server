@@ -45,18 +45,18 @@ class SlowFlushTestCase(UsageDBTestCase):
         """
         import app.auth.database as database
 
-        real_daily = database.flush_request_usage
+        real_flush = database.flush_usage_rows
         writes = 0
 
-        async def slow_daily(rows):
+        async def slow_write(hourly_rows, daily_rows):
             nonlocal writes
             writes += 1
             if writes == 1:
                 await asyncio.sleep(delay)
-            await real_daily(rows)
+            await real_flush(hourly_rows, daily_rows)
 
         with patch("app.auth.database.AsyncSessionLocal", self._session_factory), \
-             patch("app.auth.database.flush_request_usage", slow_daily), \
+             patch("app.auth.database.flush_usage_rows", slow_write), \
              patch("app.auth.database.prune_hourly_usage", _noop), \
              patch("app.auth.database.rollup_to_monthly", _noop):
             yield
@@ -177,6 +177,51 @@ class FlushInsideResettleTests(SlowFlushTestCase):
 
         self.assertEqual(dropped, 0, "the flush already emptied the buffer")
         self.assertEqual(await self._rows(RequestUsage, "alice"), (1, 4))
+
+
+class PartialFlushTests(UsageDBTestCase):
+    """The two usage tables must be written in one transaction, or not at all.
+
+    The buffer is subtracted only after the write returns, so a flush that committed
+    one table and raised on the other would leave the counts in the buffer *and* in
+    the DB. Every later cycle would re-add the half that landed, inflating it without
+    bound and splitting the 'today' chart (hourly) from the 'today' table (daily).
+    """
+
+    def _failing_daily(self):
+        """Patch the daily upsert to blow up, leaving the hourly one intact."""
+        import app.auth.database as database
+
+        real_upsert = database._usage_upsert
+
+        def upsert(table, rows, index_elements):
+            if table is RequestUsage:
+                raise RuntimeError("daily upsert failed")
+            return real_upsert(table, rows, index_elements)
+
+        return patch("app.auth.database._usage_upsert", upsert)
+
+    async def test_a_failed_daily_write_rolls_the_hourly_write_back(self):
+        tracker = RequestTracker()
+        tracker._usage_buffer[KEY] = 5
+
+        with patch("app.auth.database.AsyncSessionLocal", self._session_factory), \
+             patch("app.auth.database.prune_hourly_usage", _noop), \
+             patch("app.auth.database.rollup_to_monthly", _noop):
+            with self._failing_daily():
+                await tracker.flush_pending()
+
+            # Nothing was written, and the counts are still owed.
+            self.assertEqual(await self._rows(RequestUsageHourly, "alice"), (0, 0))
+            self.assertEqual(await self._rows(RequestUsage, "alice"), (0, 0))
+            self.assertEqual(tracker._usage_buffer[KEY], 5)
+
+            # The retry writes each table exactly once.
+            await tracker.flush_pending()
+
+        self.assertEqual(await self._rows(RequestUsageHourly, "alice"), (1, 5))
+        self.assertEqual(await self._rows(RequestUsage, "alice"), (1, 5))
+        self.assertEqual(tracker._usage_buffer, {})
 
 
 if __name__ == "__main__":

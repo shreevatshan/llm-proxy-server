@@ -519,7 +519,7 @@ async def delete_account(
 async def get_user_usage(
     view: Optional[str] = Query(None, description="'model' for drill-down by model"),
     id: Optional[str] = Query(None, description="Model name to drill into"),
-    window: str = Query("30d", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
+    window: str = Query("30d", pattern="^(24h|today|yesterday|7d|30d|month|all)$", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
     year: Optional[int] = Query(None, description="Year (required when window=month)"),
     month: Optional[int] = Query(None, description="Month 1-12 (required when window=month)"),
     current_user: User = Depends(get_current_active_user),
@@ -543,7 +543,6 @@ async def get_user_usage(
 
     result = await get_usage_aggregates(
         db,
-        group_by="model",
         filter_user=current_user.username,
         filter_model=filter_model,
         window=window,

@@ -179,17 +179,17 @@ class RequestTracker:
 
         try:
             from app.auth.database import (
-                flush_request_usage, flush_request_usage_hourly,
-                prune_hourly_usage, rollup_to_monthly,
+                flush_usage_rows, prune_hourly_usage, rollup_to_monthly,
                 purge_stale_pool_rows,
             )
-            # The two increment-on-conflict upserts are the only ops that consume
-            # the buffered counts. Run just those in the guarded block so a later
-            # failure in prune/rollup cannot leave the buffer uncleared and cause
-            # the next cycle to re-add the same counts (double-counting inflates
-            # usage and RPD decisions).
-            await flush_request_usage_hourly(hourly_rows)
-            await flush_request_usage(daily_rows)
+            # The increment-on-conflict upserts are the only ops that consume the
+            # buffered counts. Run just those in the guarded block so a later failure
+            # in prune/rollup cannot leave the buffer uncleared and cause the next
+            # cycle to re-add the same counts (double-counting inflates usage and RPD
+            # decisions). Both tables are written in one transaction, so this either
+            # consumes the snapshot entirely or leaves it untouched for the retry --
+            # a half-applied flush would re-add the committed half forever.
+            await flush_usage_rows(hourly_rows, daily_rows)
         except Exception as e:
             logger.error(f"Usage flush failed, will retry next cycle: {e}")
             return
@@ -501,6 +501,15 @@ class RequestTracker:
     async def get_today_group_count(self, user_identity, model_ids: list) -> int:
         """Return total requests today across all model_ids in a group (buffer + DB).
 
+        Models whose provider is in an instance group are excluded, mirroring the
+        exclusion get_today_count applies. Instance groups take precedence everywhere
+        else -- scope_for_model resolves such a model to the instance group, the auth
+        middleware only ever runs the instance-group gate for it, and settlement folds
+        it one way -- so counting it here as well would inflate a model-group number
+        that its own gate will never see, and split the quota display from enforcement.
+        get_today_instance_group_count needs no matching exclusion: nothing outranks an
+        instance group.
+
         `user_identity` is a username or, for a pooled user, the sequence of usernames
         sharing the pool's quota.
         """
@@ -511,25 +520,46 @@ class RequestTracker:
             return 0
         today = time_utils.local_today()
         model_set = set(model_ids)
+
+        try:
+            from app.rate_limit import rate_limit_tracker
+            _grouped_models, grouped_providers = rate_limit_tracker.grouped_keys()
+        except Exception:
+            grouped_providers = set()
+
+        def _instance_grouped(model) -> bool:
+            if not model:
+                return False
+            prefix = model.split('/', 1)[0] if '/' in model else model
+            return prefix in grouped_providers
+
         buffered = 0
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
                 # key = (date, hour, user_identity, user_type, model, server)
-                if key[0] == today and key[2] in identities and key[4] in model_set:
+                if (key[0] == today and key[2] in identities
+                        and key[4] in model_set and not _instance_grouped(key[4])):
                     buffered += count
 
         try:
             from sqlalchemy.future import select
-            from sqlalchemy import func
+            from sqlalchemy import func, or_, not_
             from app.auth.database import AsyncSessionLocal
             from app.auth.models import RequestUsage
             async with AsyncSessionLocal() as db:
+                conditions = [
+                    RequestUsage.date == today,
+                    RequestUsage.user_identity.in_(identities),
+                    RequestUsage.model.in_(model_ids),
+                ]
+                exclude = []
+                for pk in grouped_providers:
+                    exclude.append(RequestUsage.model.like(f"{pk}/%"))
+                    exclude.append(RequestUsage.model == pk)
+                if exclude:
+                    conditions.append(not_(or_(*exclude)))
                 result = await db.execute(
-                    select(func.sum(RequestUsage.request_count)).where(
-                        RequestUsage.date == today,
-                        RequestUsage.user_identity.in_(identities),
-                        RequestUsage.model.in_(model_ids),
-                    )
+                    select(func.sum(RequestUsage.request_count)).where(*conditions)
                 )
                 db_count = result.scalar() or 0
         except Exception:

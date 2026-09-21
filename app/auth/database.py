@@ -7,7 +7,7 @@ import hashlib
 import functools
 import logging
 from pathlib import Path
-from sqlalchemy import create_engine, event, String
+from sqlalchemy import and_, create_engine, event, false, or_, String
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, Session, selectinload
 from sqlalchemy.future import select
@@ -1620,43 +1620,44 @@ async def delete_response_provider_mapping(
         raise
 
 
-async def flush_request_usage(rows: list[dict]) -> None:
-    """Bulk upsert daily usage rows, incrementing request_count on conflict."""
-    if not rows:
-        return
+def _usage_upsert(table, rows: list[dict], index_elements: list[str]):
+    """Build one increment-on-conflict bulk upsert against a usage table."""
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    stmt = sqlite_insert(table).values(rows)
+    return stmt.on_conflict_do_update(
+        index_elements=index_elements,
+        set_={"request_count": table.request_count + stmt.excluded.request_count},
+    )
+
+
+async def flush_usage_rows(hourly_rows: list[dict], daily_rows: list[dict]) -> None:
+    """Write both usage tables in ONE transaction, incrementing on conflict.
+
+    The two writes have to be atomic. request_tracker subtracts its buffer only after
+    this returns, so a failure that committed one table and raised on the other would
+    leave the buffer unsubtracted, and the next cycle would re-add the half that did
+    land -- inflating it permanently and silently splitting the 'today' chart (which
+    reads hourly) from the 'today' table (which reads daily).
+    """
+    if not hourly_rows and not daily_rows:
+        return
     async with AsyncSessionLocal() as db:
         try:
-            stmt = sqlite_insert(RequestUsage).values(rows)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["date", "user_identity", "model", "server"],
-                set_={"request_count": RequestUsage.request_count + stmt.excluded.request_count},
-            )
-            await db.execute(stmt)
+            if hourly_rows:
+                await db.execute(_usage_upsert(
+                    RequestUsageHourly, hourly_rows,
+                    ["date", "hour", "user_identity", "model", "server"],
+                ))
+            if daily_rows:
+                await db.execute(_usage_upsert(
+                    RequestUsage, daily_rows,
+                    ["date", "user_identity", "model", "server"],
+                ))
             await db.commit()
         except Exception as e:
             await db.rollback()
             logger.error(f"Failed to flush request usage: {e}")
-            raise
-
-
-async def flush_request_usage_hourly(rows: list[dict]) -> None:
-    """Bulk upsert hourly usage rows, incrementing request_count on conflict."""
-    if not rows:
-        return
-    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-    async with AsyncSessionLocal() as db:
-        try:
-            stmt = sqlite_insert(RequestUsageHourly).values(rows)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=["date", "hour", "user_identity", "model", "server"],
-                set_={"request_count": RequestUsageHourly.request_count + stmt.excluded.request_count},
-            )
-            await db.execute(stmt)
-            await db.commit()
-        except Exception as e:
-            await db.rollback()
-            logger.error(f"Failed to flush hourly request usage: {e}")
             raise
 
 
@@ -1996,9 +1997,47 @@ async def get_usage_years(db: AsyncSession) -> list[int]:
     return sorted(daily_years | monthly_years)
 
 
+def _fold_identities(rows: list, *, by_model: bool = False) -> list:
+    """Collapse (user_identity, user_type) rows into one row per person.
+
+    user_type is not part of any usage table's unique key -- only
+    (date, user_identity, model, server) is -- so the stored value is whichever
+    request happened to create the row that day. alice sending through the web UI in
+    the morning and through an API key in the afternoon lands on one row labelled
+    'user'; do it on two different days and she becomes two rows and two "unique
+    users". The label is a delivery detail (user_identity already separates the admin
+    from everyone else), so it is a display hint, never an attribution key: one row
+    per identity, and the badge reads "mixed" when more than one type was seen.
+    """
+    folded: dict = {}
+    for r in rows:
+        key = (r["user_identity"], r["model"]) if by_model else (r["user_identity"],)
+        entry = folded.get(key)
+        if entry is None:
+            entry = folded[key] = {"types": set(), "count": 0}
+        if r.get("user_type"):
+            entry["types"].add(r["user_type"])
+        entry["count"] += r["request_count"]
+
+    out = []
+    for key, entry in folded.items():
+        types = entry["types"]
+        row = {
+            "user_identity": key[0],
+            "user_type": next(iter(types)) if len(types) == 1 else ("mixed" if types else None),
+        }
+        if by_model:
+            row["model"] = key[1]
+        row["request_count"] = int(entry["count"])
+        out.append(row)
+
+    if by_model:
+        return sorted(out, key=lambda x: (-x["request_count"], x["user_identity"], x["model"]))
+    return sorted(out, key=lambda x: (-x["request_count"], x["user_identity"]))
+
+
 async def get_usage_aggregates(
     db: AsyncSession,
-    group_by: str = "user",
     filter_user: Optional[str] = None,
     filter_model: Optional[str] = None,
     window: str = "30d",
@@ -2007,10 +2046,13 @@ async def get_usage_aggregates(
 ) -> dict:
     """Return aggregated usage data for the requested time window.
 
-    window: '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'month'
+    window: '24h' | 'today' | 'yesterday' | '7d' | '30d' | 'month' | 'all'
     year, month: required when window='month'
-    group_by: 'user' | 'model' (top-level only)
-    filter_user / filter_model: drill-down
+
+    With neither filter set the result is the top level: per_user, per_model and
+    totals. Either filter set makes it a drill-down returning only 'breakdown' --
+    both filters restrict the rows, and filter_model decides the axis (users who
+    used that model; otherwise the models that user used).
     """
     from sqlalchemy import func, union_all
     from datetime import date, timedelta
@@ -2030,18 +2072,6 @@ async def get_usage_aggregates(
         if window == "7d":
             return [RequestUsage.date >= today - timedelta(days=6)]
         return [RequestUsage.date >= today - timedelta(days=29)]  # default 30d
-
-    async def _query_24h(extra_where):
-        now_utc = time_utils.local_now()
-        cutoff_dt = now_utc - timedelta(hours=24)
-        cutoff_date = cutoff_dt.date()
-        cutoff_hour = cutoff_dt.hour
-
-        where = [
-            (RequestUsageHourly.date > cutoff_date) |
-            ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
-        ] + extra_where
-        return where
 
     async def _exec_top_level_query(where_clauses, use_hourly=False, use_monthly=False):
         """Run user + model top-level queries and return (per_user, per_model)."""
@@ -2074,30 +2104,55 @@ async def get_usage_aggregates(
         user_rows = (await db.execute(_user_q(tbl_u, where_clauses))).all()
         model_rows = (await db.execute(_model_q(tbl_m, where_clauses))).all()
         return (
-            [{"user_identity": r.user_identity, "user_type": r.user_type, "request_count": r.request_count} for r in user_rows],
+            _fold_identities([
+                {"user_identity": r.user_identity, "user_type": r.user_type,
+                 "request_count": r.request_count}
+                for r in user_rows
+            ]),
             [{"model": r.model, "request_count": r.request_count} for r in model_rows],
         )
 
+    def _drilldown_where(tbl):
+        """Both filters restrict; the drill target only picks the output axis.
+
+        /auth/usage always pins filter_user to the caller, so treating it as the
+        target would make ?view=model&id=X return every model the caller used
+        instead of their usage of X -- and the chart, which honours filter_model,
+        would disagree with the table beside it.
+        """
+        where = []
+        if filter_user is not None:
+            where.append(tbl.user_identity == filter_user)
+        if filter_model is not None:
+            where.append(tbl.model == filter_model)
+        return where
+
     async def _exec_drilldown_query(where_clauses, use_hourly=False, use_monthly=False):
         tbl = RequestUsageHourly if use_hourly else (RequestUsageMonthly if use_monthly else RequestUsage)
-        if filter_user is not None:
-            q = (
-                select(tbl.model, func.sum(tbl.request_count).label("request_count"))
-                .where(*where_clauses, tbl.user_identity == filter_user)
-                .group_by(tbl.model)
-                .order_by(func.sum(tbl.request_count).desc(), tbl.model)
-            )
-            rows = (await db.execute(q)).all()
-            return [{"model": r.model, "request_count": r.request_count} for r in rows]
-        else:
+        where = list(where_clauses) + _drilldown_where(tbl)
+
+        if filter_model is not None:
             q = (
                 select(tbl.user_identity, tbl.user_type, func.sum(tbl.request_count).label("request_count"))
-                .where(*where_clauses, tbl.model == filter_model)
+                .where(*where)
                 .group_by(tbl.user_identity, tbl.user_type)
                 .order_by(func.sum(tbl.request_count).desc(), tbl.user_identity)
             )
             rows = (await db.execute(q)).all()
-            return [{"user_identity": r.user_identity, "user_type": r.user_type, "request_count": r.request_count} for r in rows]
+            return _fold_identities([
+                {"user_identity": r.user_identity, "user_type": r.user_type,
+                 "request_count": r.request_count}
+                for r in rows
+            ])
+
+        q = (
+            select(tbl.model, func.sum(tbl.request_count).label("request_count"))
+            .where(*where)
+            .group_by(tbl.model)
+            .order_by(func.sum(tbl.request_count).desc(), tbl.model)
+        )
+        rows = (await db.execute(q)).all()
+        return [{"model": r.model, "request_count": r.request_count} for r in rows]
 
     # ------------------------------------------------------------------ #
     # 24h window — strict rolling 24h using the hourly table only.
@@ -2152,14 +2207,11 @@ async def get_usage_aggregates(
                 select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
                 .where(*monthly_where).group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
             )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                k = (r.user_identity, r.user_type)
-                combined[k] = combined.get(k, 0) + r.rc
-            return sorted(
-                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
+            return _fold_identities([
+                {"user_identity": r.user_identity, "user_type": r.user_type,
+                 "request_count": r.rc}
+                for r in list(d_rows) + list(m_rows)
+            ])
 
         async def _month_query_model():
             d_rows = (await db.execute(
@@ -2178,15 +2230,33 @@ async def get_usage_aggregates(
                 key=lambda x: -x["request_count"]
             )
 
+        if filter_model is not None:
+            d_rows = (await db.execute(
+                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
+                .where(*daily_where, *_drilldown_where(RequestUsage))
+                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(*monthly_where, *_drilldown_where(RequestUsageMonthly))
+                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
+            )).all()
+            breakdown = _fold_identities([
+                {"user_identity": r.user_identity, "user_type": r.user_type,
+                 "request_count": r.rc}
+                for r in list(d_rows) + list(m_rows)
+            ])
+            return {"window": window, "year": year, "month": month, "breakdown": breakdown}
+
         if filter_user is not None:
             d_rows = (await db.execute(
                 select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*daily_where, RequestUsage.user_identity == filter_user)
+                .where(*daily_where, *_drilldown_where(RequestUsage))
                 .group_by(RequestUsage.model)
             )).all()
             m_rows = (await db.execute(
                 select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*monthly_where, RequestUsageMonthly.user_identity == filter_user)
+                .where(*monthly_where, *_drilldown_where(RequestUsageMonthly))
                 .group_by(RequestUsageMonthly.model)
             )).all()
             combined: dict = {}
@@ -2194,27 +2264,6 @@ async def get_usage_aggregates(
                 combined[r.model] = combined.get(r.model, 0) + r.rc
             breakdown = sorted(
                 [{"model": m, "request_count": c} for m, c in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
-            return {"window": window, "year": year, "month": month, "breakdown": breakdown}
-
-        if filter_model is not None:
-            d_rows = (await db.execute(
-                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*daily_where, RequestUsage.model == filter_model)
-                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*monthly_where, RequestUsageMonthly.model == filter_model)
-                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
-            )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                k = (r.user_identity, r.user_type)
-                combined[k] = combined.get(k, 0) + r.rc
-            breakdown = sorted(
-                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
                 key=lambda x: -x["request_count"]
             )
             return {"window": window, "year": year, "month": month, "breakdown": breakdown}
@@ -2244,14 +2293,11 @@ async def get_usage_aggregates(
                 select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
                 .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
             )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                k = (r.user_identity, r.user_type)
-                combined[k] = combined.get(k, 0) + r.rc
-            return sorted(
-                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
+            return _fold_identities([
+                {"user_identity": r.user_identity, "user_type": r.user_type,
+                 "request_count": r.rc}
+                for r in list(d_rows) + list(m_rows)
+            ])
 
         async def _all_query_model():
             d_rows = (await db.execute(
@@ -2270,15 +2316,33 @@ async def get_usage_aggregates(
                 key=lambda x: -x["request_count"]
             )
 
+        if filter_model is not None:
+            d_rows = (await db.execute(
+                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
+                .where(*_drilldown_where(RequestUsage))
+                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
+            )).all()
+            m_rows = (await db.execute(
+                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
+                .where(*_drilldown_where(RequestUsageMonthly))
+                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
+            )).all()
+            breakdown = _fold_identities([
+                {"user_identity": r.user_identity, "user_type": r.user_type,
+                 "request_count": r.rc}
+                for r in list(d_rows) + list(m_rows)
+            ])
+            return {"window": window, "breakdown": breakdown}
+
         if filter_user is not None:
             d_rows = (await db.execute(
                 select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
-                .where(RequestUsage.user_identity == filter_user)
+                .where(*_drilldown_where(RequestUsage))
                 .group_by(RequestUsage.model)
             )).all()
             m_rows = (await db.execute(
                 select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(RequestUsageMonthly.user_identity == filter_user)
+                .where(*_drilldown_where(RequestUsageMonthly))
                 .group_by(RequestUsageMonthly.model)
             )).all()
             combined: dict = {}
@@ -2286,27 +2350,6 @@ async def get_usage_aggregates(
                 combined[r.model] = combined.get(r.model, 0) + r.rc
             breakdown = sorted(
                 [{"model": m, "request_count": c} for m, c in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
-            return {"window": window, "breakdown": breakdown}
-
-        if filter_model is not None:
-            d_rows = (await db.execute(
-                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
-                .where(RequestUsage.model == filter_model)
-                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(RequestUsageMonthly.model == filter_model)
-                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
-            )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                k = (r.user_identity, r.user_type)
-                combined[k] = combined.get(k, 0) + r.rc
-            breakdown = sorted(
-                [{"user_identity": k[0], "user_type": k[1], "request_count": v} for k, v in combined.items()],
                 key=lambda x: -x["request_count"]
             )
             return {"window": window, "breakdown": breakdown}
@@ -2340,19 +2383,60 @@ async def get_usage_aggregates(
     }
 
 
+def _span_predicate(tbl, spans: list):
+    """Restrict a usage table to [(identity, first_day, last_day)] stints.
+
+    An OR of ANDs rather than `user_identity.in_(...)`: each identity only counts
+    inside its own date range. This is what makes pool usage mean "what the pool
+    consumed" instead of "everything its current members ever sent" -- a member who
+    joined yesterday brings yesterday onward, not their whole history.
+
+    Month precision on RequestUsageMonthly: it has no date column, so the comparison
+    runs on year*12 + month and a stint covering any part of a rolled-up month pulls
+    the whole month. The same known imprecision _fold_models_into_scopes carries.
+    """
+    if not spans:
+        # No stint overlaps the window: match nothing rather than everything.
+        return false()
+
+    clauses = []
+    monthly = tbl is RequestUsageMonthly
+    for identity, lo, hi in spans:
+        if monthly:
+            ordinal = tbl.year * 12 + tbl.month
+            clauses.append(and_(
+                tbl.user_identity == identity,
+                ordinal >= lo.year * 12 + lo.month,
+                ordinal <= hi.year * 12 + hi.month,
+            ))
+        else:
+            clauses.append(and_(
+                tbl.user_identity == identity,
+                tbl.date >= lo,
+                tbl.date <= hi,
+            ))
+    return or_(*clauses)
+
+
 async def get_usage_by_user_and_model(
     db: AsyncSession,
     identities: list,
     window: str = "30d",
     year: Optional[int] = None,
     month: Optional[int] = None,
+    restrict_spans: Optional[list] = None,
 ) -> list[dict]:
     """Return the user x model cross-product of request counts for a set of identities.
 
-    [{user_identity, user_type, model, request_count}], restricted to `identities`.
-    Mirrors the window/table selection of get_usage_aggregates (hourly for 24h/today/
-    yesterday, daily for 7d/30d, daily UNION monthly for month/all) so the pool views
-    and the usage views never disagree about what a window covers.
+    [{user_identity, user_type, model, request_count}], restricted to `identities`, or
+    -- when `restrict_spans` is given as [(identity, first_day, last_day)] -- to each
+    identity only within its own date range, which is how pool views exclude traffic
+    sent before a member joined or after they left. `restrict_spans` supersedes
+    `identities` when both are passed.
+
+    Mirrors the window/table selection of get_usage_aggregates: hourly for 24h, daily
+    for today/yesterday/7d/30d, daily UNION monthly for month/all. Settlement depends
+    on window="today" reading the daily table, so the two stay in lockstep.
 
     One query (two for the union windows) serves every pool view: per-member totals,
     pool-wide per-model, per-member per-model and per-group are all folds of this one
@@ -2364,12 +2448,18 @@ async def get_usage_by_user_and_model(
     from app import time_utils
 
     identities = list(dict.fromkeys(identities or []))
-    if not identities:
+    if restrict_spans is None and not identities:
+        return []
+    if restrict_spans is not None and not restrict_spans:
         return []
 
     today = time_utils.local_today()
 
     def _rows_q(tbl, where):
+        if restrict_spans is not None:
+            scope = _span_predicate(tbl, restrict_spans)
+        else:
+            scope = tbl.user_identity.in_(identities)
         return (
             select(
                 tbl.user_identity,
@@ -2377,16 +2467,18 @@ async def get_usage_by_user_and_model(
                 tbl.model,
                 func.sum(tbl.request_count).label("rc"),
             )
-            .where(tbl.user_identity.in_(identities), *where)
+            .where(scope, *where)
             .group_by(tbl.user_identity, tbl.user_type, tbl.model)
         )
 
-    combined: dict = {}
+    collected: list = []
 
     def _absorb(rows):
-        for r in rows:
-            key = (r.user_identity, r.user_type, r.model)
-            combined[key] = combined.get(key, 0) + r.rc
+        collected.extend(
+            {"user_identity": r.user_identity, "user_type": r.user_type,
+             "model": r.model, "request_count": r.rc}
+            for r in rows
+        )
 
     if window == "24h":
         cutoff_dt = time_utils.local_now() - timedelta(hours=24)
@@ -2422,13 +2514,7 @@ async def get_usage_by_user_and_model(
             where = [RequestUsage.date >= today - timedelta(days=29)]
         _absorb((await db.execute(_rows_q(RequestUsage, where))).all())
 
-    return sorted(
-        [
-            {"user_identity": k[0], "user_type": k[1], "model": k[2], "request_count": int(v)}
-            for k, v in combined.items()
-        ],
-        key=lambda x: (-x["request_count"], x["user_identity"], x["model"]),
-    )
+    return _fold_identities(collected, by_model=True)
 
 
 async def get_usage_timeseries(
@@ -2439,6 +2525,7 @@ async def get_usage_timeseries(
     year: Optional[int] = None,
     month: Optional[int] = None,
     restrict_users: Optional[list] = None,
+    restrict_spans: Optional[list] = None,
 ) -> list[dict]:
     """Return ordered, zero-filled time buckets of request counts for the window.
 
@@ -2455,7 +2542,10 @@ async def get_usage_timeseries(
 
     filter_user / filter_model scope the series to a single user or model (drill-down).
     restrict_users limits the series to a set of identities (a pool's members) without
-    singling one out, and composes with filter_model.
+    singling one out, and composes with filter_model. restrict_spans is the
+    membership-aware form of it -- [(identity, first_day, last_day)] stints, each
+    identity counted only inside its own range -- and supersedes restrict_users so the
+    chart and the table agree about what a pool consumed.
     """
     from sqlalchemy import func
     from datetime import date, timedelta
@@ -2470,7 +2560,9 @@ async def get_usage_timeseries(
             q = q.where(tbl.user_identity == filter_user)
         if filter_model is not None:
             q = q.where(tbl.model == filter_model)
-        if identity_set is not None:
+        if restrict_spans is not None:
+            q = q.where(_span_predicate(tbl, restrict_spans))
+        elif identity_set is not None:
             q = q.where(tbl.user_identity.in_(identity_set))
         return q
 
@@ -2875,6 +2967,64 @@ async def _run_auto_migrations():
             ))
         except Exception as e:
             logger.warning(f"Auto-migration: Could not create global_rate_limits table: {e}")
+
+        # Create pool_membership_intervals and backfill one open stint per member.
+        #
+        # Pool usage is reconstructed from these spans, so without a backfill every
+        # existing pool would report zero history the moment this ships. Departures
+        # that happened *before* this migration are unrecoverable -- nothing recorded
+        # them -- so pool usage history effectively begins here: a member who left
+        # last week simply has no interval, and their traffic is excluded.
+        try:
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS pool_membership_intervals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pool_id INTEGER NOT NULL REFERENCES request_pools(id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    joined_on DATE NOT NULL,
+                    left_on DATE
+                )
+            """))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_pmi_pool_user "
+                "ON pool_membership_intervals (pool_id, user_id)"
+            ))
+
+            # joined_at is a naive UTC datetime; usage dates are local. Convert per
+            # row rather than in SQL so the TIMEZONE setting is honoured.
+            from datetime import timezone as _timezone
+            from app import time_utils as _tu
+
+            rows = (await conn.execute(text(
+                "SELECT m.pool_id, m.user_id, m.joined_at FROM request_pool_members m "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM pool_membership_intervals i"
+                "  WHERE i.pool_id = m.pool_id AND i.user_id = m.user_id"
+                ")"
+            ))).fetchall()
+            for pool_id, user_id, joined_at in rows:
+                if isinstance(joined_at, str):
+                    joined_at = datetime.fromisoformat(joined_at)
+                if joined_at is None:
+                    joined_on = _tu.local_today()
+                else:
+                    if joined_at.tzinfo is None:
+                        joined_at = joined_at.replace(tzinfo=_timezone.utc)
+                    joined_on = joined_at.astimezone(_tu.get_tz()).date()
+                await conn.execute(
+                    text("INSERT INTO pool_membership_intervals "
+                         "(pool_id, user_id, joined_on, left_on) "
+                         "VALUES (:p, :u, :j, NULL)"),
+                    {"p": pool_id, "u": user_id, "j": joined_on},
+                )
+            if rows:
+                logger.info(
+                    "Auto-migration: Opened %d pool membership interval(s)", len(rows)
+                )
+        except Exception as e:
+            logger.warning(
+                f"Auto-migration: Could not create pool_membership_intervals: {e}"
+            )
 
         # Hash any plaintext API keys in place (SHA-256) and backfill key_prefix.
         # Existing plaintext keys keep working: the lookup path hashes the incoming

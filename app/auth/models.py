@@ -170,7 +170,13 @@ class GlobalRateLimit(Base):
 
 
 class RequestUsage(Base):
-    """Per-day request usage counters keyed by (date, user_identity, model, server)."""
+    """Per-day request usage counters keyed by (date, user_identity, model, server).
+
+    user_type is NOT part of the key: the stored value is whichever request first
+    created the row, so it is a display hint only, never an attribution key. Reads
+    group by user_identity alone and report "mixed" when a person used more than one
+    delivery path.
+    """
     __tablename__ = "request_usage"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -187,7 +193,15 @@ class RequestUsage(Base):
 
 
 class RequestUsageHourly(Base):
-    """Per-hour request usage counters; retained for ~48 hours to serve the rolling-24h window."""
+    """Per-hour request usage counters; retained for ~48 hours to serve the rolling-24h window.
+
+    Keyed by (date, hour, user_identity, model, server).
+
+    user_type is NOT part of the key: the stored value is whichever request first
+    created the row, so it is a display hint only, never an attribution key. Reads
+    group by user_identity alone and report "mixed" when a person used more than one
+    delivery path.
+    """
     __tablename__ = "request_usage_hourly"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -206,7 +220,15 @@ class RequestUsageHourly(Base):
 
 
 class RequestUsageMonthly(Base):
-    """Per-month rolled-up request usage; retained forever."""
+    """Per-month rolled-up request usage; retained forever.
+
+    Keyed by (year, month, user_identity, model, server).
+
+    user_type is NOT part of the key: the stored value is whichever request first
+    created the row, so it is a display hint only, never an attribution key. Reads
+    group by user_identity alone and report "mixed" when a person used more than one
+    delivery path.
+    """
     __tablename__ = "request_usage_monthly"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -454,6 +476,38 @@ class RequestPoolMember(Base):
 
     __table_args__ = (
         Index("ix_request_pool_members_pool_id", "pool_id"),
+    )
+
+
+class PoolMembershipInterval(Base):
+    """One continuous stint of a user in a pool, in LOCAL usage dates.
+
+    RequestPoolMember answers "who is in the pool now"; this answers "who was in it
+    when", which is what any usage window reaching into the past needs. Without it,
+    pool usage is reconstructed as "current members x all their rows", so a user who
+    burned 900 requests before joining drags all 900 into the pool's total, and a
+    member who leaves retroactively erases consumption that really was the pool's.
+
+    Dates are time_utils.local_* so they compare directly against request_usage.date;
+    RequestPoolMember.joined_at is a UTC datetime and is not comparable to one.
+
+    Both ends are INCLUSIVE. Usage is day-grained, so a mid-day join cannot be split:
+    the whole day counts toward the pool, which is what settlement already charges.
+    Rows are append-only -- a rejoin opens a second interval rather than reopening the
+    closed one, and reads take the union of the spans.
+    """
+    __tablename__ = "pool_membership_intervals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    pool_id = Column(Integer, ForeignKey("request_pools.id", ondelete="CASCADE"), nullable=False)
+    # Keyed by user_id, resolved to a username at read time, so a rename cannot
+    # orphan the history the way the usage tables' identity strings can.
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    joined_on = Column(Date, nullable=False)
+    left_on = Column(Date, nullable=True)   # NULL = still a member
+
+    __table_args__ = (
+        Index("ix_pmi_pool_user", "pool_id", "user_id"),
     )
 
 

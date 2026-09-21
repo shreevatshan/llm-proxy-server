@@ -298,23 +298,23 @@ class UpdateUserProfileTests(UsageDBTestCase):
         key = (DAY, 9, "old.name", "user", "p/m", "openai")
         request_tracker._usage_buffer[key] = 4
 
-        real_daily = database.flush_request_usage
+        real_flush = database.flush_usage_rows
         writes = 0
 
-        async def slow_daily(rows):
+        async def slow_write(hourly_rows, daily_rows):
             # Stall only the first write, leaving it outstanding across the rename.
             nonlocal writes
             writes += 1
             if writes == 1:
                 await asyncio.sleep(0.3)
-            await real_daily(rows)
+            await real_flush(hourly_rows, daily_rows)
 
         async def noop(*args, **kwargs):
             return None
 
         try:
             with patch("app.auth.database.AsyncSessionLocal", self._session_factory), \
-                 patch("app.auth.database.flush_request_usage", slow_daily), \
+                 patch("app.auth.database.flush_usage_rows", slow_write), \
                  patch("app.auth.database.prune_hourly_usage", noop), \
                  patch("app.auth.database.rollup_to_monthly", noop):
                 racing = asyncio.create_task(request_tracker.flush_pending())

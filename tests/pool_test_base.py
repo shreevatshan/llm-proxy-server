@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import time_utils
 from app.auth.models import (
-    Base, RequestPool, RequestPoolMember, RequestUsage, User,
+    Base, PoolMembershipInterval, RequestPool, RequestPoolMember, RequestUsage, User,
 )
 
 DAY = date(2026, 4, 7)
@@ -105,20 +105,57 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         ))
         await self.db.commit()
 
-    async def make_pool(self, name, owner, members=()):
+    async def make_pool(self, name, owner, members=(), *, joined_on=DAY):
         """Create a pool with an owner and, optionally, extra members already in it.
 
         Bypasses the join endpoint deliberately: most settlement tests want a given
-        starting composition, not a history of joins.
+        starting composition, not a history of joins. The membership intervals pool
+        *usage* reads are opened here too, because a member with no interval has no
+        usage as far as those views are concerned — `joined_on` moves that start date
+        back for tests that care about pre-join traffic.
         """
         pool = RequestPool(name=name, owner_user_id=owner.id)
         self.db.add(pool)
         await self.db.flush()
         for user in (owner,) + tuple(members):
             self.db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
+            self.db.add(PoolMembershipInterval(
+                pool_id=pool.id, user_id=user.id, joined_on=joined_on,
+            ))
         await self.db.commit()
         await self.refresh()
         return pool
+
+    async def join_pool(self, pool, user, *, joined_on=DAY):
+        """Add one member to an existing pool, with their own stint start."""
+        self.db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
+        self.db.add(PoolMembershipInterval(
+            pool_id=pool.id, user_id=user.id, joined_on=joined_on,
+        ))
+        await self.db.commit()
+        await self.refresh()
+
+    async def leave_pool_on(self, pool, user, left_on=DAY):
+        """Close a member's stint and drop their membership row, as a departure does."""
+        from sqlalchemy import delete as sa_delete, update as sa_update
+
+        await self.db.execute(
+            sa_update(PoolMembershipInterval)
+            .where(
+                PoolMembershipInterval.pool_id == pool.id,
+                PoolMembershipInterval.user_id == user.id,
+                PoolMembershipInterval.left_on.is_(None),
+            )
+            .values(left_on=left_on)
+        )
+        await self.db.execute(
+            sa_delete(RequestPoolMember).where(
+                RequestPoolMember.pool_id == pool.id,
+                RequestPoolMember.user_id == user.id,
+            )
+        )
+        await self.db.commit()
+        await self.refresh()
 
     async def refresh(self):
         """Re-read the tracker snapshot from the test database."""
