@@ -39,9 +39,11 @@ from app.providers.anthropic_compatible import (
     _translate_anthropic_sdk_error,
 )
 from app.anthropic_models import (
+    ANTHROPIC_FORWARDABLE_EXTRAS,
     ANTHROPIC_SDK_TIMEOUT_SECONDS,
     build_anthropic_sdk_kwargs,
     is_anthropic_terminal_stream_event,
+    partition_extras,
 )
 from app.model_capabilities import (
     SURFACE_NATIVE,
@@ -226,8 +228,14 @@ class AzureProvider(OpenAICompatibleProvider):
         Reads the azure_call_style ContextVar set by the route handler:
           "deployment" → legacy AsyncAzureOpenAI using the deployment URL format
           "v1" (default) → AsyncOpenAI at /openai/v1/
+
+        Foundry resources do not host the deployment URL surface at all, so they
+        ignore the ContextVar: a deployment-style inbound request is translated
+        onto /openai/v1/.  The request body is identical either way, so only the
+        transport differs.  (Claude deployments have no OpenAI-shaped upstream
+        and are rejected by the route guard before reaching here.)
         """
-        if azure_call_style.get("v1") == "deployment":
+        if azure_call_style.get("v1") == "deployment" and not self._is_foundry_backend():
             return self._get_deployment_client(azure_api_version.get(None))
         return self._v1_client
 
@@ -237,9 +245,17 @@ class AzureProvider(OpenAICompatibleProvider):
         Raises ValueError if no usable api-version can be determined or if this
         is a Foundry backend (which has no legacy deployment URL surface).
         The deployment route handlers catch ValueError and return a 400 response.
+
+        _get_inference_client no longer routes Foundry here, so the Foundry
+        branch is defensive: it guards any direct caller.
         """
+        if self._is_foundry_backend():
+            raise ValueError(
+                "Foundry-backed Azure providers have no deployment-style upstream; "
+                "use the /openai/v1/ client instead"
+            )
         eff = api_version
-        if self._is_foundry_backend() or not eff:
+        if not eff:
             raise ValueError(
                 "api-version is required for deployment-style calls to this Azure provider"
             )
@@ -352,6 +368,19 @@ class AzureProvider(OpenAICompatibleProvider):
         payload["model"] = self.get_model_id(request.model)
         payload["stream"] = stream
         dropped_fields: List[str] = []
+
+        # model_dump() carries client-supplied extras through, so mirror the
+        # allowlist applied on the wire in build_anthropic_sdk_kwargs. Sharing
+        # partition_extras keeps this reporting path from drifting out of sync
+        # with what is actually sent.
+        _, dropped_extras = partition_extras(
+            getattr(request, "model_extra", None),
+            type(request).model_fields,
+            ANTHROPIC_FORWARDABLE_EXTRAS,
+        )
+        for key in dropped_extras:
+            payload.pop(key, None)
+        dropped_fields.extend(dropped_extras)
 
         # Drop the sampling params this model rejects (e.g. "top_p is deprecated
         # for this model"); see app.model_capabilities for the table.
@@ -559,11 +588,12 @@ class AzureProvider(OpenAICompatibleProvider):
             "/openai/v1/audio/speech",
             "/openai/v1/audio/transcriptions",
         ])
-        if not self._is_foundry_backend():
-            endpoints.append("/openai/v1/responses")
-            # self._responses_client and self.client are always set in __init__,
-            # so no additional client-presence guard is needed here.
-            endpoints.append("/v1/responses")
+        # Both backends serve the Responses API off /openai/v1/responses; Foundry
+        # supports it for MAI-DS-R1, grok-*, Llama-*, DeepSeek-*, gpt-oss-120b and
+        # the Azure OpenAI models.  self._responses_client and self.client are
+        # always set in __init__, so no client-presence guard is needed here.
+        endpoints.append("/openai/v1/responses")
+        endpoints.append("/v1/responses")
         return endpoints
 
     def get_anthropic_mode_for_model(self, model_name: str) -> str:
@@ -616,7 +646,12 @@ class AzureProvider(OpenAICompatibleProvider):
                 raise NotImplementedError("Anthropic SDK not available for Azure Foundry native mode")
 
             model_id = self.get_model_id(request.model)
-            kwargs = build_anthropic_sdk_kwargs(request, model_id)
+            # Foundry's Anthropic surface validates with a closed schema, so an
+            # unknown top-level field (e.g. a newer client's "safeguards") 400s
+            # the whole request. Forward only the extras it is known to accept.
+            kwargs = build_anthropic_sdk_kwargs(
+                request, model_id, forwardable_extras=ANTHROPIC_FORWARDABLE_EXTRAS
+            )
             self._apply_foundry_anthropic_fixups(kwargs)
 
             filtered_beta = self._filter_foundry_anthropic_beta(anthropic_beta)
@@ -655,7 +690,12 @@ class AzureProvider(OpenAICompatibleProvider):
                 raise NotImplementedError("Anthropic SDK not available for Azure Foundry native mode")
 
             model_id = self.get_model_id(request.model)
-            kwargs = build_anthropic_sdk_kwargs(request, model_id)
+            # Foundry's Anthropic surface validates with a closed schema, so an
+            # unknown top-level field (e.g. a newer client's "safeguards") 400s
+            # the whole request. Forward only the extras it is known to accept.
+            kwargs = build_anthropic_sdk_kwargs(
+                request, model_id, forwardable_extras=ANTHROPIC_FORWARDABLE_EXTRAS
+            )
             self._apply_foundry_anthropic_fixups(kwargs)
 
             filtered_beta = self._filter_foundry_anthropic_beta(anthropic_beta)

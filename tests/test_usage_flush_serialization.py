@@ -22,8 +22,9 @@ from app.request_tracker import RequestTracker
 
 from tests.test_usage_identity_rename import DAY, UsageDBTestCase
 
-# Buffer key: (date, hour, user_identity, user_type, model, server)
-KEY = (DAY, 9, "alice", "user", "p/m", "openai")
+# Buffer key: (date, hour, user_id, user_identity, user_type, model, server, pool_id).
+# user_id 1 is what UsageDBTestCase._seed hands the first identity it sees.
+KEY = (DAY, 9, 1, "alice", "user", "p/m", "openai", 0)
 
 
 async def _noop(*args, **kwargs):
@@ -111,9 +112,9 @@ class FlushVersusPurgeTests(SlowFlushTestCase):
 
             async with tracker.pause_flush():
                 await tracker.flush_pending()
-                await delete_usage_records(self.db, "user", "alice")
+                await delete_usage_records(self.db, "user", 1)
                 await self.db.commit()
-                dropped = await tracker.drop_buffered_usage("user", "alice")
+                dropped = await tracker.drop_buffered_usage("user", 1)
 
             await racing
 
@@ -142,7 +143,7 @@ class FlushInsideResettleTests(SlowFlushTestCase):
 
         async with tracker.pause_flush():
             await tracker.flush_pending()
-            await delete_usage_records(self.db, "user", "alice")
+            await delete_usage_records(self.db, "user", 1)
             await self.db.commit()
 
             # A request lands between the purge's flush and the end of the block: the
@@ -151,8 +152,8 @@ class FlushInsideResettleTests(SlowFlushTestCase):
 
             if resettle_before_drop:
                 await tracker.flush_pending()   # what settle_pool does internally
-                return await tracker.drop_buffered_usage("user", "alice")
-            dropped = await tracker.drop_buffered_usage("user", "alice")
+                return await tracker.drop_buffered_usage("user", 1)
+            dropped = await tracker.drop_buffered_usage("user", 1)
             await tracker.flush_pending()
             return dropped
 

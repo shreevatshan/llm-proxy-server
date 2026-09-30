@@ -38,6 +38,7 @@ from app.routes.stream_utils import (
     anthropic_stream_with_context_and_timeout,
     STREAM_TIMEOUT_SECONDS,
     format_anthropic_sse_event,
+    format_stream_log_context,
     set_request_tracking_outcome,
 )
 from app.rate_limit_dep import enforce_group_rate_limit
@@ -271,16 +272,19 @@ async def create_message(
                 "anthropic.stream": effective_stream,
             })
 
+            # Built for both branches: app.log only keeps WARNING and above (see
+            # run.py), so provider errors have to carry their own context.
+            request_id = getattr(getattr(request_obj, "state", None), "tracking_request_id", None)
+            request_log_context = {
+                "request_id": request_id,
+                "model": model_name,
+                "stream": effective_stream,
+                "provider": getattr(provider, "full_provider_name", "unknown"),
+            }
+
             if effective_stream:
                 # Streaming response
                 context_token = get_current()
-                request_id = getattr(getattr(request_obj, "state", None), "tracking_request_id", None)
-                stream_log_context = {
-                    "request_id": request_id,
-                    "model": model_name,
-                    "stream": effective_stream,
-                    "provider": getattr(provider, "full_provider_name", "unknown"),
-                }
 
                 async def generate():
                     terminal_event_seen = False
@@ -329,7 +333,11 @@ async def create_message(
                             }
                         })
                     except ProviderHTTPError as e:
-                        logger.warning("Anthropic stream provider HTTP error: %s", e.message)
+                        logger.warning(
+                            "Anthropic stream provider HTTP error: %s%s",
+                            e.message,
+                            format_stream_log_context(request_log_context),
+                        )
                         set_request_tracking_outcome(
                             request_obj,
                             status="errored",
@@ -381,7 +389,7 @@ async def create_message(
                         context_token,
                         request_obj,
                         timeout=STREAM_TIMEOUT_SECONDS,
-                        log_context=stream_log_context,
+                        log_context=request_log_context,
                         request_started_at=request_started_at,
                     ),
                     media_type="text/event-stream",
@@ -406,6 +414,11 @@ async def create_message(
                         f"Anthropic Messages API not supported by provider"
                     )
                 except ProviderHTTPError as e:
+                    logger.warning(
+                        "Anthropic provider HTTP error: %s%s",
+                        e.message,
+                        format_stream_log_context(request_log_context),
+                    )
                     response = _provider_http_error_response(e)
                     for key, value in anthropic_headers.items():
                         response.headers[key] = value

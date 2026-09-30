@@ -23,7 +23,7 @@ from sqlalchemy.orm import sessionmaker
 os.environ.setdefault("JWT_SECRET_KEY", "test-secret-not-placeholder-abc123")
 
 from app.auth.admin import AdminUser
-from app.auth.models import APIKey, Base, BulkUserActionRequest, User, UserRateLimit
+from app.auth.models import APIKey, Base, BulkUserActionRequest, RequestUsage, User, UserRateLimit
 from app.routes.admin import MAX_BULK_USER_IDS, bulk_user_action
 
 
@@ -187,14 +187,28 @@ class BulkUserActionTests(unittest.IsolatedAsyncioTestCase):
     # -- delete ----------------------------------------------------------
 
     async def test_delete_removes_users_and_dependent_rows(self):
+        from datetime import date
+
         alice = await self._add_user("alice")
+        bob = await self._add_user("bob")
         self.db.add(APIKey(user_id=alice.id, api_key="k" * 64, name="key"))
         self.db.add(UserRateLimit(user_id=alice.id))
+        for user in (alice, bob):
+            self.db.add(RequestUsage(
+                date=date(2026, 4, 7), user_id=user.id, pool_id=0,
+                user_identity=user.username, user_type="user",
+                model="p/m", server="openai", request_count=5,
+            ))
         await self.db.commit()
 
         result = await self._call("delete", [alice.id])
 
         self.assertEqual(result["succeeded_count"], 1)
+        # Usage rows go with the account, so a later "alice" inherits nothing;
+        # bob's are untouched.
+        self.assertEqual([r.user_identity for r in (await self.db.execute(
+            select(RequestUsage)
+        )).scalars().all()], ["bob"])
         self.assertIsNone((await self.db.execute(
             select(User).where(User.id == alice.id)
         )).scalar_one_or_none())

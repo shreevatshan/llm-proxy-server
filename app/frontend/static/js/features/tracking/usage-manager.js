@@ -126,10 +126,11 @@ class UsageManager {
     /**
      * Descend one level. `label` is what the breadcrumb shows; it defaults to the id,
      * which is the right display string for a user or a model but not for a pool, whose
-     * id is a number.
+     * id is a number. `userId` is the user row's exact key: a label alone can name both a
+     * real account and the config admin's history.
      */
-    async drillDown(axis, id, label) {
-        this._drillStack.push({ axis, id, label: label ?? String(id) });
+    async drillDown(axis, id, label, userId) {
+        this._drillStack.push({ axis, id, label: label ?? String(id), userId: userId || null });
         if (!await this._renderLevel(this._peek())) {
             // Nothing painted, so don't leave a Back button pointing at this level.
             this._drillStack.pop();
@@ -162,9 +163,6 @@ class UsageManager {
         if (!this._cache) return;
         this._drillStack = [];
         this._setHeaderMode('toggle');
-        this._restoreTopLevelStats();
-        this._renderStats(this._cache.totals);
-        this._renderChart(this._cache.timeseries);
         this._renderTopLevel();
     }
 
@@ -182,7 +180,7 @@ class UsageManager {
         if (!entry) return false;
         let data;
         try {
-            const resp = await fetch(this._buildUrl({ view: entry.axis, id: entry.id }), {
+            const resp = await fetch(this._buildUrl({ view: entry.axis, id: entry.id, userId: entry.userId }), {
                 credentials: 'include', cache: 'no-store',
             });
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -244,6 +242,7 @@ class UsageManager {
         }
         if (extra.view) params.set('view', extra.view);
         if (extra.id != null) params.set('id', extra.id);
+        if (extra.userId) params.set('user_id', extra.userId);
         return `/admin/usage?${params}`;
     }
 
@@ -264,16 +263,13 @@ class UsageManager {
             if (!deferBody) this._setHeaderMode('toggle');
         }
         // While drilled in (e.g. during a silent refresh), the stat tiles are
-        // scoped to the selection — don't overwrite them with global totals.
-        if (!this.isDrilledIn) this._renderStats(this._cache.totals);
+        // scoped to the selection — don't overwrite them with the top-level ones.
+        if (!this.isDrilledIn) this._renderStats(this._topLevelTotals());
         this._renderEarliestDate(this._cache.earliest_date);
         // deferBody: a drill-down render follows immediately (e.g. a window change while
         // a user/model is selected), so skip the top-level chart+table to avoid flashing
         // the overall view before the scoped one paints.
         if (!this.isDrilledIn && !deferBody) {
-            this._restoreTopLevelStats();
-            this._renderChart(this._cache.timeseries);
-            this._updateToggle(this.currentView);
             this._renderTopLevel();
         }
     }
@@ -403,6 +399,12 @@ class UsageManager {
 
     _renderTopLevel() {
         this._updateToggle(this.currentView);
+        // Painted here rather than by the callers so switching tabs repaints them: By
+        // Pool needs a different series and different tiles, and setView() only reaches
+        // _renderTopLevel.
+        this._restoreTopLevelStats();
+        this._renderStats(this._topLevelTotals());
+        this._renderChart(...this._topLevelChartArgs());
         if (this.currentView === 'user') {
             this._renderUserTable(this._cache.per_user);
         } else if (this.currentView === 'pool') {
@@ -411,6 +413,58 @@ class UsageManager {
         } else {
             this._renderModelTable(this._cache.per_model);
         }
+    }
+
+    /**
+     * The _renderChart arguments for the current tab.
+     *
+     * By User and By Model re-partition the same traffic -- every request has a user and
+     * a model -- so both get the overall series. By Pool doesn't: unpooled users are
+     * missing from it and a member's pre-join requests aren't the pool's, so it gets the
+     * pooled-only series instead of drawing bars the table can't account for. `||`
+     * covers a payload cached from before that field existed.
+     */
+    _topLevelChartArgs() {
+        if (this.currentView !== 'pool') return [this._cache.timeseries, {}];
+        return [this._cache.pool_timeseries || [], { label: 'Pooled requests' }];
+    }
+
+    /**
+     * The three overview tiles for the current tab, in the shape _renderStats takes.
+     *
+     * By User and By Model re-partition all traffic, so the payload's own totals are
+     * theirs. By Pool doesn't re-partition it -- unpooled users are missing and a
+     * member's pre-join requests aren't the pool's -- so global totals there were three
+     * numbers the table underneath could not account for: a pool with no traffic sat
+     * under a five-figure request count. It gets the pooled triple instead, each tile
+     * matching something on screen: the requests the bars sum to, the sum of the
+     * table's Members column, and the number of rows.
+     */
+    _topLevelTotals() {
+        if (this.currentView !== 'pool') return this._cache?.totals;
+        const pools = this._cache?.per_pool || [];
+        return {
+            // Members on the middle tile, where a pool drill-down also puts them, so
+            // descending into one pool narrows that tile instead of moving it.
+            // One pool per user (a schema UNIQUE), so summing can't count anyone twice.
+            requests: this._pooledRequests(),
+            unique_users: pools.reduce((s, p) => s + (p.member_count || 0), 0),
+            unique_models: pools.length,
+        };
+    }
+
+    /**
+     * Total requests that counted toward some pool in the window.
+     *
+     * The chart's own series, summed, so the tile and the bars can't disagree. Summing
+     * the per-pool counts now gives the same total -- each request is stamped with
+     * exactly one pool_id -- so that is kept only as the fallback for a payload cached
+     * from before pool_timeseries existed.
+     */
+    _pooledRequests() {
+        const series = this._cache?.pool_timeseries;
+        if (Array.isArray(series)) return series.reduce((s, b) => s + (b.count || 0), 0);
+        return (this._cache?.per_pool || []).reduce((s, p) => s + (p.request_count || 0), 0);
     }
 
     /**
@@ -452,7 +506,7 @@ class UsageManager {
         if (!rows || rows.length === 0) { container.innerHTML = this._emptyState(); return; }
         const total = this._cache?.totals?.requests || rows.reduce((s, r) => s + r.request_count, 0);
         const rowsHtml = rows.map(r => `
-            <tr class="usage-drilldown-row" data-axis="user" data-id="${this._esc(r.user_identity)}" style="cursor:pointer;" title="Click to see breakdown by model">
+            <tr class="usage-drilldown-row" data-axis="user" data-id="${this._esc(r.user_identity)}" data-user-id="${this._esc(String(r.user_id ?? ''))}" style="cursor:pointer;" title="Click to see breakdown by model">
                 <td>${this._esc(r.user_identity)}</td>
                 <td><span class="badge bg-secondary">${this._esc(r.user_type)}</span></td>
                 <td>${r.request_count.toLocaleString()}</td>
@@ -495,10 +549,11 @@ class UsageManager {
     _renderPoolTable(rows) {
         const container = document.getElementById('usage-table-container');
         if (!rows || rows.length === 0) { container.innerHTML = this._emptyState(); return; }
-        // Against all traffic, not the pooled subtotal — the same denominator the other
-        // two tables use. With unpooled users active these won't sum to 100%, which is
-        // the honest reading: it's each pool's share of everything.
-        const total = this._cache?.totals?.requests || rows.reduce((s, r) => s + r.request_count, 0);
+        // Against pooled traffic, not all of it: the Pooled Requests tile and the chart
+        // above are both scoped that way, so a share of everything would be the one
+        // number on the tab with a different denominator. It reads as each pool's share
+        // of what the pools consumed.
+        const total = this._pooledRequests() || rows.reduce((s, r) => s + r.request_count, 0);
         const rowsHtml = rows.map(r => `
             <tr class="usage-drilldown-row" data-axis="pool" data-id="${r.pool_id}" data-label="${this._esc(r.name)}" style="cursor:pointer;" title="Click to see breakdown by member">
                 <td>${this._esc(r.name)}</td>
@@ -539,7 +594,7 @@ class UsageManager {
         }
         const total = rows.reduce((s, r) => s + r.request_count, 0);
         const rowsHtml = rows.map(r => `
-            <tr class="usage-drilldown-row" data-axis="user" data-id="${this._esc(r.user_identity)}" data-label="${this._esc(r.user_identity)}" style="cursor:pointer;" title="Click to see breakdown by model">
+            <tr class="usage-drilldown-row" data-axis="user" data-id="${this._esc(r.user_identity)}" data-user-id="${this._esc(String(r.user_id ?? ''))}" data-label="${this._esc(r.user_identity)}" style="cursor:pointer;" title="Click to see breakdown by model">
                 <td>${this._esc(r.user_identity)}</td>
                 <td>${r.user_type ? `<span class="badge bg-secondary">${this._esc(r.user_type)}</span>` : '<span class="text-muted">—</span>'}</td>
                 <td>${r.request_count.toLocaleString()}</td>
@@ -608,13 +663,17 @@ class UsageManager {
     // layout scoped to the selection: total requests, plus the count of the other axis
     // (models for a user, users for a model, members for a pool). _setStatTile always
     // shows one card and hides the other, so walking pool -> member -> back needs no
-    // restore in between; only _returnToTopLevel calls _restoreTopLevelStats.
+    // restore in between; only _renderTopLevel calls _restoreTopLevelStats.
     _renderDrilldownStats(axis, breakdown) {
         const rows = Array.isArray(breakdown) ? breakdown : [];
         const totalReqs = rows.reduce((s, r) => s + (r.request_count || 0), 0);
 
         const totalEl = document.getElementById('usage-total-requests');
         if (totalEl) totalEl.textContent = totalReqs.toLocaleString();
+        // Back to the plain label: the tile is one selection's own traffic now, not the
+        // tab-wide 'Pooled Requests' the By Pool overview leaves behind.
+        const totalLabel = document.querySelector('#usage-stat-total .stat-label');
+        if (totalLabel) totalLabel.textContent = 'Total Requests';
 
         if (axis === 'user') {
             // Selected a user → second tile shows how many models they used.
@@ -646,21 +705,21 @@ class UsageManager {
         }
     }
 
-    // Restore the full three-tile overview (both count tiles visible with their
-    // original labels) after leaving a drill-down.
+    // Restore the full three-tile overview (both count tiles visible) after leaving a
+    // drill-down, and label all three for the current tab — By Pool counts pools and
+    // members where the other two count users and models.
     _restoreTopLevelStats() {
-        const usersCard = document.getElementById('usage-stat-users');
-        const modelsCard = document.getElementById('usage-stat-models');
-        if (usersCard) {
-            usersCard.style.display = '';
-            const l = usersCard.querySelector('.stat-label');
-            if (l) l.textContent = 'Unique Users';
-        }
-        if (modelsCard) {
-            modelsCard.style.display = '';
-            const l = modelsCard.querySelector('.stat-label');
-            if (l) l.textContent = 'Models Used';
-        }
+        const pool = this.currentView === 'pool';
+        const label = (cardId, text) => {
+            const card = document.getElementById(cardId);
+            if (!card) return;
+            card.style.display = '';
+            const l = card.querySelector('.stat-label');
+            if (l) l.textContent = text;
+        };
+        label('usage-stat-total', pool ? 'Pooled Requests' : 'Total Requests');
+        label('usage-stat-users', pool ? 'Pool Members' : 'Unique Users');
+        label('usage-stat-models', pool ? 'Pools' : 'Models Used');
     }
 
     _renderEarliestDate(dateStr) {
@@ -675,7 +734,7 @@ class UsageManager {
         }
     }
 
-    _renderChart(timeseries) {
+    _renderChart(timeseries, { label = 'Requests' } = {}) {
         const canvas = document.getElementById('usage-chart');
         if (!canvas || typeof Chart === 'undefined') return;
 
@@ -692,6 +751,7 @@ class UsageManager {
         if (this._chart) {
             this._chart.data.labels = labels;
             this._chart.data.datasets[0].data = data;
+            this._chart.data.datasets[0].label = label;
             this._chart.update();
             return;
         }
@@ -701,7 +761,7 @@ class UsageManager {
             data: {
                 labels,
                 datasets: [{
-                    label: 'Requests',
+                    label,
                     data,
                     backgroundColor: barColor,
                     borderWidth: 0,
@@ -804,7 +864,7 @@ class UsageManager {
         container.querySelectorAll('.usage-drilldown-row').forEach(row => {
             // data-label is only set where the id isn't a display string (a pool id);
             // drillDown falls back to the id everywhere else.
-            row.addEventListener('click', () => this.drillDown(row.dataset.axis, row.dataset.id, row.dataset.label));
+            row.addEventListener('click', () => this.drillDown(row.dataset.axis, row.dataset.id, row.dataset.label, row.dataset.userId));
         });
     }
 
@@ -814,12 +874,12 @@ class UsageManager {
                 // The whole row is a drill-down target; don't open it behind the dialog.
                 e.stopPropagation();
                 const row = btn.closest('tr');
-                if (row) this._deleteUsage(row.dataset.axis, row.dataset.id, btn);
+                if (row) this._deleteUsage(row.dataset.axis, row.dataset.id, btn, row.dataset.userId);
             });
         });
     }
 
-    async _deleteUsage(axis, id, btn) {
+    async _deleteUsage(axis, id, btn, userId) {
         let label, message;
         if (axis === 'pool') {
             // Names looked up from the cached payload rather than carried in a data-*
@@ -829,10 +889,11 @@ class UsageManager {
             const members = pool?.members || [];
             label = `pool '${pool?.name ?? id}'`;
             const who = members.length
-                ? `the ${members.length} member${members.length === 1 ? '' : 's'} of ${label} (${members.join(', ')})`
-                : label;
-            message = `Permanently delete ALL usage data for ${who}? ` +
-                'It also resets their request counts for today.';
+                ? ` Its ${members.length} member${members.length === 1 ? '' : 's'} (${members.join(', ')}) keep` +
+                  ' the requests they sent outside the pool.'
+                : '';
+            message = `Permanently delete all usage attributed to ${label}?${who} ` +
+                "It also resets the pool's request count for today.";
         } else {
             label = axis === 'user' ? `user '${id}'` : `model '${id}'`;
             message =
@@ -847,6 +908,7 @@ class UsageManager {
         btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
         try {
             const params = new URLSearchParams({ view: axis, id });
+            if (axis === 'user' && userId) params.set('user_id', userId);
             const resp = await fetch(`/admin/usage?${params}`, { method: 'DELETE', credentials: 'include' });
             if (!resp.ok) {
                 const body = await resp.json().catch(() => ({}));

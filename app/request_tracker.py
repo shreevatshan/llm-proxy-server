@@ -15,40 +15,14 @@ from dataclasses import dataclass, asdict
 from datetime import date, datetime, timezone
 from typing import Optional
 from app import time_utils
+from app.concurrency import TaskReentrantLock
 
 logger = logging.getLogger(__name__)
 
 
-class _TaskReentrantLock:
-    """An asyncio.Lock that the task already holding it may re-acquire.
-
-    The usage flush and the operations that have to exclude it (rename, purge) are
-    each public coroutines that take this lock, and callers also hold it across
-    their own DB transaction via RequestTracker.pause_flush(). A plain Lock would
-    self-deadlock on that nesting.
-    """
-
-    def __init__(self):
-        self._lock = asyncio.Lock()
-        self._owner = None
-        self._depth = 0
-
-    async def __aenter__(self):
-        task = asyncio.current_task()
-        if self._owner is not None and self._owner is task:
-            self._depth += 1
-            return self
-        await self._lock.acquire()
-        self._owner = task
-        self._depth = 1
-        return self
-
-    async def __aexit__(self, *exc_info):
-        self._depth -= 1
-        if self._depth == 0:
-            self._owner = None
-            self._lock.release()
-        return False
+# Promoted to app.concurrency so pool settlement can use the same primitive; the
+# private name stays for this module's own call sites.
+_TaskReentrantLock = TaskReentrantLock
 
 
 @dataclass
@@ -63,10 +37,20 @@ class ActiveRequest:
     is_streaming: bool
     start_time: float        # time.time()
     status: str = "in_progress"
+    # Attribution key for usage rows: users.id, ADMIN_USAGE_USER_ID for the config
+    # admin, None until authentication has run (such a request is never counted).
+    user_id: Optional[int] = None
+
+
+# Slots of the usage buffer key. Everything that reads or rewrites the buffer goes
+# through these names rather than bare indexes.
+_K_DATE, _K_HOUR, _K_USER_ID, _K_IDENTITY, _K_TYPE, _K_MODEL, _K_SERVER, _K_POOL = range(8)
 
 
 class RequestTracker:
-    FLUSH_INTERVAL = 60  # seconds between DB flushes
+    # Seconds between DB flushes. Bounds how much usage a hard kill can lose; the
+    # flush is one upsert per table, so it is cheap to run often.
+    FLUSH_INTERVAL = 10
 
     def __init__(self):
         self._active: dict[str, ActiveRequest] = {}
@@ -146,32 +130,40 @@ class RequestTracker:
                 return
             snapshot = dict(self._usage_buffer)
 
-        # Buffer key: (date, hour, user_identity, user_type, model, server)
+        # Buffer key: (date, hour, user_id, user_identity, user_type, model, server, pool_id)
         hourly_rows = [
             {
-                "date": key[0],
-                "hour": key[1],
-                "user_identity": key[2],
-                "user_type": key[3],
-                "model": key[4],
-                "server": key[5],
+                "date": key[_K_DATE],
+                "hour": key[_K_HOUR],
+                "user_id": key[_K_USER_ID],
+                "user_identity": key[_K_IDENTITY],
+                "user_type": key[_K_TYPE],
+                "model": key[_K_MODEL],
+                "server": key[_K_SERVER],
+                "pool_id": key[_K_POOL],
                 "request_count": count,
             }
             for key, count in snapshot.items()
         ]
 
-        # Collapse hourly rows into daily rows (sum counts for same date/user/model/server)
+        # Collapse hourly rows into daily rows: drop the hour, sum the rest. Two hourly
+        # keys differing only in user_type land on the same daily upsert key -- the
+        # label of whichever comes last wins, which is what the upsert does anyway.
         daily_map: dict[tuple, int] = defaultdict(int)
+        daily_labels: dict[tuple, tuple] = {}
         for key, count in snapshot.items():
-            daily_key = (key[0], key[2], key[3], key[4], key[5])  # drop hour
+            daily_key = (key[_K_DATE], key[_K_USER_ID], key[_K_MODEL], key[_K_SERVER], key[_K_POOL])
             daily_map[daily_key] += count
+            daily_labels[daily_key] = (key[_K_IDENTITY], key[_K_TYPE])
         daily_rows = [
             {
                 "date": k[0],
-                "user_identity": k[1],
-                "user_type": k[2],
-                "model": k[3],
-                "server": k[4],
+                "user_id": k[1],
+                "user_identity": daily_labels[k][0],
+                "user_type": daily_labels[k][1],
+                "model": k[2],
+                "server": k[3],
+                "pool_id": k[4],
                 "request_count": count,
             }
             for k, count in daily_map.items()
@@ -247,11 +239,6 @@ class RequestTracker:
         termination_reason: Optional[str] = None,
         error: Optional[str] = None,
     ) -> None:
-        async with self._lock:
-            entry = self._active.pop(request_id, None)
-        if entry is None:
-            return
-
         # Accumulate usage (skip unauthenticated requests).
         # Only successful requests count toward usage / rate limits: a 2xx
         # response ("completed") or a request the client cancelled mid-flight
@@ -260,19 +247,37 @@ class RequestTracker:
         # Requests with no model (metadata/listing endpoints like GET
         # /v1/models, /v1/responses/{id}, etc.) are not real model usage and
         # are skipped so they don't surface as an "unknown" model row.
+        #
+        # The pop and the buffer increment happen together under _lock. Splitting them
+        # leaves a window where the request is in neither _active nor the buffer, and
+        # those two are exactly what rename_identity sweeps: a rename landing in the gap
+        # relabels nothing, and the old label this then buffers rides the next flush's
+        # on-conflict update straight over the row rename_usage_identity just fixed.
+        # _usage_lock is never held across a DB write, so nesting it here is cheap.
         _COUNTED_STATUSES = ("completed", "cancelled")
-        if entry.model and entry.user_type != "unknown" and status in _COUNTED_STATUSES:
-            now_local = time_utils.local_now()
-            key = (
-                now_local.date(),
-                now_local.hour,
-                entry.user_identity,
-                entry.user_type,
-                entry.model or "unknown",
-                entry.server,
-            )
-            async with self._usage_lock:
-                self._usage_buffer[key] += 1
+        async with self._lock:
+            entry = self._active.pop(request_id, None)
+            if entry is not None and (
+                entry.model and entry.user_type != "unknown"
+                and entry.user_id is not None and status in _COUNTED_STATUSES
+            ):
+                now_local = time_utils.local_now()
+                key = (
+                    now_local.date(),
+                    now_local.hour,
+                    entry.user_id,
+                    entry.user_identity,
+                    entry.user_type,
+                    entry.model or "unknown",
+                    entry.server,
+                    # The pool the sender is in *now*: pool usage is a filter on this
+                    # column, so a request completed after leaving is not the pool's.
+                    self._pool_id_for(entry.user_id),
+                )
+                async with self._usage_lock:
+                    self._usage_buffer[key] += 1
+        if entry is None:
+            return
 
         entry.status = status
         data = self._serialize(entry)
@@ -288,11 +293,21 @@ class RequestTracker:
             event_type = "request_errored"
         await self._broadcast_raw(event_type, data)
 
+    @staticmethod
+    def _pool_id_for(user_id: int) -> int:
+        """The pool a user is in right now, per the rate limiter's snapshot (0 if none)."""
+        try:
+            from app.rate_limit import rate_limit_tracker
+            return rate_limit_tracker.pool_id_for_user(user_id)
+        except Exception:
+            return 0
+
     async def update_identity(
         self,
         request_id: str,
         user_identity: str,
         user_type: str,
+        user_id: Optional[int] = None,
     ) -> None:
         async with self._lock:
             entry = self._active.get(request_id)
@@ -300,50 +315,54 @@ class RequestTracker:
                 return
             entry.user_identity = user_identity
             entry.user_type = user_type
+            entry.user_id = user_id
             data = self._serialize(entry)
         await self._broadcast_raw("request_updated", data)
 
-    async def rename_identity(self, old: str, new: str) -> None:
-        """Move buffered and in-flight usage from one user_identity to another.
+    async def rename_identity(self, user_id: int, new: str) -> None:
+        """Relabel buffered and in-flight usage of one user with their new username.
 
-        Called after a username change has been committed. The DB rows are moved by
-        rename_usage_identity; this covers the counts that have not reached the DB
+        Called after a username change has been committed. The DB rows are relabelled
+        by rename_usage_identity; this covers the counts that have not reached the DB
         yet — anything buffered since the pre-rename flush, plus requests that were
-        already in flight when the rename happened. Without it those flush under the
-        old name and recreate the orphan row the rename just cleaned up.
+        already in flight when the rename happened. Attribution is by user_id so
+        nothing is at stake for quotas; without this, though, the next flush would
+        write new (date, hour) rows under the old label.
         """
-        if old == new:
-            return
-
         # Excludes a concurrent flush: one caught mid-write would finish writing its
-        # pre-rename snapshot under `old` — the orphan rows the SQL rename just
-        # cleaned up — and then subtract that snapshot from buffer entries this
-        # method has already moved, leaving them to flush again under `new`.
+        # pre-rename snapshot under the old label and then subtract that snapshot from
+        # buffer entries this method has already moved.
         async with self._flush_mutex:
-            async with self._usage_lock:
-                # Buffer key is (date, hour, user_identity, user_type, model, server).
-                stale = [key for key in self._usage_buffer if key[2] == old]
-                for key in stale:
-                    renamed = (key[0], key[1], new, key[3], key[4], key[5])
-                    # The new identity may already have a buffered count for this key.
-                    self._usage_buffer[renamed] += self._usage_buffer.pop(key)
-
+            # Both sweeps under _lock, nesting _usage_lock inside it exactly as
+            # end_request does. Held together they cover every counted request: one
+            # still in flight is relabelled in _active, one already completed is
+            # relabelled in the buffer, and end_request cannot be between the two.
             async with self._lock:
                 for entry in self._active.values():
-                    if entry.user_identity == old:
+                    if entry.user_id == user_id:
                         entry.user_identity = new
 
-    async def drop_buffered_usage(self, axis: str, value: str) -> int:
-        """Discard buffered counts for one user_identity (axis='user') or model.
+                async with self._usage_lock:
+                    stale = [
+                        key for key in self._usage_buffer
+                        if key[_K_USER_ID] == user_id and key[_K_IDENTITY] != new
+                    ]
+                    for key in stale:
+                        relabelled = key[:_K_IDENTITY] + (new,) + key[_K_IDENTITY + 1:]
+                        # The new label may already have a buffered count for this key.
+                        self._usage_buffer[relabelled] += self._usage_buffer.pop(key)
 
-        Called after an admin purges a user's or model's usage rows. Counts buffered
+    async def drop_buffered_usage(self, axis: str, value) -> int:
+        """Discard buffered counts for one user (axis='user', value=user_id), one model
+        (axis='model') or one pool (axis='pool', value=pool_id).
+
+        Called after an admin purges usage rows, or a user is deleted. Counts buffered
         since the last flush have not reached the DB yet, so without this they land
         on the next cycle and recreate the rows that were just deleted.
 
         Returns the number of requests dropped, for logging.
         """
-        # Buffer key is (date, hour, user_identity, user_type, model, server).
-        slot = 2 if axis == "user" else 4
+        slot = {"user": _K_USER_ID, "model": _K_MODEL, "pool": _K_POOL}[axis]
 
         # Excludes a concurrent flush, which would otherwise write its pre-purge
         # snapshot into the tables the caller just cleared.
@@ -351,6 +370,32 @@ class RequestTracker:
             async with self._usage_lock:
                 stale = [key for key in self._usage_buffer if key[slot] == value]
                 return sum(self._usage_buffer.pop(key) for key in stale)
+
+    async def forget_user(self, user_id: int) -> int:
+        """Stop attributing any usage to a user whose account was just deleted.
+
+        drop_buffered_usage alone only clears what has already completed. A request
+        still in flight -- typically a long stream -- ends later and buffers a fresh
+        count under the deleted id, and the next flush writes it back. users.id is not
+        AUTOINCREMENT, so SQLite hands that id to the next account registered, which
+        would inherit the rows and have today's portion charged against its RPD.
+
+        So, like rename_identity, both places are swept under _lock and _usage_lock
+        together: buffered counts are dropped, and in-flight entries are detached
+        (user_id=None is never counted, see end_request). end_request cannot land
+        between the two sweeps. The entries stay in _active so the live view still
+        shows them finishing.
+
+        Returns the number of buffered requests dropped, for logging.
+        """
+        async with self._flush_mutex:
+            async with self._lock:
+                for entry in self._active.values():
+                    if entry.user_id == user_id:
+                        entry.user_id = None
+                async with self._usage_lock:
+                    stale = [key for key in self._usage_buffer if key[_K_USER_ID] == user_id]
+                    return sum(self._usage_buffer.pop(key) for key in stale)
 
     async def update_streaming(
         self,
@@ -417,30 +462,31 @@ class RequestTracker:
             self._subscribers.discard(queue)
 
     @staticmethod
-    def _identity_set(user_identity) -> set:
-        """Normalise a single identity or a sequence of them into a set.
+    def _id_set(user_ids) -> set:
+        """Normalise a single user id or a sequence of them into a set.
 
-        Request pools count several usernames against one shared daily quota, so the
-        today-count readers take either form. Accepting a bare string keeps every
-        pre-pool caller working unchanged.
+        Request pools count several users against one shared daily quota, so the
+        today-count readers take either form.
         """
-        if isinstance(user_identity, str):
-            return {user_identity}
-        return set(user_identity)
+        if isinstance(user_ids, int):
+            return {user_ids}
+        return set(user_ids)
 
-    async def get_today_count(self, user_identity) -> int:
-        """Return total ungrouped requests today for user_identity (buffer + DB).
+    async def get_today_count(self, user_ids) -> int:
+        """Return total ungrouped requests today for these users (buffer + DB).
 
-        `user_identity` is a username or, for a pooled user, the sequence of usernames
-        sharing the pool's quota — counted in one query rather than one per member.
+        `user_ids` is one user id or, for a pooled user, the ids of everyone sharing
+        the pool's quota — counted in one query rather than one per member. Rows are
+        counted wherever they were sent (any pool_id): a member's consumption is theirs
+        whichever pool they were in at the time.
 
         Requests whose model belongs to a model group, or whose instance (provider_key
         prefix) belongs to an instance group, are excluded — those are governed by the
         group's own limit and never counted against the overall quota, matching the
         auth middleware's overall-gate skip.
         """
-        identities = self._identity_set(user_identity)
-        if not identities:
+        ids = self._id_set(user_ids)
+        if not ids:
             return 0
         today = time_utils.local_today()
 
@@ -462,8 +508,8 @@ class RequestTracker:
         buffered = 0
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
-                # key = (date, hour, user_identity, user_type, model, server)
-                if key[0] == today and key[2] in identities and not _is_grouped(key[4]):
+                if (key[_K_DATE] == today and key[_K_USER_ID] in ids
+                        and not _is_grouped(key[_K_MODEL])):
                     buffered += count
 
         try:
@@ -474,7 +520,7 @@ class RequestTracker:
             async with AsyncSessionLocal() as db:
                 conditions = [
                     RequestUsage.date == today,
-                    RequestUsage.user_identity.in_(identities),
+                    RequestUsage.user_id.in_(list(ids)),
                 ]
                 # Exclude grouped models (exact match) and grouped instances (prefix match).
                 exclude = []
@@ -492,13 +538,13 @@ class RequestTracker:
         except Exception:
             logger.error(
                 "get_today_count DB read failed for %s; returning buffered-only count",
-                user_identity, exc_info=True,
+                user_ids, exc_info=True,
             )
             db_count = 0
 
         return buffered + db_count
 
-    async def get_today_group_count(self, user_identity, model_ids: list) -> int:
+    async def get_today_group_count(self, user_ids, model_ids: list) -> int:
         """Return total requests today across all model_ids in a group (buffer + DB).
 
         Models whose provider is in an instance group are excluded, mirroring the
@@ -510,13 +556,13 @@ class RequestTracker:
         get_today_instance_group_count needs no matching exclusion: nothing outranks an
         instance group.
 
-        `user_identity` is a username or, for a pooled user, the sequence of usernames
-        sharing the pool's quota.
+        `user_ids` is one user id or, for a pooled user, the ids of everyone sharing
+        the pool's quota.
         """
         if not model_ids:
             return 0
-        identities = self._identity_set(user_identity)
-        if not identities:
+        ids = self._id_set(user_ids)
+        if not ids:
             return 0
         today = time_utils.local_today()
         model_set = set(model_ids)
@@ -536,9 +582,8 @@ class RequestTracker:
         buffered = 0
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
-                # key = (date, hour, user_identity, user_type, model, server)
-                if (key[0] == today and key[2] in identities
-                        and key[4] in model_set and not _instance_grouped(key[4])):
+                if (key[_K_DATE] == today and key[_K_USER_ID] in ids
+                        and key[_K_MODEL] in model_set and not _instance_grouped(key[_K_MODEL])):
                     buffered += count
 
         try:
@@ -549,7 +594,7 @@ class RequestTracker:
             async with AsyncSessionLocal() as db:
                 conditions = [
                     RequestUsage.date == today,
-                    RequestUsage.user_identity.in_(identities),
+                    RequestUsage.user_id.in_(list(ids)),
                     RequestUsage.model.in_(model_ids),
                 ]
                 exclude = []
@@ -565,35 +610,34 @@ class RequestTracker:
         except Exception:
             logger.error(
                 "get_today_group_count DB read failed for %s; returning buffered-only count",
-                user_identity, exc_info=True,
+                user_ids, exc_info=True,
             )
             db_count = 0
 
         return buffered + db_count
 
-    async def get_today_instance_group_count(self, user_identity, provider_keys: list) -> int:
+    async def get_today_instance_group_count(self, user_ids, provider_keys: list) -> int:
         """Return total requests today across all instances (provider_keys) in a group (buffer + DB).
 
         Instance membership matches the stored full model id by prefix: a model id is
         '{provider_key}/{model_name}', so membership is tested against the part before
         the first '/'.
 
-        `user_identity` is a username or, for a pooled user, the sequence of usernames
-        sharing the pool's quota.
+        `user_ids` is one user id or, for a pooled user, the ids of everyone sharing
+        the pool's quota.
         """
         if not provider_keys:
             return 0
-        identities = self._identity_set(user_identity)
-        if not identities:
+        ids = self._id_set(user_ids)
+        if not ids:
             return 0
         today = time_utils.local_today()
         pk_set = set(provider_keys)
         buffered = 0
         async with self._usage_lock:
             for key, count in self._usage_buffer.items():
-                # key = (date, hour, user_identity, user_type, model, server)
-                model = key[4]
-                if key[0] == today and key[2] in identities and model:
+                model = key[_K_MODEL]
+                if key[_K_DATE] == today and key[_K_USER_ID] in ids and model:
                     prefix = model.split('/', 1)[0] if '/' in model else model
                     if prefix in pk_set:
                         buffered += count
@@ -610,7 +654,7 @@ class RequestTracker:
                 result = await db.execute(
                     select(func.sum(RequestUsage.request_count)).where(
                         RequestUsage.date == today,
-                        RequestUsage.user_identity.in_(identities),
+                        RequestUsage.user_id.in_(list(ids)),
                         or_(*conditions),
                     )
                 )
@@ -618,7 +662,7 @@ class RequestTracker:
         except Exception:
             logger.error(
                 "get_today_instance_group_count DB read failed for %s; returning buffered-only count",
-                user_identity, exc_info=True,
+                user_ids, exc_info=True,
             )
             db_count = 0
 

@@ -220,7 +220,27 @@
 /* The result count is screen-reader-only, so the list carries the whole gap between the
    search box and the first row — enough of one that the box reads as a control over the
    list rather than the first item in it. */
-.pool-dir { margin-top: 17px; }
+.pool-dir {
+    margin-top: 17px;
+    /* Fixed, not max-height: the directory is every account on the server, so the list
+       would otherwise run the card off the page, and a height that shrank as you typed
+       would move the rows under the pointer on every keystroke. One height for the
+       loading skeleton, the full list, eight matches and none of them means the card
+       is the same shape from the moment the tab opens — only its contents scroll. */
+    height: 304px;
+    overflow-y: auto;
+    /* The card sits inside the scrolling dashboard; reaching the end of this list
+       shouldn't hand the wheel back to the page. */
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: var(--mono-4) transparent;
+}
+.pool-dir::-webkit-scrollbar { width: 6px; }
+.pool-dir::-webkit-scrollbar-track { background: transparent; }
+.pool-dir::-webkit-scrollbar-thumb {
+    background: var(--mono-4); border-radius: var(--radius-full);
+}
+.pool-dir::-webkit-scrollbar-thumb:hover { background: var(--mono-text-muted); }
 
 /* Two columns, not the roster's four: this row answers "who" and "can I act". Every
    other property is the roster's, so the two lists read as one table. */
@@ -329,19 +349,20 @@
 
 /* An incoming invite leads the no-pool state — someone is waiting on an answer. */
 .pool-invite {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    flex-wrap: wrap;
     border: 1px solid var(--dark-border); border-radius: var(--radius-md);
-    background-color: var(--dark-surface); padding: 16px 18px; margin-bottom: 14px;
+    background-color: var(--dark-surface); padding: 13px 18px; margin-bottom: 14px;
 }
 .pool-invite__title {
     font-family: var(--font-family-display); font-weight: var(--font-semibold);
     font-size: 0.95rem; color: var(--mono-text-primary);
 }
-.pool-invite__body {
-    margin: 9px 0 14px; max-width: 62ch;
-    font-size: 0.8rem; line-height: 1.6; color: var(--mono-text-secondary);
-}
-.pool-invite__body strong { color: var(--mono-text-primary); font-weight: var(--font-semibold); }
-.pool-invite__acts { display: flex; gap: 9px; flex-wrap: wrap; }
+.pool-invite__who { color: var(--mono-text-name); }
+.pool-invite__acts { display: flex; gap: 9px; flex-shrink: 0; }
+/* Decline and Accept are near-equal in length, so content sizing leaves them
+   visibly mismatched. A shared floor squares the pair off. */
+.pool-invite__acts .btn { min-width: 92px; }
 
 /* ── Usage panel ───────────────────────────────────────────────────────── */
 /* The panel is the admin Usage tab's layout: tiles, a .section-header carrying the

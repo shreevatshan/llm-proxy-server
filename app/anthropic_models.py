@@ -9,7 +9,7 @@ These models mirror the Anthropic API specification for:
 import math
 import os
 import logging
-from typing import List, Optional, Dict, Any, Union, Literal, Annotated, Tuple
+from typing import List, Optional, Dict, Any, Iterable, Union, Literal, Annotated, Tuple
 from pydantic import BaseModel, Field, model_validator
 
 # Re-exported: is_claude_at_least lives in model_capabilities (alongside the
@@ -591,9 +591,55 @@ def _merge_system_fields(
     return list(existing) + extracted_blocks
 
 
+# Top-level request fields outside the declared Anthropic schema that are still
+# safe to forward to an upstream with a closed request schema. Mirrors the
+# Bedrock allowlist in app/providers/bedrock_provider.py.
+ANTHROPIC_FORWARDABLE_EXTRAS = frozenset({"context_management", "output_config"})
+
+
+def partition_extras(
+    extras: Optional[Dict[str, Any]],
+    known_field_names: Iterable[str],
+    forwardable: Optional[Iterable[str]] = None,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Split client-supplied extra fields into (forwarded, dropped_names).
+
+    ``forwardable=None`` keeps the open passthrough: every unknown field is
+    forwarded, preserving forward compatibility for newer Anthropic fields and
+    third-party gateways. Passing a collection restricts forwarding to those
+    names and reports the rest, so an upstream that validates with a closed
+    schema (Azure Foundry) is never handed a field it would reject with
+    "Extra inputs are not permitted".
+
+    Shared by the wire path (build_anthropic_sdk_kwargs) and the metadata path
+    (AzureProvider._prepare_foundry_native_request) so the two cannot disagree
+    about which fields survive.
+    """
+    known = set(known_field_names)
+    allowed = None if forwardable is None else set(forwardable)
+
+    forwarded: Dict[str, Any] = {}
+    dropped: List[str] = []
+    for key, value in (extras or {}).items():
+        # Only skip names that duplicate a declared request field; comparing
+        # against internal kwargs keys (e.g. "timeout") would wrongly drop a
+        # client extra field that happens to share that name.
+        if key in known or value is None:
+            continue
+        if allowed is not None and key not in allowed:
+            dropped.append(key)
+            continue
+        forwarded[key] = value
+
+    return forwarded, sorted(set(dropped))
+
+
 def build_anthropic_sdk_kwargs(
     request: "AnthropicMessagesRequest",
     model_id: str,
+    *,
+    forwardable_extras: Optional[Iterable[str]] = None,
+    dropped_fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build kwargs dict for the Anthropic SDK from a request model.
 
@@ -603,6 +649,13 @@ def build_anthropic_sdk_kwargs(
     Args:
         request: The validated Anthropic Messages request.
         model_id: The provider-specific model ID (already stripped of internal prefix).
+        forwardable_extras: When given, only these unknown top-level fields are
+            forwarded via ``extra_body``; the rest are dropped. Defaults to None
+            (forward everything), which is what providers fronting a genuine
+            Anthropic endpoint want.
+        dropped_fields: Optional list extended in place with the names of any
+            extras that were dropped, so the caller can surface them (e.g. via
+            the x-llmproxy-dropped-anthropic-fields response header).
 
     Returns:
         Dict ready to be passed as **kwargs to client.messages.create().
@@ -681,18 +734,24 @@ def build_anthropic_sdk_kwargs(
 
     # Forward any extra/unknown fields via extra_body so the Anthropic SDK
     # does not reject them as unexpected kwargs. This preserves forward
-    # compatibility for newer fields and third-party gateways.
+    # compatibility for newer fields and third-party gateways, except where the
+    # caller opted into an allowlist because the upstream schema is closed.
     extra_fields = getattr(request, "model_extra", None) or {}
     if extra_fields:
-        # Only skip names that duplicate a declared request field; comparing
-        # against internal kwargs keys (e.g. "timeout") would wrongly drop a
-        # client extra field that happens to share that name.
-        known_field_names = set(type(request).model_fields)
-        filtered = {
-            k: v for k, v in extra_fields.items()
-            if k not in known_field_names and v is not None
-        }
+        filtered, dropped_extras = partition_extras(
+            extra_fields,
+            type(request).model_fields,
+            forwardable_extras,
+        )
         if filtered:
             kwargs["extra_body"] = filtered
+        if dropped_extras:
+            if dropped_fields is not None:
+                dropped_fields.extend(dropped_extras)
+            _logger.debug(
+                "Dropped unknown top-level field(s) %s for %s (not forwardable to this upstream)",
+                ", ".join(dropped_extras),
+                model_id,
+            )
 
     return kwargs

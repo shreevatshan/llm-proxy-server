@@ -1,6 +1,6 @@
 """Database models for authentication."""
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint, Index, text
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint, Index, func, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
@@ -169,81 +169,123 @@ class GlobalRateLimit(Base):
     updated_by = Column(String(50), nullable=True)
 
 
-class RequestUsage(Base):
-    """Per-day request usage counters keyed by (date, user_identity, model, server).
+# The config-based admin is not a row in `users`, so its usage is recorded under this
+# reserved id. Every usage read that resolves ids to names must special-case it.
+ADMIN_USAGE_USER_ID = 0
 
-    user_type is NOT part of the key: the stored value is whichever request first
-    created the row, so it is a display hint only, never an attribution key. Reads
-    group by user_identity alone and report "mixed" when a person used more than one
-    delivery path.
+# The pool_id a usage row carries when the sender was not in a pool at the time.
+NO_POOL_ID = 0
+
+
+class RequestUsage(Base):
+    """Per-day request usage counters keyed by (date, user_id, model, server, pool_id).
+
+    user_id is the attribution key: renaming a user leaves the rows where they are, and
+    a deleted user's rows are purged with the account, so a later account reusing the
+    name inherits nothing. The config admin, which has no users row, is stored under
+    ADMIN_USAGE_USER_ID.
+
+    pool_id is stamped at write time from the sender's pool membership at the moment the
+    request completed (NO_POOL_ID when unpooled). It is the whole basis of pool usage
+    views: "what did this pool consume" is a filter on this column, exact to the
+    request, with no reconstruction from membership history.
+
+    user_identity and user_type are display labels only, never part of the key. The
+    identity is the username at the time of the last write and is relabelled in place
+    on rename; user_type is whichever delivery path last wrote the row, and reads report
+    "mixed" when a person used more than one.
     """
     __tablename__ = "request_usage"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     date = Column(Date, index=True, nullable=False)
-    user_identity = Column(String(200), index=True, nullable=False)
+    user_id = Column(Integer, nullable=False)
+    pool_id = Column(Integer, default=NO_POOL_ID, nullable=False)
+    user_identity = Column(String(200), nullable=False)
     user_type = Column(String(20), nullable=False)
     model = Column(String(200), index=True, nullable=False)
     server = Column(String(20), nullable=False)
     request_count = Column(Integer, default=0, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint('date', 'user_identity', 'model', 'server', name='uq_usage_day'),
+        UniqueConstraint('date', 'user_id', 'model', 'server', 'pool_id', name='uq_usage_day'),
+        Index('ix_usage_user_date', 'user_id', 'date'),
+        Index('ix_usage_pool_date', 'pool_id', 'date'),
     )
 
 
 class RequestUsageHourly(Base):
     """Per-hour request usage counters; retained for ~48 hours to serve the rolling-24h window.
 
-    Keyed by (date, hour, user_identity, model, server).
-
-    user_type is NOT part of the key: the stored value is whichever request first
-    created the row, so it is a display hint only, never an attribution key. Reads
-    group by user_identity alone and report "mixed" when a person used more than one
-    delivery path.
+    Keyed by (date, hour, user_id, model, server, pool_id). See RequestUsage for the
+    meaning of each key column and of the user_identity / user_type labels.
     """
     __tablename__ = "request_usage_hourly"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     date = Column(Date, index=True, nullable=False)
     hour = Column(Integer, nullable=False)
-    user_identity = Column(String(200), index=True, nullable=False)
+    user_id = Column(Integer, nullable=False)
+    pool_id = Column(Integer, default=NO_POOL_ID, nullable=False)
+    user_identity = Column(String(200), nullable=False)
     user_type = Column(String(20), nullable=False)
     model = Column(String(200), index=True, nullable=False)
     server = Column(String(20), nullable=False)
     request_count = Column(Integer, default=0, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint('date', 'hour', 'user_identity', 'model', 'server', name='uq_usage_hour'),
+        UniqueConstraint('date', 'hour', 'user_id', 'model', 'server', 'pool_id', name='uq_usage_hour'),
         Index('ix_usage_hourly_date_hour', 'date', 'hour'),
+        Index('ix_usage_hourly_user_date', 'user_id', 'date'),
+        Index('ix_usage_hourly_pool_date', 'pool_id', 'date'),
     )
 
 
 class RequestUsageMonthly(Base):
     """Per-month rolled-up request usage; retained forever.
 
-    Keyed by (year, month, user_identity, model, server).
-
-    user_type is NOT part of the key: the stored value is whichever request first
-    created the row, so it is a display hint only, never an attribution key. Reads
-    group by user_identity alone and report "mixed" when a person used more than one
-    delivery path.
+    Keyed by (year, month, user_id, model, server, pool_id). See RequestUsage for the
+    meaning of each key column and of the user_identity / user_type labels. Because
+    pool_id travels with the row into the rollup, pool usage stays exact for rolled-up
+    months; only rows that predate the pool_id column carry a month-granular backfill.
     """
     __tablename__ = "request_usage_monthly"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     year = Column(Integer, nullable=False)
     month = Column(Integer, nullable=False)
-    user_identity = Column(String(200), index=True, nullable=False)
+    user_id = Column(Integer, nullable=False)
+    pool_id = Column(Integer, default=NO_POOL_ID, nullable=False)
+    user_identity = Column(String(200), nullable=False)
     user_type = Column(String(20), nullable=False)
     model = Column(String(200), index=True, nullable=False)
     server = Column(String(20), nullable=False)
     request_count = Column(Integer, default=0, nullable=False)
 
     __table_args__ = (
-        UniqueConstraint('year', 'month', 'user_identity', 'model', 'server', name='uq_usage_month'),
+        UniqueConstraint('year', 'month', 'user_id', 'model', 'server', 'pool_id', name='uq_usage_month'),
         Index('ix_usage_monthly_year_month', 'year', 'month'),
+        Index('ix_usage_monthly_user_ym', 'user_id', 'year', 'month'),
+        Index('ix_usage_monthly_pool_ym', 'pool_id', 'year', 'month'),
     )
+
+
+class UsageMeta(Base):
+    """Facts about how the usage tables were written that a read must not guess at.
+
+    'timezone' is the IANA zone every date/hour bucket in the usage
+    tables was computed in. Rows carry local dates with no zone, so changing TIMEZONE
+    after deployment would silently mix two calendars; startup compares the configured
+    zone against this row and logs an error on mismatch.
+
+    'pool_id_high_water' is the highest pool id ever allocated. Usage rows outlive
+    their pool, so an id must never be handed out twice (see allocate_pool_id).
+    """
+    __tablename__ = "usage_meta"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(String(200), nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class ModelGroup(Base):
@@ -459,6 +501,15 @@ class RequestPool(Base):
 
     members = relationship("RequestPoolMember", back_populates="pool", cascade="all, delete-orphan")
     invitations = relationship("RequestPoolInvitation", back_populates="pool", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        # The column's own UNIQUE is case-sensitive, so it admits "Alpha" alongside
+        # "alpha". The routes reject those as a clash (ilike), but a pre-check is not
+        # a constraint: two concurrent creates can both pass it. This index makes the
+        # database agree with the routes, which is also what lets the IntegrityError
+        # handlers there turn a lost race into a 409 instead of a duplicate pool.
+        Index("uq_request_pools_name_lower", func.lower(name), unique=True),
+    )
 
 
 class RequestPoolMember(Base):

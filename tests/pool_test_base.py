@@ -69,6 +69,8 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         self.tracker._user_to_pool = {}
         self.tracker._pool_members = {}
         self.tracker._identity_to_pool = {}
+        self.tracker._inactive_members = set()
+        self.tracker._pool_locks = {}
         self.tracker._carries = {}
         self.tracker._carries_date = None
         self.tracker._overrides = {}
@@ -98,10 +100,31 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         return user
 
-    async def seed_usage(self, username, count, *, model="p/m", server="openai", day=DAY):
+    async def user_id_of(self, username):
+        from sqlalchemy import select
+        return (await self.db.execute(
+            select(User.id).where(User.username == username)
+        )).scalar_one()
+
+    async def seed_usage(self, username, count, *, model="p/m", server="openai", day=DAY,
+                         pool_id=None):
+        """Record `count` requests for a user, the way the tracker would have.
+
+        Rows are keyed by user_id and stamped with the pool the sender is in *now*
+        (0 when unpooled), exactly as end_request stamps a completed request. Pass
+        `pool_id` explicitly to seed a row from before a join (0) or from a stint in a
+        pool the user has since left.
+        """
+        from sqlalchemy import select
+
+        uid = await self.user_id_of(username)
+        if pool_id is None:
+            pool_id = (await self.db.execute(
+                select(RequestPoolMember.pool_id).where(RequestPoolMember.user_id == uid)
+            )).scalar_one_or_none() or 0
         self.db.add(RequestUsage(
-            date=day, user_identity=username, user_type="user",
-            model=model, server=server, request_count=count,
+            date=day, user_id=uid, pool_id=pool_id, user_identity=username,
+            user_type="user", model=model, server=server, request_count=count,
         ))
         await self.db.commit()
 
@@ -154,6 +177,36 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
                 RequestPoolMember.user_id == user.id,
             )
         )
+        await self.db.commit()
+        await self.refresh()
+
+    async def make_model_group(self, name, model_id, rpd_default):
+        """A model group containing one model, with the tracker refreshed onto it."""
+        from app.auth.models import ModelGroup, ModelGroupMember
+
+        group = ModelGroup(name=name, rpm_default=None, rpd_default=rpd_default)
+        self.db.add(group)
+        await self.db.flush()
+        self.db.add(ModelGroupMember(group_id=group.id, model_id=model_id))
+        await self.db.commit()
+        await self.refresh()
+        return group
+
+    async def make_instance_group(self, name, provider_key, rpd_default):
+        """An instance group containing one provider, with the tracker refreshed."""
+        from app.auth.models import InstanceGroup, InstanceGroupMember
+
+        group = InstanceGroup(name=name, rpm_default=None, rpd_default=rpd_default)
+        self.db.add(group)
+        await self.db.flush()
+        self.db.add(InstanceGroupMember(group_id=group.id, provider_key=provider_key))
+        await self.db.commit()
+        await self.refresh()
+        return group
+
+    async def deactivate(self, user):
+        """Flip a user's is_active off and let the tracker see it."""
+        user.is_active = False
         await self.db.commit()
         await self.refresh()
 

@@ -495,24 +495,17 @@ async def delete_account(
         )
 
     try:
-        # The FK cascade drops the pool membership silently, so the pool's interval has
-        # to be closed explicitly first — otherwise the remaining members keep the
-        # departed user's limit-share as free headroom for the rest of the day. Same two
-        # steps, and the same ordering, as the admin delete endpoints: settle inside the
-        # delete's transaction, invalidate the tracker only once it has committed, since
-        # a refresh before that would read the membership row straight back.
-        from app.routes.pools import invalidate_after_user_delete, settle_before_user_delete
-        pool_id, pooled_usernames = await settle_before_user_delete(db, current_user.id)
-
-        success = await permanently_delete_user(db, current_user.id)
+        # Same sequence as the admin delete endpoints -- settle the pool, delete the
+        # account and its usage, drop buffered counts, then invalidate -- kept in one
+        # place so the three paths cannot drift. See delete_user_account.
+        from app.routes.pools import delete_user_account
+        success = await delete_user_account(db, current_user.id)
 
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="User not found"
             )
-
-        await invalidate_after_user_delete(pool_id, pooled_usernames)
 
         # Clear authentication cookie
         if response:
@@ -554,7 +547,7 @@ async def get_user_usage(
 
     result = await get_usage_aggregates(
         db,
-        filter_user=current_user.username,
+        filter_user_id=current_user.id,
         filter_model=filter_model,
         window=window,
         year=year,
@@ -562,13 +555,13 @@ async def get_user_usage(
     )
     result["timeseries"] = await get_usage_timeseries(
         db,
-        filter_user=current_user.username,
+        filter_user_id=current_user.id,
         filter_model=filter_model,
         window=window,
         year=year,
         month=month,
     )
-    result["earliest_date"] = await get_usage_earliest_date(db, filter_user=current_user.username)
+    result["earliest_date"] = await get_usage_earliest_date(db, filter_user_id=current_user.id)
     return result
 
 

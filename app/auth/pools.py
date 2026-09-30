@@ -37,7 +37,7 @@ largest-remainder apportionment to make integer splits sum exactly.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -139,23 +139,30 @@ def apportion(delta: int, members: Sequence[MemberShare]) -> Dict[int, int]:
 # --------------------------------------------------------------------------- #
 
 
-async def _load_members(db, pool_id: int) -> List[Tuple[int, str]]:
-    """[(user_id, username)] for a pool, ordered by join time then id."""
+async def _load_members(db, pool_id: int) -> Tuple[List[Tuple[int, str]], Set[int]]:
+    """``([(user_id, username)], {inactive user ids})``, ordered by join time then id.
+
+    Deactivated members are returned in the list and flagged separately rather than
+    filtered out. They are still members: the rows they sent while their account worked
+    are real and still count against the pool. What they no longer do is donate limit --
+    see settle_pool, and RateLimitTracker._pooled_rpd_limit on the enforcement side.
+    """
     from sqlalchemy import select
     from app.auth.models import RequestPoolMember, User
 
     rows = (await db.execute(
-        select(RequestPoolMember.user_id, User.username)
+        select(RequestPoolMember.user_id, User.username, User.is_active)
         .join(User, User.id == RequestPoolMember.user_id)
         .where(RequestPoolMember.pool_id == pool_id)
         .order_by(RequestPoolMember.joined_at, RequestPoolMember.id)
     )).all()
-    return [(r.user_id, r.username) for r in rows]
+    return (
+        [(r.user_id, r.username) for r in rows],
+        {r.user_id for r in rows if not r.is_active},
+    )
 
 
-def _fold_models_into_scopes(
-    usage_rows: List[dict], id_of: Dict[str, int]
-) -> Dict[Tuple[int, str, int], int]:
+def _fold_models_into_scopes(usage_rows: List[dict]) -> Dict[Tuple[int, str, int], int]:
     """Fold per-model usage rows into (user_id, scope_kind, scope_id) -> request count.
 
     Each row lands in **exactly one** scope, because that is how enforcement counts it:
@@ -174,9 +181,7 @@ def _fold_models_into_scopes(
 
     folded: Dict[Tuple[int, str, int], int] = {}
     for row in usage_rows:
-        uid = id_of.get(row["user_identity"])
-        if uid is None:
-            continue
+        uid = row["user_id"]
         count = int(row["request_count"])
         scope = rate_limit_tracker.scope_for_model(row["model"]) or ("overall", 0)
         key = (uid, scope[0], scope[1])
@@ -185,99 +190,136 @@ def _fold_models_into_scopes(
 
 
 async def _load_ledger(db, pool_id: int, today) -> Dict[Tuple[int, str, int], int]:
-    """(user_id, scope_kind, scope_id) -> charged, for today. A missing row reads as 0."""
+    """(user_id, scope_kind, scope_id) -> charged, for today. A missing row reads as 0.
+
+    Selects columns rather than entities on purpose. The writes below go through Core
+    bulk upserts, which the ORM identity map never sees, so loading these as entities
+    would leave stale objects behind for anything that reads the table again in the same
+    session -- _leave_preview settles and then re-reads.
+    """
     from sqlalchemy import select
     from app.auth.models import RequestPoolLedger
 
     rows = (await db.execute(
-        select(RequestPoolLedger).where(
+        select(
+            RequestPoolLedger.user_id,
+            RequestPoolLedger.scope_kind,
+            RequestPoolLedger.scope_id,
+            RequestPoolLedger.charged,
+        ).where(
             RequestPoolLedger.pool_id == pool_id,
             RequestPoolLedger.usage_date == today,
         )
-    )).scalars().all()
+    )).all()
     return {(r.user_id, r.scope_kind, r.scope_id): int(r.charged) for r in rows}
 
 
 async def _load_carries(db, user_ids: Sequence[int], today) -> Dict[Tuple[int, str, int], int]:
-    """(user_id, scope_kind, scope_id) -> carry, for today. A missing row reads as 0."""
+    """(user_id, scope_kind, scope_id) -> carry, for today. A missing row reads as 0.
+
+    Columns, not entities -- same reason as _load_ledger.
+    """
     from sqlalchemy import select
     from app.auth.models import UserRpdCarry
 
     if not user_ids:
         return {}
     rows = (await db.execute(
-        select(UserRpdCarry).where(
+        select(
+            UserRpdCarry.user_id,
+            UserRpdCarry.scope_kind,
+            UserRpdCarry.scope_id,
+            UserRpdCarry.carry,
+        ).where(
             UserRpdCarry.user_id.in_(list(user_ids)),
             UserRpdCarry.usage_date == today,
         )
-    )).scalars().all()
+    )).all()
     return {(r.user_id, r.scope_kind, r.scope_id): int(r.carry) for r in rows}
 
 
-async def _upsert_ledger(db, pool_id: int, user_id: int, today, scope, charged: int) -> None:
-    from sqlalchemy import select
-    from app.auth.models import RequestPoolLedger
+# Conflict targets. Each must name its unique constraint's columns exactly, in order --
+# uq_pool_ledger and uq_rpd_carry in app.auth.models. Any other target is rejected.
+_LEDGER_KEY = ["pool_id", "user_id", "usage_date", "scope_kind", "scope_id"]
+_CARRY_KEY = ["user_id", "usage_date", "scope_kind", "scope_id"]
 
-    kind, sid = scope
-    row = (await db.execute(
-        select(RequestPoolLedger).where(
-            RequestPoolLedger.pool_id == pool_id,
-            RequestPoolLedger.user_id == user_id,
-            RequestPoolLedger.usage_date == today,
-            RequestPoolLedger.scope_kind == kind,
-            RequestPoolLedger.scope_id == sid,
-        )
-    )).scalar_one_or_none()
-    if row is None:
-        db.add(RequestPoolLedger(
-            pool_id=pool_id, user_id=user_id, usage_date=today,
-            scope_kind=kind, scope_id=sid, charged=int(charged),
-        ))
+
+def _replace_upsert(db, table, rows: List[dict], index_elements: List[str], column: str):
+    """Build one replace-on-conflict bulk upsert for a settlement table.
+
+    Settlement recomputes the whole value every time rather than incrementing it, so on
+    conflict the incoming row simply wins. That is the difference from the usage upserts
+    in app.auth.database, which add to what is already there -- incrementing `charged`
+    or `carry` would double them on every re-settle and cost the idempotence the whole
+    scheme rests on.
+
+    SELECT-then-INSERT would lose a concurrent settle of the same pool: both would read a
+    missing row and both would insert. Letting the database resolve the conflict makes the
+    write safe without holding a read lock across the apportionment. The per-pool lock
+    does not make this redundant -- user_rpd_carries is keyed without pool_id, so two
+    *different* pools settling at once contend for the same carry row whenever a user
+    moved between them today, which no per-pool lock can serialise.
+
+    Dialect is taken off the bind rather than hardcoded: DATABASE_URL is env-overridable
+    and the SQLite-only code elsewhere is each guarded, so pinning it here would be the
+    one place pooling silently assumes SQLite.
+    """
+    name = db.bind.dialect.name if db.bind is not None else "sqlite"
+    if name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+    elif name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
     else:
-        row.charged = int(charged)
-    await db.flush()
-
-
-async def _upsert_carry(db, user_id: int, today, scope, carry: int) -> None:
-    from sqlalchemy import select
-    from app.auth.models import UserRpdCarry
-
-    kind, sid = scope
-    row = (await db.execute(
-        select(UserRpdCarry).where(
-            UserRpdCarry.user_id == user_id,
-            UserRpdCarry.usage_date == today,
-            UserRpdCarry.scope_kind == kind,
-            UserRpdCarry.scope_id == sid,
+        raise NotImplementedError(
+            f"Pool settlement needs an upsert construct for dialect '{name}'."
         )
-    )).scalar_one_or_none()
-    if row is None:
-        if carry == 0:
-            return  # a missing row already reads as 0; do not write noise
-        db.add(UserRpdCarry(
-            user_id=user_id, usage_date=today,
-            scope_kind=kind, scope_id=sid, carry=int(carry),
-        ))
-    else:
-        row.carry = int(carry)
-    await db.flush()
+
+    stmt = dialect_insert(table).values(rows)
+    return stmt.on_conflict_do_update(
+        index_elements=index_elements,
+        set_={column: getattr(stmt.excluded, column)},
+    )
+
+
+async def _write_settlement(db, ledger_rows: List[dict], carry_rows: List[dict]) -> None:
+    """Write a whole settlement in two statements instead of two per member per scope.
+
+    Flushes rather than commits, so this still composes into the caller's transaction --
+    that is what lets _leave_preview run a real settlement inside a savepoint and roll it
+    back. Rows are unique on their conflict key by construction (one per member per
+    scope); a duplicate would make SQLite refuse to touch the same row twice.
+    """
+    from app.auth.models import RequestPoolLedger, UserRpdCarry
+
+    if ledger_rows:
+        await db.execute(_replace_upsert(
+            db, RequestPoolLedger.__table__, ledger_rows, _LEDGER_KEY, "charged"))
+    if carry_rows:
+        await db.execute(_replace_upsert(
+            db, UserRpdCarry.__table__, carry_rows, _CARRY_KEY, "carry"))
+    if ledger_rows or carry_rows:
+        await db.flush()
 
 
 async def _member_row_counts(db, members: Sequence[Tuple[int, str]]) -> Dict[Tuple[int, str, int], int]:
     """Today's raw request_usage counts per member per scope, read fresh.
 
-    request_tracker buffers usage in memory and flushes every 60s, so a naive read can
+    request_tracker buffers usage in memory and flushes every FLUSH_INTERVAL seconds, so a naive read can
     miss up to a minute of traffic -- and it would miss it in the worst direction, since
     the missing requests are exactly the ones a departing member most recently made.
     The caller holds pause_flush() around this so a concurrent flush cannot land between
     the read and the write and shift the counts underneath the settlement.
+
+    Deliberately NOT filtered by pool_id: a member's charge is what they sent today
+    wherever they were, so rows stamped with an earlier pool (or none) count too. That
+    is what keeps SUM(charged) == pool_used across joins and leaves.
     """
     from app.auth.database import get_usage_by_user_and_model
 
-    identities = [name for _, name in members]
-    rows = await get_usage_by_user_and_model(db, identities, window="today")
-    id_of = {name: uid for uid, name in members}
-    return _fold_models_into_scopes(rows, id_of)
+    rows = await get_usage_by_user_and_model(
+        db, [uid for uid, _ in members], window="today",
+    )
+    return _fold_models_into_scopes(rows)
 
 
 async def settle_pool(db, pool_id: int, *, dissolving: bool = False) -> None:
@@ -297,7 +339,7 @@ async def settle_pool(db, pool_id: int, *, dissolving: bool = False) -> None:
     from app.request_tracker import request_tracker
     from app.rate_limit import rate_limit_tracker
 
-    members = await _load_members(db, pool_id)
+    members, inactive = await _load_members(db, pool_id)
     if not members:
         return
 
@@ -311,6 +353,24 @@ async def settle_pool(db, pool_id: int, *, dissolving: bool = False) -> None:
         ledger = await _load_ledger(db, pool_id, today)
         carries = await _load_carries(db, [uid for uid, _ in members], today)
 
+        ledger_rows: List[dict] = []
+        carry_rows: List[dict] = []
+
+        def record(uid: int, scope, charged: int, rows: int) -> None:
+            kind, sid = scope
+            ledger_rows.append(dict(
+                pool_id=pool_id, user_id=uid, usage_date=today,
+                scope_kind=kind, scope_id=sid, charged=int(charged),
+            ))
+            carry = int(charged) - int(rows)
+            # A missing carry row already reads as 0; only write one if it says something
+            # or if there is already a row to correct.
+            if carry != 0 or (uid, kind, sid) in carries:
+                carry_rows.append(dict(
+                    user_id=uid, usage_date=today,
+                    scope_kind=kind, scope_id=sid, carry=carry,
+                ))
+
         for scope in rate_limit_tracker.settlement_scopes():
             kind, sid = scope
             limits = {
@@ -318,17 +378,35 @@ async def settle_pool(db, pool_id: int, *, dissolving: bool = False) -> None:
                 for uid, _ in members
             }
 
-            if any(v is None for v in limits.values()):
-                # Unlimited pool on this scope: nothing is enforced, so nothing is owed.
-                # A leaver walks out with their full own limit, which is the confirmed
-                # behaviour and the main foot-gun of the sum rule.
+            # Only active members decide whether the pool is unlimited. A disabled
+            # account cannot send anything, so letting one keep the pool uncapped would
+            # leave the grant standing with nobody able to withdraw it.
+            if any(limits[uid] is None for uid, _ in members if uid not in inactive):
+                # Unlimited pool on this scope: no cap is enforced while the pool stands,
+                # so there is nothing to apportion -- each member simply owns what they
+                # sent, clamped to their own limit:
+                #
+                #     charged = min(own_limit, effective_used)
+                #
+                # which is exactly the clamp admit_member applies, so admission and
+                # settlement agree on the same inputs. Charging a flat 0 here instead --
+                # the old behaviour -- erased the member's day: joining a pool that had
+                # any unlimited member and leaving again reset the counter to zero, on
+                # demand, and the `delta == 0` skip below then froze that wipe in place
+                # for whoever stayed behind after the unlimited member left.
+                #
+                # The grant survives: nobody is capped while the pool is unlimited. It is
+                # only settled honestly on the way out, so a member who spends past their
+                # own limit walks out at that limit rather than at zero.
                 for uid, _ in members:
                     rows = by_scope.get((uid, kind, sid), 0)
-                    if rows == 0 and (uid, kind, sid) not in ledger and \
-                            carries.get((uid, kind, sid), 0) == 0:
+                    carry_in = carries.get((uid, kind, sid), 0)
+                    if rows == 0 and (uid, kind, sid) not in ledger and carry_in == 0:
                         continue
-                    await _upsert_ledger(db, pool_id, uid, today, scope, charged=0)
-                    await _upsert_carry(db, uid, today, scope, carry=-rows)
+                    own = limits[uid]
+                    effective = max(0, rows + carry_in)
+                    charged = effective if own is None else min(own, effective)
+                    record(uid, scope, charged, rows)
                 continue
 
             used = sum(
@@ -339,10 +417,16 @@ async def settle_pool(db, pool_id: int, *, dissolving: bool = False) -> None:
             if delta == 0 and not dissolving:
                 continue  # nothing closed on this scope; skip the writes entirely
 
+            # An inactive member's limit is pinned at what they have already been
+            # charged, which is zero headroom: they absorb none of a new delta, so the
+            # active members split all of it. A refund still reaches them, because
+            # refund headroom is `charged` -- if their rows are purged their charge must
+            # come down with everyone else's.
             shares = apportion(delta, [
                 MemberShare(
                     user_id=uid,
-                    limit=limits[uid],
+                    limit=(ledger.get((uid, kind, sid), 0) if uid in inactive
+                           else limits[uid]),
                     charged=ledger.get((uid, kind, sid), 0),
                     consumed=by_scope.get((uid, kind, sid), 0),
                 )
@@ -351,11 +435,9 @@ async def settle_pool(db, pool_id: int, *, dissolving: bool = False) -> None:
 
             for uid, _ in members:
                 charged = ledger.get((uid, kind, sid), 0) + shares.get(uid, 0)
-                await _upsert_ledger(db, pool_id, uid, today, scope, charged=charged)
-                await _upsert_carry(
-                    db, uid, today, scope,
-                    carry=charged - by_scope.get((uid, kind, sid), 0),
-                )
+                record(uid, scope, charged, by_scope.get((uid, kind, sid), 0))
+
+        await _write_settlement(db, ledger_rows, carry_rows)
 
 
 async def admit_member(db, pool_id: int, user_id: int, username: str) -> None:
@@ -388,22 +470,35 @@ async def admit_member(db, pool_id: int, user_id: int, username: str) -> None:
         by_scope = await _member_row_counts(db, [(user_id, username)])
         carries = await _load_carries(db, [user_id], today)
 
+        ledger_rows: List[dict] = []
+        carry_rows: List[dict] = []
+
         for scope in rate_limit_tracker.settlement_scopes():
             kind, sid = scope
             limit = rate_limit_tracker.member_limit_for_scope(user_id, kind, sid)
             rows = by_scope.get((user_id, kind, sid), 0)
-            effective = max(0, rows + carries.get((user_id, kind, sid), 0))
+            carry_in = carries.get((user_id, kind, sid), 0)
+            effective = max(0, rows + carry_in)
 
-            if limit is None:
-                charged = 0          # unlimited on this scope: nothing is owed
-            else:
-                charged = min(limit, effective)
+            # Unlimited on this scope: the joiner owns what they sent, uncapped. Same
+            # clamp settle_pool applies, so admission and settlement agree.
+            charged = effective if limit is None else min(limit, effective)
 
-            if charged == 0 and rows == 0 and carries.get((user_id, kind, sid), 0) == 0:
+            if charged == 0 and rows == 0 and carry_in == 0:
                 continue             # nothing to record; a missing row reads as 0
 
-            await _upsert_ledger(db, pool_id, user_id, today, scope, charged=charged)
-            await _upsert_carry(db, user_id, today, scope, carry=charged - rows)
+            ledger_rows.append(dict(
+                pool_id=pool_id, user_id=user_id, usage_date=today,
+                scope_kind=kind, scope_id=sid, charged=int(charged),
+            ))
+            carry = int(charged) - int(rows)
+            if carry != 0 or (user_id, kind, sid) in carries:
+                carry_rows.append(dict(
+                    user_id=user_id, usage_date=today,
+                    scope_kind=kind, scope_id=sid, carry=carry,
+                ))
+
+        await _write_settlement(db, ledger_rows, carry_rows)
 
 
 async def clear_member_settlement(db, pool_id: int, user_id: int) -> None:

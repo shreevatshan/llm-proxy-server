@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from typing import List, Optional, Literal
+from typing import Annotated, List, Optional, Literal
 import os
 import json
 import urllib.parse
@@ -23,6 +23,7 @@ from app.auth.database import (
     clear_all_model_configurations, admin_reset_user_password, update_user_profile, get_usage_aggregates, get_usage_years,
     delete_usage_records,
     count_usage_requests,
+    usage_user_ids_for_pool,
     get_global_rate_limit, upsert_global_rate_limit,
     get_user_rate_limit, upsert_user_rate_limit, delete_user_rate_limit,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
@@ -801,14 +802,6 @@ async def delete_user(
         user.is_active = False
         await db.commit()
         await db.refresh(user)
-
-        # Invalidate cached auth entries so the deactivated user's API keys stop
-        # working immediately (the cache would otherwise keep serving them).
-        from app.auth.cache import auth_cache
-        auth_cache.invalidate_user_api_keys(user.id)
-        auth_cache.invalidate_user_by_id(user.id)
-
-        return {"message": f"User {user.username} has been deactivated"}
     except Exception as e:
         await db.rollback()
         logger.error("Failed to deactivate user %s: %s", user_id, e, exc_info=True)
@@ -816,6 +809,25 @@ async def delete_user(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to deactivate user"
         )
+
+    # Invalidate cached auth entries so the deactivated user's API keys stop
+    # working immediately (the cache would otherwise keep serving them).
+    from app.auth.cache import auth_cache
+    auth_cache.invalidate_user_api_keys(user.id)
+    auth_cache.invalidate_user_by_id(user.id)
+
+    # is_active changes the pool's limit: a deactivated member cannot send, so
+    # their limit no longer counts toward the sum. Re-apportion whatever pool they
+    # are in -- a no-op when they are in none.
+    #
+    # Outside the try, as in the bulk path: the change is already committed, so a
+    # settlement failure is not "the change did not happen" and must not be
+    # reported as one. The rollback in the handler above would be a no-op against
+    # it anyway, leaving the caller told the operation failed when it did not.
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
+
+    return {"message": f"User {user.username} has been deactivated"}
 
 
 @router.put("/users/activate")
@@ -836,13 +848,25 @@ async def activate_user(
         user.is_active = True
         await db.commit()
         await db.refresh(user)
-        return {"message": f"User {user.username} has been activated"}
     except Exception as e:
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to activate user: {str(e)}"
         )
+
+    # is_active changes the pool's limit: a deactivated member cannot send, so
+    # their limit no longer counts toward the sum. Re-apportion whatever pool they
+    # are in -- a no-op when they are in none.
+    #
+    # Outside the try, as in the bulk path: the change is already committed, so a
+    # settlement failure is not "the change did not happen" and must not be
+    # reported as one. The rollback in the handler above would be a no-op against
+    # it anyway, leaving the caller told the operation failed when it did not.
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
+
+    return {"message": f"User {user.username} has been activated"}
 
 
 @router.put("/users/approve")
@@ -870,13 +894,25 @@ async def approve_user(
         user.is_pending_approval = False
         await db.commit()
         await db.refresh(user)
-        return {"message": f"User {user.username} has been approved and activated"}
     except Exception as e:
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to approve user: {str(e)}"
         )
+
+    # is_active changes the pool's limit: a deactivated member cannot send, so
+    # their limit no longer counts toward the sum. Re-apportion whatever pool they
+    # are in -- a no-op when they are in none.
+    #
+    # Outside the try, as in the bulk path: the change is already committed, so a
+    # settlement failure is not "the change did not happen" and must not be
+    # reported as one. The rollback in the handler above would be a no-op against
+    # it anyway, leaving the caller told the operation failed when it did not.
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
+
+    return {"message": f"User {user.username} has been approved and activated"}
 
 
 @router.put("/users/reset-password")
@@ -1017,17 +1053,12 @@ async def permanently_delete_user_endpoint(
         )
     
     try:
-        # The FK cascade drops the pool membership silently, so the pool's interval has
-        # to be closed explicitly first — otherwise the remaining members keep the
-        # departed user's limit-share as free headroom for the rest of the day. The
-        # tracker is invalidated only after the delete commits, since a refresh before
-        # that would read the membership row straight back.
-        from app.routes.pools import invalidate_after_user_delete, settle_before_user_delete
-        pool_id, pooled_usernames = await settle_before_user_delete(db, user_id)
-
-        success = await permanently_delete_user(db, user_id)
+        # Settle the pool, delete the account and its usage rows, drop buffered counts,
+        # invalidate the tracker -- one implementation shared with the bulk and
+        # self-service deletes. See delete_user_account.
+        from app.routes.pools import delete_user_account
+        success = await delete_user_account(db, user_id)
         if success:
-            await invalidate_after_user_delete(pool_id, pooled_usernames)
             return {"message": f"User {user.username} has been permanently deleted"}
         else:
             raise HTTPException(
@@ -1086,7 +1117,7 @@ async def bulk_user_action(
     if action == "delete":
         # permanently_delete_user commits internally, so this cannot be one
         # transaction; partial completion is possible and is reported per user.
-        from app.routes.pools import invalidate_after_user_delete, settle_before_user_delete
+        from app.routes.pools import delete_user_account
 
         for user_id in user_ids:
             user = await get_user_by_id(db, user_id)
@@ -1096,12 +1127,8 @@ async def bulk_user_action(
 
             username = user.username
             try:
-                # Same two steps as the single-user endpoint above, for the same
-                # reasons: settle the pool inside the delete's transaction, invalidate
-                # the tracker only once it has committed.
-                pool_id, pooled_usernames = await settle_before_user_delete(db, user_id)
-                if await permanently_delete_user(db, user_id):
-                    await invalidate_after_user_delete(pool_id, pooled_usernames)
+                # Same sequence as the single-user endpoint above; see delete_user_account.
+                if await delete_user_account(db, user_id):
                     succeeded.append({"id": user_id, "username": username})
                 else:
                     failed.append({"id": user_id, "username": username, "error": "User not found"})
@@ -1163,6 +1190,11 @@ async def bulk_user_action(
                     auth_cache.invalidate_user_api_keys(user.id)
                     auth_cache.invalidate_user_by_id(user.id)
 
+            # One re-apportionment pass for the whole batch, not one per user: every
+            # toggle here moved a member's contribution to their pool's limit.
+            from app.routes.pools import resettle_pools_after_commit
+            await resettle_pools_after_commit(db, user_ids=[u.id for u in targets])
+
     past_tense = {
         "approve": "approved",
         "deactivate": "deactivated",
@@ -1207,7 +1239,8 @@ async def update_rate_limit_defaults(
     row = await upsert_global_rate_limit(db, body.rpm_default, body.rpd_default, current_admin.username)
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_defaults()
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
     return GlobalRateLimitResponse.model_validate(row)
 
 
@@ -1277,7 +1310,8 @@ async def update_user_rate_limit(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_user(user_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
 
     global_row = await get_global_rate_limit(db)
     rpm_default = global_row.rpm_default if global_row else None
@@ -1311,7 +1345,8 @@ async def delete_user_rate_limit_override(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_user(user_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
 
     return {"message": f"Rate limit override removed for user {user.username}"}
 
@@ -1420,7 +1455,9 @@ async def create_model_group_endpoint(
     group = await create_model_group(db, body.name, body.description, body.rpm_default, body.rpd_default, current_admin.username)
 
     from app.rate_limit import rate_limit_tracker
-    await rate_limit_tracker.refresh_now()
+    # No re-settle: a group created now has no members, so scope_for_model maps
+    # nothing into it, its usage is 0 and settlement would find delta == 0.
+    # Its rpd_default starts mattering when set_model_group_members_endpoint runs.
 
     return ModelGroupResponse(
         id=group.id, name=group.name, description=group.description,
@@ -1460,7 +1497,8 @@ async def update_model_group_endpoint(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_group(group_id)
-    await rate_limit_tracker.refresh_now()
+    # No re-settle: ModelGroupUpdate carries name and description only, neither of
+    # which is an apportionment weight.
 
     refreshed = await list_model_groups(db, group_id=group_id)
     return ModelGroupResponse(
@@ -1485,7 +1523,8 @@ async def delete_model_group_endpoint(
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
 
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
     return {"message": f"Model group {group_id} deleted"}
 
 
@@ -1537,7 +1576,8 @@ async def set_model_group_members_endpoint(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_group(group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
 
     return {"group_id": group_id, "model_ids": model_ids}
 
@@ -1572,7 +1612,8 @@ async def update_model_group_limits_endpoint(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_group(group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
 
     return {"group_id": group_id, "rpm_default": group.rpm_default, "rpd_default": group.rpd_default}
 
@@ -1637,7 +1678,8 @@ async def upsert_model_group_user_override(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_user_group(user_id, group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
 
     effective_rpm = override.rpm_limit if override.rpm_limit is not None else group_row.rpm_default
     effective_rpd = override.rpd_limit if override.rpd_limit is not None else group_row.rpd_default
@@ -1668,7 +1710,8 @@ async def delete_model_group_user_override(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_user_group(user_id, group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
 
     return {"message": f"Override removed for user {user.username} on group {group_id}"}
 
@@ -1935,7 +1978,8 @@ async def create_instance_group_endpoint(
     group = await create_instance_group(db, body.name, body.description, body.rpm_default, body.rpd_default, current_admin.username)
 
     from app.rate_limit import rate_limit_tracker
-    await rate_limit_tracker.refresh_now()
+    # No re-settle: an empty group folds no usage into its scope, so delta == 0.
+    # See create_model_group_endpoint.
 
     return InstanceGroupResponse(
         id=group.id, name=group.name, description=group.description,
@@ -1975,7 +2019,7 @@ async def update_instance_group_endpoint(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_instance_group(group_id)
-    await rate_limit_tracker.refresh_now()
+    # No re-settle: InstanceGroupUpdate is name and description only.
 
     refreshed = await list_instance_groups(db, group_id=group_id)
     return InstanceGroupResponse(
@@ -2000,7 +2044,8 @@ async def delete_instance_group_endpoint(
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
 
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
     return {"message": f"Instance group {group_id} deleted"}
 
 
@@ -2052,7 +2097,8 @@ async def set_instance_group_members_endpoint(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_instance_group(group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
 
     return {"group_id": group_id, "provider_keys": provider_keys}
 
@@ -2087,7 +2133,8 @@ async def update_instance_group_limits_endpoint(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_instance_group(group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
 
     return {"group_id": group_id, "rpm_default": group.rpm_default, "rpd_default": group.rpd_default}
 
@@ -2151,7 +2198,8 @@ async def upsert_instance_group_user_override(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_user_instance_group(user_id, group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
 
     effective_rpm = override.rpm_limit if override.rpm_limit is not None else group_row.rpm_default
     effective_rpd = override.rpd_limit if override.rpd_limit is not None else group_row.rpd_default
@@ -2182,7 +2230,8 @@ async def delete_instance_group_user_override(
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_user_instance_group(user_id, group_id)
-    await rate_limit_tracker.refresh_now()
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, user_ids=[user_id])
 
     return {"message": f"Override removed for user {user.username} on instance group {group_id}"}
 
@@ -2963,6 +3012,8 @@ async def get_usage_years_endpoint(
 async def get_usage(
     view: Optional[str] = Query(None, description="'user', 'model' or 'pool' for drill-down"),
     id: Optional[str] = Query(None, description="Identity value to drill into"),
+    # Annotated so a direct call (tests) gets a real None, not the Query marker.
+    user_id: Annotated[Optional[int], Query(description="Exact user_id when view=user; disambiguates a shared label")] = None,
     window: str = Query("30d", pattern="^(24h|today|yesterday|7d|30d|month|all)$", description="Time window: 24h | today | yesterday | 7d | 30d | month | all"),
     year: Optional[int] = Query(None, description="Year (required when window=month)"),
     month: Optional[int] = Query(None, description="Month 1-12 (required when window=month)"),
@@ -2981,20 +3032,21 @@ async def get_usage(
     from app.request_tracker import request_tracker
     from app.auth.database import (
         get_usage_by_user_and_model, get_usage_earliest_date, get_usage_timeseries,
+        get_usage_totals_by_pool,
     )
     from app.routes.pools import member_spans, pool_membership_map, window_bounds
     await request_tracker.flush_pending()
 
     # Pool drill-down: the members' own per-user split, scoped to one pool.
     #
-    # Built from the same two primitives build_pool_usage folds rather than by calling
-    # it, because that function returns per_model / per_group / per_member_per_model
-    # too — the full user x model cross product, all of which would be discarded here —
-    # and it flushes and resolves the group tables to do it. Its drill-down path also
-    # 403s on non-membership, which is not the right answer for an admin.
+    # Built from the same primitives build_pool_usage folds rather than by calling it,
+    # because that function returns per_model / per_group / per_member_per_model too —
+    # the full user x model cross product, all of which would be discarded here — and
+    # it resolves the group tables to do it. Its drill-down path also 403s on
+    # non-membership, which is not the right answer for an admin.
     #
-    # Scoped by membership interval, like build_pool_usage: a member's rows count only
-    # for the days they were in the pool.
+    # Scoped by the rows' pool_id, like build_pool_usage: a member's rows count only
+    # for the requests they sent while in the pool.
     if view == "pool":
         pool_id = _parse_pool_id(id)
         membership = await pool_membership_map(db)
@@ -3003,11 +3055,8 @@ async def get_usage(
         pool = membership[pool_id]
         identities = pool["members"]
 
-        lo, hi = window_bounds(window, year, month)
-        spans = await member_spans(db, pool_id, lo=lo, hi=hi)
-
         cross = await get_usage_by_user_and_model(
-            db, [], window=window, year=year, month=month, restrict_spans=spans,
+            db, pool_id=pool_id, window=window, year=year, month=month,
         )
         folded: dict = {}
         for r in cross:
@@ -3018,7 +3067,9 @@ async def get_usage(
         # Zero-filled from the current roster *plus* anyone whose stint overlaps the
         # window, so every member shows up even with no traffic (an absent row reads as
         # "not in the pool") and a leaver's contribution has a row to land in.
-        listed = list(dict.fromkeys(identities + [s[0] for s in spans]))
+        lo, hi = window_bounds(window, year, month)
+        spans = await member_spans(db, pool_id, lo=lo, hi=hi)
+        listed = list(dict.fromkeys(identities + [s[0] for s in spans] + list(folded)))
         breakdown = [
             {
                 "user_identity": name,
@@ -3034,22 +3085,22 @@ async def get_usage(
             "pool": {"id": pool_id, "name": pool["name"], "member_count": len(identities)},
             "breakdown": breakdown,
             "timeseries": await get_usage_timeseries(
-                db, window=window, year=year, month=month, restrict_spans=spans,
+                db, pool_ids=[pool_id], window=window, year=year, month=month,
             ),
             "earliest_date": await get_usage_earliest_date(db),
         }
 
-    filter_user: Optional[str] = None
+    filter_user_id: Optional[int] = None
     filter_model: Optional[str] = None
 
     if view == "user" and id is not None:
-        filter_user = id
+        filter_user_id = await _resolve_usage_user_id(db, id, user_id)
     elif view == "model" and id is not None:
         filter_model = id
 
     result = await get_usage_aggregates(
         db,
-        filter_user=filter_user,
+        filter_user_id=filter_user_id,
         filter_model=filter_model,
         window=window,
         year=year,
@@ -3057,7 +3108,7 @@ async def get_usage(
     )
     result["timeseries"] = await get_usage_timeseries(
         db,
-        filter_user=filter_user,
+        filter_user_id=filter_user_id,
         filter_model=filter_model,
         window=window,
         year=year,
@@ -3070,18 +3121,25 @@ async def get_usage(
     #
     # Not a fold of the per_user rows: those are each member's *whole* total for the
     # window, which would credit a pool with everything its members sent before they
-    # joined. One spans query per pool is the honest way to get the same number the
-    # pool's own drill-down shows, so the two views cannot disagree.
+    # joined. The rows' own pool_id is the honest attribution, and it is the same
+    # number the pool's drill-down shows, so the two views cannot disagree. Only pools
+    # that still exist are listed; rows of a deleted pool keep its id but stay in the
+    # members' own totals rather than surfacing as a phantom pool.
     if view is None:
         membership = await pool_membership_map(db)
-        lo, hi = window_bounds(window, year, month)
-        counts = {}
-        for pool_id in membership:
-            spans = await member_spans(db, pool_id, lo=lo, hi=hi)
-            rows = await get_usage_by_user_and_model(
-                db, [], window=window, year=year, month=month, restrict_spans=spans,
-            )
-            counts[pool_id] = sum(r["request_count"] for r in rows)
+        pool_ids = list(membership)
+        counts = await get_usage_totals_by_pool(
+            db, pool_ids, window=window, year=year, month=month,
+        )
+
+        # The By Pool chart's own series. `timeseries` above covers *all* traffic, which
+        # is the right series for By User and By Model -- every request has a user and a
+        # model, so those two only re-partition the same bars. Pools don't partition it:
+        # unpooled users exist, and a member's pre-join rows aren't the pool's. Reusing
+        # the overall series there drew a chart that disagreed with the table under it.
+        result["pool_timeseries"] = await get_usage_timeseries(
+            db, pool_ids=pool_ids, window=window, year=year, month=month,
+        )
 
         result["per_pool"] = sorted(
             (
@@ -3089,10 +3147,10 @@ async def get_usage(
                     "pool_id": pool_id,
                     "name": pool["name"],
                     "member_count": len(pool["members"]),
-                    # Carried so the delete confirm can name who it is about to purge.
-                    # Bounded by MAX_POOL_MEMBERS (25), so this is a handful of strings.
+                    # Carried so the delete confirm can name the members. Bounded by
+                    # MAX_POOL_MEMBERS (25), so this is a handful of strings.
                     "members": pool["members"],
-                    "request_count": counts[pool_id],
+                    "request_count": counts.get(pool_id, 0),
                 }
                 for pool_id, pool in membership.items()
             ),
@@ -3110,88 +3168,139 @@ def _parse_pool_id(raw: Optional[str]) -> int:
         raise HTTPException(status_code=400, detail="id must be a pool id when view=pool")
 
 
+async def _resolve_usage_user_id(
+    db: AsyncSession, name: str, user_id: Optional[int] = None,
+) -> int:
+    """Map a row from the usage UI to the user_id the usage tables are keyed by.
+
+    The By User rows carry their user_id, and the UI sends it back; that is the only
+    unambiguous key. A label alone can name two identities: is_reserved_username only
+    rejects the admin's name while the admin is enabled, so a user who registered it
+    during a disabled stint -- or under an earlier ADMIN_USERNAME -- shares the label
+    with the admin's own rows.
+
+    Without a user_id (a hand-built URL, an older client), the name is resolved with
+    `users` first, matching the rekey migration's rule that a real account wins a
+    collision. The config admin is not a users row; its traffic lives under
+    ADMIN_USAGE_USER_ID, found by its current name or, since admin rows are never
+    relabelled, by any label its history was written under. A name that matches none of
+    these is a 404: a deleted user's rows went with the account.
+    """
+    from app.auth.database import is_reserved_username, usage_has_admin_label
+    from app.auth.models import ADMIN_USAGE_USER_ID
+
+    if user_id is not None:
+        if user_id == ADMIN_USAGE_USER_ID or await get_user_by_id(db, user_id) is not None:
+            return user_id
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user = await get_user_by_username(db, name)
+    if user is not None:
+        return user.id
+    if is_reserved_username(name) or await usage_has_admin_label(db, name):
+        return ADMIN_USAGE_USER_ID
+    raise HTTPException(status_code=404, detail="User not found")
+
+
 @router.delete("/usage")
 async def delete_usage(
     view: str = Query(..., description="'user', 'model' or 'pool'"),
     id: str = Query(..., description="Identity value, or pool id when view=pool"),
+    # Annotated so a direct call (tests) gets a real None, not the Query marker.
+    user_id: Annotated[Optional[int], Query(description="Exact user_id when view=user; disambiguates a shared label")] = None,
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete all usage data, for all time, for one user, one model or a whole pool.
+    """Delete all usage data, for all time, for one user, one model or one pool.
 
     Removes the rows from the hourly, daily and monthly tables together — leaving any
     of them behind would make the data reappear as soon as the time window changes.
 
-    view=pool expands to its members and runs the per-user purge for each of them inside
-    the one flush boundary; a flush landing between two members would write pre-purge
-    counts straight back.
+    view=pool deletes the rows *attributed to the pool* (their pool_id), which is
+    exactly the number the By Pool table shows. What its members sent outside the pool
+    is theirs and stays.
 
     The identity is passed as a query parameter rather than a path segment because
     model ids contain slashes (e.g. 'openai/gpt-4o').
     """
+    from contextlib import AsyncExitStack
+
     from app.request_tracker import request_tracker
     from app.rate_limit import rate_limit_tracker
-    from app.routes.pools import pool_membership_map, resettle_after_usage_purge
+    from app.routes.pools import (
+        pool_guard, pool_ids_for_users, pool_membership_map, resettle_after_usage_purge,
+    )
 
     if view not in ("user", "model", "pool"):
         raise HTTPException(status_code=400, detail="view must be 'user', 'model' or 'pool'")
     if not id or not id.strip():
         raise HTTPException(status_code=400, detail="id is required")
 
-    # One purge per member for a pool, one for the identity itself otherwise. Members
-    # are disjoint by identity, so counting and deleting them in turn is safe.
+    # Resolve the axis value the tables are keyed by, and who is affected by it.
     members: List[str] = []
+    resettle_user_ids: List[int] = []
     if view == "pool":
         pool_id = _parse_pool_id(id)
         membership = await pool_membership_map(db)
         if pool_id not in membership:
             raise HTTPException(status_code=404, detail="Pool not found")
         members = membership[pool_id]["members"]
-        targets = [("user", name) for name in members]
+        # Current members for the confirm text, but everyone with rows in the pool for
+        # the resettle: a user who left earlier today still owns rows stamped with it,
+        # and the purge takes those too. Leaving them out would strand their new pool's
+        # ledger charging traffic that no longer exists for the rest of the day.
+        resettle_user_ids = list(dict.fromkeys(
+            membership[pool_id]["member_ids"] + await usage_user_ids_for_pool(db, pool_id)
+        ))
+        axis, value = "pool", pool_id
+    elif view == "user":
+        user_id = await _resolve_usage_user_id(db, id, user_id)
+        resettle_user_ids = [user_id]
+        axis, value = "user", user_id
     else:
-        targets = [(view, id)]
+        axis, value = "model", id
 
     # The purge spans both places usage lives — the DB rows and the counts still
     # buffered in the tracker — so the flush is held off across the whole sequence.
     # Otherwise one landing between the two writes its pre-purge snapshot straight
     # back into the tables that were just cleared.
-    async with request_tracker.pause_flush():
-        # Drain the buffer first so counts recorded in the last minute are deleted too.
-        await request_tracker.flush_pending()
+    #
+    # The pool locks are taken first, outside the pause, because resettle_after_usage_purge
+    # below acquires them and settlement takes pause_flush internally: acquiring in the
+    # other order here and in a concurrent settle is the AB-BA cycle pool_lock's docstring
+    # warns about. Re-acquiring them inside is free — they are re-entrant per task.
+    async with AsyncExitStack() as pool_stack:
+        for pid in await pool_ids_for_users(db, resettle_user_ids):
+            await pool_stack.enter_async_context(pool_guard(pid))
 
-        total = 0
-        deleted: dict = {}
-        try:
-            for t_view, t_id in targets:
+        async with request_tracker.pause_flush():
+            # Drain the buffer first so counts recorded in the last cycle are deleted too.
+            await request_tracker.flush_pending()
+
+            try:
                 # Counted before the delete: this is the request count the admin saw in
                 # the table, not the number of rows, which is spread over three tables
                 # holding the same traffic at different granularities.
-                total += await count_usage_requests(db, t_view, t_id)
-                for table, n in (await delete_usage_records(db, t_view, t_id)).items():
-                    deleted[table] = deleted.get(table, 0) + n
-            await db.commit()
-        except Exception as e:
-            await db.rollback()
-            logger.error(f"Failed to delete usage for {view} '{id}': {e}")
-            raise HTTPException(status_code=500, detail="Failed to delete usage data")
+                total = await count_usage_requests(db, axis, value)
+                deleted = await delete_usage_records(db, axis, value)
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.error(f"Failed to delete usage for {view} '{id}': {e}")
+                raise HTTPException(status_code=500, detail="Failed to delete usage data")
 
-        # Anything buffered between the flush and the commit would otherwise flush
-        # back into the tables we just cleared.
-        dropped = 0
-        for t_view, t_id in targets:
-            dropped += await request_tracker.drop_buffered_usage(t_view, t_id)
+            # Anything buffered between the flush and the commit would otherwise flush
+            # back into the tables we just cleared.
+            dropped = await request_tracker.drop_buffered_usage(axis, value)
 
-        # Strictly after the drop above: settle_pool flushes the tracker itself, so
-        # running it first would write those buffered counts back to the DB, where
-        # drop_buffered_usage can no longer reach them.
-        if view == "user":
-            # A pooled user's ledger charges them for traffic that no longer exists.
-            # Pre-existing gap, fixed here rather than only on the new pool path.
-            await resettle_after_usage_purge(db, [id])
-        elif view == "pool":
-            await resettle_after_usage_purge(db, members)
+            # Strictly after the drop above: settle_pool flushes the tracker itself, so
+            # running it first would write those buffered counts back to the DB, where
+            # drop_buffered_usage can no longer reach them. A pooled user's ledger charges
+            # them for traffic that no longer exists until this runs.
+            if resettle_user_ids:
+                await resettle_after_usage_purge(db, resettle_user_ids)
 
-    # RPD is a COUNT over today's rows, and the counts are cached per identity.
+    # RPD is a SUM over today's rows, and the counts are cached per identity.
     # resettle_after_usage_purge already invalidated and re-snapshotted the pool paths.
     if view == "model":
         # The same settlement staleness exists here in principle, but a model's traffic

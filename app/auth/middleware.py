@@ -121,20 +121,27 @@ async def _enforce_rate_limit(
         raise RateLimitExceeded.openai(decision)
 
 
-def _resolve_identity(auth_result) -> tuple[Optional[str], Optional[str]]:
-    """Normalise an auth result to the ``(identity, kind)`` pair we report it under.
+def _resolve_identity(auth_result) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    """Normalise an auth result to the ``(identity, kind, user_id)`` triple we report it under.
+
+    ``user_id`` is the attribution key of the usage tables: the owning user's id for an
+    API key, the user's own id otherwise, and ADMIN_USAGE_USER_ID for the config admin,
+    which has no users row. ``identity`` is only the display label.
 
     The isinstance order is load-bearing: AdminUser is checked first because its
     ``id`` is None, so the APIKey branch would render it as "key:None". An
-    unrecognised auth object yields ``(None, None)`` and is reported nowhere.
+    unrecognised auth object yields ``(None, None, None)`` and is reported nowhere.
     """
+    from app.auth.models import ADMIN_USAGE_USER_ID
+
     if isinstance(auth_result, AdminUser):
-        return auth_result.username, "admin"
+        return auth_result.username, "admin", ADMIN_USAGE_USER_ID
     if isinstance(auth_result, (APIKey, CachedAPIKey)):
-        return getattr(auth_result, 'username', None) or f"key:{auth_result.id}", "api_key"
+        label = getattr(auth_result, 'username', None) or f"key:{auth_result.id}"
+        return label, "api_key", int(auth_result.user_id)
     if isinstance(auth_result, (User, CachedUser)):
-        return auth_result.username, "user"
-    return None, None
+        return auth_result.username, "user", int(auth_result.id)
+    return None, None, None
 
 
 async def _update_tracking_identity(request: Request, auth_result) -> None:
@@ -145,13 +152,13 @@ async def _update_tracking_identity(request: Request, auth_result) -> None:
     calls this, so the OTel spans and the usage rows can never disagree.
     """
     try:
-        identity, kind = _resolve_identity(auth_result)
+        identity, kind, user_id = _resolve_identity(auth_result)
     except Exception:
         # Reading .username/.id can raise on a detached ORM object
         # (DetachedInstanceError / MissingGreenlet) -- the JWT cache-miss path
         # hands us a User whose session is already closed. Identity reporting is
         # best-effort and must never turn a successful auth into a 500.
-        identity, kind = None, None
+        identity, kind, user_id = None, None, None
 
     # Deliberately above the tracking_request_id guard: requests outside
     # _TRACKED_PREFIXES -- notably the OpenAI routers re-mounted under /openai on
@@ -168,7 +175,7 @@ async def _update_tracking_identity(request: Request, auth_result) -> None:
 
         if identity is not None:
             await request_tracker.update_identity(
-                request.state.tracking_request_id, identity, kind
+                request.state.tracking_request_id, identity, kind, user_id
             )
     except Exception:
         pass

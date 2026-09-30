@@ -21,7 +21,7 @@ from starlette.testclient import TestClient
 from app.auth.admin import AdminUser
 from app.auth.cache import CachedAPIKey, CachedUser
 from app.auth.middleware import _resolve_identity
-from app.auth.models import APIKey, User
+from app.auth.models import ADMIN_USAGE_USER_ID, APIKey, User
 from app.tracing import (
     UserIdSpanProcessor,
     begin_trace_identity,
@@ -129,25 +129,26 @@ class ResolveIdentityTests(unittest.TestCase):
 
     def test_all_auth_types(self):
         cases = [
-            (AdminUser("root", "root@example.com"), ("root", "admin")),
-            (User(id=3, username="alice"), ("alice", "user")),
+            (AdminUser("root", "root@example.com"), ("root", "admin", ADMIN_USAGE_USER_ID)),
+            (User(id=3, username="alice"), ("alice", "user", 3)),
             (
                 CachedUser(id=3, username="alice", email="a@example.com", is_active=True),
-                ("alice", "user"),
+                ("alice", "user", 3),
             ),
-            (APIKey(id=7, user_id=3, name="key"), ("key:7", "api_key")),
+            # An API key attributes to its OWNER's user id, whatever its label.
+            (APIKey(id=7, user_id=3, name="key"), ("key:7", "api_key", 3)),
             (
                 CachedAPIKey(
                     id=7, user_id=3, api_key="k", name="key", is_active=True,
                     username="alice",
                 ),
-                ("alice", "api_key"),
+                ("alice", "api_key", 3),
             ),
             (
                 CachedAPIKey(id=7, user_id=3, api_key="k", name="key", is_active=True),
-                ("key:7", "api_key"),
+                ("key:7", "api_key", 3),
             ),
-            (object(), (None, None)),
+            (object(), (None, None, None)),
         ]
         for auth_result, expected in cases:
             with self.subTest(type=type(auth_result).__name__, expected=expected):
@@ -155,13 +156,14 @@ class ResolveIdentityTests(unittest.TestCase):
 
     def test_admin_is_matched_before_api_key(self):
         """AdminUser.id is None, so the APIKey branch would render it "key:None"."""
-        identity, kind = _resolve_identity(AdminUser("root", "root@example.com"))
+        identity, kind, user_id = _resolve_identity(AdminUser("root", "root@example.com"))
         self.assertEqual(identity, "root")
         self.assertNotEqual(identity, "key:None")
+        self.assertEqual(user_id, ADMIN_USAGE_USER_ID, "the admin has no users row")
 
     def test_empty_username_is_preserved_not_coerced(self):
         """The tracker is called with "" today; the refactor must not change that."""
-        self.assertEqual(_resolve_identity(User(id=3, username="")), ("", "user"))
+        self.assertEqual(_resolve_identity(User(id=3, username="")), ("", "user", 3))
 
 
 class ContextPropagationTests(unittest.TestCase):

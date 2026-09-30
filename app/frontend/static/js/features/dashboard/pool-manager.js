@@ -195,29 +195,14 @@ class PoolManager {
 
     _inviteHtml(i) {
         const esc = s => window.UIUtils.escapeHtml(s);
-        // Stating the pool's current usage AND that the joiner isn't charged for it is
-        // what prevents the likeliest support question.
-        const used = Number(i.pool_used || 0).toLocaleString();
-        const limit = this._fmt(i.pool_limit);
-        const mine = this._fmt(i.counterparty_limit);
-        const spent = i.pool_limit === null || i.pool_limit === undefined
-            ? `The pool has used ${used} requests today.`
-            : `The pool has used ${used} of its ${limit} requests today.`;
         return `
             <div class="pool-invite" data-invite="${i.id}">
                 <div class="pool-invite__title">
-                    ${esc(i.inviter_username)} invited you to ${esc(i.pool_name)}
+                    <span class="pool-invite__who">${esc(i.inviter_username)}</span> invited you to ${esc(i.pool_name)}
                 </div>
-                <p class="pool-invite__body">
-                    ${spent} You won't be charged for any of it — you're only charged for what
-                    the pool spends after you join.
-                    ${i.counterparty_limit === null || i.counterparty_limit === undefined
-                        ? 'You have no daily limit, so joining makes this pool unlimited for everyone in it.'
-                        : `Your <strong>${mine}</strong> daily requests join the pool.`}
-                </p>
                 <div class="pool-invite__acts">
                     <button class="btn btn-secondary btn-sm" data-act="decline" data-invite="${i.id}">Decline</button>
-                    <button class="btn btn-primary btn-sm" data-act="accept" data-invite="${i.id}">Join pool</button>
+                    <button class="btn btn-primary btn-sm" data-act="accept" data-invite="${i.id}">Accept</button>
                 </div>
             </div>
         `;
@@ -424,6 +409,15 @@ class PoolManager {
         return people.filter(p => p.username.toLowerCase().includes(q));
     }
 
+    // The list scrolls, so a new query has to start at its own first match rather than
+    // wherever the old one had been left. Only the search calls this: an invite or a
+    // cancel rewrites the same rows, and yanking someone back to the top of the list
+    // after they pressed a button halfway down it would lose their place for nothing.
+    _scrollDirToTop() {
+        const list = document.getElementById('poolDirList');
+        if (list) list.scrollTop = 0;
+    }
+
     _renderDirectory() {
         const list = document.getElementById('poolDirList');
         const count = document.getElementById('poolDirCount');
@@ -553,7 +547,9 @@ class PoolManager {
     }
 
     _unlimitedNotice(data) {
-        // The main foot-gun of the sum rule, stated where it bites.
+        // The main consequence of the sum rule, stated where it bites. Note the grant is
+        // only good while the pool stands: leaving settles each member at what they
+        // actually sent, capped at their own limit.
         const overall = (data.scopes || []).find(s => s.scope_kind === 'overall');
         if (!overall || !overall.is_unlimited) return '';
         const free = (data.members || [])
@@ -564,8 +560,9 @@ class PoolManager {
         return `
             <div class="pool-notice">
                 <i class="fas fa-infinity"></i>
-                <span>${who} no daily limit, so this pool is unlimited. Leaving restores every
-                member's full daily limit.</span>
+                <span>${who} no daily limit, so nobody here is capped while the pool stands.
+                On leaving, each member is charged what they actually sent, up to their own
+                daily limit.</span>
             </div>
         `;
     }
@@ -583,8 +580,9 @@ class PoolManager {
             return `
                 <div class="pool-notice">
                     <i class="fas fa-user-slash"></i>
-                    <span><strong>${name}</strong> is deactivated. They can't send requests, but
-                    their ${lim} still counts toward the pool limit.</span>
+                    <span><strong>${name}</strong> is deactivated. They can't send requests, so
+                    their ${lim} no longer counts toward the pool limit — what they already
+                    sent today still does.</span>
                     ${act}
                 </div>
             `;
@@ -641,6 +639,7 @@ class PoolManager {
             search.addEventListener('input', () => {
                 this._dirQuery = search.value;
                 this._renderDirectory();
+                this._scrollDirToTop();
             });
             search.addEventListener('keydown', (e) => {
                 if (e.key === 'Escape' && search.value) {
@@ -648,6 +647,7 @@ class PoolManager {
                     search.value = '';
                     this._dirQuery = '';
                     this._renderDirectory();
+                    this._scrollDirToTop();
                 }
             });
         }

@@ -157,7 +157,7 @@ async def _request_is_disconnected(request: Request) -> bool:
         return False
 
 
-def _format_stream_log_context(log_context: Optional[dict[str, Any]]) -> str:
+def format_stream_log_context(log_context: Optional[dict[str, Any]]) -> str:
     """Return a compact JSON suffix for stream lifecycle logs."""
     if not log_context:
         return ""
@@ -503,7 +503,7 @@ async def anthropic_stream_with_context_and_timeout(
         "final_status": "completed",
     }
 
-    logger.info("Anthropic stream started%s", _format_stream_log_context(log_context))
+    logger.info("Anthropic stream started%s", format_stream_log_context(log_context))
 
     try:
         async for chunk in _stream_with_timeout_and_disconnect_anthropic(
@@ -536,7 +536,7 @@ async def anthropic_stream_with_context_and_timeout(
         logger.info(
             "Anthropic stream cancelled after %s chunks%s",
             chunks_yielded,
-            _format_stream_log_context(log_context),
+            format_stream_log_context(log_context),
         )
         raise
     except Exception as e:
@@ -555,7 +555,7 @@ async def anthropic_stream_with_context_and_timeout(
             "Anthropic stream error after %s chunks: %s%s",
             chunks_yielded,
             e,
-            _format_stream_log_context(log_context),
+            format_stream_log_context(log_context),
         )
         raise
     finally:
@@ -566,7 +566,7 @@ async def anthropic_stream_with_context_and_timeout(
             stream_state.get("termination_reason", "completed"),
             chunks_yielded,
             elapsed,
-            _format_stream_log_context(log_context),
+            format_stream_log_context(log_context),
         )
         safe_detach(token)
 
@@ -616,7 +616,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                 logger.warning(
                     "Anthropic stream exceeded timeout of %ss%s",
                     timeout,
-                    _format_stream_log_context(log_context),
+                    format_stream_log_context(log_context),
                 )
                 yield format_anthropic_sse_event(
                     "error",
@@ -664,7 +664,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                     "Anthropic %s after %ss%s",
                     budget_reason,
                     chunk_budget,
-                    _format_stream_log_context(log_context),
+                    format_stream_log_context(log_context),
                 )
                 yield format_anthropic_sse_event(
                     "error",
@@ -700,7 +700,7 @@ async def _stream_with_timeout_and_disconnect_anthropic(
                     pending_chunk_started_at = None
                     logger.info(
                         "Anthropic client disconnected while waiting for next chunk%s",
-                        _format_stream_log_context(log_context),
+                        format_stream_log_context(log_context),
                     )
                     break
                 # Upstream still silent this poll. Emit a keepalive ping so the

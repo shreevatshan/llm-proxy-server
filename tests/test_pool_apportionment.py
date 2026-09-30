@@ -127,5 +127,46 @@ class ApportionmentTests(unittest.TestCase):
         self.assertEqual(apportion(10, []), {})
 
 
+class ZeroWeightTests(unittest.TestCase):
+    """Members with no limit to apportion against.
+
+    A zero weight is routine, not a corner case: settlement gives one to every
+    deactivated member, pinning their limit at what they have already been charged so
+    they absorb nothing new. The rule is that quota is destroyed rather than invented --
+    a share nobody can take is dropped, never handed to someone arbitrarily.
+    """
+
+    def test_all_weights_zero_drops_the_whole_delta(self):
+        shares = apportion(7, [member(1, 0), member(2, 0)])
+
+        self.assertEqual(shares, {1: 0, 2: 0})
+        self.assertEqual(sum(shares.values()), 0,
+                         "no weight to split by, so the remainder is dropped")
+
+    def test_zero_weight_members_absorb_nothing_and_the_rest_split_it_all(self):
+        # bob is pinned at zero headroom the way a deactivated member is.
+        shares = apportion(9, [member(1, 10), member(2, 0), member(3, 20)])
+
+        self.assertEqual(shares[2], 0)
+        self.assertEqual(sum(shares.values()), 9, "the full delta still lands")
+        self.assertEqual(shares[1] + shares[3], 9)
+        self.assertLess(shares[1], shares[3], "split by the positive weights only, 10:20")
+
+    def test_a_zero_weight_member_already_charged_absorbs_no_more(self):
+        # The exact shape settlement builds for an inactive member: limit pinned at
+        # charged, so headroom is zero even though the weight is not.
+        shares = apportion(6, [member(1, 4, charged=4), member(2, 10, charged=0)])
+
+        self.assertEqual(shares[1], 0, "no headroom left, so nothing sticks")
+        self.assertEqual(shares[2], 6)
+
+    def test_a_refund_still_reaches_a_member_pinned_at_their_charge(self):
+        # Refund headroom is `charged`, not unused limit, so purging usage under an
+        # inactive member still brings their charge back down.
+        shares = apportion(-6, [member(1, 3, charged=3), member(2, 3, charged=3)])
+
+        self.assertEqual(shares, {1: -3, 2: -3})
+
+
 if __name__ == "__main__":
     unittest.main()

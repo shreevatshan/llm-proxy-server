@@ -101,6 +101,34 @@ def is_grok(model_id: str) -> bool:
     return "xai." in lower or "grok" in lower
 
 
+# "us.openai.gpt-6-luna", "gpt-5.6-terra", "openai.gpt-5-mini", and Azure
+# deployment names such as "prod-gpt5". Not the open-weight
+# "openai.gpt-oss-120b-1:0" or the non-reasoning "gpt-5-chat-latest", which
+# still take the sampling params.
+# The major is a single digit so Azure's "gpt-35-turbo" (3.5) is not read as 35.
+_OPENAI_GPT_VERSION_RE = re.compile(r'(?<![a-z0-9])gpt-?(?P<major>\d)(?:\.\d+)?(?!\d)')
+
+
+# The non-reasoning "gpt-5-chat-latest", which still takes the sampling params.
+# Anchored to the end of the version token rather than searched for anywhere in
+# the id: the id routinely carries a provider prefix or an admin-chosen
+# deployment name, and one containing "-chat" ("team-chat-gpt-5") says nothing
+# about the family. The trailing boundary keeps a deployment of the reasoning
+# model named "gpt-5-chatbot" from reading as the chat variant.
+_OPENAI_GPT_CHAT_SUFFIX_RE = re.compile(r'-chat(?![a-z0-9])')
+
+
+def is_openai_reasoning_gpt(model_id: str) -> bool:
+    """True if ``model_id`` is an OpenAI GPT >= 5 model (a reasoning model)."""
+    lower = (model_id or "").lower()
+    if "gpt-oss" in lower:
+        return False
+    match = _OPENAI_GPT_VERSION_RE.search(lower)
+    if match is None or int(match.group("major")) < 5:
+        return False
+    return _OPENAI_GPT_CHAT_SUFFIX_RE.match(lower, match.end()) is None
+
+
 # Thinking configuration styles.
 THINKING_BUDGET = "budget"      # {"type": "enabled", "budget_tokens": N}
 THINKING_ADAPTIVE = "adaptive"  # {"type": "adaptive"} — budget_tokens is rejected
@@ -151,6 +179,13 @@ RULES: Tuple[CapabilityRule, ...] = (
         rejects=frozenset({"temperature", "top_p", "stop_sequences"}),
         surfaces=frozenset({SURFACE_CONVERSE}),
         note="Grok on Bedrock accepts only maxTokens in inferenceConfig",
+    ),
+    # OpenAI's GPT >= 5 reasoning models reject the sampling knobs outright
+    # ("This model doesn't support the temperature field").
+    CapabilityRule(
+        match=is_openai_reasoning_gpt,
+        rejects=frozenset({"temperature", "top_p"}),
+        note="OpenAI GPT >= 5 reasoning models reject temperature/top_p",
     ),
 )
 

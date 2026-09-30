@@ -60,6 +60,7 @@ class UpdateModelTests(unittest.IsolatedAsyncioTestCase):
             user_type="user",
             is_streaming=False,
             start_time=0.0,
+            user_id=1,
         )
         return tracker
 
@@ -93,6 +94,48 @@ class UpdateModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(keys), 1)
         self.assertIn("azure:foundry/gpt-5.4", keys[0])
         self.assertNotIn("|gpt-5.4|", keys[0])
+
+
+class UsageKeyTests(unittest.IsolatedAsyncioTestCase):
+    """What end_request records: the user id and the pool they are in at that moment."""
+
+    def _tracker(self, user_id=7):
+        tracker = RequestTracker()
+        tracker._broadcast_raw = AsyncMock()
+        tracker._active["req-1"] = ActiveRequest(
+            request_id="req-1", server="openai", endpoint="/v1/chat/completions",
+            method="POST", model="p/m", user_identity="alice", user_type="user",
+            is_streaming=False, start_time=0.0, user_id=user_id,
+        )
+        return tracker
+
+    async def test_the_key_carries_user_id_and_the_current_pool(self):
+        from app.rate_limit import rate_limit_tracker
+
+        tracker = self._tracker()
+        with patch.object(rate_limit_tracker, "pool_id_for_user", return_value=3) as pool_of:
+            await tracker.end_request("req-1", status="completed")
+
+        pool_of.assert_called_once_with(7)
+        (key, count), = tracker._usage_buffer.items()
+        date_, hour, user_id, identity, kind, model, server, pool_id = key
+        self.assertEqual((user_id, identity, kind, model, server, pool_id),
+                         (7, "alice", "user", "p/m", "openai", 3))
+        self.assertEqual(count, 1)
+
+    async def test_an_unpooled_user_is_stamped_zero(self):
+        tracker = self._tracker()
+        await tracker.end_request("req-1", status="completed")
+
+        (key,) = tracker._usage_buffer
+        self.assertEqual(key[-1], 0)
+
+    async def test_a_request_with_no_user_id_is_not_counted(self):
+        """Authentication never ran (or failed): there is nobody to attribute it to."""
+        tracker = self._tracker(user_id=None)
+        await tracker.end_request("req-1", status="completed")
+
+        self.assertEqual(tracker._usage_buffer, {})
 
 
 class RequestTrackingMiddlewareTests(unittest.TestCase):

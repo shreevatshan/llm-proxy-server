@@ -20,7 +20,11 @@ from sqlalchemy.orm import sessionmaker
 
 from app import time_utils
 from app.auth.database import get_usage_aggregates, get_usage_timeseries
-from app.auth.models import Base, RequestUsage, RequestUsageHourly
+from app.auth.models import ADMIN_USAGE_USER_ID, Base, RequestUsage, RequestUsageHourly
+
+# Usage rows are keyed by user_id; the label rides along for display. Tests seed by
+# label and resolve the id here.
+IDS = {"root": ADMIN_USAGE_USER_ID, "alice": 1, "bob": 2}
 
 
 class AggregateTestCase(unittest.IsolatedAsyncioTestCase):
@@ -48,7 +52,8 @@ class AggregateTestCase(unittest.IsolatedAsyncioTestCase):
     async def seed(self, identity, count, *, user_type="user", model="p/m",
                    server="openai", day=None):
         self.db.add(RequestUsage(
-            date=day or self.today, user_identity=identity, user_type=user_type,
+            date=day or self.today, user_id=IDS[identity], pool_id=0,
+            user_identity=identity, user_type=user_type,
             model=model, server=server, request_count=count,
         ))
         await self.db.commit()
@@ -56,8 +61,9 @@ class AggregateTestCase(unittest.IsolatedAsyncioTestCase):
     async def seed_hourly(self, identity, count, *, hour=9, user_type="user",
                           model="p/m", server="openai", day=None):
         self.db.add(RequestUsageHourly(
-            date=day or self.today, hour=hour, user_identity=identity,
-            user_type=user_type, model=model, server=server, request_count=count,
+            date=day or self.today, hour=hour, user_id=IDS[identity], pool_id=0,
+            user_identity=identity, user_type=user_type, model=model, server=server,
+            request_count=count,
         ))
         await self.db.commit()
 
@@ -94,7 +100,7 @@ class OnePersonOneRowTests(AggregateTestCase):
         self.assertEqual(result["per_user"][0]["user_type"], "api_key")
 
     async def test_distinct_identities_stay_distinct(self):
-        # user_identity is what separates the admin from everyone else.
+        # user_id is what separates the admin (ADMIN_USAGE_USER_ID) from everyone else.
         await self.seed("root", 4, user_type="admin")
         await self.seed("alice", 3, user_type="user")
 
@@ -114,12 +120,12 @@ class OnePersonOneRowTests(AggregateTestCase):
         result = await get_usage_aggregates(self.db, window="7d", filter_model="p/m")
 
         self.assertEqual(result["breakdown"],
-                         [{"user_identity": "alice", "user_type": "mixed",
+                         [{"user_id": 1, "user_identity": "alice", "user_type": "mixed",
                            "request_count": 8}])
 
 
 class DrilldownFilterCompositionTests(AggregateTestCase):
-    """/auth/usage pins filter_user to the caller, so both filters must apply."""
+    """/auth/usage pins filter_user_id to the caller, so both filters must apply."""
 
     async def _seed_two_models(self):
         await self.seed("alice", 7, model="p/wanted")
@@ -130,19 +136,19 @@ class DrilldownFilterCompositionTests(AggregateTestCase):
         await self._seed_two_models()
 
         result = await get_usage_aggregates(
-            self.db, window="today", filter_user="alice", filter_model="p/wanted",
+            self.db, window="today", filter_user_id=IDS["alice"], filter_model="p/wanted",
         )
 
         # Alice's usage of p/wanted alone -- not every model she used, and not
         # bob's traffic on the same model.
         self.assertEqual(result["breakdown"],
-                         [{"user_identity": "alice", "user_type": "user",
+                         [{"user_id": 1, "user_identity": "alice", "user_type": "user",
                            "request_count": 7}])
 
     async def test_filter_user_alone_still_breaks_down_by_model(self):
         await self._seed_two_models()
 
-        result = await get_usage_aggregates(self.db, window="today", filter_user="alice")
+        result = await get_usage_aggregates(self.db, window="today", filter_user_id=IDS["alice"])
 
         self.assertEqual(result["breakdown"],
                          [{"model": "p/wanted", "request_count": 7},
@@ -164,10 +170,10 @@ class DrilldownFilterCompositionTests(AggregateTestCase):
         await self.seed_hourly("bob", 9, model="p/wanted")
 
         result = await get_usage_aggregates(
-            self.db, window="today", filter_user="alice", filter_model="p/wanted",
+            self.db, window="today", filter_user_id=IDS["alice"], filter_model="p/wanted",
         )
         series = await get_usage_timeseries(
-            self.db, window="today", filter_user="alice", filter_model="p/wanted",
+            self.db, window="today", filter_user_id=IDS["alice"], filter_model="p/wanted",
         )
 
         self.assertEqual(sum(b["request_count"] for b in result["breakdown"]),
@@ -178,22 +184,22 @@ class DrilldownFilterCompositionTests(AggregateTestCase):
 
         result = await get_usage_aggregates(
             self.db, window="month", year=self.today.year, month=self.today.month,
-            filter_user="alice", filter_model="p/wanted",
+            filter_user_id=IDS["alice"], filter_model="p/wanted",
         )
 
         self.assertEqual(result["breakdown"],
-                         [{"user_identity": "alice", "user_type": "user",
+                         [{"user_id": 1, "user_identity": "alice", "user_type": "user",
                            "request_count": 7}])
 
     async def test_composition_holds_for_the_all_window(self):
         await self._seed_two_models()
 
         result = await get_usage_aggregates(
-            self.db, window="all", filter_user="alice", filter_model="p/wanted",
+            self.db, window="all", filter_user_id=IDS["alice"], filter_model="p/wanted",
         )
 
         self.assertEqual(result["breakdown"],
-                         [{"user_identity": "alice", "user_type": "user",
+                         [{"user_id": 1, "user_identity": "alice", "user_type": "user",
                            "request_count": 7}])
 
 

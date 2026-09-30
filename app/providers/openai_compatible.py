@@ -5,6 +5,7 @@ from typing import List, Dict, Any, AsyncGenerator
 from openai import AsyncOpenAI
 from app.providers.base import BaseProvider, ProviderHTTPError
 from app.model_alias import echo_model_name
+from app.model_capabilities import SURFACE_NATIVE, scrub as scrub_unsupported_params
 
 # When True, provider methods will NOT overwrite the upstream model name
 # in responses.  Set by the Azure OpenAI routes so the native model
@@ -216,7 +217,15 @@ class OpenAICompatibleProvider(BaseProvider):
             k: v for k, v in request_dict.items() 
             if v is not None and v != [] and v != {}
         }
-        
+
+        # ResponseFormat declares json_schema=None, so {"type": "json_object"}
+        # dumps as {"type": "json_object", "json_schema": null}. Azure rejects
+        # that with "Unknown parameter: 'response_format.json_schema'".
+        if isinstance(request_dict.get("response_format"), dict):
+            request_dict["response_format"] = {
+                k: v for k, v in request_dict["response_format"].items() if v is not None
+            }
+
         # If max_tokens is set, replace it with max_completion_tokens for newer
         # chat models (GPT-4o, o1, etc.) that reject max_tokens.
         # ONLY for chat completions: the legacy Completions API
@@ -230,7 +239,23 @@ class OpenAICompatibleProvider(BaseProvider):
         ):
             request_dict["max_completion_tokens"] = request_dict["max_tokens"]
             del request_dict["max_tokens"]  # Remove max_tokens to avoid conflicts
-        
+
+        # Drop sampling params the target model rejects (e.g. GPT-5 reasoning
+        # models: "'temperature' does not support 0.6 with this model"). Check
+        # both the client-facing name and the deployment it was mapped to,
+        # since either may be the one that carries the version.
+        if isinstance(request, (ChatCompletionRequest, CompletionRequest, ResponsesCreateRequest)):
+            removed = set()
+            for model_id in {getattr(request, "model", None), request_dict.get("model")}:
+                if model_id:
+                    removed.update(scrub_unsupported_params(request_dict, model_id, SURFACE_NATIVE))
+            if removed:
+                logger.debug(
+                    "Removed %s for %s (not supported by this model)",
+                    ", ".join(sorted(removed)),
+                    request_dict.get("model"),
+                )
+
         custom_provider = getattr(self, 'custom_provider_name', '').lower()
 
         # LMStudio uses "structured" instead of OpenAI's "response_format" for structured output.

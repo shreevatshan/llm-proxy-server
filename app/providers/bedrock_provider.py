@@ -2931,6 +2931,15 @@ class BedrockProvider(BaseProvider):
 
             args["toolConfig"] = tool_config
 
+        removed = scrub_unsupported_params(
+            inference_config,
+            model_id,
+            SURFACE_CONVERSE,
+            spellings=CONVERSE_SPELLINGS,
+        )
+        if removed and self.debug:
+            logger.info(f"Removed {', '.join(removed)} for {model_id} (not supported by this model)")
+
         self._apply_grok_constraints(args)
 
         return _sanitize_for_json(args)

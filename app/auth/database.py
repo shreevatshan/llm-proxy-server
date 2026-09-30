@@ -7,7 +7,7 @@ import hashlib
 import functools
 import logging
 from pathlib import Path
-from sqlalchemy import and_, create_engine, event, false, or_, String
+from sqlalchemy import create_engine, event, false, String
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, Session, selectinload
 from sqlalchemy.future import select
@@ -456,9 +456,9 @@ async def delete_api_key(db: AsyncSession, api_key_id: int, user_id: int) -> boo
 async def update_user_profile(db: AsyncSession, user_id: int, username: Optional[str] = None, email: Optional[str] = None) -> Optional[User]:
     """Update user profile information.
 
-    A username change also moves that user's request usage (see
-    rename_usage_identity): usage is keyed by the username string, so leaving it
-    behind would both orphan the history and hand the user a fresh daily quota.
+    A username change also relabels that user's request usage rows (see
+    rename_usage_identity). Usage is keyed by user_id, so nothing moves and the daily
+    quota is untouched; the relabel only keeps the tables reading the current name.
     This is the single chokepoint for renames — both the admin path and the
     self-service profile path go through here.
     """
@@ -514,7 +514,8 @@ async def update_user_profile(db: AsyncSession, user_id: int, username: Optional
 
             if renaming:
                 # Same transaction as the username change: both land or neither does.
-                await rename_usage_identity(db, old_username, username)
+                # Usage is keyed by user_id, so this only rewrites the display label.
+                await rename_usage_identity(db, user_id, username)
 
             await db.commit()
             await db.refresh(user)
@@ -526,14 +527,14 @@ async def update_user_profile(db: AsyncSession, user_id: int, username: Optional
             # Post-commit, still inside the flush pause: relocate counts that never
             # reached the DB, and drop cache entries keyed by either name.
             try:
-                await request_tracker.rename_identity(old_username, username)
+                await request_tracker.rename_identity(user_id, username)
             except Exception as e:
-                logger.warning(f"In-memory usage rename of '{old_username}' failed: {e}")
+                logger.warning(f"In-memory usage relabel of '{old_username}' failed: {e}")
             rate_limit_tracker.invalidate_identity(old_username)
             rate_limit_tracker.invalidate_identity(username)
-            # Usage rows are keyed by the username string, so a pool's snapshot holds
-            # the *old* name until it refreshes. Without this the pool would count
-            # against a name that no longer has rows for up to the refresh interval.
+            # The snapshot's identity->pool index is keyed by username, so until it
+            # is rebuilt a lookup by the new name finds no pool -- and the next
+            # invalidate_identity() for it would leave the pool's RPD caches standing.
             try:
                 await rate_limit_tracker.refresh_now()
             except Exception as e:
@@ -846,6 +847,12 @@ async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
             UserModelAccessException,
         ):
             await db.execute(_sql_delete(_model).where(_model.user_id == user_id))
+
+        # Usage rows are keyed by user_id and go with the account, so a later user
+        # who takes this username inherits neither the history nor today's quota.
+        # Callers hold request_tracker.pause_flush() around this and drop the
+        # buffered counts afterwards; see permanently_delete_user_endpoint.
+        await purge_user_usage(db, user_id)
 
         # Finally delete the user
         await db.delete(user)
@@ -1621,14 +1628,30 @@ async def delete_response_provider_mapping(
 
 
 def _usage_upsert(table, rows: list[dict], index_elements: list[str]):
-    """Build one increment-on-conflict bulk upsert against a usage table."""
+    """Build one increment-on-conflict bulk upsert against a usage table.
+
+    The conflict target must name the table's unique constraint columns exactly, in
+    order; SQLite rejects any other target. user_identity and user_type are labels
+    outside the key, so the latest flush wins them: after a rename the very next flush
+    relabels the rows it touches, and the relabel in rename_usage_identity covers the
+    rest.
+    """
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
     stmt = sqlite_insert(table).values(rows)
     return stmt.on_conflict_do_update(
         index_elements=index_elements,
-        set_={"request_count": table.request_count + stmt.excluded.request_count},
+        set_={
+            "request_count": table.request_count + stmt.excluded.request_count,
+            "user_identity": stmt.excluded.user_identity,
+            "user_type": stmt.excluded.user_type,
+        },
     )
+
+
+USAGE_DAILY_KEY = ["date", "user_id", "model", "server", "pool_id"]
+USAGE_HOURLY_KEY = ["date", "hour", "user_id", "model", "server", "pool_id"]
+USAGE_MONTHLY_KEY = ["year", "month", "user_id", "model", "server", "pool_id"]
 
 
 async def flush_usage_rows(hourly_rows: list[dict], daily_rows: list[dict]) -> None:
@@ -1645,15 +1668,9 @@ async def flush_usage_rows(hourly_rows: list[dict], daily_rows: list[dict]) -> N
     async with AsyncSessionLocal() as db:
         try:
             if hourly_rows:
-                await db.execute(_usage_upsert(
-                    RequestUsageHourly, hourly_rows,
-                    ["date", "hour", "user_identity", "model", "server"],
-                ))
+                await db.execute(_usage_upsert(RequestUsageHourly, hourly_rows, USAGE_HOURLY_KEY))
             if daily_rows:
-                await db.execute(_usage_upsert(
-                    RequestUsage, daily_rows,
-                    ["date", "user_identity", "model", "server"],
-                ))
+                await db.execute(_usage_upsert(RequestUsage, daily_rows, USAGE_DAILY_KEY))
             await db.commit()
         except Exception as e:
             await db.rollback()
@@ -1699,13 +1716,23 @@ async def purge_stale_pool_rows() -> None:
             logger.error(f"Pool ledger/carry purge failed: {e}")
 
 
+def _month_bounds(year: int, month: int):
+    """(first_day, last_day) of a calendar month, for index-friendly date range filters."""
+    from datetime import date, timedelta
+    first = date(year, month, 1)
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return first, nxt - timedelta(days=1)
+
+
 async def rollup_to_monthly() -> None:
     """Roll up fully-aged months from request_usage into request_usage_monthly.
 
     A month is eligible when its last calendar day is at least 30 days before today,
-    ensuring we never roll up a partially-complete month.
+    ensuring we never roll up a partially-complete month. The rollup groups on the
+    monthly key -- (user_id, model, server, pool_id) -- so pool attribution survives
+    it exactly; user_identity / user_type ride along as labels.
     """
-    from sqlalchemy import func, delete, text
+    from sqlalchemy import func, delete
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
     from datetime import date, timedelta
     from app import time_utils
@@ -1731,19 +1758,20 @@ async def rollup_to_monthly() -> None:
                 if last_day_of_month >= today - timedelta(days=30):
                     continue  # month not fully aged yet
 
-                # Aggregate all daily rows for this month
+                first_day, last_day = _month_bounds(year, month)
+                in_month = [RequestUsage.date >= first_day, RequestUsage.date <= last_day]
+
                 agg_q = select(
-                    RequestUsage.user_identity,
-                    RequestUsage.user_type,
+                    RequestUsage.user_id,
+                    RequestUsage.pool_id,
+                    func.max(RequestUsage.user_identity).label("user_identity"),
+                    func.max(RequestUsage.user_type).label("user_type"),
                     RequestUsage.model,
                     RequestUsage.server,
                     func.sum(RequestUsage.request_count).label("request_count"),
-                ).where(
-                    func.strftime('%Y', RequestUsage.date) == str(year),
-                    func.strftime('%m', RequestUsage.date) == f"{month:02d}",
-                ).group_by(
-                    RequestUsage.user_identity,
-                    RequestUsage.user_type,
+                ).where(*in_month).group_by(
+                    RequestUsage.user_id,
+                    RequestUsage.pool_id,
                     RequestUsage.model,
                     RequestUsage.server,
                 )
@@ -1756,6 +1784,8 @@ async def rollup_to_monthly() -> None:
                     {
                         "year": year,
                         "month": month,
+                        "user_id": r.user_id,
+                        "pool_id": r.pool_id,
                         "user_identity": r.user_identity,
                         "user_type": r.user_type,
                         "model": r.model,
@@ -1765,21 +1795,10 @@ async def rollup_to_monthly() -> None:
                     for r in agg_rows
                 ]
 
-                # Upsert into monthly table
-                stmt = sqlite_insert(RequestUsageMonthly).values(monthly_rows)
-                stmt = stmt.on_conflict_do_update(
-                    index_elements=["year", "month", "user_identity", "model", "server"],
-                    set_={"request_count": RequestUsageMonthly.request_count + stmt.excluded.request_count},
-                )
-                await db.execute(stmt)
+                await db.execute(_usage_upsert(RequestUsageMonthly, monthly_rows, USAGE_MONTHLY_KEY))
 
                 # Delete the source daily rows for this month
-                await db.execute(
-                    delete(RequestUsage).where(
-                        func.strftime('%Y', RequestUsage.date) == str(year),
-                        func.strftime('%m', RequestUsage.date) == f"{month:02d}",
-                    )
-                )
+                await db.execute(delete(RequestUsage).where(*in_month))
                 await db.commit()
                 logger.info(f"Rolled up {len(monthly_rows)} groups for {year}-{month:02d} into monthly table")
 
@@ -1789,183 +1808,86 @@ async def rollup_to_monthly() -> None:
             raise
 
 
-# Usage tables keyed by the username string (user_identity), with the time columns
-# that complete each one's uniqueness key. Renaming a user has to move rows in all
-# three; see rename_usage_identity below.
-_USAGE_IDENTITY_TABLES = (
-    ("request_usage", ("date",)),
-    ("request_usage_hourly", ("date", "hour")),
-    ("request_usage_monthly", ("year", "month")),
-)
+# The three usage tables, each keyed by user_id (+ its own time columns). Every
+# maintenance operation that touches "all of a user's usage" has to hit all three.
+_USAGE_TABLES = (RequestUsage, RequestUsageHourly, RequestUsageMonthly)
 
 
-async def rename_usage_identity(db: AsyncSession, old: str, new: str) -> dict[str, int]:
-    """Move every usage row from user_identity ``old`` to ``new``.
+async def rename_usage_identity(db: AsyncSession, user_id: int, new: str) -> dict[str, int]:
+    """Relabel every usage row of ``user_id`` with the new username.
 
-    Usage is keyed by username string rather than user_id, so a rename would
-    otherwise orphan the history *and* reset the daily quota (RPD is a COUNT over
-    rows matching the current username). This migrates the data with the name.
+    Usage is keyed by user_id, so a rename moves nothing and can never collide: this
+    only rewrites the user_identity display label so the tables read the current name.
+    Runs in the caller's transaction and never commits, so the username change and the
+    relabel succeed or fail together.
 
-    Runs in the caller's transaction and never commits, so the username change and
-    the usage move succeed or fail together. Takes the session as a parameter so the
-    audit script and the tests can drive it against any database.
-
-    Rows for ``new`` may already exist (e.g. the name was previously used), and the
-    uniqueness keys forbid duplicates, so conflicting rows are merged by summing
-    request_count. Each uniqueness key includes user_identity plus the table's time
-    columns, model and server, so at most one source row matches any destination row
-    and the merge subquery is single-valued by construction. user_type is not part of
-    any key; a merge keeps the destination row's value.
-
-    Returns a {table: rows_moved} map for logging.
+    Returns a {table: rows_relabelled} map for logging.
     """
-    from sqlalchemy import text
+    from sqlalchemy import update
 
-    moved: dict[str, int] = {}
-    if old == new:
-        return moved
-
-    for table, time_cols in _USAGE_IDENTITY_TABLES:
-        cols = (*time_cols, "model", "server")
-        # Correlate a source row (old identity) with a destination row (new identity).
-        src_to_dst = " AND ".join(f"src.{c} = dst.{c}" for c in cols)
-        # Same correlation for the DELETE, where the target table cannot be aliased.
-        dst_to_target = " AND ".join(f"dst.{c} = {table}.{c}" for c in cols)
-        params = {"old": old, "new": new}
-
-        # 1. Fold conflicting source rows into the destination rows.
-        merged = await db.execute(
-            text(
-                f"UPDATE {table} AS dst "
-                f"   SET request_count = dst.request_count + ("
-                f"       SELECT src.request_count FROM {table} AS src"
-                f"        WHERE src.user_identity = :old AND {src_to_dst})"
-                f" WHERE dst.user_identity = :new"
-                f"   AND EXISTS (SELECT 1 FROM {table} AS src"
-                f"                WHERE src.user_identity = :old AND {src_to_dst})"
-            ),
-            params,
+    relabelled: dict[str, int] = {}
+    for table in _USAGE_TABLES:
+        result = await db.execute(
+            update(table)
+            .where(table.user_id == user_id, table.user_identity != new)
+            .values(user_identity=new)
         )
-
-        # 2. Drop the source rows that were just merged.
-        await db.execute(
-            text(
-                f"DELETE FROM {table}"
-                f" WHERE user_identity = :old"
-                f"   AND EXISTS (SELECT 1 FROM {table} AS dst"
-                f"                WHERE dst.user_identity = :new AND {dst_to_target})"
-            ),
-            params,
-        )
-
-        # 3. Rename the rows that had nothing to merge into.
-        renamed = await db.execute(
-            text(f"UPDATE {table} SET user_identity = :new WHERE user_identity = :old"),
-            params,
-        )
-
-        count = (merged.rowcount or 0) + (renamed.rowcount or 0)
-        if count:
-            moved[table] = count
-
-    if moved:
-        logger.info(f"Moved usage rows from '{old}' to '{new}': {moved}")
-    return moved
+        if result.rowcount:
+            relabelled[table.__tablename__] = result.rowcount
+    if relabelled:
+        logger.info(f"Relabelled usage rows of user {user_id} to '{new}': {relabelled}")
+    return relabelled
 
 
-async def migrate_api_key_usage_identities(db: AsyncSession) -> dict[str, int]:
-    """Move usage rows recorded under ``key:<id>`` onto the owning user's username.
-
-    _authenticate_azure used to cache API keys without the owner's username, so
-    Azure traffic was recorded under "key:<id>" while the same person's traffic on
-    every other surface went under their username. That is two buckets in the usage
-    tables — and since RPD is a COUNT over rows matching the *current* username,
-    two separate daily quotas. Both surfaces now report the username, so the old
-    rows are moved across to keep the history and the quota continuous.
-
-    Idempotent, and cheap when there is nothing to do: it starts by asking which
-    "key:<id>" identities still have rows, so on an already-migrated database this is
-    three empty index probes and no writes. Rows whose owning key or user has been
-    deleted are left alone rather than guessed at.
-
-    Runs in the caller's transaction and never commits, matching
-    rename_usage_identity, so the tests and the startup migration can both drive it.
-
-    Returns a {table: rows_moved} map for logging.
-    """
-    from sqlalchemy import text
-
-    stale: set[str] = set()
-    for table, _time_cols in _USAGE_IDENTITY_TABLES:
-        # A half-open range rather than LIKE 'key:%' (';' is the byte after ':'):
-        # both hit the same rows, but only the range uses the user_identity index.
-        # SQLite's default case_sensitive_like=OFF disables its LIKE-prefix
-        # optimization, and Postgres needs text_pattern_ops for it -- so LIKE would
-        # full-scan all three tables, including the monthly rollup that is retained
-        # forever, on every startup.
-        rows = await db.execute(text(
-            f"SELECT DISTINCT user_identity FROM {table} "
-            f"WHERE user_identity >= 'key:' AND user_identity < 'key;'"
-        ))
-        stale.update(r[0] for r in rows if r[0])
-
-    moved: dict[str, int] = {}
-    for identity in stale:
-        try:
-            key_id = int(identity.split(":", 1)[1])
-        except (IndexError, ValueError):
-            continue  # not one of ours — leave it untouched
-        owner = (await db.execute(
-            select(User.username)
-            .join(APIKey, APIKey.user_id == User.id)
-            .where(APIKey.id == key_id)
-        )).scalar_one_or_none()
-        if not owner:
-            continue
-        for table, count in (await rename_usage_identity(db, identity, owner)).items():
-            moved[table] = moved.get(table, 0) + count
-
-    return moved
+# Which column each purge/count axis binds against. The axis picks one of three column
+# literals; the value itself is always a bound parameter.
+_USAGE_AXIS_COLUMNS = {"user": "user_id", "model": "model", "pool": "pool_id"}
 
 
-async def delete_usage_records(db: AsyncSession, axis: str, value: str) -> dict[str, int]:
-    """Delete every usage row for one user_identity (axis='user') or model (axis='model').
+async def delete_usage_records(db: AsyncSession, axis: str, value) -> dict[str, int]:
+    """Delete every usage row for one user (axis='user', value=user_id), one model
+    (axis='model', value=model id) or one pool (axis='pool', value=pool_id).
 
-    Usage is spread across three tables with different retention — hourly (~48h),
-    daily, and the monthly rollup that is kept forever — so a purge has to hit all
+    Usage is spread across three tables with different retention -- hourly (~48h),
+    daily, and the monthly rollup that is kept forever -- so a purge has to hit all
     three or the data reappears the moment the admin widens the time window.
 
-    Runs in the caller's transaction and never commits, matching rename_usage_identity
-    and letting the tests drive it against any database. Takes the axis rather than
-    two optional filters so the column name is always one of two literals; the value
-    itself is bound, never interpolated.
+    Runs in the caller's transaction and never commits, letting the tests drive it
+    against any database.
 
-    Note the two side effects: usage is keyed by the username string rather than
-    user_id (see the comment above _USAGE_IDENTITY_TABLES), so a purge by user is
-    keyed on the *current* name; and RPD is a COUNT over today's request_usage rows,
-    so deleting them resets that user's daily quota.
+    Side effect worth knowing: RPD is a SUM over today's request_usage rows, so deleting
+    a user's or a pool's rows resets the corresponding daily quota.
 
     Returns a {table: rows_deleted} map for logging.
     """
-    from sqlalchemy import text
+    from sqlalchemy import delete
 
-    column = "user_identity" if axis == "user" else "model"
+    column = _USAGE_AXIS_COLUMNS[axis]
     deleted: dict[str, int] = {}
 
-    for table, _time_cols in _USAGE_IDENTITY_TABLES:
+    for table in _USAGE_TABLES:
         result = await db.execute(
-            text(f"DELETE FROM {table} WHERE {column} = :value"),
-            {"value": value},
+            delete(table).where(getattr(table, column) == value)
         )
-        deleted[table] = result.rowcount or 0
+        deleted[table.__tablename__] = result.rowcount or 0
 
     if any(deleted.values()):
         logger.info(f"Deleted usage rows for {axis} '{value}': {deleted}")
     return deleted
 
 
-async def count_usage_requests(db: AsyncSession, axis: str, value: str) -> int:
-    """Return how many requests are recorded for one user_identity or model.
+async def purge_user_usage(db: AsyncSession, user_id: int) -> dict[str, int]:
+    """Delete all usage of a user being permanently deleted. Same transaction as the caller.
+
+    Rows are keyed by user_id, so this is what stops a later account that takes the
+    same username from inheriting the history -- and, if it happens the same day, the
+    consumed daily quota.
+    """
+    return await delete_usage_records(db, "user", user_id)
+
+
+async def count_usage_requests(db: AsyncSession, axis: str, value) -> int:
+    """Return how many requests are recorded for one user, model or pool.
 
     Sums request_count over the daily and monthly tables only. rollup_to_monthly
     deletes the daily rows it aggregates, so those two are disjoint and together
@@ -1973,25 +1895,64 @@ async def count_usage_requests(db: AsyncSession, axis: str, value: str) -> int:
     and would double-count. Summing rowcounts across all three instead (as a delete
     result does) counts the same traffic up to three times.
     """
-    from sqlalchemy import text
+    from sqlalchemy import func
 
-    column = "user_identity" if axis == "user" else "model"
+    column = _USAGE_AXIS_COLUMNS[axis]
     total = 0
-    for table in ("request_usage", "request_usage_monthly"):
+    for table in (RequestUsage, RequestUsageMonthly):
         result = await db.execute(
-            text(f"SELECT COALESCE(SUM(request_count), 0) FROM {table} WHERE {column} = :value"),
-            {"value": value},
+            select(func.coalesce(func.sum(table.request_count), 0))
+            .where(getattr(table, column) == value)
         )
         total += result.scalar_one() or 0
-    return total
+    return int(total)
 
 
-async def get_usage_earliest_date(db: AsyncSession, filter_user: Optional[str] = None) -> Optional[str]:
+async def usage_user_ids_for_pool(db: AsyncSession, pool_id: int) -> List[int]:
+    """Every user_id that has rows stamped with this pool, current member or not.
+
+    Membership is the wrong source for "who is affected if this pool's usage is
+    purged": rows carry the pool the sender was in when the request completed, so a
+    user who has since left still owns rows here. Settling only today's members would
+    leave that user's ledger charging traffic the purge just deleted.
+    """
+    ids: set = set()
+    for table in _USAGE_TABLES:
+        result = await db.execute(
+            select(table.user_id).where(table.pool_id == pool_id).distinct()
+        )
+        ids.update(int(uid) for uid in result.scalars().all() if uid is not None)
+    return sorted(ids)
+
+
+async def usage_has_admin_label(db: AsyncSession, label: str) -> bool:
+    """True if any usage row is the config admin's under this display name.
+
+    The admin has no `users` row, so its rows keep whatever ADMIN_USERNAME was in force
+    when they were written and nothing relabels them afterwards. Without this, renaming
+    or disabling the admin turns its history into a row the UI can neither open nor
+    delete: the label no longer resolves through is_reserved_username, and there is no
+    account to fall back to.
+    """
+    from app.auth.models import ADMIN_USAGE_USER_ID
+
+    for table in _USAGE_TABLES:
+        result = await db.execute(
+            select(table.user_id)
+            .where(table.user_id == ADMIN_USAGE_USER_ID, table.user_identity == label)
+            .limit(1)
+        )
+        if result.first() is not None:
+            return True
+    return False
+
+
+async def get_usage_earliest_date(db: AsyncSession, filter_user_id: Optional[int] = None) -> Optional[str]:
     """Return the earliest date for which any usage data exists, as an ISO string (YYYY-MM-DD).
 
     Checks the daily table first (exact dates), then falls back to the monthly rollup
     (returns the first day of the earliest year/month found there).
-    When filter_user is given, scopes to that user only.
+    When filter_user_id is given, scopes to that user only.
     """
     from sqlalchemy import func
     from datetime import date
@@ -1999,17 +1960,15 @@ async def get_usage_earliest_date(db: AsyncSession, filter_user: Optional[str] =
     daily_q = select(func.min(RequestUsage.date))
     # Order by (year, month) rather than min(year)/min(month) independently —
     # independent mins pick the wrong date across year boundaries.
-    monthly_q = select(RequestUsageMonthly.year, RequestUsageMonthly.month).order_by(
+    monthly_q = select(RequestUsageMonthly.year, RequestUsageMonthly.month)
+
+    if filter_user_id is not None:
+        daily_q = daily_q.where(RequestUsage.user_id == filter_user_id)
+        monthly_q = monthly_q.where(RequestUsageMonthly.user_id == filter_user_id)
+
+    monthly_q = monthly_q.order_by(
         RequestUsageMonthly.year.asc(), RequestUsageMonthly.month.asc()
     ).limit(1)
-
-    if filter_user:
-        daily_q = daily_q.where(RequestUsage.user_identity == filter_user)
-        monthly_q = select(RequestUsageMonthly.year, RequestUsageMonthly.month).where(
-            RequestUsageMonthly.user_identity == filter_user
-        ).order_by(
-            RequestUsageMonthly.year.asc(), RequestUsageMonthly.month.asc()
-        ).limit(1)
 
     # Compute earliest from both sources — the daily table may only hold recent
     # rows while older data lives solely in the monthly rollup, so we must take
@@ -2035,8 +1994,7 @@ async def get_usage_earliest_date(db: AsyncSession, filter_user: Optional[str] =
 
 async def get_usage_years(db: AsyncSession) -> list[int]:
     """Return sorted list of years with any usage data (daily or monthly tables)."""
-    from sqlalchemy import func, union_all, literal_column
-    from datetime import date
+    from sqlalchemy import func
 
     q_daily = select(
         func.strftime('%Y', RequestUsage.date).label('yr')
@@ -2053,32 +2011,32 @@ async def get_usage_years(db: AsyncSession) -> list[int]:
 
 
 def _fold_identities(rows: list, *, by_model: bool = False) -> list:
-    """Collapse (user_identity, user_type) rows into one row per person.
+    """Collapse (user_id, user_identity, user_type) rows into one row per person.
 
-    user_type is not part of any usage table's unique key -- only
-    (date, user_identity, model, server) is -- so the stored value is whichever
-    request happened to create the row that day. alice sending through the web UI in
-    the morning and through an API key in the afternoon lands on one row labelled
-    'user'; do it on two different days and she becomes two rows and two "unique
-    users". The label is a delivery detail (user_identity already separates the admin
-    from everyone else), so it is a display hint, never an attribution key: one row
-    per identity, and the badge reads "mixed" when more than one type was seen.
+    The key is user_id; user_identity is the label the rows carry (the current
+    username, or the admin name for ADMIN_USAGE_USER_ID) and user_type is a delivery
+    detail. Neither is part of any usage table's unique key, so one person's rows can
+    still differ in user_type: alice through the web UI in the morning and through an
+    API key in the afternoon. The badge reads "mixed" when more than one type was seen.
     """
     folded: dict = {}
     for r in rows:
-        key = (r["user_identity"], r["model"]) if by_model else (r["user_identity"],)
+        key = (r["user_id"], r["model"]) if by_model else (r["user_id"],)
         entry = folded.get(key)
         if entry is None:
-            entry = folded[key] = {"types": set(), "count": 0}
+            entry = folded[key] = {"types": set(), "count": 0, "label": None}
         if r.get("user_type"):
             entry["types"].add(r["user_type"])
+        if r.get("user_identity"):
+            entry["label"] = r["user_identity"]
         entry["count"] += r["request_count"]
 
     out = []
     for key, entry in folded.items():
         types = entry["types"]
         row = {
-            "user_identity": key[0],
+            "user_id": key[0],
+            "user_identity": entry["label"],
             "user_type": next(iter(types)) if len(types) == 1 else ("mixed" if types else None),
         }
         if by_model:
@@ -2087,13 +2045,95 @@ def _fold_identities(rows: list, *, by_model: bool = False) -> list:
         out.append(row)
 
     if by_model:
-        return sorted(out, key=lambda x: (-x["request_count"], x["user_identity"], x["model"]))
-    return sorted(out, key=lambda x: (-x["request_count"], x["user_identity"]))
+        return sorted(out, key=lambda x: (-x["request_count"], x["user_identity"] or "", x["model"]))
+    return sorted(out, key=lambda x: (-x["request_count"], x["user_identity"] or ""))
+
+
+def _user_rows_q(tbl, where):
+    """Per-person aggregate on one usage table: (user_id, user_identity, user_type, sum)."""
+    from sqlalchemy import func
+    return (
+        select(
+            tbl.user_id,
+            tbl.user_identity,
+            tbl.user_type,
+            func.sum(tbl.request_count).label("request_count"),
+        )
+        .where(*where)
+        .group_by(tbl.user_id, tbl.user_identity, tbl.user_type)
+    )
+
+
+def _model_rows_q(tbl, where):
+    """Per-model aggregate on one usage table: (model, sum)."""
+    from sqlalchemy import func
+    return (
+        select(tbl.model, func.sum(tbl.request_count).label("request_count"))
+        .where(*where)
+        .group_by(tbl.model)
+    )
+
+
+def _user_row_dicts(rows) -> list:
+    return [
+        {"user_id": r.user_id, "user_identity": r.user_identity,
+         "user_type": r.user_type, "request_count": r.request_count}
+        for r in rows
+    ]
+
+
+def _merge_model_rows(*row_sets) -> list:
+    combined: dict = {}
+    for rows in row_sets:
+        for r in rows:
+            combined[r.model] = combined.get(r.model, 0) + int(r.request_count)
+    return sorted(
+        [{"model": m, "request_count": c} for m, c in combined.items()],
+        key=lambda x: (-x["request_count"], x["model"]),
+    )
+
+
+def _window_tables(window: str, year: Optional[int], month: Optional[int]):
+    """Which usage tables a window reads, each with its own WHERE clauses.
+
+    Returns [(table, [clauses])]. Mirrors the retention design: hourly for the rolling
+    24h, daily for today/yesterday/7d/30d, and daily UNION monthly for the month and
+    all-time windows (a month sits in exactly one of the two, so the union never
+    double-counts). Every usage reader goes through this so the table, the chart and
+    the pool views can never disagree about what a window contains.
+    """
+    from datetime import timedelta
+    from app import time_utils
+
+    today = time_utils.local_today()
+
+    if window == "24h":
+        cutoff_dt = time_utils.local_now() - timedelta(hours=24)
+        cutoff_date, cutoff_hour = cutoff_dt.date(), cutoff_dt.hour
+        return [(RequestUsageHourly, [
+            (RequestUsageHourly.date > cutoff_date)
+            | ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
+        ])]
+    if window == "month" and year and month:
+        first_day, last_day = _month_bounds(year, month)
+        return [
+            (RequestUsage, [RequestUsage.date >= first_day, RequestUsage.date <= last_day]),
+            (RequestUsageMonthly, [RequestUsageMonthly.year == year, RequestUsageMonthly.month == month]),
+        ]
+    if window == "all":
+        return [(RequestUsage, []), (RequestUsageMonthly, [])]
+    if window == "today":
+        return [(RequestUsage, [RequestUsage.date == today])]
+    if window == "yesterday":
+        return [(RequestUsage, [RequestUsage.date == today - timedelta(days=1)])]
+    if window == "7d":
+        return [(RequestUsage, [RequestUsage.date >= today - timedelta(days=6)])]
+    return [(RequestUsage, [RequestUsage.date >= today - timedelta(days=29)])]  # default 30d
 
 
 async def get_usage_aggregates(
     db: AsyncSession,
-    filter_user: Optional[str] = None,
+    filter_user_id: Optional[int] = None,
     filter_model: Optional[str] = None,
     window: str = "30d",
     year: Optional[int] = None,
@@ -2108,479 +2148,161 @@ async def get_usage_aggregates(
     totals. Either filter set makes it a drill-down returning only 'breakdown' --
     both filters restrict the rows, and filter_model decides the axis (users who
     used that model; otherwise the models that user used).
+
+    Both filters restrict; the drill target only picks the output axis. /auth/usage
+    always pins filter_user_id to the caller, so treating it as the target would make
+    ?view=model&id=X return every model the caller used instead of their usage of X --
+    and the chart, which honours filter_model, would disagree with the table beside it.
     """
-    from sqlalchemy import func, union_all
-    from datetime import date, timedelta
-    from app import time_utils
-
-    today = time_utils.local_today()
-
-    # ------------------------------------------------------------------ #
-    # Build the base query (or queries for month UNION) depending on window
-    # ------------------------------------------------------------------ #
-
-    def _daily_where():
-        if window == "today":
-            return [RequestUsage.date == today]
-        if window == "yesterday":
-            return [RequestUsage.date == today - timedelta(days=1)]
-        if window == "7d":
-            return [RequestUsage.date >= today - timedelta(days=6)]
-        return [RequestUsage.date >= today - timedelta(days=29)]  # default 30d
-
-    async def _exec_top_level_query(where_clauses, use_hourly=False, use_monthly=False):
-        """Run user + model top-level queries and return (per_user, per_model)."""
-        tbl_u = RequestUsageHourly if use_hourly else (RequestUsageMonthly if use_monthly else RequestUsage)
-        tbl_m = tbl_u
-
-        def _user_q(tbl, where):
-            return (
-                select(
-                    tbl.user_identity,
-                    tbl.user_type,
-                    func.sum(tbl.request_count).label("request_count"),
-                )
-                .where(*where)
-                .group_by(tbl.user_identity, tbl.user_type)
-                .order_by(func.sum(tbl.request_count).desc(), tbl.user_identity)
-            )
-
-        def _model_q(tbl, where):
-            return (
-                select(
-                    tbl.model,
-                    func.sum(tbl.request_count).label("request_count"),
-                )
-                .where(*where)
-                .group_by(tbl.model)
-                .order_by(func.sum(tbl.request_count).desc(), tbl.model)
-            )
-
-        user_rows = (await db.execute(_user_q(tbl_u, where_clauses))).all()
-        model_rows = (await db.execute(_model_q(tbl_m, where_clauses))).all()
-        return (
-            _fold_identities([
-                {"user_identity": r.user_identity, "user_type": r.user_type,
-                 "request_count": r.request_count}
-                for r in user_rows
-            ]),
-            [{"model": r.model, "request_count": r.request_count} for r in model_rows],
-        )
-
-    def _drilldown_where(tbl):
-        """Both filters restrict; the drill target only picks the output axis.
-
-        /auth/usage always pins filter_user to the caller, so treating it as the
-        target would make ?view=model&id=X return every model the caller used
-        instead of their usage of X -- and the chart, which honours filter_model,
-        would disagree with the table beside it.
-        """
+    def _filters(tbl):
         where = []
-        if filter_user is not None:
-            where.append(tbl.user_identity == filter_user)
+        if filter_user_id is not None:
+            where.append(tbl.user_id == filter_user_id)
         if filter_model is not None:
             where.append(tbl.model == filter_model)
         return where
 
-    async def _exec_drilldown_query(where_clauses, use_hourly=False, use_monthly=False):
-        tbl = RequestUsageHourly if use_hourly else (RequestUsageMonthly if use_monthly else RequestUsage)
-        where = list(where_clauses) + _drilldown_where(tbl)
-
-        if filter_model is not None:
-            q = (
-                select(tbl.user_identity, tbl.user_type, func.sum(tbl.request_count).label("request_count"))
-                .where(*where)
-                .group_by(tbl.user_identity, tbl.user_type)
-                .order_by(func.sum(tbl.request_count).desc(), tbl.user_identity)
-            )
-            rows = (await db.execute(q)).all()
-            return _fold_identities([
-                {"user_identity": r.user_identity, "user_type": r.user_type,
-                 "request_count": r.request_count}
-                for r in rows
-            ])
-
-        q = (
-            select(tbl.model, func.sum(tbl.request_count).label("request_count"))
-            .where(*where)
-            .group_by(tbl.model)
-            .order_by(func.sum(tbl.request_count).desc(), tbl.model)
-        )
-        rows = (await db.execute(q)).all()
-        return [{"model": r.model, "request_count": r.request_count} for r in rows]
-
-    # ------------------------------------------------------------------ #
-    # 24h window — strict rolling 24h using the hourly table only.
-    # Requests made before request_usage_hourly was introduced will not
-    # appear; this resolves naturally within 24h of first deploy.
-    # ------------------------------------------------------------------ #
-    if window == "24h":
-        now_utc = time_utils.local_now()
-        cutoff_dt = now_utc - timedelta(hours=24)
-        cutoff_date = cutoff_dt.date()
-        cutoff_hour = cutoff_dt.hour
-        base_where = [
-            (RequestUsageHourly.date > cutoff_date) |
-            ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
-        ]
-
-        if filter_user is not None or filter_model is not None:
-            breakdown = await _exec_drilldown_query(base_where, use_hourly=True)
-            return {"window": window, "breakdown": breakdown}
-
-        per_user, per_model = await _exec_top_level_query(base_where, use_hourly=True)
-        total_requests = sum(r["request_count"] for r in per_user)
-        return {
-            "window": window,
-            "per_user": per_user,
-            "per_model": per_model,
-            "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
-        }
-
-    # ------------------------------------------------------------------ #
-    # Month window — UNION daily rows (not yet rolled up) + monthly rows
-    # ------------------------------------------------------------------ #
+    tables = _window_tables(window, year, month)
+    result: dict = {"window": window}
     if window == "month" and year and month:
-        yr_str = str(year)
-        mo_str = f"{month:02d}"
+        result.update({"year": year, "month": month})
 
-        daily_where = [
-            func.strftime('%Y', RequestUsage.date) == yr_str,
-            func.strftime('%m', RequestUsage.date) == mo_str,
-        ]
-        monthly_where = [
-            RequestUsageMonthly.year == year,
-            RequestUsageMonthly.month == month,
-        ]
-
-        async def _month_query_user():
-            d_rows = (await db.execute(
-                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*daily_where).group_by(RequestUsage.user_identity, RequestUsage.user_type)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*monthly_where).group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
-            )).all()
-            return _fold_identities([
-                {"user_identity": r.user_identity, "user_type": r.user_type,
-                 "request_count": r.rc}
-                for r in list(d_rows) + list(m_rows)
-            ])
-
-        async def _month_query_model():
-            d_rows = (await db.execute(
-                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*daily_where).group_by(RequestUsage.model)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*monthly_where).group_by(RequestUsageMonthly.model)
-            )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                combined[r.model] = combined.get(r.model, 0) + r.rc
-            return sorted(
-                [{"model": m, "request_count": c} for m, c in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
-
+    if filter_user_id is not None or filter_model is not None:
         if filter_model is not None:
-            d_rows = (await db.execute(
-                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*daily_where, *_drilldown_where(RequestUsage))
-                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*monthly_where, *_drilldown_where(RequestUsageMonthly))
-                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
-            )).all()
-            breakdown = _fold_identities([
-                {"user_identity": r.user_identity, "user_type": r.user_type,
-                 "request_count": r.rc}
-                for r in list(d_rows) + list(m_rows)
-            ])
-            return {"window": window, "year": year, "month": month, "breakdown": breakdown}
+            # Users who used this model (optionally: one user's usage of it).
+            rows: list = []
+            for tbl, where in tables:
+                rows.extend((await db.execute(_user_rows_q(tbl, where + _filters(tbl)))).all())
+            result["breakdown"] = _fold_identities(_user_row_dicts(rows))
+        else:
+            row_sets = [
+                (await db.execute(_model_rows_q(tbl, where + _filters(tbl)))).all()
+                for tbl, where in tables
+            ]
+            result["breakdown"] = _merge_model_rows(*row_sets)
+        return result
 
-        if filter_user is not None:
-            d_rows = (await db.execute(
-                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*daily_where, *_drilldown_where(RequestUsage))
-                .group_by(RequestUsage.model)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*monthly_where, *_drilldown_where(RequestUsageMonthly))
-                .group_by(RequestUsageMonthly.model)
-            )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                combined[r.model] = combined.get(r.model, 0) + r.rc
-            breakdown = sorted(
-                [{"model": m, "request_count": c} for m, c in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
-            return {"window": window, "year": year, "month": month, "breakdown": breakdown}
+    user_rows: list = []
+    model_row_sets: list = []
+    for tbl, where in tables:
+        user_rows.extend((await db.execute(_user_rows_q(tbl, where))).all())
+        model_row_sets.append((await db.execute(_model_rows_q(tbl, where))).all())
 
-        per_user = await _month_query_user()
-        per_model = await _month_query_model()
-        total_requests = sum(r["request_count"] for r in per_user)
-        return {
-            "window": window,
-            "year": year,
-            "month": month,
-            "per_user": per_user,
-            "per_model": per_model,
-            "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
-        }
-
-    # ------------------------------------------------------------------ #
-    # All-time window — UNION daily rows + monthly rollups, no date filter
-    # ------------------------------------------------------------------ #
-    if window == "all":
-        async def _all_query_user():
-            d_rows = (await db.execute(
-                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
-                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
-            )).all()
-            return _fold_identities([
-                {"user_identity": r.user_identity, "user_type": r.user_type,
-                 "request_count": r.rc}
-                for r in list(d_rows) + list(m_rows)
-            ])
-
-        async def _all_query_model():
-            d_rows = (await db.execute(
-                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
-                .group_by(RequestUsage.model)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .group_by(RequestUsageMonthly.model)
-            )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                combined[r.model] = combined.get(r.model, 0) + r.rc
-            return sorted(
-                [{"model": m, "request_count": c} for m, c in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
-
-        if filter_model is not None:
-            d_rows = (await db.execute(
-                select(RequestUsage.user_identity, RequestUsage.user_type, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*_drilldown_where(RequestUsage))
-                .group_by(RequestUsage.user_identity, RequestUsage.user_type)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*_drilldown_where(RequestUsageMonthly))
-                .group_by(RequestUsageMonthly.user_identity, RequestUsageMonthly.user_type)
-            )).all()
-            breakdown = _fold_identities([
-                {"user_identity": r.user_identity, "user_type": r.user_type,
-                 "request_count": r.rc}
-                for r in list(d_rows) + list(m_rows)
-            ])
-            return {"window": window, "breakdown": breakdown}
-
-        if filter_user is not None:
-            d_rows = (await db.execute(
-                select(RequestUsage.model, func.sum(RequestUsage.request_count).label("rc"))
-                .where(*_drilldown_where(RequestUsage))
-                .group_by(RequestUsage.model)
-            )).all()
-            m_rows = (await db.execute(
-                select(RequestUsageMonthly.model, func.sum(RequestUsageMonthly.request_count).label("rc"))
-                .where(*_drilldown_where(RequestUsageMonthly))
-                .group_by(RequestUsageMonthly.model)
-            )).all()
-            combined: dict = {}
-            for r in list(d_rows) + list(m_rows):
-                combined[r.model] = combined.get(r.model, 0) + r.rc
-            breakdown = sorted(
-                [{"model": m, "request_count": c} for m, c in combined.items()],
-                key=lambda x: -x["request_count"]
-            )
-            return {"window": window, "breakdown": breakdown}
-
-        per_user = await _all_query_user()
-        per_model = await _all_query_model()
-        total_requests = sum(r["request_count"] for r in per_user)
-        return {
-            "window": window,
-            "per_user": per_user,
-            "per_model": per_model,
-            "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
-        }
-
-    # ------------------------------------------------------------------ #
-    # Daily-table windows: today, yesterday, 7d, 30d
-    # ------------------------------------------------------------------ #
-    base_where = _daily_where()
-
-    if filter_user is not None or filter_model is not None:
-        breakdown = await _exec_drilldown_query(base_where)
-        return {"window": window, "breakdown": breakdown}
-
-    per_user, per_model = await _exec_top_level_query(base_where)
-    total_requests = sum(r["request_count"] for r in per_user)
-    return {
-        "window": window,
+    per_user = _fold_identities(_user_row_dicts(user_rows))
+    per_model = _merge_model_rows(*model_row_sets)
+    result.update({
         "per_user": per_user,
         "per_model": per_model,
-        "totals": {"requests": total_requests, "unique_users": len(per_user), "unique_models": len(per_model)},
-    }
-
-
-def _span_predicate(tbl, spans: list):
-    """Restrict a usage table to [(identity, first_day, last_day)] stints.
-
-    An OR of ANDs rather than `user_identity.in_(...)`: each identity only counts
-    inside its own date range. This is what makes pool usage mean "what the pool
-    consumed" instead of "everything its current members ever sent" -- a member who
-    joined yesterday brings yesterday onward, not their whole history.
-
-    Month precision on RequestUsageMonthly: it has no date column, so the comparison
-    runs on year*12 + month and a stint covering any part of a rolled-up month pulls
-    the whole month. The same known imprecision _fold_models_into_scopes carries.
-    """
-    if not spans:
-        # No stint overlaps the window: match nothing rather than everything.
-        return false()
-
-    clauses = []
-    monthly = tbl is RequestUsageMonthly
-    for identity, lo, hi in spans:
-        if monthly:
-            ordinal = tbl.year * 12 + tbl.month
-            clauses.append(and_(
-                tbl.user_identity == identity,
-                ordinal >= lo.year * 12 + lo.month,
-                ordinal <= hi.year * 12 + hi.month,
-            ))
-        else:
-            clauses.append(and_(
-                tbl.user_identity == identity,
-                tbl.date >= lo,
-                tbl.date <= hi,
-            ))
-    return or_(*clauses)
+        "totals": {
+            "requests": sum(r["request_count"] for r in per_user),
+            "unique_users": len(per_user),
+            "unique_models": len(per_model),
+        },
+    })
+    return result
 
 
 async def get_usage_by_user_and_model(
     db: AsyncSession,
-    identities: list,
+    user_ids: Optional[list] = None,
+    *,
+    pool_id: Optional[int] = None,
     window: str = "30d",
     year: Optional[int] = None,
     month: Optional[int] = None,
-    restrict_spans: Optional[list] = None,
 ) -> list[dict]:
-    """Return the user x model cross-product of request counts for a set of identities.
+    """Return the user x model cross-product of request counts.
 
-    [{user_identity, user_type, model, request_count}], restricted to `identities`, or
-    -- when `restrict_spans` is given as [(identity, first_day, last_day)] -- to each
-    identity only within its own date range, which is how pool views exclude traffic
-    sent before a member joined or after they left. `restrict_spans` supersedes
-    `identities` when both are passed.
+    [{user_id, user_identity, user_type, model, request_count}], restricted to
+    `user_ids` (every row those users sent, in any pool or none) and/or to `pool_id`
+    (every row stamped with that pool, whoever sent it). Both given: that pool's rows
+    from those users. Neither given: nothing -- an unscoped cross-product is never
+    what a caller wants.
 
-    Mirrors the window/table selection of get_usage_aggregates: hourly for 24h, daily
-    for today/yesterday/7d/30d, daily UNION monthly for month/all. Settlement depends
+    Uses the same window/table selection as get_usage_aggregates. Settlement depends
     on window="today" reading the daily table, so the two stay in lockstep.
 
-    One query (two for the union windows) serves every pool view: per-member totals,
-    pool-wide per-model, per-member per-model and per-group are all folds of this one
-    result set in Python. Settlement (app/auth/pools.py) uses window="today" to get the
-    per-member, per-scope row counts it needs for every member and scope at once.
+    One query per table serves every pool view: per-member totals, pool-wide
+    per-model, per-member per-model and per-group are all folds of this one result
+    set in Python. Settlement (app/auth/pools.py) uses window="today" with user_ids
+    and NO pool filter -- a member's charge is what they sent today wherever they were.
     """
     from sqlalchemy import func
-    from datetime import timedelta
-    from app import time_utils
 
-    identities = list(dict.fromkeys(identities or []))
-    if restrict_spans is None and not identities:
+    if user_ids is None and pool_id is None:
         return []
-    if restrict_spans is not None and not restrict_spans:
-        return []
-
-    today = time_utils.local_today()
+    if user_ids is not None:
+        user_ids = list(dict.fromkeys(user_ids))
+        if not user_ids:
+            return []
 
     def _rows_q(tbl, where):
-        if restrict_spans is not None:
-            scope = _span_predicate(tbl, restrict_spans)
-        else:
-            scope = tbl.user_identity.in_(identities)
+        scope = []
+        if user_ids is not None:
+            scope.append(tbl.user_id.in_(user_ids))
+        if pool_id is not None:
+            scope.append(tbl.pool_id == pool_id)
         return (
             select(
+                tbl.user_id,
                 tbl.user_identity,
                 tbl.user_type,
                 tbl.model,
                 func.sum(tbl.request_count).label("rc"),
             )
-            .where(scope, *where)
-            .group_by(tbl.user_identity, tbl.user_type, tbl.model)
+            .where(*scope, *where)
+            .group_by(tbl.user_id, tbl.user_identity, tbl.user_type, tbl.model)
         )
 
     collected: list = []
-
-    def _absorb(rows):
+    for tbl, where in _window_tables(window, year, month):
         collected.extend(
-            {"user_identity": r.user_identity, "user_type": r.user_type,
-             "model": r.model, "request_count": r.rc}
-            for r in rows
+            {"user_id": r.user_id, "user_identity": r.user_identity,
+             "user_type": r.user_type, "model": r.model, "request_count": r.rc}
+            for r in (await db.execute(_rows_q(tbl, where))).all()
         )
-
-    if window == "24h":
-        cutoff_dt = time_utils.local_now() - timedelta(hours=24)
-        cutoff_date, cutoff_hour = cutoff_dt.date(), cutoff_dt.hour
-        where = [
-            (RequestUsageHourly.date > cutoff_date)
-            | ((RequestUsageHourly.date == cutoff_date) & (RequestUsageHourly.hour >= cutoff_hour))
-        ]
-        _absorb((await db.execute(_rows_q(RequestUsageHourly, where))).all())
-
-    elif window == "month" and year and month:
-        _absorb((await db.execute(_rows_q(RequestUsage, [
-            func.strftime('%Y', RequestUsage.date) == str(year),
-            func.strftime('%m', RequestUsage.date) == f"{month:02d}",
-        ]))).all())
-        _absorb((await db.execute(_rows_q(RequestUsageMonthly, [
-            RequestUsageMonthly.year == year,
-            RequestUsageMonthly.month == month,
-        ]))).all())
-
-    elif window == "all":
-        _absorb((await db.execute(_rows_q(RequestUsage, []))).all())
-        _absorb((await db.execute(_rows_q(RequestUsageMonthly, []))).all())
-
-    else:
-        if window == "today":
-            where = [RequestUsage.date == today]
-        elif window == "yesterday":
-            where = [RequestUsage.date == today - timedelta(days=1)]
-        elif window == "7d":
-            where = [RequestUsage.date >= today - timedelta(days=6)]
-        else:  # default 30d
-            where = [RequestUsage.date >= today - timedelta(days=29)]
-        _absorb((await db.execute(_rows_q(RequestUsage, where))).all())
-
     return _fold_identities(collected, by_model=True)
+
+
+async def get_usage_totals_by_pool(
+    db: AsyncSession,
+    pool_ids: list,
+    window: str = "30d",
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+) -> dict:
+    """{pool_id: request_count} over the window, for the given pools, in one query per table.
+
+    Feeds the admin By Pool table. Pools absent from the result had no traffic; pools
+    not in `pool_ids` (deleted ones whose rows still carry their id) are left out so
+    they never surface as phantom rows.
+    """
+    from sqlalchemy import func
+
+    pool_ids = list(dict.fromkeys(pool_ids))
+    if not pool_ids:
+        return {}
+    totals: dict = {}
+    for tbl, where in _window_tables(window, year, month):
+        rows = (await db.execute(
+            select(tbl.pool_id, func.sum(tbl.request_count).label("rc"))
+            .where(tbl.pool_id.in_(pool_ids), *where)
+            .group_by(tbl.pool_id)
+        )).all()
+        for r in rows:
+            totals[r.pool_id] = totals.get(r.pool_id, 0) + int(r.rc or 0)
+    return totals
 
 
 async def get_usage_timeseries(
     db: AsyncSession,
-    filter_user: Optional[str] = None,
+    filter_user_id: Optional[int] = None,
     filter_model: Optional[str] = None,
     window: str = "30d",
     year: Optional[int] = None,
     month: Optional[int] = None,
-    restrict_users: Optional[list] = None,
-    restrict_spans: Optional[list] = None,
+    user_ids: Optional[list] = None,
+    pool_ids: Optional[list] = None,
 ) -> list[dict]:
     """Return ordered, zero-filled time buckets of request counts for the window.
 
@@ -2595,12 +2317,10 @@ async def get_usage_timeseries(
                         once the month has been rolled up and daily rows deleted)
       - all          -> one bucket per month (YYYY-MM), union of daily + monthly tables
 
-    filter_user / filter_model scope the series to a single user or model (drill-down).
-    restrict_users limits the series to a set of identities (a pool's members) without
-    singling one out, and composes with filter_model. restrict_spans is the
-    membership-aware form of it -- [(identity, first_day, last_day)] stints, each
-    identity counted only inside its own range -- and supersedes restrict_users so the
-    chart and the table agree about what a pool consumed.
+    filter_user_id / filter_model scope the series to a single user or model
+    (drill-down). user_ids limits it to a set of people without singling one out;
+    pool_ids limits it to rows stamped with any of those pools, which is how the By
+    Pool chart shows exactly what the pools consumed. All of them compose.
     """
     from sqlalchemy import func
     from datetime import date, timedelta
@@ -2608,17 +2328,15 @@ async def get_usage_timeseries(
 
     today = time_utils.local_today()
 
-    identity_set = list(dict.fromkeys(restrict_users)) if restrict_users is not None else None
-
     def _apply_filters(q, tbl):
-        if filter_user is not None:
-            q = q.where(tbl.user_identity == filter_user)
+        if filter_user_id is not None:
+            q = q.where(tbl.user_id == filter_user_id)
         if filter_model is not None:
             q = q.where(tbl.model == filter_model)
-        if restrict_spans is not None:
-            q = q.where(_span_predicate(tbl, restrict_spans))
-        elif identity_set is not None:
-            q = q.where(tbl.user_identity.in_(identity_set))
+        if user_ids is not None:
+            q = q.where(tbl.user_id.in_(list(dict.fromkeys(user_ids))) if user_ids else false())
+        if pool_ids is not None:
+            q = q.where(tbl.pool_id.in_(list(dict.fromkeys(pool_ids))) if pool_ids else false())
         return q
 
     # ------------------------------------------------------------------ #
@@ -2713,15 +2431,11 @@ async def get_usage_timeseries(
     # month — daily buckets for the month, or a single monthly bucket
     # ------------------------------------------------------------------ #
     if window == "month" and year and month:
-        yr_str = str(year)
-        mo_str = f"{month:02d}"
+        first_day, last_day = _month_bounds(year, month)
 
         q = (
             select(RequestUsage.date, func.sum(RequestUsage.request_count).label("rc"))
-            .where(
-                func.strftime('%Y', RequestUsage.date) == yr_str,
-                func.strftime('%m', RequestUsage.date) == mo_str,
-            )
+            .where(RequestUsage.date >= first_day, RequestUsage.date <= last_day)
             .group_by(RequestUsage.date)
         )
         q = _apply_filters(q, RequestUsage)
@@ -2729,12 +2443,7 @@ async def get_usage_timeseries(
 
         if rows:
             counts = {r.date.isoformat(): int(r.rc) for r in rows}
-            # Number of days in the month for zero-fill.
-            if month == 12:
-                next_first = date(year + 1, 1, 1)
-            else:
-                next_first = date(year, month + 1, 1)
-            days_in_month = (next_first - date(year, month, 1)).days
+            days_in_month = (last_day - first_day).days + 1
             return [
                 {"label": date(year, month, d).isoformat(),
                  "count": counts.get(date(year, month, d).isoformat(), 0)}
@@ -2803,29 +2512,342 @@ async def get_usage_timeseries(
     ]
 
 
+# --------------------------------------------------------------------------- #
+# Usage-table rekey migration: username-string keys -> (user_id, pool_id) keys
+#
+# Pre-rekey usage rows are keyed by the username string and carry no pool. The
+# rebuild below maps every identity to a user id (the config admin to
+# ADMIN_USAGE_USER_ID, legacy "key:<id>" identities to the key's owner), merges rows
+# that collapse onto one key, and back-fills pool_id from the membership intervals.
+# Identities that resolve to nothing -- deleted users, deleted keys -- are dropped,
+# matching the purge-on-delete policy; the file backup taken first is the safety net.
+# --------------------------------------------------------------------------- #
+
+_USAGE_TABLE_NAMES = ("request_usage", "request_usage_hourly", "request_usage_monthly")
+
+
+def _sqlite_db_path() -> Optional[str]:
+    """Filesystem path of the SQLite database, or None for other engines / in-memory."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return None
+    path = DATABASE_URL.split("///")[-1]
+    if not path or path.startswith(":memory:"):
+        return None
+    return os.path.abspath(path)
+
+
+def _backup_sqlite_file(tag: str) -> Optional[str]:
+    """Copy the live database with VACUUM INTO (safe under WAL) and return the path.
+
+    Runs on the stdlib driver outside any SQLAlchemy transaction: VACUUM cannot run
+    inside one. Blocking; callers hand it to a thread.
+    """
+    import sqlite3
+    import time as _time
+
+    path = _sqlite_db_path()
+    if path is None or not os.path.exists(path):
+        return None
+    dest = f"{path}.{tag}-{_time.strftime('%Y%m%d-%H%M%S')}.bak"
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(f"VACUUM INTO '{dest.replace(chr(39), chr(39) * 2)}'")
+    finally:
+        conn.close()
+    return dest
+
+
+async def _usage_tables_needing_rekey(conn) -> list:
+    """Names of usage tables that exist but still lack the user_id column."""
+    from sqlalchemy import text
+
+    pending = []
+    for table in _USAGE_TABLE_NAMES:
+        rows = (await conn.execute(text(f"PRAGMA table_info({table})"))).fetchall()
+        columns = [r[1] for r in rows]
+        if columns and "user_id" not in columns:
+            pending.append(table)
+    return pending
+
+
+async def _build_usage_identity_map(conn) -> None:
+    """Create and fill the temp table mapping legacy identity strings to (user_id, label)."""
+    from sqlalchemy import text
+    from app.auth.models import ADMIN_USAGE_USER_ID
+
+    await conn.execute(text("DROP TABLE IF EXISTS _usage_identity_map"))
+    await conn.execute(text(
+        "CREATE TEMP TABLE _usage_identity_map ("
+        " user_identity TEXT PRIMARY KEY, user_id INTEGER NOT NULL, label TEXT NOT NULL)"
+    ))
+
+    entries: dict = {}
+    users = (await conn.execute(text("SELECT id, username FROM users"))).fetchall()
+    for uid, username in users:
+        entries[username] = (int(uid), username)
+    keys = (await conn.execute(text(
+        "SELECT k.id, k.user_id, u.username FROM api_keys k JOIN users u ON u.id = k.user_id"
+    ))).fetchall()
+    for key_id, uid, username in keys:
+        entries.setdefault(f"key:{key_id}", (int(uid), username))
+
+    from app.auth.admin import get_admin_username, is_admin_enabled
+    if is_admin_enabled():
+        admin_name = get_admin_username()
+        if admin_name:
+            # setdefault, not assignment: is_reserved_username only rejects this name
+            # while the admin is enabled, so a user who registered it during a disabled
+            # stint -- or under an earlier ADMIN_USERNAME -- holds a real `users` row
+            # under it. Overwriting would rekey that account's whole history to
+            # ADMIN_USAGE_USER_ID, irreversibly. The map is keyed by identity alone and
+            # cannot split a genuine collision, so the real account wins and the admin's
+            # own rows fold into it -- misattributed, but nothing is lost.
+            if admin_name in entries:
+                logger.warning(
+                    "Usage rekey: '%s' is both the admin username and a real account; "
+                    "admin usage recorded under that name will be attributed to the account",
+                    admin_name,
+                )
+            entries.setdefault(admin_name, (ADMIN_USAGE_USER_ID, admin_name))
+
+    # Only the config admin ever writes user_type 'admin', so rows labelled that way
+    # belong to it whatever the admin account is called -- or whether it is enabled --
+    # at the moment this migration runs. Without this, migrating with the admin
+    # disabled would silently drop its whole history as unattributable.
+    for table in _USAGE_TABLE_NAMES:
+        rows = await conn.execute(text(
+            f"SELECT DISTINCT user_identity FROM {table} WHERE user_type = 'admin'"
+        ))
+        for (identity,) in rows.fetchall():
+            if identity:
+                entries.setdefault(identity, (ADMIN_USAGE_USER_ID, identity))
+
+    for identity, (uid, label) in entries.items():
+        await conn.execute(
+            text("INSERT INTO _usage_identity_map (user_identity, user_id, label) "
+                 "VALUES (:i, :u, :l)"),
+            {"i": identity, "u": uid, "l": label},
+        )
+
+
+async def _rekey_usage_table(conn, table: str) -> dict:
+    """Rebuild one usage table onto the (user_id, pool_id) key. Returns a stats dict.
+
+    Copy-out rather than RENAME: a renamed table keeps its indexes under their old
+    names, which then collide with the CREATE INDEX statements of the new table.
+    Nothing references the usage tables by foreign key, so DROP is safe.
+    """
+    from sqlalchemy import text
+
+    time_cols = {
+        "request_usage": ("date",),
+        "request_usage_hourly": ("date", "hour"),
+        "request_usage_monthly": ("year", "month"),
+    }[table]
+    tcols = ", ".join(f"m.{c}" for c in time_cols)
+    ins_tcols = ", ".join(time_cols)
+
+    before = (await conn.execute(text(
+        f"SELECT COUNT(*), COALESCE(SUM(request_count), 0) FROM {table}"
+    ))).one()
+    orphans = (await conn.execute(text(
+        f"SELECT COUNT(*), COALESCE(SUM(request_count), 0) FROM {table} "
+        f"WHERE user_identity NOT IN (SELECT user_identity FROM _usage_identity_map)"
+    ))).one()
+
+    await conn.execute(text(f"DROP TABLE IF EXISTS {table}_mig"))
+    await conn.execute(text(f"CREATE TABLE {table}_mig AS SELECT * FROM {table}"))
+    await conn.execute(text(f"DROP TABLE {table}"))
+    await conn.run_sync(lambda sync_conn: Base.metadata.tables[table].create(sync_conn))
+
+    await conn.execute(text(
+        f"INSERT INTO {table} ({ins_tcols}, user_id, pool_id, user_identity, user_type, "
+        f"model, server, request_count) "
+        f"SELECT {tcols}, im.user_id, 0, im.label, MAX(m.user_type), m.model, m.server, "
+        f"SUM(m.request_count) "
+        f"FROM {table}_mig m JOIN _usage_identity_map im ON im.user_identity = m.user_identity "
+        f"GROUP BY {tcols}, im.user_id, m.model, m.server"
+    ))
+    await conn.execute(text(f"DROP TABLE {table}_mig"))
+
+    after = (await conn.execute(text(
+        f"SELECT COUNT(*), COALESCE(SUM(request_count), 0) FROM {table}"
+    ))).one()
+    return {
+        "rows_before": before[0], "requests_before": before[1],
+        "rows_after": after[0], "requests_after": after[1],
+        "orphan_rows_dropped": orphans[0], "orphan_requests_dropped": orphans[1],
+    }
+
+
+async def _backfill_usage_pool_ids(conn, tables: list) -> int:
+    """Stamp pool_id onto pre-rekey rows from the membership intervals. Returns rows updated.
+
+    Day-granular for daily/hourly and month-granular for the rollup -- the precision the
+    interval table has. Stints are applied oldest first with a `pool_id = 0` guard, so
+    on a day a user left one pool for another the earlier stint keeps the day.
+
+    That guard decides the whole day, not just the part before the move: a usage row is
+    one row per day, so traffic sent after joining the later pool is stamped with the
+    earlier one too. There is no finer split available -- the rows being backfilled
+    predate pool_id entirely -- and picking the earlier stint at least keeps the day
+    attributed to the pool that held the member for the start of it.
+    """
+    from sqlalchemy import text
+    from app import time_utils
+
+    today = time_utils.local_today()
+    intervals = (await conn.execute(text(
+        "SELECT pool_id, user_id, joined_on, left_on FROM pool_membership_intervals "
+        "ORDER BY joined_on, id"
+    ))).fetchall()
+    updated = 0
+    for pool_id, user_id, joined_on, left_on in intervals:
+        lo = joined_on if isinstance(joined_on, str) else joined_on.isoformat()
+        hi_date = left_on or today
+        hi = hi_date if isinstance(hi_date, str) else hi_date.isoformat()
+        params = {"p": pool_id, "u": user_id, "lo": lo, "hi": hi}
+        for table in tables:
+            if table == "request_usage_monthly":
+                lo_ord = int(lo[:4]) * 12 + int(lo[5:7])
+                hi_ord = int(hi[:4]) * 12 + int(hi[5:7])
+                result = await conn.execute(text(
+                    f"UPDATE {table} SET pool_id = :p WHERE user_id = :u AND pool_id = 0 "
+                    f"AND (year * 12 + month) BETWEEN :lo_ord AND :hi_ord"
+                ), {"p": pool_id, "u": user_id, "lo_ord": lo_ord, "hi_ord": hi_ord})
+            else:
+                result = await conn.execute(text(
+                    f"UPDATE {table} SET pool_id = :p WHERE user_id = :u AND pool_id = 0 "
+                    f"AND date >= :lo AND date <= :hi"
+                ), params)
+            updated += result.rowcount or 0
+    return updated
+
+
+async def _check_usage_timezone(conn) -> None:
+    """Record the zone the usage buckets are computed in; shout if it has changed."""
+    from sqlalchemy import text
+    from app.config import config
+
+    configured = config.server.timezone
+    row = (await conn.execute(text(
+        "SELECT value FROM usage_meta WHERE key = 'timezone'"
+    ))).first()
+    if row is None:
+        await conn.execute(
+            text("INSERT INTO usage_meta (key, value, updated_at) "
+                 "VALUES ('timezone', :tz, CURRENT_TIMESTAMP)"),
+            {"tz": configured},
+        )
+        return
+    if row[0] != configured:
+        logger.error(
+            "TIMEZONE is '%s' but the usage tables were bucketed in '%s'. Day and hour "
+            "boundaries of existing rows no longer line up with new ones. Restore the "
+            "old value, or accept the discontinuity by updating usage_meta.timezone.",
+            configured, row[0],
+        )
+
+
+_POOL_ID_HIGH_WATER_KEY = "pool_id_high_water"
+
+
+async def _seed_pool_id_high_water(conn) -> None:
+    """Record the highest pool id ever seen, if no high-water mark exists yet.
+
+    Usage rows keep a dissolved pool's id, so the seed covers them as well as live
+    pools: an id that only survives in usage is still spent.
+    """
+    from sqlalchemy import text
+
+    await conn.execute(text(
+        "INSERT OR IGNORE INTO usage_meta (key, value, updated_at) "
+        "SELECT :k, CAST(MAX("
+        "  (SELECT COALESCE(MAX(id), 0) FROM request_pools),"
+        "  (SELECT COALESCE(MAX(pool_id), 0) FROM request_usage),"
+        "  (SELECT COALESCE(MAX(pool_id), 0) FROM request_usage_hourly),"
+        "  (SELECT COALESCE(MAX(pool_id), 0) FROM request_usage_monthly)"
+        ") AS TEXT), CURRENT_TIMESTAMP"
+    ), {"k": _POOL_ID_HIGH_WATER_KEY})
+
+
+async def allocate_pool_id(db: AsyncSession) -> int:
+    """Return a pool id that no pool, live or dissolved, has ever had.
+
+    request_pools.id is a plain INTEGER PRIMARY KEY, so SQLite would hand a dissolved
+    pool's id to the next pool created -- and that pool would inherit every usage row
+    still stamped with it, in its usage views and in an admin's per-pool purge.
+    AUTOINCREMENT would fix that, but only by rebuilding a table that four others
+    cascade from. A high-water mark in usage_meta gives the same guarantee.
+
+    The UPDATE comes before the read so this transaction holds SQLite's write lock
+    by the time it reads: two concurrent creates cannot be handed the same id.
+    """
+    from sqlalchemy import text
+
+    await _seed_pool_id_high_water(db)
+    await db.execute(text(
+        "UPDATE usage_meta SET value = CAST(MAX("
+        "  CAST(value AS INTEGER), (SELECT COALESCE(MAX(id), 0) FROM request_pools)"
+        ") + 1 AS TEXT), updated_at = CURRENT_TIMESTAMP WHERE key = :k"
+    ), {"k": _POOL_ID_HIGH_WATER_KEY})
+    value = (await db.execute(
+        text("SELECT value FROM usage_meta WHERE key = :k"), {"k": _POOL_ID_HIGH_WATER_KEY}
+    )).scalar_one()
+    return int(value)
+
+
 async def init_database():
     """Initialize the database and create tables asynchronously."""
     # Create data directory if it doesn't exist
     os.makedirs("data", exist_ok=True)
-    
+
     # Create tables asynchronously
     await create_tables_async()
-    
+
     # Run auto-migrations for schema updates
     await _run_auto_migrations()
-    
+
     print("Database initialized successfully!")
 
 
 async def _run_auto_migrations():
     """Auto-migrate database schema for new columns and renamed provider types.
-    
+
     This handles:
     1. Adding provider_credentials columns if missing
     2. Renaming provider_type 'openai_compatible' to 'custom' with default supported_apis
+    3. Rebuilding the usage tables onto (user_id, pool_id) keys, with a file backup first
     """
+    import asyncio
     from sqlalchemy import text
-    
+
+    # The usage rekey rewrites three tables and drops unresolvable rows, so the file is
+    # backed up before anything else runs. VACUUM INTO cannot run inside a transaction,
+    # hence outside the engine.begin() block below.
+    async with engine.connect() as conn:
+        usage_rekey_pending = await _usage_tables_needing_rekey(conn)
+    if usage_rekey_pending:
+        try:
+            backup = await asyncio.to_thread(_backup_sqlite_file, "pre-usage-rekey")
+        except Exception as e:
+            # Without a backup the rekey's orphan drop is unrecoverable, and without
+            # the rekey every usage write fails. Neither is acceptable: stop here.
+            raise RuntimeError(
+                f"usage tables {usage_rekey_pending} need rekeying but the pre-migration "
+                f"backup failed: {e}"
+            ) from e
+        if not backup:
+            # A None return is not a success: the live file could not be resolved (a
+            # relocated or non-file-backed DATABASE_URL), so there is nothing to roll
+            # back to. Same bargain as the raise above -- refuse rather than drop rows
+            # with no recovery path.
+            raise RuntimeError(
+                f"usage tables {usage_rekey_pending} need rekeying but the database file "
+                f"could not be located to back up first"
+            )
+        logger.info("Auto-migration: database backed up to %s", backup)
+
     async with engine.begin() as conn:
         # Check if is_pending_approval column exists on users table
         try:
@@ -3130,21 +3152,49 @@ async def _run_auto_migrations():
                 "exist; deduplicate them manually to enforce uniqueness: %s", e
             )
 
-    # Fold historical "key:<id>" usage rows onto the owning user's username.
-    # Runs outside the schema block above because it works on a session.
-    try:
-        async with AsyncSessionLocal() as db:
-            moved = await migrate_api_key_usage_identities(db)
-            if moved:
-                await db.commit()
-                logger.info(
-                    "Auto-migration: Moved API-key usage rows to owner usernames: %s",
-                    moved,
-                )
-    except Exception as e:
-        logger.warning(
-            f"Auto-migration: Could not move API-key usage rows to usernames: {e}"
-        )
+        # Enforce case-insensitive uniqueness of request_pools.name. The column's
+        # own UNIQUE is case-sensitive, so "Alpha" and "alpha" both fit in it even
+        # though app/routes/pools.py treats them as the same name. Pre-existing
+        # deployments need this index created explicitly; fresh ones get it from the
+        # model. If existing rows already collide, warn and continue rather than
+        # crash startup -- the route-level ilike checks still block new collisions.
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_request_pools_name_lower "
+                "ON request_pools (lower(name))"
+            ))
+        except Exception as e:
+            logger.warning(
+                "Auto-migration: Could not create case-insensitive unique index on "
+                "request_pools(name) — likely pool names differing only by case "
+                "exist; rename one of them to enforce uniqueness: %s", e
+            )
+
+        # Rebuild the usage tables onto (user_id, pool_id) keys. Runs last: it needs
+        # the users, api_keys and pool_membership_intervals tables in their final
+        # shape, and the backup was taken before this block opened. Not wrapped in a
+        # swallow-all try: a half-migrated usage schema would break every write, so a
+        # failure here must abort startup and leave the transaction rolled back.
+        if usage_rekey_pending:
+            await _build_usage_identity_map(conn)
+            for table in usage_rekey_pending:
+                stats = await _rekey_usage_table(conn, table)
+                logger.info("Auto-migration: rekeyed %s: %s", table, stats)
+            stamped = await _backfill_usage_pool_ids(conn, usage_rekey_pending)
+            logger.info("Auto-migration: back-filled pool_id on %d usage row(s)", stamped)
+            await conn.execute(text("DROP TABLE IF EXISTS _usage_identity_map"))
+
+        try:
+            await _check_usage_timezone(conn)
+        except Exception as e:
+            logger.warning(f"Auto-migration: usage timezone check failed: {e}")
+
+        # Seed at startup, while the usage buffer is still empty, so the mark also
+        # covers ids of pools dissolved before it existed. allocate_pool_id seeds too.
+        try:
+            await _seed_pool_id_high_water(conn)
+        except Exception as e:
+            logger.warning(f"Auto-migration: could not seed the pool id high-water mark: {e}")
 
 
 def init_database_sync():

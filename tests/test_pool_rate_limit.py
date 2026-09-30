@@ -48,6 +48,55 @@ class PooledLimitTests(PoolTestCase):
         self.assertEqual(status.rpd_count, 9, "Bob sees the pool's consumption, not his own")
         self.assertEqual(status.rpd_remaining, 1)
 
+    async def test_a_deactivated_members_limit_leaves_the_pool_sum(self):
+        alice = await self.make_user("alice", rpd_limit=5)
+        bob = await self.make_user("bob", rpd_limit=7)
+        await self.make_pool("team", alice, [bob])
+        self.assertEqual(
+            (await self.tracker.get_user_status(alice.id, "alice")).rpd_limit, 12)
+
+        await self.deactivate(bob)
+
+        status = await self.tracker.get_user_status(alice.id, "alice")
+        self.assertEqual(status.rpd_limit, 5,
+                         "Bob cannot send, so his 7 is not quota anyone can spend")
+
+    async def test_a_deactivated_members_rows_still_count(self):
+        alice = await self.make_user("alice", rpd_limit=5)
+        bob = await self.make_user("bob", rpd_limit=7)
+        await self.make_pool("team", alice, [bob])
+        await self.seed_usage("bob", 3)      # sent while his account still worked
+
+        await self.deactivate(bob)
+
+        status = await self.tracker.get_user_status(alice.id, "alice")
+        self.assertEqual(status.rpd_count, 3, "the traffic was real; it still counts")
+        self.assertEqual(status.rpd_limit, 5)
+        self.assertEqual(status.rpd_remaining, 2)
+
+    async def test_a_deactivated_unlimited_member_does_not_keep_the_pool_unlimited(self):
+        alice = await self.make_user("alice", rpd_limit=5)
+        root = await self.make_user("root", rpd_limit=None)
+        await self.make_pool("team", alice, [root])
+        self.assertIsNone((await self.tracker.get_user_status(alice.id, "alice")).rpd_limit)
+
+        await self.deactivate(root)
+
+        status = await self.tracker.get_user_status(alice.id, "alice")
+        self.assertEqual(status.rpd_limit, 5,
+                         "a disabled account cannot withdraw the grant it is making")
+
+    async def test_a_pool_of_only_deactivated_members_has_no_quota(self):
+        alice = await self.make_user("alice", rpd_limit=5)
+        bob = await self.make_user("bob", rpd_limit=7)
+        await self.make_pool("team", alice, [bob])
+
+        await self.deactivate(alice)
+        await self.deactivate(bob)
+
+        status = await self.tracker.get_user_status(alice.id, "alice")
+        self.assertEqual(status.rpd_limit, 0)
+
     async def test_an_unpooled_user_is_unaffected(self):
         alice = await self.make_user("alice", rpd_limit=5)
         bob = await self.make_user("bob", rpd_limit=5)
@@ -221,28 +270,12 @@ class PooledLimitTests(PoolTestCase):
 class PooledGroupLimitTests(PoolTestCase):
     """The group tiers pool the same way the overall tier does."""
 
-    async def _model_group(self, name, model_id, rpd_default):
-        group = ModelGroup(name=name, rpm_default=None, rpd_default=rpd_default)
-        self.db.add(group)
-        await self.db.flush()
-        self.db.add(ModelGroupMember(group_id=group.id, model_id=model_id))
-        await self.db.commit()
-        await self.refresh()
-        return group
 
-    async def _instance_group(self, name, provider_key, rpd_default):
-        group = InstanceGroup(name=name, rpm_default=None, rpd_default=rpd_default)
-        self.db.add(group)
-        await self.db.flush()
-        self.db.add(InstanceGroupMember(group_id=group.id, provider_key=provider_key))
-        await self.db.commit()
-        await self.refresh()
-        return group
 
     async def test_model_group_rpd_is_pooled(self):
         alice = await self.make_user("alice", rpd_limit=100)
         bob = await self.make_user("bob", rpd_limit=100)
-        group = await self._model_group("grouped", "openai/gpt-4o", rpd_default=3)
+        group = await self.make_model_group("grouped", "openai/gpt-4o", rpd_default=3)
         await self.make_pool("team", alice, [bob])
         await self.seed_usage("alice", 4, model="openai/gpt-4o")
 
@@ -267,8 +300,8 @@ class PooledGroupLimitTests(PoolTestCase):
     async def test_instance_group_rpd_is_pooled_and_takes_precedence(self):
         alice = await self.make_user("alice", rpd_limit=100)
         bob = await self.make_user("bob", rpd_limit=100)
-        await self._model_group("by-model", "azure/gpt-4o", rpd_default=3)
-        ig = await self._instance_group("by-instance", "azure", rpd_default=4)
+        await self.make_model_group("by-model", "azure/gpt-4o", rpd_default=3)
+        ig = await self.make_instance_group("by-instance", "azure", rpd_default=4)
         await self.make_pool("team", alice, [bob])
         await self.seed_usage("alice", 5, model="azure/gpt-4o")
 
@@ -286,7 +319,7 @@ class PooledGroupLimitTests(PoolTestCase):
     async def test_grouped_requests_do_not_count_against_the_pooled_overall_quota(self):
         alice = await self.make_user("alice", rpd_limit=5)
         bob = await self.make_user("bob", rpd_limit=5)
-        await self._model_group("grouped", "openai/gpt-4o", rpd_default=50)
+        await self.make_model_group("grouped", "openai/gpt-4o", rpd_default=50)
         await self.make_pool("team", alice, [bob])
         await self.seed_usage("alice", 4, model="openai/gpt-4o")
         await self.seed_usage("bob", 1, model="other/model")

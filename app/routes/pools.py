@@ -19,8 +19,9 @@ check in build_pool_usage() is a security boundary and is tested as one.
 """
 
 import logging
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import date, datetime
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Set, Tuple, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, delete as sa_delete, or_, select, update as sa_update
@@ -28,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.admin import AdminUser
-from app.auth.database import get_db, get_user_by_username
+from app.auth.database import allocate_pool_id, get_db, get_user_by_username
 from app.auth.middleware import get_current_active_user
 from app.auth.models import (
     MAX_POOL_MEMBERS,
@@ -232,6 +233,28 @@ def _scope_name(scope_kind: str, scope_id: int) -> str:
     return getattr(group, "name", None) or f"Group {scope_id}"
 
 
+@asynccontextmanager
+async def pool_guard(pool_id: Optional[int]):
+    """Serialise one pool's composition changes end to end.
+
+    Wraps read-membership / settle / mutate / commit as a unit, so two changes to the
+    same pool cannot apportion against each other's stale membership. Held across the
+    commit on purpose: releasing at the settle boundary would let the next writer read
+    a ledger the first has not yet made visible.
+
+    Acquired before request_tracker.pause_flush(), never after -- see the ordering note
+    on RateLimitTracker.pool_lock. A None pool_id is a no-op, so callers that may not
+    have resolved a pool can use this unconditionally.
+    """
+    from app.rate_limit import rate_limit_tracker
+
+    if pool_id is None:
+        yield
+        return
+    async with rate_limit_tracker.pool_lock(pool_id):
+        yield
+
+
 async def _invalidate(pool_id: Optional[int], usernames: List[str]) -> None:
     """Drop every cache entry a composition change invalidates, then re-snapshot.
 
@@ -307,14 +330,28 @@ def _active_scopes(detail: dict, members: List[tuple]) -> List[tuple]:
     ]
 
 
-def _build_scope_rows(detail: dict, members: List[tuple], scopes: List[tuple]):
-    """Return (pool-level scope rows, per-member scope rows keyed by user_id)."""
+def _build_scope_rows(
+    detail: dict, members: List[tuple], scopes: List[tuple],
+    inactive: Optional[Set[int]] = None,
+):
+    """Return (pool-level scope rows, per-member scope rows keyed by user_id).
+
+    `inactive` are members whose account is deactivated. Their limit is left out of the
+    pool total, because enforcement leaves it out too -- a disabled account cannot send,
+    so its quota is not quota anyone can spend. Their `sent` and `carry` stay in: that
+    traffic was real. Their own per-member row still shows their own limit, so the tab
+    explains where the missing headroom went rather than silently dropping it.
+    """
+    inactive = inactive or set()
     pool_scopes: List[PoolScopeResponse] = []
     per_member: dict = {uid: [] for uid, _ in members}
 
     for scope_kind, scope_id in scopes:
         name = _scope_name(scope_kind, scope_id)
-        limits = [detail[(uid, scope_kind, scope_id)][0] for uid, _ in members]
+        limits = [
+            detail[(uid, scope_kind, scope_id)][0]
+            for uid, _ in members if uid not in inactive
+        ]
         unlimited = any(v is None for v in limits)
         pool_limit = None if unlimited else sum(limits)
         # What the limiter itself reads: max(0, rows + carries), summed over the pool.
@@ -358,7 +395,9 @@ async def _render_pool(db: AsyncSession, pool: RequestPool) -> tuple:
 
     detail = await _member_scopes(db, pool.id, members, time_utils.local_today())
     scopes = _relevant_scopes()
-    pool_scopes, per_member = _build_scope_rows(detail, members, scopes)
+    inactive = {r.user_id for r in rows
+                if r.user_id in users and not users[r.user_id].is_active}
+    pool_scopes, per_member = _build_scope_rows(detail, members, scopes, inactive)
 
     member_responses = [
         PoolMemberResponse(
@@ -434,16 +473,22 @@ async def create_pool(
         )
 
     try:
-        pool = RequestPool(name=name, description=description, owner_user_id=user.id)
+        pool = RequestPool(
+            id=await allocate_pool_id(db),
+            name=name, description=description, owner_user_id=user.id,
+        )
         db.add(pool)
         await db.flush()
-        db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
-        await db.flush()
-        await _open_interval(db, pool.id, user.id)
-        # The creator is the only member, so there is no interval to close; their own
-        # usage enters the pool through the admission clamp like any other joiner.
-        await pool_settlement.admit_member(db, pool.id, user.id, user.username)
-        await db.commit()
+        # The pool id only exists after the flush, so the guard starts here. Nothing
+        # else can be touching a pool it cannot yet name.
+        async with pool_guard(pool.id):
+            db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
+            await db.flush()
+            await _open_interval(db, pool.id, user.id)
+            # The creator is the only member, so there is no interval to close; their
+            # own usage enters the pool through the admission clamp like any joiner.
+            await pool_settlement.admit_member(db, pool.id, user.id, user.username)
+            await db.commit()
     except IntegrityError:
         await db.rollback()
         # Both pre-checks above have a race window, and two UNIQUE constraints can land
@@ -491,9 +536,10 @@ async def update_my_pool(
             detail="Only the pool owner can change its name or description",
         )
 
+    attempted_name: Optional[str] = None
     try:
         if payload.name is not None:
-            name = payload.name.strip()
+            name = attempted_name = payload.name.strip()
             if not name:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pool name is required")
             if len(name) > POOL_NAME_MAX_LENGTH:
@@ -523,6 +569,23 @@ async def update_my_pool(
     except HTTPException:
         await db.rollback()
         raise
+    except IntegrityError:
+        # The clash pre-check above has a race window, and the only UNIQUE this
+        # statement can violate is on the name. Without this the loser of a rename
+        # race got a 500 telling them nothing, while create -- same race, same
+        # constraint -- already answered 409.
+        await db.rollback()
+        if attempted_name is None:
+            # No rename was requested, so the name index cannot be what failed.
+            logger.error(f"Pool update failed for pool {pool.id}: integrity error", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update pool",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A pool named '{attempted_name}' already exists",
+        )
     except Exception as e:
         await db.rollback()
         logger.error(f"Pool update failed for pool {pool.id}: {e}", exc_info=True)
@@ -568,8 +631,9 @@ async def delete_my_pool(
 
     pool_id, pool_name = pool.id, pool.name
     try:
-        usernames = await _dissolve(db, pool)
-        await db.commit()
+        async with pool_guard(pool_id):
+            usernames = await _dissolve(db, pool)
+            await db.commit()
     except Exception as e:
         await db.rollback()
         logger.error(f"Pool deletion failed for pool {pool_id}: {e}", exc_info=True)
@@ -873,56 +937,78 @@ async def accept_invite(
         )
 
     pool = await _get_pool(db, invite.pool_id)
-    existing = await _member_rows(db, pool.id)
-    if len(existing) >= MAX_POOL_MEMBERS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"This pool is full ({MAX_POOL_MEMBERS} members).",
-        )
 
-    users = await _users_by_id(db, [r.user_id for r in existing])
-    affected = [users[r.user_id].username for r in existing if r.user_id in users]
-
-    try:
-        # Close the interval against the members who were actually there, THEN join.
-        await pool_settlement.settle_pool(db, pool.id)
-
-        db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
-        await db.flush()
-        await _open_interval(db, pool.id, user.id)
-        await pool_settlement.admit_member(db, pool.id, user.id, user.username)
-
-        invite.status = "accepted"
-        invite.responded_at = datetime.utcnow()
-
-        # A stale invite must not later let this user switch pools silently.
-        others = (await db.execute(
-            select(RequestPoolInvitation).where(
-                RequestPoolInvitation.invitee_user_id == user.id,
-                RequestPoolInvitation.status == "pending",
-                RequestPoolInvitation.id != invite.id,
+    # Everything from the member count to the commit runs under the pool lock. The count
+    # is the only thing standing between MAX_POOL_MEMBERS and two pending invites to a
+    # full-but-one pool both accepting -- there is no DB constraint behind it -- so
+    # reading it outside the lock would leave the check advisory.
+    async with pool_guard(pool.id):
+        existing = await _member_rows(db, pool.id)
+        if len(existing) >= MAX_POOL_MEMBERS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"This pool is full ({MAX_POOL_MEMBERS} members).",
             )
-        )).scalars().all()
-        for other in others:
-            other.status = "superseded"
-            other.responded_at = datetime.utcnow()
 
-        await db.commit()
-    except IntegrityError:
-        # The user_id UNIQUE constraint is the real one-pool-per-user guarantee; the
-        # check above is advisory and loses to a concurrent accept.
-        await db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="You're already in a pool. Leave it first to join another.",
-        )
-    except Exception as e:
-        await db.rollback()
-        logger.error(f"Accepting pool invite {invite_id} failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to join pool",
-        )
+        users = await _users_by_id(db, [r.user_id for r in existing])
+        affected = [users[r.user_id].username for r in existing if r.user_id in users]
+
+        try:
+            # Close the interval against the members who were actually there, THEN join.
+            await pool_settlement.settle_pool(db, pool.id)
+
+            db.add(RequestPoolMember(pool_id=pool.id, user_id=user.id))
+            await db.flush()
+            await _open_interval(db, pool.id, user.id)
+            await pool_settlement.admit_member(db, pool.id, user.id, user.username)
+
+            invite.status = "accepted"
+            invite.responded_at = datetime.utcnow()
+
+            # A stale invite must not later let this user switch pools silently.
+            others = (await db.execute(
+                select(RequestPoolInvitation).where(
+                    RequestPoolInvitation.invitee_user_id == user.id,
+                    RequestPoolInvitation.status == "pending",
+                    RequestPoolInvitation.id != invite.id,
+                )
+            )).scalars().all()
+            for other in others:
+                other.status = "superseded"
+                other.responded_at = datetime.utcnow()
+
+            await db.commit()
+        except IntegrityError:
+            # RequestPoolMember.user_id UNIQUE is the real one-pool-per-user guarantee,
+            # and the pre-check above loses to an accept from another process. Re-read
+            # to say which pool they are actually in rather than guessing, the same way
+            # create_pool disambiguates its two constraints.
+            await db.rollback()
+            if await _pool_of(db, user.id):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="You're already in a pool. Leave it first to join another.",
+                )
+            # Not the membership index, then. uq_pool_invite_pending, uq_pool_ledger
+            # and uq_rpd_carry can all raise inside this try, and none of them means
+            # what the message above says -- log the real one rather than lose it.
+            logger.error(
+                f"Accepting pool invite {invite_id} hit an unexpected integrity error",
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Couldn't join that pool. Please try again.",
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Accepting pool invite {invite_id} failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to join pool",
+            )
 
     await _invalidate(pool.id, affected + [user.username])
     return {"message": f"Joined {pool.name}"}
@@ -1039,8 +1125,9 @@ async def leave_pool(
     pool = await _get_pool(db, membership.pool_id)
     pool_id, pool_name = pool.id, pool.name
     try:
-        affected = await _remove_member(db, pool, user.id, user.username)
-        await db.commit()
+        async with pool_guard(pool_id):
+            affected = await _remove_member(db, pool, user.id, user.username)
+            await db.commit()
     except Exception as e:
         await db.rollback()
         logger.error(f"Leaving pool {pool_id} failed for user {user.id}: {e}", exc_info=True)
@@ -1097,8 +1184,9 @@ async def remove_member(
     pool_id = pool.id
     pool_name = pool.name
     try:
-        affected = await _remove_member(db, pool, user_id, target_name)
-        await db.commit()
+        async with pool_guard(pool_id):
+            affected = await _remove_member(db, pool, user_id, target_name)
+            await db.commit()
     except Exception as e:
         await db.rollback()
         logger.error(f"Removing member {user_id} from pool {pool_id} failed: {e}", exc_info=True)
@@ -1131,23 +1219,28 @@ async def _leave_preview(db: AsyncSession, pool: RequestPool, user_id: int) -> L
     users = await _users_by_id(db, [r.user_id for r in rows])
     members = [(r.user_id, users[r.user_id].username) for r in rows if r.user_id in users]
 
-    savepoint = await db.begin_nested()
-    try:
-        await pool_settlement.settle_pool(db, pool.id)
-        detail = await _member_scopes(db, pool.id, members, today)
-        scopes = _active_scopes(detail, members)
-        preview = []
-        for scope_kind, scope_id in scopes:
-            limit, sent, charged, _carry = detail[(user_id, scope_kind, scope_id)]
-            preview.append(PoolLeavePreview(
-                scope_kind=scope_kind, scope_id=scope_id,
-                name=_scope_name(scope_kind, scope_id),
-                limit=limit, sent=sent, charged=charged,
-                remaining=None if limit is None else max(0, limit - charged),
-            ))
-        return preview
-    finally:
-        await savepoint.rollback()
+    # The savepoint covers this session, but settle_pool calls request_tracker's flush,
+    # which commits on a session of its own and rolls back with nothing. Take the pool
+    # lock so a real composition change cannot interleave with the throwaway settle and
+    # read a ledger that is about to be rolled out from under it.
+    async with pool_guard(pool.id):
+        savepoint = await db.begin_nested()
+        try:
+            await pool_settlement.settle_pool(db, pool.id)
+            detail = await _member_scopes(db, pool.id, members, today)
+            scopes = _active_scopes(detail, members)
+            preview = []
+            for scope_kind, scope_id in scopes:
+                limit, sent, charged, _carry = detail[(user_id, scope_kind, scope_id)]
+                preview.append(PoolLeavePreview(
+                    scope_kind=scope_kind, scope_id=scope_id,
+                    name=_scope_name(scope_kind, scope_id),
+                    limit=limit, sent=sent, charged=charged,
+                    remaining=None if limit is None else max(0, limit - charged),
+                ))
+            return preview
+        finally:
+            await savepoint.rollback()
 
 
 @router.get("/me", response_model=MyPoolResponse)
@@ -1222,10 +1315,11 @@ async def build_pool_usage(
     Carries are never applied here. This reports what each member really sent; only the
     quota numbers reflect settlement.
 
-    Every number below is bounded by membership *intervals*, not by the current roster:
-    a member's traffic counts only for the days they were actually in the pool. Without
-    that, a heavy user joining today would drag their whole history in, and a member
-    leaving would retroactively erase spending that really was the pool's.
+    Every number below is a filter on the rows' pool_id, stamped when each request
+    completed: a member's traffic counts for the pool only while they were in it, to the
+    request. Membership intervals are consulted only to decide who may be drilled into --
+    anyone with a stint overlapping the window, so a former member's row is not a dead
+    link -- and never to attribute traffic.
     """
     from app.auth.database import (
         get_usage_by_user_and_model, get_usage_timeseries,
@@ -1249,17 +1343,16 @@ async def build_pool_usage(
 
     # Drill-down into one member: the membership check is the security boundary. This is
     # the one place a user reads another user's usage, and it is allowed only inside the
-    # pool they share. Anyone with a stint overlapping the window qualifies -- a former
-    # member appears in the breakdown, so 403-ing their row would be a dead link.
+    # pool they share.
     if view == "user" and target:
-        target_spans = [s for s in spans if s[0] == target]
-        if not target_spans:
+        target_user = await get_user_by_username(db, target)
+        if target_user is None or not any(s[0] == target for s in spans):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="That user isn't in this pool",
             )
         detail = await get_usage_by_user_and_model(
-            db, [], window=window, year=year, month=month, restrict_spans=target_spans,
+            db, [target_user.id], pool_id=pool.id, window=window, year=year, month=month,
         )
         by_model: dict = {}
         for r in detail:
@@ -1271,7 +1364,8 @@ async def build_pool_usage(
                 key=lambda x: (-x["request_count"], x["model"]),
             ),
             "timeseries": await get_usage_timeseries(
-                db, window=window, year=year, month=month, restrict_spans=target_spans,
+                db, filter_user_id=target_user.id, pool_ids=[pool.id],
+                window=window, year=year, month=month,
             ),
         }
 
@@ -1281,18 +1375,18 @@ async def build_pool_usage(
             "breakdown": [
                 {"user_identity": r["user_identity"], "request_count": r["request_count"]}
                 for r in await get_usage_by_user_and_model(
-                    db, [], window=window, year=year, month=month, restrict_spans=spans,
+                    db, pool_id=pool.id, window=window, year=year, month=month,
                 )
                 if r["model"] == target
             ],
             "timeseries": await get_usage_timeseries(
-                db, filter_model=target, window=window, year=year, month=month,
-                restrict_spans=spans,
+                db, filter_model=target, pool_ids=[pool.id],
+                window=window, year=year, month=month,
             ),
         }
 
     cross = await get_usage_by_user_and_model(
-        db, [], window=window, year=year, month=month, restrict_spans=spans,
+        db, pool_id=pool.id, window=window, year=year, month=month,
     )
 
     # Every view below is a fold of that one result set.
@@ -1367,13 +1461,13 @@ async def build_pool_usage(
         "per_group": per_group,
         "per_member_per_model": cross,
         "timeseries": await get_usage_timeseries(
-            db, window=window, year=year, month=month, restrict_spans=spans,
+            db, pool_ids=[pool.id], window=window, year=year, month=month,
         ),
         "totals": {
             "requests": sum(per_member_totals.values()),
-            # Everyone who was in the pool at some point in the window, so the count
+            # Everyone who sent something as a member in the window, so the count
             # matches the number of rows in per_member rather than the live roster.
-            "unique_members": len({s[0] for s in spans}),
+            "unique_members": len(per_member_totals),
             "unique_models": len(per_model_totals),
         },
     }
@@ -1416,19 +1510,15 @@ async def get_pool_usage(
 
 
 async def pool_membership_map(db: AsyncSession) -> dict:
-    """{pool_id: {"name": str, "members": [username, ...]}} for every pool, in one query.
+    """{pool_id: {"name": str, "members": [username, ...], "member_ids": [id, ...]}} in one query.
 
     Deliberately not admin_list_pools: that renders the quota meters and settlement for
     every pool (a _render_pool each, with a flush of its own), and the By Pool usage
-    views need nothing but names. Member order matches _member_rows so a pool reads the
-    same here as it does everywhere else.
-
-    The usernames are the join key the whole By Pool feature rests on: membership is
-    stored by user_id, but User.username is exactly what user_identity holds in the
-    usage tables.
+    views need nothing but names and ids. Member order matches _member_rows so a pool
+    reads the same here as it does everywhere else.
     """
     rows = (await db.execute(
-        select(RequestPool.id, RequestPool.name, User.username)
+        select(RequestPool.id, RequestPool.name, User.id, User.username)
         .select_from(RequestPool)
         .outerjoin(RequestPoolMember, RequestPoolMember.pool_id == RequestPool.id)
         .outerjoin(User, User.id == RequestPoolMember.user_id)
@@ -1436,17 +1526,18 @@ async def pool_membership_map(db: AsyncSession) -> dict:
     )).all()
 
     out: dict = {}
-    for pool_id, name, username in rows:
-        entry = out.setdefault(pool_id, {"name": name, "members": []})
+    for pool_id, name, user_id, username in rows:
+        entry = out.setdefault(pool_id, {"name": name, "members": [], "member_ids": []})
         # The outer join yields one NULL-username row for a memberless pool. That should
         # not happen — _remove_member deletes a pool that loses its last member — but
         # such a pool still belongs in the map at zero rather than vanishing from it.
         if username is not None:
             entry["members"].append(username)
+            entry["member_ids"].append(user_id)
     return out
 
 
-async def resettle_after_usage_purge(db: AsyncSession, usernames: List[str]) -> None:
+async def resettle_after_usage_purge(db: AsyncSession, user_ids: List[int]) -> None:
     """Re-settle every pool the given users belong to, after their usage was deleted.
 
     Settlement charges a pool's members against the rows in today's usage table, so
@@ -1464,40 +1555,163 @@ async def resettle_after_usage_purge(db: AsyncSession, usernames: List[str]) -> 
     Must be called after drop_buffered_usage: settle_pool flushes the tracker itself, so
     running it first would write buffered counts back into the tables just cleared, and
     drop_buffered_usage only clears the in-memory buffer.
+
+    The settle / commit / invalidate / refresh mechanics live in resettle_pools, which
+    the admin limit-edit paths share; this is just the purge's name for it.
+    """
+    await resettle_pools(db, user_ids=user_ids)
+
+
+async def pool_ids_for_users(db: AsyncSession, user_ids: Sequence[int]) -> List[int]:
+    """The pools these users belong to, deduplicated and in ascending id order.
+
+    Ascending because callers hold several of these locks at once; see resettle_pools.
+    """
+    ids = list(dict.fromkeys(user_ids))
+    if not ids:
+        return []
+    return sorted(dict.fromkeys((await db.execute(
+        select(RequestPoolMember.pool_id).where(RequestPoolMember.user_id.in_(ids))
+    )).scalars().all()))
+
+
+async def resettle_pools(
+    db: AsyncSession,
+    *,
+    user_ids: Optional[List[int]] = None,
+    all_pools: bool = False,
+) -> None:
+    """Re-apportion pools after an edit that changed the weights settlement splits by.
+
+    Apportionment divides a pool's consumption in proportion to its members' limits, so
+    the ledger describes the limits that were in force when it was written. Change one
+    -- an RPD override, a group default, a group's membership, an account being
+    deactivated -- and every ``charged`` in that pool is stale until the next
+    composition change, which may be tomorrow.
+
+    Ordering matters and is the reason this exists rather than a call to settle_pool at
+    each site:
+
+    1. ``refresh_now`` first, so settlement reads the *new* limits. It resolves every
+       limit out of the tracker snapshot, not the database, so settling before the
+       reload would re-apportion by the numbers that were just replaced.
+    2. Settle each affected pool, under its own lock, and commit once.
+    3. Invalidate and ``refresh_now`` again, because only a reload pulls the rewritten
+       UserRpdCarry rows back into the snapshot.
+
+    Pass ``user_ids`` for an edit scoped to particular users, or ``all_pools`` for one
+    that moves a global or group default. Either way this is a no-op when nothing is
+    pooled, which is the common case -- an ordinary limit edit must not pay for a
+    settlement pass.
     """
     from app.rate_limit import rate_limit_tracker
 
-    if not usernames:
-        return
+    await rate_limit_tracker.refresh_now()
 
-    user_ids = list((await db.execute(
-        select(User.id).where(User.username.in_(usernames))
-    )).scalars().all())
-    if not user_ids:
-        return
-
-    pool_ids = list(dict.fromkeys((await db.execute(
-        select(RequestPoolMember.pool_id).where(RequestPoolMember.user_id.in_(user_ids))
-    )).scalars().all()))
+    pool_ids = (
+        sorted((await db.execute(select(RequestPool.id))).scalars().all())
+        if all_pools else await pool_ids_for_users(db, user_ids or [])
+    )
     if not pool_ids:
         return
 
+    # Every member of an affected pool, not just the edited user: a change to one
+    # member's weight moves everyone else's share too.
+    usernames = list((await db.execute(
+        select(User.username)
+        .join(RequestPoolMember, RequestPoolMember.user_id == User.id)
+        .where(RequestPoolMember.pool_id.in_(pool_ids))
+    )).scalars().all())
+
     try:
-        for pool_id in pool_ids:
-            await pool_settlement.settle_pool(db, pool_id)
-        await db.commit()
+        # Held across the whole loop *and* the commit, not acquired per iteration.
+        # Every pool settles in one transaction, so releasing a pool's lock before the
+        # commit would let another task settle it against rows our session has written
+        # but not yet committed -- a lost update, not a deadlock. Sorted because holding
+        # several at once is what makes acquisition order matter.
+        async with AsyncExitStack() as stack:
+            for pool_id in pool_ids:
+                await stack.enter_async_context(pool_guard(pool_id))
+            for pool_id in pool_ids:
+                await pool_settlement.settle_pool(db, pool_id)
+            await db.commit()
     except Exception:
         await db.rollback()
         raise
 
-    # _invalidate widened to N pools with a single refresh. The refresh is the part that
-    # matters: only it re-reads UserRpdCarry into the tracker's snapshot, which the
-    # settlement above just rewrote. invalidate_identity alone drops the RPD count cache.
     for pool_id in pool_ids:
         rate_limit_tracker.invalidate_pool(pool_id)
     for name in usernames:
         rate_limit_tracker.invalidate_identity(name)
     await rate_limit_tracker.refresh_now()
+
+
+async def resettle_pools_after_commit(
+    db: AsyncSession,
+    *,
+    user_ids: Optional[List[int]] = None,
+    all_pools: bool = False,
+) -> None:
+    """resettle_pools for an edit that is already committed, without raising.
+
+    The edit stands whatever happens here, so a settlement failure is logged, not
+    raised: a 500 would tell the admin the change failed when it did not. The stale
+    ledger heals at the pool's next composition change or local midnight.
+
+    Runs in a session of its own. resettle_pools rolls back on failure, and a rollback
+    expires every object in the session -- including the ones the caller is about to
+    serialise into its response, which would then fail to lazy-load and 500 anyway.
+    """
+    try:
+        async with AsyncSession(bind=db.bind, expire_on_commit=False) as own:
+            await resettle_pools(own, user_ids=user_ids, all_pools=all_pools)
+    except Exception as e:
+        logger.error(
+            "Pool re-apportionment failed after a committed edit (user_ids=%s, "
+            "all_pools=%s); ledgers stay stale until the next settlement: %s",
+            user_ids, all_pools, e, exc_info=True,
+        )
+
+
+async def delete_user_account(db: AsyncSession, user_id: int) -> bool:
+    """Permanently delete a user: settle their pool, drop the account and its usage.
+
+    The one implementation behind the admin, bulk-admin and self-service deletes, so
+    the three can never disagree about the order of operations:
+
+    0. Under the user's pool lock, taken before pause_flush so the two nest the way
+       settle_pool needs them to.
+    1. Under pause_flush, so no usage flush can land between the row purge and the
+       buffer drop and resurrect rows the purge just removed.
+    2. settle_before_user_delete closes the pool's interval inside the delete's
+       transaction; otherwise the FK cascade drops the membership silently and the
+       remaining members keep the departed user's limit-share as free headroom.
+    3. permanently_delete_user purges the usage rows (keyed by user_id) with the
+       account and commits.
+    4. The still-buffered counts for that user id are discarded, and requests still in
+       flight are detached so they cannot re-add a count under the id when they end.
+    5. The tracker is invalidated only once the delete has committed, since a refresh
+       before that would read the membership row straight back.
+    """
+    from app.auth.database import permanently_delete_user
+    from app.request_tracker import request_tracker
+
+    # Resolve the pool first so the pool lock can be taken OUTSIDE pause_flush. The two
+    # must nest in that order everywhere: settle_pool takes pause_flush from inside the
+    # pool lock, so holding the flush mutex while waiting for the lock would deadlock
+    # against it. A user who is not in a pool gets a no-op guard.
+    membership = await _pool_of(db, user_id)
+    guarded_pool_id = membership.pool_id if membership else None
+
+    async with pool_guard(guarded_pool_id):
+        async with request_tracker.pause_flush():
+            pool_id, pooled_usernames = await settle_before_user_delete(db, user_id)
+            success = await permanently_delete_user(db, user_id)
+            if success:
+                await request_tracker.forget_user(user_id)
+    if success:
+        await invalidate_after_user_delete(pool_id, pooled_usernames)
+    return success
 
 
 async def admin_list_pools(db: AsyncSession) -> List[AdminPoolResponse]:
@@ -1528,8 +1742,9 @@ async def admin_delete_pool(db: AsyncSession, pool_id: int) -> str:
     pool = await _get_pool(db, pool_id)
     name = pool.name
     try:
-        usernames = await _dissolve(db, pool)
-        await db.commit()
+        async with pool_guard(pool_id):
+            usernames = await _dissolve(db, pool)
+            await db.commit()
     except Exception:
         await db.rollback()
         raise
@@ -1548,8 +1763,9 @@ async def admin_remove_member(db: AsyncSession, user_id: int) -> str:
     username = users[user_id].username if user_id in users else ""
     pool_id = pool.id
     try:
-        affected = await _remove_member(db, pool, user_id, username)
-        await db.commit()
+        async with pool_guard(pool_id):
+            affected = await _remove_member(db, pool, user_id, username)
+            await db.commit()
     except Exception:
         await db.rollback()
         raise

@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from unittest.mock import patch
@@ -172,6 +173,120 @@ class BuildAnthropicSdkKwargsCapabilityTests(unittest.TestCase):
             "claude-sonnet-4-6",
         )
         self.assertEqual(kwargs["thinking"], {"type": "enabled", "budget_tokens": 4096})
+
+
+class BuildAnthropicSdkKwargsExtraFieldTests(unittest.TestCase):
+    """AnthropicMessagesRequest is extra="allow", so unknown client fields reach
+    the builder. Forwarding them blindly 400s an upstream with a closed schema
+    ("safeguards: Extra inputs are not permitted" from Azure Foundry)."""
+
+    ALLOWLIST = anthropic_models.ANTHROPIC_FORWARDABLE_EXTRAS
+
+    def _request(self, **kwargs):
+        kwargs.setdefault("max_tokens", 16)
+        return anthropic_models.AnthropicMessagesRequest(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            **kwargs,
+        )
+
+    def _kwargs(self, request, **opts):
+        return anthropic_models.build_anthropic_sdk_kwargs(
+            request, "claude-opus-5", **opts
+        )
+
+    # --- default: open passthrough, unchanged for custom providers ---
+
+    def test_unknown_field_forwarded_by_default(self):
+        kwargs = self._kwargs(self._request(safeguards={"enabled": True}))
+        self.assertEqual(kwargs.get("extra_body"), {"safeguards": {"enabled": True}})
+
+    def test_default_reports_nothing_dropped(self):
+        dropped = []
+        self._kwargs(self._request(safeguards={"enabled": True}), dropped_fields=dropped)
+        self.assertEqual(dropped, [])
+
+    # --- allowlist: what Foundry opts into ---
+
+    def test_unknown_field_dropped_under_allowlist(self):
+        kwargs = self._kwargs(
+            self._request(safeguards={"enabled": True}),
+            forwardable_extras=self.ALLOWLIST,
+        )
+        self.assertNotIn("safeguards", json.dumps(kwargs, default=str))
+
+    def test_dropped_field_is_reported(self):
+        dropped = []
+        self._kwargs(
+            self._request(safeguards={"enabled": True}),
+            forwardable_extras=self.ALLOWLIST,
+            dropped_fields=dropped,
+        )
+        self.assertEqual(dropped, ["safeguards"])
+
+    def test_allowlisted_field_still_forwarded(self):
+        kwargs = self._kwargs(
+            self._request(context_management={"ttl": 1}, safeguards={"enabled": True}),
+            forwardable_extras=self.ALLOWLIST,
+        )
+        self.assertEqual(kwargs.get("extra_body"), {"context_management": {"ttl": 1}})
+
+    def test_extra_body_omitted_when_nothing_survives(self):
+        kwargs = self._kwargs(
+            self._request(safeguards={"enabled": True}),
+            forwardable_extras=self.ALLOWLIST,
+        )
+        self.assertNotIn("extra_body", kwargs)
+
+    # --- guards that must survive the refactor ---
+
+    def test_none_valued_extra_is_dropped_silently(self):
+        dropped = []
+        kwargs = self._kwargs(
+            self._request(some_new_field=None),
+            forwardable_extras=self.ALLOWLIST,
+            dropped_fields=dropped,
+        )
+        self.assertNotIn("extra_body", kwargs)
+        self.assertEqual(dropped, [])
+
+    def test_internal_kwarg_name_is_not_treated_as_declared_field(self):
+        # "timeout" is an internal kwargs key but not a declared request field,
+        # so a client extra of that name must still be forwarded on the default
+        # path rather than silently swallowed.
+        kwargs = self._kwargs(self._request(timeout=123))
+        self.assertEqual(kwargs.get("extra_body"), {"timeout": 123})
+        self.assertEqual(kwargs["timeout"], anthropic_models.ANTHROPIC_SDK_TIMEOUT_SECONDS)
+
+
+class PartitionExtrasTests(unittest.TestCase):
+    def test_none_forwardable_passes_everything_through(self):
+        forwarded, dropped = anthropic_models.partition_extras(
+            {"a": 1, "b": 2}, known_field_names=set()
+        )
+        self.assertEqual(forwarded, {"a": 1, "b": 2})
+        self.assertEqual(dropped, [])
+
+    def test_declared_field_names_are_skipped_not_reported(self):
+        forwarded, dropped = anthropic_models.partition_extras(
+            {"model": "x", "a": 1}, known_field_names={"model"}, forwardable=set()
+        )
+        self.assertEqual(forwarded, {})
+        self.assertEqual(dropped, ["a"])
+
+    def test_dropped_names_are_sorted_and_deduped(self):
+        _, dropped = anthropic_models.partition_extras(
+            {"z": 1, "a": 2, "m": 3}, known_field_names=set(), forwardable=set()
+        )
+        self.assertEqual(dropped, ["a", "m", "z"])
+
+    def test_empty_and_none_extras(self):
+        for extras in (None, {}):
+            with self.subTest(extras=extras):
+                forwarded, dropped = anthropic_models.partition_extras(
+                    extras, known_field_names=set(), forwardable=set()
+                )
+                self.assertEqual((forwarded, dropped), ({}, []))
 
 
 if __name__ == "__main__":

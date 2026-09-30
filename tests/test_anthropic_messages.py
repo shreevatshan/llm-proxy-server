@@ -13,6 +13,7 @@ from app.openai_models import ModelInfo
 from app.providers import anthropic_compatible
 from app.request_tracker import request_tracker
 from app.routes import anthropic_messages
+from app.providers.azure_provider import AzureProvider
 from app.providers.base import AnthropicRequestMetadata
 from app.providers.bedrock_provider import BedrockProvider
 from app.providers.custom_providers import CustomProvider
@@ -116,6 +117,28 @@ class FakeAdapterProvider(FakeNonCustomProvider):
             mode="adapter",
             transport="chat",
             dropped_fields=["thinking", "anthropic-beta"],
+        )
+
+
+class FakeFoundryNativeProvider(FakeNonCustomProvider):
+    """Delegates metadata to a real AzureProvider so the route-level header
+    reflects the actual Foundry filtering rules rather than a canned list.
+    get_anthropic_request_metadata is pure, so no network is involved."""
+
+    def __init__(self):
+        super().__init__()
+        self.full_provider_name = "azure:foundry"
+        self._real = AzureProvider({
+            "name": "foundry",
+            "endpoint": "https://example.services.ai.azure.com/",
+            "api_key": "k",
+            "azure_backend": "foundry",
+            "dynamic_discovery": False,
+        })
+
+    def get_anthropic_request_metadata(self, request, anthropic_beta=None):
+        return self._real.get_anthropic_request_metadata(
+            request, anthropic_beta=anthropic_beta
         )
 
 
@@ -430,6 +453,27 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get("x-llmproxy-anthropic-mode"), "adapter")
         self.assertIn("thinking", response.headers.get("x-llmproxy-dropped-anthropic-fields", ""))
+
+    def test_foundry_native_reports_unknown_top_level_field_as_dropped(self):
+        # Regression: a client-sent "safeguards" used to be forwarded verbatim
+        # and 400 the request ("safeguards: Extra inputs are not permitted").
+        # It must now be dropped, and the drop reported in the header.
+        provider = FakeFoundryNativeProvider()
+        response, _, _ = self._invoke_create_message(
+            self._payload(
+                model="azure:foundry/claude-opus-5",
+                stream=False,
+                safeguards={"enabled": True},
+            ),
+            provider,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("x-llmproxy-anthropic-mode"), "native")
+        self.assertIn(
+            "safeguards",
+            response.headers.get("x-llmproxy-dropped-anthropic-fields", ""),
+        )
 
     def test_sdk_backed_custom_provider_stops_after_message_stop(self):
         event_stream = FakeAsyncAnthropicEventStream([

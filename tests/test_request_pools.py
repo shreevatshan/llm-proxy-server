@@ -173,6 +173,70 @@ class PoolMembershipTests(PoolTestCase):
         self.assertEqual(ctx.exception.status_code, 400)
         self.assertIn(str(MAX_POOL_MEMBERS), ctx.exception.detail)
 
+    async def test_accepting_into_a_full_pool_is_rejected(self):
+        """The create_invite check is advisory; this is the one that has to hold.
+
+        Two invites issued while there was still room can both be pending when the pool
+        fills up, so the count is re-checked at accept time. It runs under the pool lock
+        so a second accept cannot read the membership the first has not committed yet.
+        """
+        alice = await self.make_user("alice", rpd_limit=5)
+        await pool_routes.create_pool(PoolCreate(name="team"), alice, self.db)
+        pool = (await self.db.execute(select(RequestPool))).scalar_one()
+
+        latecomer = await self.make_user("latecomer", rpd_limit=5)
+        await pool_routes.create_invite(
+            PoolInviteCreate(username="latecomer"), alice, self.db
+        )
+        invite = (await self.db.execute(select(RequestPoolInvitation))).scalar_one()
+
+        # The pool fills up while the invite sits unanswered.
+        for i in range(MAX_POOL_MEMBERS - 1):
+            filler = await self.make_user(f"filler{i}", rpd_limit=1)
+            self.db.add(RequestPoolMember(pool_id=pool.id, user_id=filler.id))
+        await self.db.commit()
+
+        with self.assertRaises(HTTPException) as ctx:
+            await pool_routes.accept_invite(invite.id, latecomer, self.db)
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn(str(MAX_POOL_MEMBERS), ctx.exception.detail)
+
+        await self.db.refresh(invite)
+        self.assertEqual(invite.status, "pending", "a rejected accept leaves it open")
+        self.assertEqual(
+            len((await self.db.execute(
+                select(RequestPoolMember).where(RequestPoolMember.pool_id == pool.id)
+            )).scalars().all()),
+            MAX_POOL_MEMBERS,
+            "and does not squeeze in a 26th member",
+        )
+
+    async def test_a_deactivated_member_stays_in_the_pool_but_stops_donating_quota(self):
+        alice = await self.make_user("alice", rpd_limit=5)
+        bob = await self.make_user("bob", rpd_limit=7)
+        await pool_routes.create_pool(PoolCreate(name="team"), alice, self.db)
+        await pool_routes.create_invite(PoolInviteCreate(username="bob"), alice, self.db)
+        invite = (await self.db.execute(select(RequestPoolInvitation))).scalar_one()
+        await pool_routes.accept_invite(invite.id, bob, self.db)
+
+        view = await pool_routes.get_my_pool(alice, self.db)
+        self.assertEqual(len(view.members), 2)
+        self.assertEqual(
+            next(s for s in view.scopes if s.scope_kind == "overall").limit, 12)
+
+        bob.is_active = False
+        await self.db.commit()
+        await self.refresh()
+
+        view = await pool_routes.get_my_pool(alice, self.db)
+        self.assertEqual(len(view.members), 2,
+                         "he is still a member -- deactivating is not kicking")
+        self.assertFalse(next(m for m in view.members if m.username == "bob").is_active)
+        self.assertEqual(
+            next(s for s in view.scopes if s.scope_kind == "overall").limit, 5,
+            "but his 7 is gone from the shared ceiling",
+        )
+
     async def test_only_the_owner_can_remove_another_member(self):
         alice = await self.make_user("alice", rpd_limit=5)
         bob = await self.make_user("bob", rpd_limit=5)
@@ -564,3 +628,240 @@ class DirectoryTests(PoolTestCase):
         row = await self._row(alice, "carol")
         self.assertNotIn("invite_id", row)
         self.assertNotIn("can_cancel", row)
+
+
+class PoolLockTests(PoolTestCase):
+    """The per-pool lock behind every composition change.
+
+    Settlement reads a pool's membership, apportions against it and writes a ledger row
+    per member. Two of those interleaving apportion against a membership that is already
+    stale by the time they write, and the MAX_POOL_MEMBERS re-check at accept time has
+    no database constraint behind it, so the lock is the only thing deciding both.
+    """
+
+    async def _overlap(self, first_pool, second_pool):
+        """Run two guarded sections concurrently; return True if they overlapped."""
+        import asyncio
+
+        state = {"inside": 0, "overlapped": False}
+
+        async def section(pool_id):
+            async with pool_routes.pool_guard(pool_id):
+                state["inside"] += 1
+                if state["inside"] > 1:
+                    state["overlapped"] = True
+                await asyncio.sleep(0)      # hand control to the other task
+                await asyncio.sleep(0)
+                state["inside"] -= 1
+
+        await asyncio.gather(section(first_pool), section(second_pool))
+        return state["overlapped"]
+
+    async def test_two_changes_to_one_pool_do_not_interleave(self):
+        self.assertFalse(await self._overlap(1, 1))
+
+    async def test_changes_to_different_pools_still_run_concurrently(self):
+        self.assertTrue(await self._overlap(1, 2),
+                        "locking per pool, not globally -- one pool must not stall another")
+
+    async def test_an_unpooled_caller_takes_no_lock(self):
+        # delete_user_account guards unconditionally, so None has to be a clean no-op.
+        self.assertTrue(await self._overlap(None, None))
+        self.assertNotIn(None, self.tracker._pool_locks)
+
+    async def test_the_lock_registry_does_not_grow_without_bound(self):
+        async with pool_routes.pool_guard(7):
+            pass
+        self.assertIn(7, self.tracker._pool_locks)
+
+        self.tracker._evict_stale_buckets()
+        self.assertNotIn(7, self.tracker._pool_locks,
+                         "an unheld lock is reclaimed; nobody is inside it to be split off")
+
+    async def test_a_held_lock_survives_eviction(self):
+        async with pool_routes.pool_guard(7):
+            self.tracker._evict_stale_buckets()
+            self.assertIn(7, self.tracker._pool_locks,
+                          "dropping this one would let a second writer build a new lock "
+                          "and walk straight into the critical section")
+
+
+class PoolLockOrderingTests(PoolTestCase):
+    """The pool lock must be outermost, and re-entrant so nesting stays free.
+
+    Two locks are in play on every settlement: the pool lock and request_tracker's flush
+    mutex, which settle_pool takes internally. Acquire them in opposite orders in two
+    tasks and they deadlock on each other -- the ordering rule in pool_lock's docstring
+    is what rules that out, and re-entrancy is what lets a caller hold the pool lock
+    across a section that settles again inside it.
+    """
+
+    async def test_the_pool_lock_is_reentrant_within_one_task(self):
+        """Without this, every outermost acquisition would self-deadlock on the re-take.
+
+        The admin usage-delete endpoint takes the locks before pausing the flush and
+        then calls a resettle that takes them again; delete_user_account is the same
+        shape. Both are only writable because the second acquisition is free.
+        """
+        import asyncio
+
+        lock = self.tracker.pool_lock(1)
+        async with lock:
+            async with lock:                      # would hang on a plain asyncio.Lock
+                self.assertTrue(lock.locked())
+        self.assertFalse(lock.locked(), "the outermost exit is what actually releases it")
+
+        # ...and it is re-entrant per *task*, not globally: a second task still waits.
+        entered = asyncio.Event()
+
+        async def other():
+            async with lock:
+                entered.set()
+
+        async with lock:
+            task = asyncio.ensure_future(other())
+            await asyncio.sleep(0)
+            self.assertFalse(entered.is_set(), "a different task must not walk in")
+        await asyncio.wait_for(task, timeout=1)
+
+    async def test_the_admin_usage_purge_takes_the_pool_lock_before_the_flush_mutex(self):
+        """Asserts the acquisition ORDER, because the cycle it prevents needs two tasks.
+
+        Staging a real AB-BA here would hang rather than fail, and a test that hangs on
+        regression is worse than no test. So this records the order the endpoint takes
+        the two locks in and pins it: pool lock, then flush mutex. Reversed, a task
+        holding the flush mutex here would wait on a pool lock held by a settle that is
+        itself waiting for the flush mutex.
+        """
+        from contextlib import asynccontextmanager
+
+        from app.request_tracker import request_tracker
+        from app.routes import admin as admin_routes
+        from app.routes import pools as pool_routes
+        from app.auth.admin import AdminUser
+
+        alice = await self.make_user("alice", rpd_limit=10)
+        bob = await self.make_user("bob", rpd_limit=10)
+        pool = await self.make_pool("team", alice, [bob])
+        await self.seed_usage("alice", 6)
+
+        order = []
+        real_guard, real_pause = pool_routes.pool_guard, request_tracker.pause_flush
+
+        @asynccontextmanager
+        async def traced_guard(pool_id):
+            if pool_id is not None:
+                order.append(("pool", pool_id))
+            async with real_guard(pool_id):
+                yield
+
+        @asynccontextmanager
+        async def traced_pause():
+            order.append(("flush", None))
+            async with real_pause():
+                yield
+
+        pool_routes.pool_guard = traced_guard
+        request_tracker.pause_flush = traced_pause
+        try:
+            await admin_routes.delete_usage(
+                view="user", id="alice", user_id=alice.id,
+                current_admin=AdminUser(username="root", email="root@example.test"),
+                db=self.db,
+            )
+        finally:
+            pool_routes.pool_guard = real_guard
+            request_tracker.pause_flush = real_pause
+
+        self.assertIn(("pool", pool.id), order, "the purge must lock the affected pool")
+        self.assertIn(("flush", None), order)
+        self.assertLess(order.index(("pool", pool.id)), order.index(("flush", None)),
+                        "pool lock outermost; see pool_lock's ORDERING note")
+
+        self.assertEqual(await self.charged(pool.id, alice.id), 0,
+                         "and the purged rows come off the ledger, not just the usage table")
+
+
+class PoolIdReuseTests(PoolTestCase):
+    """A pool id is never handed out twice.
+
+    Usage rows keep a dissolved pool's id, and every pool usage view -- and the admin's
+    per-pool purge -- is a filter on that id. A new pool given the old id would inherit
+    the old pool's history and could have it deleted along with its own.
+    """
+
+    async def test_a_dissolved_pools_id_is_not_reused(self):
+        alice = await self.make_user("alice", rpd_limit=5)
+        await pool_routes.create_pool(PoolCreate(name="first"), alice, self.db)
+        first_id = (await self.db.execute(select(RequestPool.id))).scalar_one()
+        await self.seed_usage("alice", 3)
+        await pool_routes.delete_my_pool(alice, self.db)
+
+        await pool_routes.create_pool(PoolCreate(name="second"), alice, self.db)
+        second_id = (await self.db.execute(select(RequestPool.id))).scalar_one()
+        self.assertGreater(second_id, first_id)
+
+    async def test_an_id_surviving_only_in_usage_is_not_reused(self):
+        # A pool dissolved before the high-water mark existed leaves nothing behind
+        # but its usage rows; the seed must still count its id as spent.
+        alice = await self.make_user("alice", rpd_limit=5)
+        await self.seed_usage("alice", 3, pool_id=7)
+
+        await pool_routes.create_pool(PoolCreate(name="team"), alice, self.db)
+        self.assertEqual((await self.db.execute(select(RequestPool.id))).scalar_one(), 8)
+
+
+class PoolLockEvictionTests(PoolTestCase):
+
+    async def test_a_lock_with_a_waiter_is_not_evicted(self):
+        """release() clears locked() before the next waiter has taken the lock.
+
+        Evicting in that gap would let a new caller build a fresh lock and enter
+        alongside the woken waiter, which still holds the old one.
+        """
+        import asyncio
+
+        lock = self.tracker.pool_lock(1)
+        waiter_in = asyncio.Event()
+
+        async def waiter():
+            async with self.tracker.pool_lock(1):
+                waiter_in.set()
+
+        async with lock:
+            task = asyncio.ensure_future(waiter())
+            await asyncio.sleep(0)             # let it queue on the lock
+        # Released, but the waiter has not run yet to take it.
+        self.assertFalse(lock.locked())
+        self.tracker._evict_stale_buckets()
+        self.assertIs(self.tracker.pool_lock(1), lock,
+                      "the lock the waiter is queued on must survive the sweep")
+        await asyncio.wait_for(task, timeout=1)
+        self.assertTrue(waiter_in.is_set())
+
+        self.tracker._evict_stale_buckets()
+        self.assertIsNot(self.tracker.pool_lock(1), lock, "an idle lock is still swept")
+
+
+class AdminResettleFailureTests(PoolTestCase):
+
+    async def test_a_failed_resettle_does_not_fail_a_committed_edit(self):
+        from unittest import mock
+
+        from app.auth.models import User
+        from app.routes import admin as admin_routes
+
+        alice = await self.make_user("alice", rpd_limit=5)
+        await pool_routes.create_pool(PoolCreate(name="team"), alice, self.db)
+
+        with mock.patch.object(pool_routes, "resettle_pools",
+                               side_effect=RuntimeError("settlement blew up")):
+            result = await admin_routes.delete_user(
+                user_id=alice.id, current_admin=AdminUser(username="root", email="root@example.test"), db=self.db,
+            )
+
+        self.assertIn("deactivated", result["message"])
+        is_active = (await self.db.execute(
+            select(User.is_active).where(User.id == alice.id)
+        )).scalar_one()
+        self.assertFalse(is_active, "the deactivation was committed and stands")

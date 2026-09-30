@@ -179,6 +179,36 @@ def _build_model_name(provider_name: str, deployment: str) -> str:
     return f"{provider_name}/{deployment}"
 
 
+def _deployment_call_guard(provider, model_name: str, api_version: Optional[str]):
+    """Validate a deployment-style call.  Returns an error response, or None to proceed.
+
+    Foundry resources have no deployment-style upstream.  OpenAI-family
+    deployments are translated onto /openai/v1/ by
+    AzureProvider._get_inference_client, where api-version carries no meaning, so
+    it is accepted and ignored.  Claude deployments are served only at
+    {endpoint}/anthropic and have no OpenAI-shaped upstream at all.
+
+    Call this with the *post-alias* model name: an alias can rewrite the URL's
+    deployment, so checking the raw path param would let an alias pointing at a
+    Claude deployment slip past.  (An alias pointing at a different provider is
+    not re-resolved here; the guard checks the URL provider.)
+
+    TODO: expose a public property on AzureProvider instead of reaching into the
+    private _is_foundry_backend() / _is_anthropic_deployment().
+    """
+    if provider._is_foundry_backend():
+        if provider._is_anthropic_deployment(model_name):
+            return _azure_error(400, "InvalidRequest",
+                                "Claude deployments on Foundry-backed Azure providers are "
+                                "not available over the Azure OpenAI surface; use "
+                                "/v1/messages instead")
+        return None
+    if not api_version:
+        return _azure_error(400, "InvalidRequest",
+                            "api-version is required for deployment-style calls")
+    return None
+
+
 # ==================== Models / Deployments ====================
 
 def _caller_user_id(auth: Union[User, AdminUser, APIKey]) -> Optional[int]:
@@ -252,20 +282,17 @@ async def azure_chat_completions(
 
     # Signal the provider to use the legacy deployment-style upstream call and
     # forward the inbound api-version.  Pre-validate so streaming responses get
-    # a clean 400 before the StreamingResponse wrapper is returned.
-    # TODO: expose a public property on AzureProvider instead of reaching into
-    # the private _is_foundry_backend().
-    if provider._is_foundry_backend():
-        return _azure_error(400, "InvalidRequest",
-                            "Foundry-backed Azure providers do not support "
-                            "deployment-style calls; use the responses endpoint")
-    if not api_version:
-        return _azure_error(400, "InvalidRequest",
-                            "api-version is required for deployment-style calls")
+    # a clean 400 before the StreamingResponse wrapper is returned.  (Foundry
+    # ignores both ContextVars; see _deployment_call_guard.)
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    # Validate after the alias resolves (it can rewrite the URL's deployment) and
+    # before signalling the deployment call style.
+    guard_error = _deployment_call_guard(provider, model_name, api_version)
+    if guard_error is not None:
+        return guard_error
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -334,19 +361,15 @@ async def azure_completions(
     request_started_at = time.monotonic()
     provider = _get_azure_provider(provider_name)
 
-    # TODO: expose a public property on AzureProvider instead of reaching into
-    # the private _is_foundry_backend().
-    if provider._is_foundry_backend():
-        return _azure_error(400, "InvalidRequest",
-                            "Foundry-backed Azure providers do not support "
-                            "deployment-style calls; use the responses endpoint")
-    if not api_version:
-        return _azure_error(400, "InvalidRequest",
-                            "api-version is required for deployment-style calls")
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    # Validate after the alias resolves (it can rewrite the URL's deployment) and
+    # before signalling the deployment call style.
+    guard_error = _deployment_call_guard(provider, model_name, api_version)
+    if guard_error is not None:
+        return guard_error
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -413,19 +436,15 @@ async def azure_embeddings(
     """Azure OpenAI embeddings endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    # TODO: expose a public property on AzureProvider instead of reaching into
-    # the private _is_foundry_backend().
-    if provider._is_foundry_backend():
-        return _azure_error(400, "InvalidRequest",
-                            "Foundry-backed Azure providers do not support "
-                            "deployment-style calls; use the responses endpoint")
-    if not api_version:
-        return _azure_error(400, "InvalidRequest",
-                            "api-version is required for deployment-style calls")
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    # Validate after the alias resolves (it can rewrite the URL's deployment) and
+    # before signalling the deployment call style.
+    guard_error = _deployment_call_guard(provider, model_name, api_version)
+    if guard_error is not None:
+        return guard_error
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -467,19 +486,15 @@ async def azure_image_generation(
     """Azure OpenAI image generation endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    # TODO: expose a public property on AzureProvider instead of reaching into
-    # the private _is_foundry_backend().
-    if provider._is_foundry_backend():
-        return _azure_error(400, "InvalidRequest",
-                            "Foundry-backed Azure providers do not support "
-                            "deployment-style calls; use the responses endpoint")
-    if not api_version:
-        return _azure_error(400, "InvalidRequest",
-                            "api-version is required for deployment-style calls")
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    # Validate after the alias resolves (it can rewrite the URL's deployment) and
+    # before signalling the deployment call style.
+    guard_error = _deployment_call_guard(provider, model_name, api_version)
+    if guard_error is not None:
+        return guard_error
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -521,19 +536,15 @@ async def azure_audio_speech(
     """Azure OpenAI text-to-speech endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    # TODO: expose a public property on AzureProvider instead of reaching into
-    # the private _is_foundry_backend().
-    if provider._is_foundry_backend():
-        return _azure_error(400, "InvalidRequest",
-                            "Foundry-backed Azure providers do not support "
-                            "deployment-style calls; use the responses endpoint")
-    if not api_version:
-        return _azure_error(400, "InvalidRequest",
-                            "api-version is required for deployment-style calls")
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    # Validate after the alias resolves (it can rewrite the URL's deployment) and
+    # before signalling the deployment call style.
+    guard_error = _deployment_call_guard(provider, model_name, api_version)
+    if guard_error is not None:
+        return guard_error
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
     request.model = model_name
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
@@ -601,19 +612,15 @@ async def azure_audio_transcription(
     """Azure OpenAI audio transcription endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    # TODO: expose a public property on AzureProvider instead of reaching into
-    # the private _is_foundry_backend().
-    if provider._is_foundry_backend():
-        return _azure_error(400, "InvalidRequest",
-                            "Foundry-backed Azure providers do not support "
-                            "deployment-style calls; use the responses endpoint")
-    if not api_version:
-        return _azure_error(400, "InvalidRequest",
-                            "api-version is required for deployment-style calls")
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    # Validate after the alias resolves (it can rewrite the URL's deployment) and
+    # before signalling the deployment call style.
+    guard_error = _deployment_call_guard(provider, model_name, api_version)
+    if guard_error is not None:
+        return guard_error
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 
@@ -674,19 +681,15 @@ async def azure_audio_translation(
     """Azure OpenAI audio translation endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    # TODO: expose a public property on AzureProvider instead of reaching into
-    # the private _is_foundry_backend().
-    if provider._is_foundry_backend():
-        return _azure_error(400, "InvalidRequest",
-                            "Foundry-backed Azure providers do not support "
-                            "deployment-style calls; use the responses endpoint")
-    if not api_version:
-        return _azure_error(400, "InvalidRequest",
-                            "api-version is required for deployment-style calls")
+    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    # Validate after the alias resolves (it can rewrite the URL's deployment) and
+    # before signalling the deployment call style.
+    guard_error = _deployment_call_guard(provider, model_name, api_version)
+    if guard_error is not None:
+        return guard_error
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
     await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
     await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
 

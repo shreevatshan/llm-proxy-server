@@ -231,7 +231,7 @@ class UsageBufferParityTests(unittest.IsolatedAsyncioTestCase):
         tracker._broadcast_raw = AsyncMock()
         await tracker.start_request(**kwargs)
         # Mirrors _update_tracking_identity once auth resolves the caller.
-        await tracker.update_identity(kwargs["request_id"], "alice", "user")
+        await tracker.update_identity(kwargs["request_id"], "alice", "user", 1)
         await tracker.end_request(kwargs["request_id"], status="completed")
         return list(tracker._usage_buffer.keys())
 

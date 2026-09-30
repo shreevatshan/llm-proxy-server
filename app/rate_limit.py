@@ -29,8 +29,9 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from app import time_utils
+from app.concurrency import TaskReentrantLock, lock_in_use
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,10 @@ class RateLimitDecision:
     group_rpm_remaining: Optional[int] = None
     group_rpd_limit: Optional[int] = None
     group_rpd_remaining: Optional[int] = None
+    # True when the daily quota that denied the request is a shared pool quota.
+    # Only set on RPD denials, where it suppresses the "join a pool" hint that
+    # would otherwise be advice the user has already taken.
+    pooled: bool = False
 
 
 @dataclass
@@ -211,6 +216,22 @@ def _human_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
+def _pooling_hint(d: RateLimitDecision) -> str:
+    """Suffix suggesting request pooling, for RPD denials only.
+
+    A daily quota is the one limit pooling can raise: members share the sum of
+    their RPD limits. Omitted when the quota that denied the request is already
+    a pool's, so a pooled user is never told to do what they have done.
+    """
+    if d.pooled:
+        return ""
+    return (
+        " If you need a larger daily quota, try request pooling — join or create a pool "
+        "from the Request Pool tab in the console to share a combined daily quota with "
+        "other users."
+    )
+
+
 def _limit_message(d: RateLimitDecision) -> str:
     if d.limited_by == "instance_group_rpm":
         return (
@@ -222,7 +243,7 @@ def _limit_message(d: RateLimitDecision) -> str:
         return (
             f"Rate limit exceeded for instance group '{d.group_name}': {d.group_rpd_limit} requests per day. "
             f"Retry after {_human_duration(d.retry_after_seconds)}, or use an instance outside this group. "
-            f"View your allowed quota in the console."
+            f"View your allowed quota in the console." + _pooling_hint(d)
         )
     if d.limited_by == "group_rpm":
         return (
@@ -234,7 +255,7 @@ def _limit_message(d: RateLimitDecision) -> str:
         return (
             f"Rate limit exceeded for model group '{d.group_name}': {d.group_rpd_limit} requests per day. "
             f"Retry after {_human_duration(d.retry_after_seconds)}, or use a model outside this group. "
-            f"View your allowed quota in the console."
+            f"View your allowed quota in the console." + _pooling_hint(d)
         )
     if d.limited_by == "rpm":
         limit = d.rpm_limit
@@ -247,7 +268,7 @@ def _limit_message(d: RateLimitDecision) -> str:
     return (
         f"Rate limit exceeded: {limit} requests per day. "
         f"Retry after {_human_duration(d.retry_after_seconds)}. "
-        f"View your allowed quota in the console."
+        f"View your allowed quota in the console." + _pooling_hint(d)
     )
 
 
@@ -289,6 +310,9 @@ class RateLimitTracker:
         # Group RPD cache keyed by (scope_key, group_id)
         self._group_rpd_cache: Dict[Tuple[str, int], _RpdCacheEntry] = {}
         self._user_locks: Dict[int, asyncio.Lock] = {}
+        # One lock per pool, serialising composition changes and settlement. See
+        # pool_lock() for the ordering rule that makes it safe.
+        self._pool_locks: Dict[int, TaskReentrantLock] = {}
         self._db_session_factory: Optional[Callable] = None
         self._running = False
         self._refresh_task: Optional[asyncio.Task] = None
@@ -303,11 +327,17 @@ class RateLimitTracker:
         self._instance_group_rpd_cache: Dict[Tuple[str, int], _RpdCacheEntry] = {}      # (scope_key, group_id)
         self._user_instance_group_overrides: Dict[Tuple[int, int], _UserInstanceGroupOverride] = {}  # (user_id, group_id)
         # Request-pool state. Only RPD is pooled; every RPM structure above stays
-        # strictly per-user. Usernames are cached alongside ids because RPD counting is
-        # keyed by the username string (RequestUsage.user_identity), not by user_id.
+        # strictly per-user. RPD counting itself goes through the member user ids
+        # (RequestUsage.user_id); usernames are cached alongside them so
+        # invalidate_identity() can find the pool a name belongs to.
         self._user_to_pool: Dict[int, int] = {}                    # user_id → pool_id
         self._pool_members: Dict[int, List[Tuple[int, str]]] = {}  # pool_id → [(user_id, username)]
         self._identity_to_pool: Dict[str, int] = {}                # username → pool_id
+        # Pooled members whose account is deactivated. Kept beside _pool_members rather
+        # than folded into it: they are still members for counting purposes (the rows
+        # they sent before being disabled are real) but contribute no limit, and every
+        # existing (uid, uname) unpack site stays untouched.
+        self._inactive_members: Set[int] = set()
         self._carries: Dict[Tuple[int, str, int], int] = {}        # (user_id, scope_kind, scope_id) → carry
         self._carries_date = None                                  # local day the carries were loaded for
 
@@ -323,6 +353,27 @@ class RateLimitTracker:
         if user_id not in self._user_locks:
             self._user_locks[user_id] = asyncio.Lock()
         return self._user_locks[user_id]
+
+    def pool_lock(self, pool_id: int) -> TaskReentrantLock:
+        """Serialise composition changes and settlement for one pool.
+
+        settle_pool reads the pool's usage, apportions it and writes a ledger row per
+        member. Two of those interleaving -- a join racing a leave, or two accepts --
+        apportion against a membership that is already stale by the time they write.
+        The conflict-safe upserts keep the writes from colliding; this keeps them from
+        describing different pools.
+
+        ORDERING: acquire this **before** request_tracker.pause_flush(), never after.
+        settle_pool takes pause_flush internally, so a caller holding the flush mutex
+        while waiting here would deadlock against a settle holding this and waiting for
+        the flush. Every call site below follows that order.
+
+        Single-process, like the rest of this module -- see the note at the top of the
+        file. Across workers the database constraints remain the real guarantee.
+        """
+        if pool_id not in self._pool_locks:
+            self._pool_locks[pool_id] = TaskReentrantLock()
+        return self._pool_locks[pool_id]
 
     async def start(self) -> None:
         self._lock = asyncio.Lock()
@@ -389,7 +440,12 @@ class RateLimitTracker:
                 # Load pool membership joined to User for the usernames the RPD
                 # counters are keyed by.
                 result = await db.execute(
-                    select(RequestPoolMember.pool_id, RequestPoolMember.user_id, User.username)
+                    select(
+                        RequestPoolMember.pool_id,
+                        RequestPoolMember.user_id,
+                        User.username,
+                        User.is_active,
+                    )
                     .join(User, User.id == RequestPoolMember.user_id)
                 )
                 pool_member_rows = result.all()
@@ -467,13 +523,17 @@ class RateLimitTracker:
                 pool_members: Dict[int, List[Tuple[int, str]]] = {}
                 user_to_pool: Dict[int, int] = {}
                 identity_to_pool: Dict[str, int] = {}
-                for pool_id, uid, uname in pool_member_rows:
+                inactive_members: Set[int] = set()
+                for pool_id, uid, uname, is_active in pool_member_rows:
                     pool_members.setdefault(pool_id, []).append((uid, uname))
                     user_to_pool[uid] = pool_id
                     identity_to_pool[uname] = pool_id
+                    if not is_active:
+                        inactive_members.add(uid)
                 self._pool_members = pool_members
                 self._user_to_pool = user_to_pool
                 self._identity_to_pool = identity_to_pool
+                self._inactive_members = inactive_members
                 self._carries = {
                     (row.user_id, row.scope_kind, row.scope_id): row.carry
                     for row in carry_rows
@@ -503,15 +563,21 @@ class RateLimitTracker:
             for k in expired:
                 del cache[k]
 
-        # Sweep idle per-user locks: no active RPM bucket and not currently held.
-        # Skipping locked() locks avoids evicting a lock a request is holding
-        # while suspended at an await inside `async with user_lock`.
+        # Sweep idle per-user locks: no active RPM bucket, and nobody holding or waiting
+        # for the lock. Evicting one in use would let the next caller build a new lock and
+        # enter the critical section alongside whoever holds or is about to take the old one.
         idle_locks = [
             uid for uid, lk in self._user_locks.items()
-            if uid not in self._minute_buckets and not lk.locked()
+            if uid not in self._minute_buckets and not lock_in_use(lk)
         ]
         for uid in idle_locks:
             del self._user_locks[uid]
+
+        # Pool locks have no per-request bucket to key idleness off, so "not in use" is
+        # the whole test. It must count waiters, not just the holder: a released lock
+        # reads unlocked before its next waiter has taken it (see lock_in_use).
+        for pid in [p for p, lk in self._pool_locks.items() if not lk.in_use()]:
+            del self._pool_locks[pid]
 
     def invalidate_user(self, user_id: int) -> None:
         self._overrides.pop(user_id, None)
@@ -567,8 +633,20 @@ class RateLimitTracker:
             self._instance_group_rpd_cache.pop(key, None)
 
     async def refresh_now(self) -> None:
-        """Force an immediate config reload from DB (called after admin edits)."""
+        """Force an immediate config reload from DB (called after admin edits).
+
+        Also drops the cached RPD counts. Every caller is on a path where something the
+        counts depend on just changed -- a limit edit, a composition change, a purge --
+        so serving a count cached before that change for the rest of _RPD_TTL would
+        enforce against numbers that are already gone. In particular _load_config is what
+        re-reads UserRpdCarry into the snapshot, and a carry rewritten by settlement is
+        invisible until the cached count expires.
+
+        The periodic reload in _refresh_loop calls _load_config directly and is
+        deliberately left alone: it is not reacting to a change, so it keeps its cache.
+        """
         await self._load_config()
+        self.invalidate_all_rpd()
 
     def model_belongs_to_group(self, model_id: str) -> bool:
         """True if the model is mapped to a configured model group."""
@@ -611,22 +689,33 @@ class RateLimitTracker:
     # its count is the sum of their consumption. Only RPD is pooled — every RPM path
     # above keeps reading the caller's own user_id.
 
-    def _rpd_scope(self, user_id: int, username: str) -> Tuple[str, List[str], List[int], Optional[int]]:
-        """Return (cache_scope_key, identities_to_count, member_user_ids, pool_id).
+    def _rpd_scope(self, user_id: int, username: str) -> Tuple[str, List[int], Optional[int]]:
+        """Return (cache_scope_key, member_user_ids, pool_id).
 
-        Unpooled: ("user:alice", ["alice"], [7], None)
-        Pooled:   ("pool:3", ["alice","bob","carol"], [7,8,9], 3)
+        Unpooled: ("user:alice", [7], None)
+        Pooled:   ("pool:3", [7,8,9], 3)
 
-        The scope key is what the RPD caches are keyed by, so all members of a pool
-        share one cache entry — one DB read per pool per TTL, not one per member.
-        Both forms are prefixed so the two keyspaces cannot collide; see
-        _user_scope_key.
+        The member ids are what the usage tables are keyed by, so they are what the
+        today-counts are read for. The scope key is what the RPD caches are keyed by,
+        so all members of a pool share one cache entry — one DB read per pool per TTL,
+        not one per member. Both forms are prefixed so the two keyspaces cannot
+        collide; see _user_scope_key.
         """
         pool_id = self._user_to_pool.get(user_id)
         members = self._pool_members.get(pool_id) if pool_id is not None else None
         if not members:
-            return _user_scope_key(username), [username], [user_id], None
-        return (_pool_scope_key(pool_id), [u for _, u in members], [i for i, _ in members], pool_id)
+            return _user_scope_key(username), [user_id], None
+        return _pool_scope_key(pool_id), [i for i, _ in members], pool_id
+
+    def pool_id_for_user(self, user_id: int) -> int:
+        """The pool this user is in per the current snapshot, or 0 when unpooled.
+
+        request_tracker stamps this onto every usage row as it is recorded, which is
+        what makes pool usage a plain filter. The snapshot is re-read after every
+        composition change (_invalidate -> refresh_now), so the stamp tracks joins and
+        leaves as soon as they commit.
+        """
+        return self._user_to_pool.get(user_id) or 0
 
     def _own_rpd_limit(self, user_id: int) -> Optional[int]:
         """One user's own effective overall RPD — their override, else the global default."""
@@ -641,9 +730,18 @@ class RateLimitTracker:
         `per_member` is a callable resolving one member's effective limit for the tier
         being checked; it is evaluated under the global lock, where the snapshot dicts
         this reads are already held.
+
+        Deactivated members are skipped, limit and unlimited alike. A disabled account
+        cannot send a request -- get_api_key joins on User.is_active and every
+        middleware path gates on it -- so counting its limit would hand a quota nobody
+        can spend to whoever it was pooled with, and one disabled unlimited account
+        would make the pool unlimited forever. Their rows still count: _rpd_scope keeps
+        returning every member id, because traffic they sent while active was real.
         """
         total = 0
         for uid in member_ids:
+            if uid in self._inactive_members:
+                continue
             value = per_member(uid)
             if value is None:
                 return None
@@ -684,7 +782,7 @@ class RateLimitTracker:
             override = self._overrides.get(user_id)
             rpm = override.rpm_limit if (override and override.rpm_limit is not None) else self._defaults.rpm_default
 
-            scope_key, identities, member_ids, pool_id = self._rpd_scope(user_id, username)
+            scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
             if pool_id is None:
                 rpd = override.rpd_limit if (override and override.rpd_limit is not None) else self._defaults.rpd_default
             else:
@@ -695,7 +793,7 @@ class RateLimitTracker:
             bucket = self._minute_buckets.get(user_id)
             rpm_count = (bucket.count if bucket and bucket.window == current_window else 0)
 
-        rpd_count = await self._get_today_count(scope_key, identities, member_ids)
+        rpd_count = await self._get_today_count(scope_key, member_ids)
 
         rpm_remaining = max(0, rpm - rpm_count) if rpm is not None else None
         rpd_remaining = max(0, rpd - rpd_count) if rpd is not None else None
@@ -727,7 +825,7 @@ class RateLimitTracker:
             g_rpm, _own_rpd = self._resolve_group_limits(user_id, group)
 
             # RPD may be pooled across the members' group limits; RPM stays per-user.
-            scope_key, identities, member_ids, pool_id = self._rpd_scope(user_id, username)
+            scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
             if pool_id is None:
                 g_rpd = _own_rpd
             else:
@@ -768,7 +866,7 @@ class RateLimitTracker:
             # Group RPD check
             if g_rpd is not None:
                 group_today_count = await self._get_today_group_count(
-                    scope_key, identities, member_ids, group.model_ids, group.group_id
+                    scope_key, member_ids, group.model_ids, group.group_id
                 )
                 if group_today_count >= g_rpd:
                     return RateLimitDecision(
@@ -782,6 +880,7 @@ class RateLimitTracker:
                         group_rpm_limit=g_rpm,
                         group_rpd_limit=g_rpd,
                         group_rpd_remaining=0,
+                        pooled=pool_id is not None,
                     )
 
             # Passed — increment group RPM bucket
@@ -808,7 +907,7 @@ class RateLimitTracker:
             g_rpm, _own_rpd = self._resolve_instance_group_limits(user_id, group)
 
             # RPD may be pooled across the members' group limits; RPM stays per-user.
-            scope_key, identities, member_ids, pool_id = self._rpd_scope(user_id, username)
+            scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
             if pool_id is None:
                 g_rpd = _own_rpd
             else:
@@ -849,7 +948,7 @@ class RateLimitTracker:
             # Instance-group RPD check
             if g_rpd is not None:
                 group_today_count = await self._get_today_instance_group_count(
-                    scope_key, identities, member_ids, group.provider_keys, group.group_id
+                    scope_key, member_ids, group.provider_keys, group.group_id
                 )
                 if group_today_count >= g_rpd:
                     return RateLimitDecision(
@@ -863,6 +962,7 @@ class RateLimitTracker:
                         group_rpm_limit=g_rpm,
                         group_rpd_limit=g_rpd,
                         group_rpd_remaining=0,
+                        pooled=pool_id is not None,
                     )
 
             # Passed — increment instance-group RPM bucket
@@ -919,7 +1019,7 @@ class RateLimitTracker:
             rpm = override.rpm_limit if (override and override.rpm_limit is not None) else self._defaults.rpm_default
 
             # RPD may be pooled; RPM above is always this user's own.
-            scope_key, identities, member_ids, pool_id = self._rpd_scope(user_id, username)
+            scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
             if pool_id is None:
                 rpd = override.rpd_limit if (override and override.rpd_limit is not None) else self._defaults.rpd_default
             else:
@@ -952,7 +1052,7 @@ class RateLimitTracker:
 
             # 2) Request RPD check
             if rpd is not None:
-                today_count = await self._get_today_count(scope_key, identities, member_ids)
+                today_count = await self._get_today_count(scope_key, member_ids)
                 if today_count >= rpd:
                     return RateLimitDecision(
                         allowed=False,
@@ -960,13 +1060,14 @@ class RateLimitTracker:
                         rpd_limit=rpd, rpd_remaining=0,
                         retry_after_seconds=_seconds_until_local_midnight(),
                         limited_by="rpd",
+                        pooled=pool_id is not None,
                     )
 
             # All checks passed — increment the RPM bucket
             bucket.count += 1
             rpm_remaining = (rpm - bucket.count) if rpm is not None else None
 
-        rpd_count = await self._get_today_count(scope_key, identities, member_ids)
+        rpd_count = await self._get_today_count(scope_key, member_ids)
         rpd_remaining = max(0, rpd - rpd_count) if rpd is not None else None
 
         return RateLimitDecision(
@@ -984,9 +1085,9 @@ class RateLimitTracker:
 
         Pooled callers get the whole pool's count, matching what enforcement sees.
         """
-        scope_key, identities, member_ids, _ = self._rpd_scope(user_id, user_identity)
+        scope_key, member_ids, _ = self._rpd_scope(user_id, user_identity)
         return await self._get_today_group_count(
-            scope_key, identities, member_ids, model_ids, group_id
+            scope_key, member_ids, model_ids, group_id
         )
 
     async def get_instance_group_rpd_count(
@@ -996,9 +1097,9 @@ class RateLimitTracker:
 
         Pooled callers get the whole pool's count, matching what enforcement sees.
         """
-        scope_key, identities, member_ids, _ = self._rpd_scope(user_id, user_identity)
+        scope_key, member_ids, _ = self._rpd_scope(user_id, user_identity)
         return await self._get_today_instance_group_count(
-            scope_key, identities, member_ids, provider_keys, group_id
+            scope_key, member_ids, provider_keys, group_id
         )
 
     def pooled_rpd_limits(self, user_id: int, username: str) -> Tuple[Optional[int], int, Optional[int]]:
@@ -1095,7 +1196,7 @@ class RateLimitTracker:
         return self._carry_sum([user_id], scope_kind, scope_id)
 
     async def _get_today_count(
-        self, scope_key: str, identities: List[str], member_ids: List[int]
+        self, scope_key: str, member_ids: List[int]
     ) -> int:
         """Return today's effective total request count with a 5-second TTL cache.
 
@@ -1120,7 +1221,7 @@ class RateLimitTracker:
 
         try:
             from app.request_tracker import request_tracker
-            rows = await request_tracker.get_today_count(identities)
+            rows = await request_tracker.get_today_count(member_ids)
         except Exception:
             logger.error(
                 "RPD count read failed for %s; serving last-known count",
@@ -1137,7 +1238,7 @@ class RateLimitTracker:
         return count
 
     async def _get_today_group_count(
-        self, scope_key: str, identities: List[str], member_ids: List[int],
+        self, scope_key: str, member_ids: List[int],
         model_ids: List[str], group_id: int,
     ) -> int:
         """Return today's effective request count for all models in the group, TTL-cached."""
@@ -1149,7 +1250,7 @@ class RateLimitTracker:
 
         try:
             from app.request_tracker import request_tracker
-            rows = await request_tracker.get_today_group_count(identities, model_ids)
+            rows = await request_tracker.get_today_group_count(member_ids, model_ids)
         except Exception:
             logger.error(
                 "Group RPD count read failed for %s group %s; serving last-known count",
@@ -1164,7 +1265,7 @@ class RateLimitTracker:
         return count
 
     async def _get_today_instance_group_count(
-        self, scope_key: str, identities: List[str], member_ids: List[int],
+        self, scope_key: str, member_ids: List[int],
         provider_keys: List[str], group_id: int,
     ) -> int:
         """Return today's effective request count across all instances in the group, TTL-cached."""
@@ -1176,7 +1277,7 @@ class RateLimitTracker:
 
         try:
             from app.request_tracker import request_tracker
-            rows = await request_tracker.get_today_instance_group_count(identities, provider_keys)
+            rows = await request_tracker.get_today_instance_group_count(member_ids, provider_keys)
         except Exception:
             logger.error(
                 "Instance-group RPD count read failed for %s group %s; serving last-known count",

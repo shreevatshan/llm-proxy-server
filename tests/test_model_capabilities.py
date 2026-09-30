@@ -86,6 +86,39 @@ class RejectedParamsTests(unittest.TestCase):
         )
         self.assertEqual(rejected_params("us.xai.grok-4.6", SURFACE_NATIVE), frozenset())
 
+    def test_openai_reasoning_gpt_rejects_sampling(self):
+        for model in (
+            "us.openai.gpt-6-luna",
+            "gpt-5.6-terra",
+            "azure:foundry/gpt-5.6-terra",
+            "openai.gpt-5-mini",
+            "gpt-5",
+            "prod-gpt5",
+            # A "-chat" anywhere in the id used to disqualify the whole model:
+            # an admin-chosen deployment name says nothing about the family, and
+            # the exception is for the "gpt-5-chat" variant specifically.
+            "team-chat-gpt-5",
+            "azure-chat-east/gpt-5",
+            "gpt-5-chatbot-prod",
+        ):
+            for surface in (SURFACE_CONVERSE, SURFACE_NATIVE):
+                with self.subTest(model=model, surface=surface):
+                    self.assertEqual(
+                        rejected_params(model, surface),
+                        frozenset({"temperature", "top_p"}),
+                    )
+
+    def test_gpt_oss_and_older_gpt_unrestricted(self):
+        for model in (
+            "openai.gpt-oss-120b-1:0",
+            "gpt-5-chat-latest",
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-35-turbo",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(rejected_params(model, SURFACE_CONVERSE), frozenset())
+
     def test_unknown_and_unparseable_models_unrestricted(self):
         # A deployment name that hides the version matches no rule — the known
         # limitation the startup warning exists to surface.
@@ -258,3 +291,31 @@ class DeploymentNameWarningTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpenAICompatibleScrubTests(unittest.TestCase):
+    def _prepare(self, model, override=None, **params):
+        from app.openai_models import ChatCompletionRequest
+        from app.providers.openai_compatible import OpenAICompatibleProvider
+
+        request = ChatCompletionRequest(
+            model=model, messages=[{"role": "user", "content": "hi"}], **params
+        )
+        class _Stub(OpenAICompatibleProvider):
+            get_model_id = get_available_models = lambda *a, **k: None
+
+        # _prepare_request_dict only reads provider attributes via getattr.
+        return _Stub.__new__(_Stub)._prepare_request_dict(request, override)
+
+    def test_drops_temperature_for_gpt5_deployment(self):
+        body = self._prepare("gpt-5.6-terra", temperature=0.6, top_p=0.9)
+        self.assertNotIn("temperature", body)
+        self.assertNotIn("top_p", body)
+
+    def test_checks_mapped_deployment_name(self):
+        body = self._prepare("researcher", override="gpt-5.6-terra", temperature=0.6)
+        self.assertNotIn("temperature", body)
+
+    def test_keeps_temperature_for_older_models(self):
+        body = self._prepare("gpt-4.1", temperature=0.6)
+        self.assertEqual(body["temperature"], 0.6)

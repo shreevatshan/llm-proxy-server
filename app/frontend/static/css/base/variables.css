@@ -16,6 +16,9 @@
     --mono-text-primary:   #fafafa;
     --mono-text-secondary: #b8b8b8;
     --mono-text-muted:     #876580;
+    /* The muted mauve at a brighter value — the one hue in the stack, used
+       where a name has to be picked out of a sentence. */
+    --mono-text-name:      #c9a0c2;
     --mono-text-inverse:   #0d0d0d;
 
     /* Pure */

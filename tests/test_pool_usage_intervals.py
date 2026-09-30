@@ -1,16 +1,17 @@
 """Tests that pool usage means what the pool consumed, not what its members ever sent.
 
-The usage tables have no pool dimension -- rows are keyed by user identity -- so a pool's
-consumption has to be reconstructed at read time. Reconstructing it as "current members x
-all their rows" is wrong in both directions:
+Every usage row carries the pool_id its sender was in when the request completed, so a
+pool's consumption is a filter on that column -- exact to the request. Reconstructing it
+as "current members x all their rows" would be wrong in both directions:
 
-  * someone who burned 900 requests before joining drags all 900 in with them, so the
-    Usage tab reports a number the pool never spent and the Quotas tab disagrees with it;
-  * someone who leaves retroactively erases spending that genuinely was the pool's, so
-    yesterday's total silently changes when today's roster does.
+  * someone who burned 900 requests before joining would drag all 900 in with them, so
+    the Usage tab reports a number the pool never spent and the Quotas tab disagrees;
+  * someone who leaves would retroactively erase spending that genuinely was the pool's,
+    so yesterday's total silently changes when today's roster does.
 
-PoolMembershipInterval records each stint, and every pool usage read is bounded by those
-spans. Both ends are inclusive, matching what settlement charges for a mid-day join.
+PoolMembershipInterval still records each stint, but only to decide who may be drilled
+into; it never attributes traffic. seed_usage mirrors the tracker: a row seeded while a
+user is a member is stamped with their pool, otherwise with 0.
 """
 
 import unittest
@@ -35,13 +36,26 @@ class PoolUsageIntervalTests(PoolTestCase):
         pool = await self.make_pool("team", bob)
 
         await self.seed_usage("alice", 900, day=DAY - timedelta(days=5))
-        await self.seed_usage("alice", 3, day=DAY)
         await self.seed_usage("bob", 10, day=DAY, model="other/model")
 
         await self.join_pool(pool, alice, joined_on=DAY)
+        await self.seed_usage("alice", 3, day=DAY)
 
         self.assertEqual(await self._total(pool), 13,
                          "alice's 3 since joining plus bob's 10, not her 900 from before")
+
+    async def test_a_same_day_join_is_exact_to_the_request(self):
+        """Attribution is per request, not per day: what alice sent this morning,
+        before joining, is hers alone even though the join is on the same date."""
+        alice = await self.make_user("alice", rpd_limit=100)
+        bob = await self.make_user("bob", rpd_limit=100)
+        pool = await self.make_pool("team", bob)
+
+        await self.seed_usage("alice", 40, day=DAY)          # before joining
+        await self.join_pool(pool, alice, joined_on=DAY)
+        await self.seed_usage("alice", 3, day=DAY, model="p/after")
+
+        self.assertEqual(await self._total(pool, window="today"), 3)
 
     async def test_a_leavers_contribution_stays_in_the_pools_history(self):
         alice = await self.make_user("alice", rpd_limit=100)
@@ -56,7 +70,7 @@ class PoolUsageIntervalTests(PoolTestCase):
                          "the pool really did spend it; walking out cannot unspend it")
 
     async def test_the_join_day_and_the_leave_day_are_both_counted(self):
-        """Usage is day-grained, so a mid-day join cannot be split -- as settlement agrees."""
+        """Requests sent while a member on the day of joining and of leaving are the pool's."""
         alice = await self.make_user("alice", rpd_limit=100)
         bob = await self.make_user("bob", rpd_limit=100)
         pool = await self.make_pool("team", alice, joined_on=DAY - timedelta(days=9))
@@ -122,8 +136,8 @@ class PoolUsageIntervalTests(PoolTestCase):
         pool = await self.make_pool("team", bob)
 
         await self.seed_usage("alice", 900, day=DAY - timedelta(days=5))
-        await self.seed_usage("alice", 3, day=DAY)
         await self.join_pool(pool, alice, joined_on=DAY)
+        await self.seed_usage("alice", 3, day=DAY)
 
         payload = await pool_routes.build_pool_usage(
             self.db, pool.id, window="30d", view="user", target="alice",
@@ -146,10 +160,10 @@ class PoolUsageIntervalTests(PoolTestCase):
         self.assertEqual(payload["totals"]["requests"], overall.used)
 
     async def test_pool_usage_is_empty_before_anyone_has_a_stint(self):
-        """No overlapping interval must mean no rows, never every row."""
+        """Rows from before the pool existed carry no pool and must never be counted."""
         alice = await self.make_user("alice", rpd_limit=100)
         pool = await self.make_pool("team", alice, joined_on=DAY)
-        await self.seed_usage("alice", 40, day=DAY - timedelta(days=2))
+        await self.seed_usage("alice", 40, day=DAY - timedelta(days=2), pool_id=0)
 
         payload = await pool_routes.build_pool_usage(self.db, pool.id, window="yesterday")
         self.assertEqual(payload["totals"]["requests"], 0)
@@ -157,7 +171,7 @@ class PoolUsageIntervalTests(PoolTestCase):
 
 
 class AdminPoolIntervalTests(PoolTestCase):
-    """The admin By Pool views fold the same spans, so they cannot drift from the member view."""
+    """The admin By Pool views filter the same pool_id, so they cannot drift from the member view."""
 
     async def _pool_with_a_leaver(self):
         alice = await self.make_user("alice", rpd_limit=100)
