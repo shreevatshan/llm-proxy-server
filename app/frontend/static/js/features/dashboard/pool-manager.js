@@ -40,6 +40,11 @@ class PoolManager {
         // drilled-in test. `axis` is always the API's word ('user' | 'model'), not
         // the switch's ('member' | 'model'); the rows carry the mapping.
         this._drill = null;
+        // Live polling, on the same terms as UserUsageManager's: only while the panel
+        // is on screen (UserUsageManager.setScope says when), only on the live windows.
+        this._usageLive = false;
+        this._usageRefreshTimer = null;
+        this._usageRefreshMs = 60_000;
 
         // Pool tab sub-tabs. _render() replaces #poolContainer wholesale and
         // _wirePooled() rebinds from scratch, so none of this can live in the DOM:
@@ -932,6 +937,7 @@ class PoolManager {
         const prev = this._drill;
         this._usageWindow = win;
         this._updateWindowButtons(win);
+        this._armUsageTimer();
         // Stay in 'back' mode when a drill-down is about to be re-applied, so the view
         // switch doesn't flash in and straight back out between the two renders.
         this._exitDrill({ render: false, header: !prev });
@@ -1032,6 +1038,10 @@ class PoolManager {
 
         this._drill = { axis, id };
         this._setControlsMode('back');
+        this._paintDrill(axis, id, data);
+    }
+
+    _paintDrill(axis, id, data) {
         this._renderChart(data.timeseries);
         this._renderDrilldownStats(axis, data.breakdown);
 
@@ -1040,6 +1050,71 @@ class PoolManager {
         container.innerHTML = axis === 'user'
             ? this._modelBreakdownHtml(data.breakdown, id)
             : this._memberBreakdownHtml(data.breakdown, id);
+    }
+
+    // ---------------------------------------------------------------- //
+    // Live refresh. Without it the panel kept whatever it fetched first while
+    // My usage, beside it, polled -- so a member's own row here read lower than
+    // their own total there.
+    // ---------------------------------------------------------------- //
+
+    // The panel just came on screen: catch up now, then keep polling on a live window.
+    startUsageRefresh() {
+        this._usageLive = true;
+        // No _usage yet means a first load is already on its way via _render().
+        if (this._usage) this._silentRefreshUsage();
+        this._armUsageTimer();
+    }
+
+    stopUsageRefresh() {
+        this._usageLive = false;
+        this._clearUsageTimer();
+    }
+
+    _armUsageTimer() {
+        this._clearUsageTimer();
+        if (!this._usageLive || !['24h', 'today'].includes(this._usageWindow)) return;
+        this._usageRefreshTimer = setInterval(() => this._silentRefreshUsage(), this._usageRefreshMs);
+    }
+
+    _clearUsageTimer() {
+        if (this._usageRefreshTimer) {
+            clearInterval(this._usageRefreshTimer);
+            this._usageRefreshTimer = null;
+        }
+    }
+
+    // Re-fetch whatever is on screen -- the pool-wide view, or the drill-down plus the
+    // pool-wide payload Back returns to. Silent: a failure keeps the current view.
+    async _silentRefreshUsage() {
+        if (!this._cache?.pool || !this._usage) return;
+        const win = this._usageWindow;
+        const drill = this._drill;
+        try {
+            const r = await makeAuthenticatedRequest(
+                `/auth/pools/usage?${new URLSearchParams({ window: win })}`);
+            if (!r.ok) return;
+            const usage = await r.json();
+            let scoped = null;
+            if (drill) {
+                const params = new URLSearchParams({ window: win, view: drill.axis, id: drill.id });
+                const d = await makeAuthenticatedRequest(`/auth/pools/usage?${params}`);
+                if (d.ok) scoped = await d.json();
+            }
+            // The reader changed window or drilled in or out while this was in flight;
+            // their own fetch owns the panel now. drillDown sets a fresh object, so
+            // identity is the test.
+            if (this._usageWindow !== win || this._drill !== drill) return;
+            this._usage = usage;
+            if (!drill) {
+                this._renderChart(usage.timeseries);
+                this._renderUsage();
+            } else if (scoped) {
+                this._paintDrill(drill.axis, drill.id, scoped);
+            }
+        } catch (error) {
+            // Silent — keep the existing view
+        }
     }
 
     back() {

@@ -6,7 +6,12 @@
  * (mirrors admin UsageManager, minus the per-user drill-down and year picker).
  * "Pool usage" is PoolManager's panel, which lives in this tab but is rendered
  * and fetched entirely by PoolManager — this manager only shows it, hides it,
- * and makes sure it has loaded.
+ * makes sure it has loaded, and tells it when to poll.
+ *
+ * Both panels refresh the same way: at once whenever they come back on screen,
+ * then every minute while a live window (24h, today) is selected, and not at all
+ * while hidden. One panel polling while the other sat on its first fetch is how
+ * a member's own row in the pool panel came to read lower than My usage.
  *
  * The two panels keep separate windows on purpose (30d here, today there): the
  * question "what did I send this month" and "what is the pool burning today" are
@@ -82,11 +87,16 @@ class UserUsageManager {
         if (myPanel) myPanel.style.display = this._scope === 'my' ? '' : 'none';
         if (poolPanel) poolPanel.style.display = this._scope === 'pool' ? '' : 'none';
 
+        const mgr = window.PoolManager;
         if (this._scope === 'my') {
+            // Only one panel is on screen, so only one of them should be polling.
+            mgr?.stopUsageRefresh();
             if (!this._cache || this._loadError) {
                 this.load().catch(err => console.error('[UserUsageManager] load failed:', err));
             } else {
+                // Coming back to a cached panel: catch up now rather than at the next tick.
                 this._tabIsActive = true;
+                this._silentRefresh();
                 this._startRefreshIfLive();
             }
             requestAnimationFrame(() => {
@@ -94,12 +104,11 @@ class UserUsageManager {
                 this._positionIndicator(this._window);
             });
         } else {
-            // Only one panel is on screen, so only one of them should be polling.
             this.stopAutoRefresh();
-            const mgr = window.PoolManager;
             if (mgr && (!mgr._cache || mgr._loadError)) {
                 mgr.load().catch(err => console.error('[UserUsageManager] pool load failed:', err));
             }
+            mgr?.startUsageRefresh();
             requestAnimationFrame(() => {
                 this._positionScopeIndicator();
                 mgr?._positionIndicator();
@@ -175,7 +184,11 @@ class UserUsageManager {
             const url = this._buildUrl();
             const response = await makeAuthenticatedRequest(url);
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
-            this._cache = await response.json();
+            const data = await response.json();
+            // The window changed while this was in flight; setWindow's own fetch owns
+            // the panel now, and painting this would put the old window's numbers back.
+            if (url !== this._buildUrl()) return;
+            this._cache = data;
             this._loadError = false;
             this._render(this._cache);
         } catch (error) {
@@ -388,6 +401,7 @@ document.addEventListener('DOMContentLoaded', function () {
             mgr.setScope(mgr._scope);
         } else {
             mgr.stopAutoRefresh();
+            window.PoolManager?.stopUsageRefresh();
         }
     };
 });
