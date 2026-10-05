@@ -1154,8 +1154,9 @@ class ProviderManager:
             except Exception as e:
                 set_span_error(span, e)
                 # Preserve typed errors so the route layer can map them to the
-                # correct status (ValueError->400, NotImplementedError->501).
-                if isinstance(e, (ValueError, NotImplementedError)):
+                # correct status (ValueError->400, NotImplementedError->501,
+                # ProviderHTTPError->upstream status/body).
+                if isinstance(e, (ValueError, NotImplementedError, ProviderHTTPError)):
                     raise
                 raise Exception(f"Responses create error: {str(e)}")
 

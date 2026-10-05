@@ -4,7 +4,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.openai_models import ChatCompletionRequest, ChatCompletionResponse
 from app.providers.provider_manager import provider_manager
@@ -32,6 +32,7 @@ from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
+from app.websearch import HEADER_NAME as WEBSEARCH_HEADER, maybe_intercept_chat, provider_key_for_model
 from opentelemetry import trace
 from opentelemetry.context import attach
 
@@ -89,7 +90,16 @@ async def chat_completions(
                 
                 # Preprocess the request
                 request = await transformation_manager.preprocess_request(request, context)
-            
+
+            websearch_loop = maybe_intercept_chat(
+                request,
+                provider_key_for_model(request.model),
+                provider_manager.chat_completion,
+                provider_manager.chat_completion_stream,
+            )
+            if websearch_loop is not None:
+                add_span_attributes(span, {"chat.websearch_interception": True})
+
             if request.stream:
                 # Validate the model up front so a bad/unknown model name yields
                 # a clean 400 (caught below) instead of an SSE error chunk inside
@@ -113,6 +123,8 @@ async def chat_completions(
                 # Add W3C Trace Context header if available
                 if traceparent:
                     headers["traceparent"] = traceparent
+                if websearch_loop is not None:
+                    headers[WEBSEARCH_HEADER] = "enabled"
                 
                 # Add streaming timeout info to span
                 add_span_attributes(span, {
@@ -123,7 +135,9 @@ async def chat_completions(
                 
                 return StreamingResponse(
                     stream_with_context_and_timeout(
-                        provider_manager.chat_completion_stream(request),
+                        websearch_loop.stream()
+                        if websearch_loop is not None
+                        else provider_manager.chat_completion_stream(request),
                         current_context,
                         request_obj,
                         timeout=STREAM_TIMEOUT_SECONDS,
@@ -134,7 +148,10 @@ async def chat_completions(
                 )
             else:
                 # For non-streaming responses, Langtrace will handle LLM instrumentation
-                response = await provider_manager.chat_completion(request)
+                if websearch_loop is not None:
+                    response = await websearch_loop.run()
+                else:
+                    response = await provider_manager.chat_completion(request)
 
                 # Apply response transformations
                 if transformation_manager:
@@ -145,6 +162,12 @@ async def chat_completions(
                 
                 # Use exclude_unset to preserve upstream response fidelity:
                 # only include fields actually returned by the provider
+                if websearch_loop is not None:
+                    content = response.model_dump(exclude_unset=True) if hasattr(response, 'model_dump') else response
+                    return JSONResponse(
+                        content=content,
+                        headers={WEBSEARCH_HEADER: websearch_loop.stats.header_value()},
+                    )
                 if hasattr(response, 'model_dump'):
                     return response.model_dump(exclude_unset=True)
                 return response

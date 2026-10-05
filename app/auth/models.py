@@ -169,6 +169,29 @@ class GlobalRateLimit(Base):
     updated_by = Column(String(50), nullable=True)
 
 
+class WebSearchSettings(Base):
+    """Web search interception settings (SearXNG). Single row (id=1)."""
+    __tablename__ = "websearch_settings"
+
+    id = Column(Integer, primary_key=True)  # always 1
+    enabled = Column(Boolean, default=False, nullable=False)
+    searxng_base_url = Column(String(500), nullable=True)
+    engines = Column(String(500), nullable=True)
+    categories = Column(String(200), nullable=True)
+    language = Column(String(20), nullable=True)
+    safesearch = Column(Integer, nullable=True)
+    time_range = Column(String(10), nullable=True)
+    max_results = Column(Integer, nullable=True)
+    max_snippet_chars = Column(Integer, nullable=True)
+    timeout_seconds = Column(Integer, nullable=True)
+    max_agentic_loops = Column(Integer, nullable=True)
+    max_queries_per_turn = Column(Integer, nullable=True)
+    apply_to = Column(Text, nullable=True)           # JSON array of API surfaces
+    enabled_providers = Column(Text, nullable=True)  # JSON array of provider keys; "*" = all
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+
 # The config-based admin is not a row in `users`, so its usage is recorded under this
 # reserved id. Every usage read that resolves ids to names must special-case it.
 ADMIN_USAGE_USER_ID = 0
@@ -747,6 +770,136 @@ class GlobalRateLimitUpdate(BaseModel):
         if self.rpd_default is not None and self.rpd_default < 0:
             raise ValueError("rpd_default must be >= 0")
         return self
+
+
+WEBSEARCH_API_SURFACES = ("anthropic_messages", "chat_completions", "responses")
+WEBSEARCH_SAFESEARCH_VALUES = (0, 1, 2)
+WEBSEARCH_TIME_RANGES = ("day", "week", "month", "year")
+
+# Effective values used when a websearch_settings column is NULL.
+WEBSEARCH_DEFAULTS = {
+    "enabled": False,
+    "searxng_base_url": None,
+    "engines": None,
+    "categories": "general",
+    "language": "auto",
+    "safesearch": 1,
+    "time_range": None,
+    "max_results": 5,
+    "max_snippet_chars": 500,
+    "timeout_seconds": 10,
+    "max_agentic_loops": 3,
+    "max_queries_per_turn": 5,
+    "apply_to": list(WEBSEARCH_API_SURFACES),
+    "enabled_providers": [],
+}
+
+
+class WebSearchSettingsResponse(BaseModel):
+    enabled: bool = False
+    searxng_base_url: Optional[str] = None
+    engines: Optional[str] = None
+    categories: Optional[str] = None
+    language: Optional[str] = None
+    safesearch: int = 1
+    time_range: Optional[str] = None
+    max_results: int = 5
+    max_snippet_chars: int = 500
+    timeout_seconds: int = 10
+    max_agentic_loops: int = 3
+    max_queries_per_turn: int = 5
+    apply_to: List[str] = Field(default_factory=lambda: list(WEBSEARCH_API_SURFACES))
+    enabled_providers: List[str] = Field(default_factory=list)
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+
+class WebSearchSettingsUpdate(BaseModel):
+    """Full replacement of the web search settings."""
+    enabled: bool = False
+    searxng_base_url: Optional[str] = None
+    engines: Optional[str] = None
+    categories: Optional[str] = None
+    language: Optional[str] = None
+    safesearch: int = 1
+    time_range: Optional[str] = None
+    max_results: int = Field(default=5, ge=1, le=20)
+    max_snippet_chars: int = Field(default=500, ge=50, le=5000)
+    timeout_seconds: int = Field(default=10, ge=1, le=60)
+    max_agentic_loops: int = Field(default=3, ge=1, le=10)
+    max_queries_per_turn: int = Field(default=5, ge=1, le=10)
+    apply_to: List[str] = Field(default_factory=lambda: list(WEBSEARCH_API_SURFACES))
+    enabled_providers: List[str] = Field(default_factory=list)
+
+    @field_validator("searxng_base_url", "engines", "categories", "language", "time_range", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
+
+    @field_validator("searxng_base_url")
+    @classmethod
+    def _validate_url(cls, v):
+        if v is None:
+            return v
+        if not re.match(r"^https?://[^\s/]+", v):
+            raise ValueError("searxng_base_url must start with http:// or https://")
+        return v.rstrip("/")
+
+    @field_validator("safesearch")
+    @classmethod
+    def _validate_safesearch(cls, v):
+        if v not in WEBSEARCH_SAFESEARCH_VALUES:
+            raise ValueError("safesearch must be 0, 1 or 2")
+        return v
+
+    @field_validator("time_range")
+    @classmethod
+    def _validate_time_range(cls, v):
+        if v is not None and v not in WEBSEARCH_TIME_RANGES:
+            raise ValueError(f"time_range must be one of {', '.join(WEBSEARCH_TIME_RANGES)}")
+        return v
+
+    @field_validator("apply_to")
+    @classmethod
+    def _validate_apply_to(cls, v):
+        unknown = [s for s in v if s not in WEBSEARCH_API_SURFACES]
+        if unknown:
+            raise ValueError(f"unknown API surface(s): {', '.join(unknown)}")
+        return list(dict.fromkeys(v))
+
+    @field_validator("enabled_providers")
+    @classmethod
+    def _validate_providers(cls, v):
+        return list(dict.fromkeys(p.strip() for p in v if isinstance(p, str) and p.strip()))
+
+    @model_validator(mode="after")
+    def _require_url_when_enabled(self):
+        if self.enabled and not self.searxng_base_url:
+            raise ValueError("searxng_base_url is required when web search is enabled")
+        return self
+
+
+class WebSearchEnginesRequest(BaseModel):
+    # Unsaved base URL to query; omitted -> stored settings.
+    searxng_base_url: Optional[str] = None
+
+    @field_validator("searxng_base_url", mode="before")
+    @classmethod
+    def _validate_url(cls, v):
+        if isinstance(v, str):
+            v = v.strip() or None
+        if v is not None and not re.match(r"^https?://[^\s/]+", v):
+            raise ValueError("searxng_base_url must start with http:// or https://")
+        return v.rstrip("/") if v else v
+
+
+class WebSearchTestRequest(BaseModel):
+    query: str = Field(default="SearXNG", min_length=1, max_length=500)
+    # Optional unsaved settings to test before saving; omitted -> stored settings.
+    settings: Optional[WebSearchSettingsUpdate] = None
 
 
 class UserRateLimitResponse(BaseModel):

@@ -61,6 +61,14 @@ from app.routes.stream_utils import (
 from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access
 from app.model_alias import apply_alias
+from fastapi.encoders import jsonable_encoder
+from app.websearch import (
+    HEADER_NAME as WEBSEARCH_HEADER,
+    maybe_intercept_chat,
+    maybe_intercept_responses,
+    responses_websearch_stream,
+    settle_pending_responses_calls,
+)
 from app.tracing import (
     get_w3c_traceparent,
     create_span,
@@ -304,6 +312,12 @@ async def azure_chat_completions(
             "azure.api_version": api_version or "",
         })
         try:
+            websearch_loop = maybe_intercept_chat(
+                request,
+                getattr(provider, "full_provider_name", None),
+                provider.chat_completion,
+                provider.chat_completion_stream,
+            )
             if request.stream:
                 current_context = otel_context.get_current()
                 traceparent = get_w3c_traceparent()
@@ -315,9 +329,13 @@ async def azure_chat_completions(
                 if traceparent:
                     headers["traceparent"] = traceparent
 
+                if websearch_loop is not None:
+                    headers[WEBSEARCH_HEADER] = "enabled"
                 return StreamingResponse(
                     stream_with_context_and_timeout(
-                        provider.chat_completion_stream(request),
+                        websearch_loop.stream()
+                        if websearch_loop is not None
+                        else provider.chat_completion_stream(request),
                         current_context,
                         request_obj,
                         timeout=STREAM_TIMEOUT_SECONDS,
@@ -327,6 +345,12 @@ async def azure_chat_completions(
                     headers=headers,
                 )
             else:
+                if websearch_loop is not None:
+                    response = await websearch_loop.run()
+                    return JSONResponse(
+                        content=response.model_dump(exclude_unset=True),
+                        headers={WEBSEARCH_HEADER: websearch_loop.stats.header_value()},
+                    )
                 response = await provider.chat_completion(request)
                 if hasattr(response, 'model_dump'):
                     return response.model_dump(exclude_unset=True)
@@ -778,6 +802,13 @@ async def azure_responses_create(
             "azure.api_version": api_version or "",
         })
         try:
+            owner_id = get_owner_user_id(auth)
+            request = settle_pending_responses_calls(request)
+            websearch_loop = maybe_intercept_responses(
+                request,
+                getattr(provider, "full_provider_name", None),
+                lambda r: provider_manager.responses_create(r, user_id=owner_id),
+            )
             if request.stream:
                 current_context = otel_context.get_current()
                 traceparent = get_w3c_traceparent()
@@ -788,6 +819,8 @@ async def azure_responses_create(
                 }
                 if traceparent:
                     headers["traceparent"] = traceparent
+                if websearch_loop is not None:
+                    headers[WEBSEARCH_HEADER] = "enabled"
 
                 # Route through provider_manager (not the provider directly) so
                 # the response_id -> provider mapping is stored with the owning
@@ -795,8 +828,10 @@ async def azure_responses_create(
                 # cancel/input_items below.
                 return StreamingResponse(
                     stream_with_context_and_timeout(
-                        provider_manager.responses_create_stream(
-                            request, user_id=get_owner_user_id(auth)
+                        responses_websearch_stream(websearch_loop)
+                        if websearch_loop is not None
+                        else provider_manager.responses_create_stream(
+                            request, user_id=owner_id
                         ),
                         current_context,
                         request_obj,
@@ -807,8 +842,14 @@ async def azure_responses_create(
                     headers=headers,
                 )
             else:
+                if websearch_loop is not None:
+                    response = await websearch_loop.run()
+                    return JSONResponse(
+                        content=jsonable_encoder(response),
+                        headers={WEBSEARCH_HEADER: websearch_loop.stats.header_value()},
+                    )
                 response = await provider_manager.responses_create(
-                    request, user_id=get_owner_user_id(auth)
+                    request, user_id=owner_id
                 )
                 return response
         except NotImplementedError as e:

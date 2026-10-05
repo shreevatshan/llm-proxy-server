@@ -14,7 +14,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -607,6 +607,35 @@ async def upsert_global_rate_limit(
         db.add(row)
     row.rpm_default = rpm
     row.rpd_default = rpd
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def get_websearch_settings(db: AsyncSession) -> Optional[WebSearchSettings]:
+    """Return the singleton web search settings row (id=1), or None if never saved."""
+    result = await db.execute(select(WebSearchSettings).where(WebSearchSettings.id == 1))
+    return result.scalar_one_or_none()
+
+
+async def upsert_websearch_settings(
+    db: AsyncSession, values: dict, admin_username: str
+) -> WebSearchSettings:
+    """Create or update the web search settings singleton.
+
+    ``values`` maps column names to already-validated values; list values are
+    stored as JSON.
+    """
+    row = await get_websearch_settings(db)
+    if row is None:
+        row = WebSearchSettings(id=1)
+        db.add(row)
+    for key, value in values.items():
+        if isinstance(value, list):
+            value = json.dumps(value)
+        setattr(row, key, value)
     row.updated_by = admin_username
     row.updated_at = datetime.utcnow()
     await db.commit()

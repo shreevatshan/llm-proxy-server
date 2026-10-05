@@ -41,6 +41,9 @@
     <button class="tab-button" onclick="showTab('model-mapping')">
         <i class="fas fa-map-signs"></i> Model Mapping
     </button>
+    <button class="tab-button" onclick="showTab('websearch')">
+        <i class="fas fa-magnifying-glass"></i> Web Search
+    </button>
 </div>
 
 <!-- Users Management Section -->
@@ -1081,6 +1084,178 @@
         </div>
     </div>
 </div>
+<!-- Web Search Interception Section -->
+<div class="section tab-content ws-page" id="websearch-tab" style="display: none;">
+    <div class="ws-head">
+        <h4 class="mb-0"><i class="fas fa-magnifying-glass me-2"></i>Web Search Interception</h4>
+        <button class="btn btn-primary" id="ws-save-btn" onclick="window.WebSearchManager?.save()">
+            <i class="fas fa-save me-1"></i>Save
+        </button>
+    </div>
+
+    <!-- Interception -->
+    <div class="card ws-card">
+        <div class="card-header ws-card__head">
+            <h5 class="mb-0"><i class="fas fa-shuffle me-2"></i>Interception</h5>
+            <div class="form-check form-switch mb-0">
+                <input class="form-check-input" type="checkbox" role="switch" id="ws-enabled">
+                <label class="form-check-label" for="ws-enabled">Enabled</label>
+            </div>
+        </div>
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-lg-4 col-md-6">
+                    <label class="form-label" id="ws-surfaces-label">API surfaces</label>
+                    <div class="dropdown ws-picker" id="ws-surfaces-picker" data-labelledby="ws-surfaces-label"></div>
+                </div>
+                <div class="col-lg-4 col-md-6">
+                    <label class="form-label" id="ws-providers-label">Providers</label>
+                    <div class="dropdown ws-picker" id="ws-providers-picker" data-labelledby="ws-providers-label"></div>
+                </div>
+                <div class="col-lg-2 col-6">
+                    <label class="form-label" for="ws-max-loops">Search rounds</label>
+                    <input type="number" id="ws-max-loops" class="form-control" min="1" max="10">
+                    <div class="form-text">Per request, 1–10.</div>
+                </div>
+                <div class="col-lg-2 col-6">
+                    <label class="form-label" for="ws-max-queries">Queries per round</label>
+                    <input type="number" id="ws-max-queries" class="form-control" min="1" max="10">
+                    <div class="form-text">Run in parallel.</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- SearXNG connection -->
+    <div class="card ws-card">
+        <div class="card-header ws-card__head">
+            <button class="ws-card__toggle collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#ws-conn-body"
+                    aria-expanded="false" aria-controls="ws-conn-body">
+                <i class="fas fa-chevron-right ws-chevron"></i>
+                <h5 class="mb-0"><i class="fas fa-plug me-2"></i>SearXNG connection</h5>
+                <span class="ws-card__summary" id="ws-conn-summary"></span>
+            </button>
+        </div>
+        <div class="collapse" id="ws-conn-body">
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-md-9">
+                        <label class="form-label" for="ws-base-url">Base URL</label>
+                        <input type="url" id="ws-base-url" class="form-control" placeholder="http://searxng:8080"
+                               oninput="window.WebSearchManager?.updateParamsVisibility()">
+                        <div class="form-text">
+                            Every query the model writes is sent here. The instance must list <code>json</code>
+                            under <code>search.formats</code> in its <code>settings.yml</code>.
+                        </div>
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label" for="ws-timeout">Timeout (s)</label>
+                        <input type="number" id="ws-timeout" class="form-control" min="1" max="60">
+                    </div>
+                </div>
+                <div class="ws-test">
+                    <label class="form-label" for="ws-test-query">Test with a query</label>
+                    <div class="ws-test__row">
+                        <input type="text" id="ws-test-query" class="form-control" value="SearXNG">
+                        <button class="btn btn-outline-secondary" id="ws-test-btn" onclick="window.WebSearchManager?.test()">
+                            <i class="fas fa-vial me-1"></i>Run test
+                        </button>
+                    </div>
+                    <div class="form-text">Uses the values on this page, saved or not.</div>
+                    <div id="ws-test-result"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Search parameters (shown once a base URL is entered) -->
+    <div class="card ws-card" id="ws-params-card" style="display: none;">
+        <div class="card-header ws-card__head">
+            <button class="ws-card__toggle" type="button" data-bs-toggle="collapse" data-bs-target="#ws-params-body"
+                    aria-expanded="true" aria-controls="ws-params-body">
+                <i class="fas fa-chevron-right ws-chevron"></i>
+                <h5 class="mb-0"><i class="fas fa-sliders me-2"></i>Search parameters</h5>
+                <span class="ws-card__summary" id="ws-params-summary"></span>
+            </button>
+            <button class="btn btn-outline-secondary btn-sm" type="button" id="ws-engines-fetch-btn"
+                    onclick="window.WebSearchManager?.fetchEngines()" title="Reload categories and engines from SearXNG">
+                <i class="fas fa-rotate me-1"></i>Reload from SearXNG
+            </button>
+        </div>
+        <div class="collapse show" id="ws-params-body">
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-lg-4 col-md-5">
+                        <label class="form-label" id="ws-source-label">Search with</label>
+                        <div class="btn-group ws-segmented" role="radiogroup" aria-labelledby="ws-source-label">
+                            <input type="radio" class="btn-check" name="ws-source" id="ws-source-all" value="all" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="ws-source-all">All</label>
+                            <input type="radio" class="btn-check" name="ws-source" id="ws-source-categories" value="categories" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="ws-source-categories">Categories</label>
+                            <input type="radio" class="btn-check" name="ws-source" id="ws-source-engines" value="engines" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="ws-source-engines">Engines</label>
+                        </div>
+                    </div>
+                    <div class="col-lg-8 col-md-7">
+                        <div id="ws-source-all-field">
+                            <label class="form-label">Covers</label>
+                            <p class="ws-source-note" id="ws-source-all-note">Every category on the instance, using the engines it turns on by default.</p>
+                        </div>
+                        <div id="ws-source-categories-field">
+                            <label class="form-label" id="ws-categories-label" for="ws-categories">Categories</label>
+                            <input type="text" id="ws-categories" class="form-control" placeholder="general (comma-separated)"
+                                   oninput="window.WebSearchManager?.renderCategories()">
+                            <div class="dropdown ws-picker" id="ws-categories-picker" data-labelledby="ws-categories-label" hidden></div>
+                            <div class="form-text">Each category searches the engines the instance turns on for it.</div>
+                        </div>
+                        <div id="ws-source-engines-field">
+                            <label class="form-label" id="ws-engines-label" for="ws-engines">Engines</label>
+                            <input type="text" id="ws-engines" class="form-control" placeholder="Comma-separated, e.g. bing,duckduckgo">
+                            <div class="dropdown ws-picker" id="ws-engines-picker" data-labelledby="ws-engines-label" hidden></div>
+                            <div class="form-text">Only these engines are searched. With none picked, searches use the general category.</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="ws-subhead">Results</div>
+                <div class="row g-3">
+                    <div class="col-lg col-md-4 col-6">
+                        <label class="form-label" for="ws-language">Language</label>
+                        <input type="text" id="ws-language" class="form-control" placeholder="auto">
+                    </div>
+                    <div class="col-lg col-md-4 col-6">
+                        <label class="form-label" for="ws-safesearch">Safe search</label>
+                        <select id="ws-safesearch" class="form-select">
+                            <option value="0">Off</option>
+                            <option value="1">Moderate</option>
+                            <option value="2">Strict</option>
+                        </select>
+                    </div>
+                    <div class="col-lg col-md-4 col-6">
+                        <label class="form-label" for="ws-time-range">Time range</label>
+                        <select id="ws-time-range" class="form-select">
+                            <option value="">Any time</option>
+                            <option value="day">Past day</option>
+                            <option value="week">Past week</option>
+                            <option value="month">Past month</option>
+                            <option value="year">Past year</option>
+                        </select>
+                    </div>
+                    <div class="col-lg col-md-6 col-6">
+                        <label class="form-label" for="ws-max-results">Results per query</label>
+                        <input type="number" id="ws-max-results" class="form-control" min="1" max="20">
+                    </div>
+                    <div class="col-lg col-md-6 col-12">
+                        <label class="form-label" for="ws-snippet-chars">Snippet length</label>
+                        <input type="number" id="ws-snippet-chars" class="form-control" min="50" max="5000">
+                        <div class="form-text">Characters, 50–5000.</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="ws-updated" id="ws-updated"></div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
@@ -1099,5 +1274,6 @@
 <script src="/static/js/features/admin/instance-group-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-access-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-alias-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/websearch-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/admin-dashboard.js?v={{ cache_version }}"></script>
 {% endblock %}

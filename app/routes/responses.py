@@ -11,7 +11,8 @@ import time
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.openai_models import (
     ResponsesCreateRequest,
@@ -37,6 +38,13 @@ from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
+from app.websearch import (
+    HEADER_NAME as WEBSEARCH_HEADER,
+    maybe_intercept_responses,
+    provider_key_for_model,
+    responses_websearch_stream,
+    settle_pending_responses_calls,
+)
 from typing import Union
 from app.routes.stream_utils import (
     stream_with_context_and_timeout,
@@ -146,6 +154,16 @@ async def responses_create(
             await enforce_group_rate_limit(request_obj, auth, request.model)
             await enforce_model_access(request_obj, auth, request.model)
 
+            owner_id = get_owner_user_id(auth)
+            request = settle_pending_responses_calls(request)
+            websearch_loop = maybe_intercept_responses(
+                request,
+                provider_key_for_model(request.model),
+                lambda r: provider_manager.responses_create(r, user_id=owner_id),
+            )
+            if websearch_loop is not None:
+                add_span_attributes(span, {"responses.websearch_interception": True})
+
             if request.stream:
                 # Validate the model up front so a bad/unknown model name yields
                 # a clean 400 (caught below) instead of an SSE error chunk inside
@@ -164,7 +182,9 @@ async def responses_create(
                 }
                 if traceparent:
                     headers["traceparent"] = traceparent
-                
+                if websearch_loop is not None:
+                    headers[WEBSEARCH_HEADER] = "enabled"
+
                 add_span_attributes(span, {
                     "stream.timeout_seconds": STREAM_TIMEOUT_SECONDS,
                     "stream.enabled": True,
@@ -173,8 +193,10 @@ async def responses_create(
                 
                 return StreamingResponse(
                     stream_with_context_and_timeout(
-                        provider_manager.responses_create_stream(
-                            request, user_id=get_owner_user_id(auth)
+                        responses_websearch_stream(websearch_loop)
+                        if websearch_loop is not None
+                        else provider_manager.responses_create_stream(
+                            request, user_id=owner_id
                         ),
                         current_context,
                         request_obj,
@@ -185,8 +207,14 @@ async def responses_create(
                     headers=headers
                 )
             else:
+                if websearch_loop is not None:
+                    response = await websearch_loop.run()
+                    return JSONResponse(
+                        content=jsonable_encoder(response),
+                        headers={WEBSEARCH_HEADER: websearch_loop.stats.header_value()},
+                    )
                 response = await provider_manager.responses_create(
-                    request, user_id=get_owner_user_id(auth)
+                    request, user_id=owner_id
                 )
                 return response
 

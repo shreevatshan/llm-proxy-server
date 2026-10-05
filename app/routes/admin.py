@@ -35,6 +35,7 @@ from app.auth.database import (
     get_user_model_policy, upsert_user_model_policy,
     list_user_model_exceptions, get_user_model_exception, upsert_user_model_exception,
     delete_user_model_exception, set_user_model_exceptions_bulk,
+    get_websearch_settings, upsert_websearch_settings,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
@@ -51,6 +52,7 @@ from app.auth.models import (
     InstanceGroupResponse, UserInstanceGroupRateLimitResponse, UserInstanceGroupRateLimitUpdate,
     ModelAliasUpsert, ModelAliasResponse,
     AdminPoolResponse,
+    WebSearchSettingsResponse, WebSearchSettingsUpdate, WebSearchTestRequest, WebSearchEnginesRequest,
 )
 from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_admin_email
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -1242,6 +1244,130 @@ async def update_rate_limit_defaults(
     from app.routes.pools import resettle_pools_after_commit
     await resettle_pools_after_commit(db, all_pools=True)
     return GlobalRateLimitResponse.model_validate(row)
+
+
+# ==================== Web Search Interception (SearXNG) ====================
+
+def _websearch_response(row) -> WebSearchSettingsResponse:
+    from app.websearch.settings import config_from_row
+
+    cfg = config_from_row(row)
+    return WebSearchSettingsResponse(
+        enabled=cfg.enabled,
+        searxng_base_url=cfg.searxng_base_url,
+        engines=cfg.engines,
+        categories=cfg.categories,
+        language=cfg.language,
+        safesearch=cfg.safesearch,
+        time_range=cfg.time_range,
+        max_results=cfg.max_results,
+        max_snippet_chars=cfg.max_snippet_chars,
+        timeout_seconds=cfg.timeout_seconds,
+        max_agentic_loops=cfg.max_agentic_loops,
+        max_queries_per_turn=cfg.max_queries_per_turn,
+        apply_to=sorted(cfg.apply_to),
+        enabled_providers=sorted(cfg.enabled_providers),
+        updated_at=getattr(row, "updated_at", None),
+        updated_by=getattr(row, "updated_by", None),
+    )
+
+
+def _websearch_values(body: WebSearchSettingsUpdate) -> dict:
+    return body.model_dump()
+
+
+@router.get("/websearch/settings", response_model=WebSearchSettingsResponse)
+async def get_websearch_settings_endpoint(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get web search interception settings (API key masked)."""
+    return _websearch_response(await get_websearch_settings(db))
+
+
+@router.put("/websearch/settings", response_model=WebSearchSettingsResponse)
+async def update_websearch_settings_endpoint(
+    body: WebSearchSettingsUpdate,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace web search interception settings and reload the request-time snapshot."""
+    row = await upsert_websearch_settings(db, _websearch_values(body), current_admin.username)
+    from app.websearch.settings import config_from_row, websearch_settings_cache
+    websearch_settings_cache.set_config(config_from_row(row))
+    return _websearch_response(row)
+
+
+@router.post("/websearch/test")
+async def test_websearch_endpoint(
+    body: WebSearchTestRequest,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Run one live SearXNG query with stored or unsaved settings."""
+    import time as _time
+    from app.websearch.searxng import search
+    from app.websearch.settings import config_from_row
+
+    stored = config_from_row(await get_websearch_settings(db))
+    cfg = stored
+    if body.settings is not None:
+        values = _websearch_values(body.settings)
+        values["apply_to"] = frozenset(values["apply_to"])
+        values["enabled_providers"] = frozenset(values["enabled_providers"])
+        cfg = stored.with_overrides(**values)
+    if not cfg.searxng_base_url:
+        raise HTTPException(status_code=400, detail="SearXNG base URL is not configured")
+
+    started = _time.monotonic()
+    outcome = await search(body.query, cfg)
+    latency_ms = int((_time.monotonic() - started) * 1000)
+    if not outcome.ok:
+        return {"ok": False, "latency_ms": latency_ms, "error_code": outcome.error_code, "error": outcome.message}
+    return {
+        "ok": True,
+        "latency_ms": latency_ms,
+        "result_count": len(outcome.results),
+        "results": [
+            {"title": r.title, "url": r.url, "snippet": r.snippet, "date": r.date}
+            for r in outcome.results[:3]
+        ],
+    }
+
+
+@router.post("/websearch/engines")
+async def list_websearch_engines(
+    body: WebSearchEnginesRequest,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Engines and categories loaded on the SearXNG instance (from its /config)."""
+    from app.websearch.searxng import SearxngConfigError, fetch_engines
+    from app.websearch.settings import config_from_row
+
+    stored = config_from_row(await get_websearch_settings(db))
+    base_url = body.searxng_base_url or stored.searxng_base_url
+    if not base_url:
+        raise HTTPException(status_code=400, detail="SearXNG base URL is not configured")
+    try:
+        return await fetch_engines(base_url, stored.timeout_seconds)
+    except SearxngConfigError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/websearch/providers")
+async def list_websearch_providers(
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Provider keys for the interception multi-select."""
+    items = [
+        {
+            "provider_key": getattr(provider, "full_provider_name", key),
+            "provider_type": getattr(provider, "provider_type", ""),
+        }
+        for key, provider in sorted(provider_manager.providers.items())
+    ]
+    return {"providers": items}
 
 
 @router.get("/rate-limits/users")

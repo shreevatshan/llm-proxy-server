@@ -87,6 +87,33 @@ services:
     networks:
       - llm-proxy-network
 
+  # SearXNG metasearch engine used by the proxy's web search interception.
+  # Configure it in Admin -> Web Search with base URL http://searxng:8080
+  # (the service name on llm-proxy-network; no host port is published).
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    volumes:
+      # Enables format=json, which the proxy requires (otherwise HTTP 403).
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    environment:
+      # Bind IPv4; the default (::) fails on hosts with IPv6 disabled.
+      - GRANIAN_HOST=0.0.0.0
+      # REQUIRED: SearXNG refuses to start without a real secret. Generate one with:
+      #   python -c "import secrets; print(secrets.token_hex(32))"
+      - SEARXNG_SECRET=change-this-to-a-random-secret
+    # Uncomment to reach SearXNG from the host for debugging:
+    # ports:
+    #   - "8080:8080"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - llm-proxy-network
+
 networks:
   llm-proxy-network:
     driver: bridge

@@ -38,3 +38,6 @@
 
 /* 10. Bootstrap overrides — must be last */
 @import url('pages/dark-flat-override.css');
+
+/* 11. Page-scoped rules that sit on top of the overrides */
+@import url('pages/websearch.css');

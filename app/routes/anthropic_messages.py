@@ -45,6 +45,11 @@ from app.rate_limit_dep import enforce_group_rate_limit
 from app.model_access_dep import enforce_model_access, ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
+from app.websearch import (
+    HEADER_NAME as WEBSEARCH_HEADER,
+    maybe_intercept_anthropic,
+    rewrite_anthropic_count_tokens_payload,
+)
 from opentelemetry import trace
 from opentelemetry.context import get_current
 
@@ -235,6 +240,14 @@ async def create_message(
                 "anthropic.provider": getattr(provider, 'full_provider_name', 'unknown'),
             })
 
+            # Web search interception rewrites the tools (and replayed history)
+            # before metadata is computed, so neither the dropped-fields header
+            # nor any adapter ever sees the server-side web search tool.
+            websearch_loop = maybe_intercept_anthropic(request, provider, anthropic_beta)
+            if websearch_loop is not None:
+                request = websearch_loop.request
+                add_span_attributes(span, {"anthropic.websearch_interception": True})
+
             request_metadata = _get_anthropic_request_metadata(provider, request, anthropic_beta)
             if request_metadata.mode == "unsupported":
                 return _anthropic_error(
@@ -265,6 +278,8 @@ async def create_message(
                 "anthropic.dropped_fields": ",".join(request_metadata.dropped_fields),
             })
             anthropic_headers = _anthropic_headers_from_metadata(request_metadata)
+            if websearch_loop is not None:
+                anthropic_headers[WEBSEARCH_HEADER] = "enabled"
 
             effective_stream = _get_effective_stream(request, provider)
             await _sync_request_tracking_streaming_mode(request_obj, effective_stream)
@@ -289,7 +304,12 @@ async def create_message(
                 async def generate():
                     terminal_event_seen = False
                     try:
-                        async for chunk in provider.anthropic_messages_stream(request, anthropic_beta=anthropic_beta):
+                        upstream_stream = (
+                            websearch_loop.stream()
+                            if websearch_loop is not None
+                            else provider.anthropic_messages_stream(request, anthropic_beta=anthropic_beta)
+                        )
+                        async for chunk in upstream_stream:
                             event_type, payload = _parse_sse_chunk(chunk)
                             # The first terminal error is still surfaced as the
                             # request outcome. Only error events that arrive
@@ -403,7 +423,11 @@ async def create_message(
             else:
                 # Non-streaming response
                 try:
-                    response = await provider.anthropic_messages(request, anthropic_beta=anthropic_beta)
+                    if websearch_loop is not None:
+                        response = await websearch_loop.run()
+                        anthropic_headers[WEBSEARCH_HEADER] = websearch_loop.stats.header_value()
+                    else:
+                        response = await provider.anthropic_messages(request, anthropic_beta=anthropic_beta)
                     if hasattr(response, "model_dump"):
                         response = response.model_dump(exclude_none=True)
                     return JSONResponse(content=response, headers=anthropic_headers)
@@ -551,6 +575,7 @@ async def count_message_tokens(
                 )
 
             if provider:
+                payload = rewrite_anthropic_count_tokens_payload(payload, provider)
                 try:
                     count_request = AnthropicCountTokensRequest.model_validate(payload)
                     provider_response = await provider.anthropic_count_tokens(count_request)

@@ -160,6 +160,10 @@ function showTab(tabName) {
         window.ModelAliasManager?.load();
     }
 
+    if (tabName === 'websearch') {
+        window.WebSearchManager?.load();
+    }
+
     // Load unified model management when switching to the models tab
     if (tabName === 'models') {
         window.ModelsManager?.load();

@@ -1,0 +1,24 @@
+# SearXNG settings for the LLM proxy's web search interception.
+# Mounted into the searxng container at /etc/searxng (see docker-compose).
+# Only overrides are listed; everything else comes from SearXNG's defaults.
+use_default_settings:
+  engines:
+    # wikidata's startup query is often rejected (HTTP 403); when its init
+    # fails, SearXNG errors on every "general" search ("search error").
+    remove:
+      - wikidata
+
+server:
+  # secret_key is supplied through the SEARXNG_SECRET environment variable.
+  # The instance is only reachable on the internal compose network, so the
+  # bot limiter (which would also need a Valkey/Redis service) is off.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+search:
+  safe_search: 1
+  # The proxy calls /search?format=json; without "json" here SearXNG answers 403.
+  formats:
+    - html
+    - json
