@@ -26,8 +26,13 @@ from app.tracing import (
 )
 
 
-async def clear_models_for_provider(db: AsyncSession, provider_key: str) -> int:
-    """Clear all models for a specific provider."""
+async def clear_models_for_provider(db: AsyncSession, provider_key: str, commit: bool = True) -> int:
+    """Clear all models for a specific provider.
+
+    With ``commit=False`` the deletes are flushed but not committed, so the caller
+    can re-insert in the same transaction. The flush matters: model_id is unique and
+    the unit of work emits INSERTs before DELETEs within a single flush.
+    """
     try:
         models = await get_models_by_provider(db, provider_key)
         count = len(models)
@@ -35,7 +40,10 @@ async def clear_models_for_provider(db: AsyncSession, provider_key: str) -> int:
         for model in models:
             await db.delete(model)
         
-        await db.commit()
+        if commit:
+            await db.commit()
+        else:
+            await db.flush()
         return count
     except Exception as e:
         await db.rollback()
@@ -164,7 +172,9 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
 
             # Fetch succeeded (or manual deployments are known): now it's safe to
             # clear and replace.
-            cleared_count = await clear_models_for_provider(db, provider_key)
+            # Clear and re-insert in one transaction: readers never see the provider
+            # empty, and the SQLite write lock is taken once instead of per model.
+            cleared_count = await clear_models_for_provider(db, provider_key, commit=False)
             add_span_attributes(span, {
                 "provider.models_cleared": cleared_count
             })
@@ -174,6 +184,7 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
                     "provider.deployments_count": 0,
                     "provider.status": "no_deployments"
                 })
+                await db.commit()
                 return {
                     "provider_key": provider_key,
                     "provider_type": "azure",
@@ -200,9 +211,12 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
                     model_id=model_id,
                     provider_key=provider_key,
                     model_name=deployment_name,
-                    is_enabled=is_enabled
+                    is_enabled=is_enabled,
+                    commit=False,
                 )
                 created_count += 1
+
+            await db.commit()
             
             add_span_attributes(span, {
                 "provider.models_created": created_count,
@@ -284,7 +298,9 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
                 await _close_provider_instance(provider_instance)
 
             # Fetch succeeded: now it's safe to clear and replace.
-            cleared_count = await clear_models_for_provider(db, provider_key)
+            # Clear and re-insert in one transaction: readers never see the provider
+            # empty, and the SQLite write lock is taken once instead of per model.
+            cleared_count = await clear_models_for_provider(db, provider_key, commit=False)
             add_span_attributes(span, {
                 "provider.models_cleared": cleared_count
             })
@@ -294,6 +310,7 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
                     "provider.models_fetched": 0,
                     "provider.status": "no_models"
                 })
+                await db.commit()
                 return {
                     "provider_key": provider_key,
                     "provider_type": provider_creds.provider_type,
@@ -323,9 +340,12 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
                     model_id=model.id,
                     provider_key=provider_key,
                     model_name=model_name,
-                    is_enabled=is_enabled
+                    is_enabled=is_enabled,
+                    commit=False,
                 )
                 created_count += 1
+
+            await db.commit()
             
             add_span_attributes(span, {
                 "provider.models_created": created_count,

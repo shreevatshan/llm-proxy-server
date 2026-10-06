@@ -345,10 +345,13 @@ async def sync_models_from_providers(
             is_enabled = existing_model.is_enabled if existing_model else True
             
             await create_or_update_model_configuration(
-                db, model.id, provider_key, model_name, is_enabled
+                db, model.id, provider_key, model_name, is_enabled, commit=False
             )
             synced_models += 1
-        
+
+        # One commit for the whole sync rather than one write-lock acquisition per model.
+        await db.commit()
+
         # Identify stale models (models in DB but not synced)
         from app.auth.database import identify_stale_models
         stale_models = await identify_stale_models(db, synced_model_ids)

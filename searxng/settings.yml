@@ -7,6 +7,9 @@ use_default_settings:
     # fails, SearXNG errors on every "general" search ("search error").
     remove:
       - wikidata
+      # DuckDuckGo answers server IPs with a CAPTCHA, so it never returns
+      # results and only adds a warning to the log on every search.
+      - duckduckgo
 
 server:
   # secret_key is supplied through the SEARXNG_SECRET environment variable.
@@ -15,6 +18,13 @@ server:
   limiter: false
   public_instance: false
   image_proxy: false
+
+outgoing:
+  # Per-engine timeout. The 3s default is too short for Brave, which then
+  # drops out of the results; keep it below the proxy's web search timeout
+  # (Admin -> Web Search, 10s by default) so SearXNG answers first.
+  request_timeout: 5.0
+  max_request_timeout: 8.0
 
 search:
   safe_search: 1

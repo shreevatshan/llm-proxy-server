@@ -29,7 +29,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from app import time_utils
 from app.concurrency import TaskReentrantLock, lock_in_use
 
@@ -309,6 +309,10 @@ class RateLimitTracker:
         self._rpd_cache: Dict[str, _RpdCacheEntry] = {}            # scope_key → entry
         # Group RPD cache keyed by (scope_key, group_id)
         self._group_rpd_cache: Dict[Tuple[str, int], _RpdCacheEntry] = {}
+        # Single-flight for RPD cache refills: (cache kind, cache key) → [lock, holders].
+        # Concurrent misses on one key share a single DB read instead of each taking a
+        # pooled connection. Entries are dropped once nobody holds or awaits them.
+        self._rpd_inflight: Dict[Tuple[str, Any], list] = {}
         self._user_locks: Dict[int, asyncio.Lock] = {}
         # One lock per pool, serialising composition changes and settlement. See
         # pool_lock() for the ordering rule that makes it safe.
@@ -1214,82 +1218,95 @@ class RateLimitTracker:
         if expired) instead of caching a fabricated 0 — caching 0 would disable
         the daily limit for the whole TTL on every transient error (fail-open).
         """
-        now = time.time()
-        entry = self._rpd_cache.get(scope_key)
-        if entry and entry.expires_at > now:
-            return entry.count
-
-        try:
+        async def load() -> int:
             from app.request_tracker import request_tracker
             rows = await request_tracker.get_today_count(member_ids)
-        except Exception:
-            logger.error(
-                "RPD count read failed for %s; serving last-known count",
-                scope_key, exc_info=True,
-            )
-            # Serve the stale cached value if present; otherwise 0 but do NOT
-            # cache it so the next request retries the DB immediately.
-            return entry.count if entry else 0
+            return max(0, rows + self._carry_sum(member_ids, "overall", 0))
 
-        count = max(0, rows + self._carry_sum(member_ids, "overall", 0))
-        self._rpd_cache[scope_key] = _RpdCacheEntry(
-            count=count, expires_at=now + _RPD_TTL
+        return await self._read_rpd_cached(
+            "overall", self._rpd_cache, scope_key, load,
+            "RPD count read failed for %s; serving last-known count", (scope_key,),
         )
-        return count
+
+    async def _read_rpd_cached(
+        self, kind: str, cache: Dict[Any, _RpdCacheEntry], cache_key: Any,
+        load: Callable[[], Awaitable[int]], error_msg: str, error_args: tuple,
+    ) -> int:
+        """Serve an RPD count from `cache`, refilling it with one `load()` per key.
+
+        Requests that miss together wait on the first one's read and then take the
+        value it cached, so a burst for one user or pool opens one DB session, not one
+        per request.
+
+        On a load failure the last-known entry is served even if expired; with none,
+        0 is returned but NOT cached, so the next request retries immediately.
+        Requests already waiting when a load fails share that failure rather than
+        each retrying in turn, which would queue them behind one DB timeout apiece.
+        """
+        entry = cache.get(cache_key)
+        if entry and entry.expires_at > time.time():
+            return entry.count
+
+        flight_key = (kind, cache_key)
+        flight = self._rpd_inflight.get(flight_key)
+        if flight is None:
+            # [lock, holders, monotonic time of the last failed load]
+            flight = self._rpd_inflight[flight_key] = [asyncio.Lock(), 0, None]
+        flight[1] += 1
+        arrived = time.monotonic()
+        try:
+            async with flight[0]:
+                # Another request may have refilled the entry while we waited.
+                entry = cache.get(cache_key)
+                now = time.time()
+                if entry and entry.expires_at > now:
+                    return entry.count
+                if flight[2] is not None and flight[2] >= arrived:
+                    return entry.count if entry else 0
+                try:
+                    count = await load()
+                except Exception:
+                    flight[2] = time.monotonic()
+                    logger.error(error_msg, *error_args, exc_info=True)
+                    return entry.count if entry else 0
+                cache[cache_key] = _RpdCacheEntry(count=count, expires_at=now + _RPD_TTL)
+                return count
+        finally:
+            flight[1] -= 1
+            if flight[1] == 0 and self._rpd_inflight.get(flight_key) is flight:
+                del self._rpd_inflight[flight_key]
 
     async def _get_today_group_count(
         self, scope_key: str, member_ids: List[int],
         model_ids: List[str], group_id: int,
     ) -> int:
         """Return today's effective request count for all models in the group, TTL-cached."""
-        now = time.time()
-        cache_key = (scope_key, group_id)
-        entry = self._group_rpd_cache.get(cache_key)
-        if entry and entry.expires_at > now:
-            return entry.count
-
-        try:
+        async def load() -> int:
             from app.request_tracker import request_tracker
             rows = await request_tracker.get_today_group_count(member_ids, model_ids)
-        except Exception:
-            logger.error(
-                "Group RPD count read failed for %s group %s; serving last-known count",
-                scope_key, group_id, exc_info=True,
-            )
-            return entry.count if entry else 0
+            return max(0, rows + self._carry_sum(member_ids, "model_group", group_id))
 
-        count = max(0, rows + self._carry_sum(member_ids, "model_group", group_id))
-        self._group_rpd_cache[cache_key] = _RpdCacheEntry(
-            count=count, expires_at=now + _RPD_TTL
+        return await self._read_rpd_cached(
+            "model_group", self._group_rpd_cache, (scope_key, group_id), load,
+            "Group RPD count read failed for %s group %s; serving last-known count",
+            (scope_key, group_id),
         )
-        return count
 
     async def _get_today_instance_group_count(
         self, scope_key: str, member_ids: List[int],
         provider_keys: List[str], group_id: int,
     ) -> int:
         """Return today's effective request count across all instances in the group, TTL-cached."""
-        now = time.time()
-        cache_key = (scope_key, group_id)
-        entry = self._instance_group_rpd_cache.get(cache_key)
-        if entry and entry.expires_at > now:
-            return entry.count
-
-        try:
+        async def load() -> int:
             from app.request_tracker import request_tracker
             rows = await request_tracker.get_today_instance_group_count(member_ids, provider_keys)
-        except Exception:
-            logger.error(
-                "Instance-group RPD count read failed for %s group %s; serving last-known count",
-                scope_key, group_id, exc_info=True,
-            )
-            return entry.count if entry else 0
+            return max(0, rows + self._carry_sum(member_ids, "instance_group", group_id))
 
-        count = max(0, rows + self._carry_sum(member_ids, "instance_group", group_id))
-        self._instance_group_rpd_cache[cache_key] = _RpdCacheEntry(
-            count=count, expires_at=now + _RPD_TTL
+        return await self._read_rpd_cached(
+            "instance_group", self._instance_group_rpd_cache, (scope_key, group_id), load,
+            "Instance-group RPD count read failed for %s group %s; serving last-known count",
+            (scope_key, group_id),
         )
-        return count
 
 
 rate_limit_tracker = RateLimitTracker()

@@ -59,6 +59,11 @@ class ProviderManager:
         
         # Per-provider lock to prevent concurrent DB syncs for the same provider
         self._provider_sync_locks: Dict[str, asyncio.Lock] = {}
+
+        # Serialises provider DB syncs across providers. SQLite has a single writer, so
+        # parallel syncs only parked connections on the write lock until the pool ran
+        # dry; model fetches still run in parallel, only the short write is queued.
+        self._db_write_lock = asyncio.Lock()
     
     def _track_task(self, task: asyncio.Task) -> None:
         """Track a background task for proper cleanup on shutdown."""
@@ -534,12 +539,16 @@ class ProviderManager:
             self._provider_sync_locks[provider_name] = asyncio.Lock()
         
         async with self._provider_sync_locks[provider_name]:
-            await self._sync_provider_to_database_locked(provider_name, models)
+            async with self._db_write_lock:
+                await self._sync_provider_to_database_locked(provider_name, models)
 
     async def _sync_provider_to_database_locked(self, provider_name: str, models: List[ModelInfo]) -> None:
         """Sync provider models to database (must be called under lock).
         
         Uses upsert logic: update existing models, insert new ones, remove stale ones.
+        Everything is staged and committed once, and nothing is written when the
+        provider's models are unchanged, so a sync holds the SQLite write lock at most
+        once and briefly.
         """
         with create_span(
             "provider.sync_to_database",
@@ -556,41 +565,52 @@ class ProviderManager:
                         # Get existing models to preserve enabled states and detect stale models
                         from app.auth.database import get_models_by_provider
                         existing_models = await get_models_by_provider(db, provider_name)
-                        enabled_states = {m.model_id: m.is_enabled for m in existing_models}
-                        existing_ids = set(enabled_states.keys())
+                        existing_by_id = {m.model_id: m for m in existing_models}
                         
                         # Build set of new model IDs
                         new_ids = {m.id for m in models}
                         
                         # Delete stale models (in DB but no longer from provider)
-                        stale_ids = existing_ids - new_ids
-                        if stale_ids:
-                            for m in existing_models:
-                                if m.model_id in stale_ids:
-                                    await db.delete(m)
-                            await db.commit()
+                        stale_ids = set(existing_by_id) - new_ids
+                        for model_id in stale_ids:
+                            await db.delete(existing_by_id[model_id])
                         
-                        # Upsert current models
-                        created_count = 0
+                        # Upsert current models, touching only rows that actually change
+                        # (is_enabled is admin-owned and always preserved).
+                        updated_count = 0
+                        inserted_count = 0
                         for model in models:
                             model_name = model.id.split('/', 1)[1] if '/' in model.id else model.id
-                            is_enabled = enabled_states.get(model.id, True)
+                            existing = existing_by_id.get(model.id)
+                            if existing is not None:
+                                if existing.provider_key != provider_name or existing.model_name != model_name:
+                                    existing.provider_key = provider_name
+                                    existing.model_name = model_name
+                                    updated_count += 1
+                                continue
                             
+                            # Not under this provider; the helper's lookup still covers a
+                            # row filed under another provider_key.
                             await create_or_update_model_configuration(
                                 db=db,
                                 model_id=model.id,
                                 provider_key=provider_name,
                                 model_name=model_name,
-                                is_enabled=is_enabled
+                                is_enabled=True,
+                                commit=False,
                             )
-                            created_count += 1
+                            inserted_count += 1
                         
-                        await db.commit()
-                        print(f"✓ Database synced with {created_count} models for {provider_name}" +
-                              (f" (removed {len(stale_ids)} stale)" if stale_ids else ""))
+                        if stale_ids or updated_count or inserted_count:
+                            await db.commit()
+                            print(f"✓ Database synced with {len(models)} models for {provider_name}" +
+                                  f" (added {inserted_count}, updated {updated_count}, removed {len(stale_ids)} stale)")
+                        else:
+                            print(f"✓ Database already in sync for {provider_name} ({len(models)} models)")
                         
                         add_span_attributes(span, {
-                            "provider.models_created": created_count,
+                            "provider.models_created": inserted_count,
+                            "provider.models_updated": updated_count,
                             "provider.models_stale_removed": len(stale_ids),
                             "provider.db_sync_status": "success"
                         })

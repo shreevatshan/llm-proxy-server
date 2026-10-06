@@ -26,6 +26,11 @@ SYNC_DATABASE_URL = DATABASE_URL.replace("sqlite+aiosqlite://", "sqlite://")
 
 # Database timeout and retry configuration
 DATABASE_BUSY_TIMEOUT = int(os.getenv("DATABASE_BUSY_TIMEOUT", "5"))  # seconds
+# Async connection pool sizing. SQLite has a single writer, so raising these only
+# lets more sessions queue on the write lock; tune with care.
+DATABASE_POOL_SIZE = int(os.getenv("DATABASE_POOL_SIZE", "5"))
+DATABASE_MAX_OVERFLOW = int(os.getenv("DATABASE_MAX_OVERFLOW", "10"))
+DATABASE_POOL_TIMEOUT = int(os.getenv("DATABASE_POOL_TIMEOUT", "30"))  # seconds
 DB_RETRY_MAX_ATTEMPTS = int(os.getenv("DB_RETRY_MAX_ATTEMPTS", "3"))
 DB_RETRY_BACKOFF_MS = int(os.getenv("DB_RETRY_BACKOFF_MS", "100"))  # milliseconds
 
@@ -64,6 +69,9 @@ ensure_db_directory()
 engine = create_async_engine(
     DATABASE_URL, 
     echo=False,
+    pool_size=DATABASE_POOL_SIZE,
+    max_overflow=DATABASE_MAX_OVERFLOW,
+    pool_timeout=DATABASE_POOL_TIMEOUT,
     pool_pre_ping=True,
     pool_recycle=300,  # Recycle connections after 5 minutes
     connect_args={"check_same_thread": False, "timeout": DATABASE_BUSY_TIMEOUT}
@@ -997,9 +1005,15 @@ async def create_or_update_model_configuration(
     model_id: str,
     provider_key: str,
     model_name: str,
-    is_enabled: bool = True
+    is_enabled: bool = True,
+    commit: bool = True,
 ) -> ModelConfiguration:
-    """Create or update a model configuration."""
+    """Create or update a model configuration.
+
+    With ``commit=False`` the change is only staged on the session, so bulk
+    callers can write many rows in one transaction (one SQLite write-lock
+    acquisition) and commit once themselves.
+    """
     existing = await get_model_configuration(db, model_id)
     
     if existing:
@@ -1007,8 +1021,9 @@ async def create_or_update_model_configuration(
         existing.model_name = model_name
         existing.is_enabled = is_enabled
         existing.updated_at = datetime.utcnow()
-        await db.commit()
-        await db.refresh(existing)
+        if commit:
+            await db.commit()
+            await db.refresh(existing)
         return existing
     else:
         model_config = ModelConfiguration(
@@ -1018,8 +1033,9 @@ async def create_or_update_model_configuration(
             is_enabled=is_enabled
         )
         db.add(model_config)
-        await db.commit()
-        await db.refresh(model_config)
+        if commit:
+            await db.commit()
+            await db.refresh(model_config)
         return model_config
 
 
