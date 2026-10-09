@@ -2985,6 +2985,27 @@ async def _run_auto_migrations():
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add azure_backend column: {e}")
 
+        # Add the backend-selection columns to websearch_settings. NULL means
+        # "use the default" (provider -> searxng), so existing rows keep working.
+        # On a fresh database create_tables_async() has already made these and
+        # this is a no-op.
+        try:
+            result = await conn.execute(text("PRAGMA table_info(websearch_settings)"))
+            columns = [row[1] for row in result.fetchall()]
+            if columns:
+                for name, ddl in (
+                    ('provider', "ALTER TABLE websearch_settings ADD COLUMN provider TEXT"),
+                    ('fourget_base_url', "ALTER TABLE websearch_settings ADD COLUMN fourget_base_url TEXT"),
+                    ('fourget_scraper', "ALTER TABLE websearch_settings ADD COLUMN fourget_scraper TEXT"),
+                    ('fourget_lang', "ALTER TABLE websearch_settings ADD COLUMN fourget_lang TEXT"),
+                    ('fourget_country', "ALTER TABLE websearch_settings ADD COLUMN fourget_country TEXT"),
+                ):
+                    if name not in columns:
+                        logger.info(f"Auto-migration: Adding '{name}' column to websearch_settings")
+                        await conn.execute(text(ddl))
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not add websearch backend columns: {e}")
+
         # Migrate api_version → discovery_api_version and drop legacy Azure AD columns.
         try:
             result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))

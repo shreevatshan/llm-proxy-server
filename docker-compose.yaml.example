@@ -98,12 +98,18 @@ services:
   searxng:
     image: searxng/searxng:latest
     container_name: searxng
-    volumes:
+    configs:
       # Enables format=json, which the proxy requires (otherwise HTTP 403).
-      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - source: searxng_settings
+        target: /etc/searxng/settings.yml
     environment:
       # Bind IPv4; the default (::) fails on hosts with IPv6 disabled.
       - GRANIAN_HOST=0.0.0.0
+      # Only reachable on the internal compose network, so the bot limiter
+      # (which would also need a Valkey/Redis service) is off.
+      - SEARXNG_LIMITER=false
+      - SEARXNG_PUBLIC_INSTANCE=false
+      - SEARXNG_IMAGE_PROXY=false
       # REQUIRED: SearXNG refuses to start without a real secret. Generate one with:
       #   python -c "import secrets; print(secrets.token_hex(32))"
       - SEARXNG_SECRET=change-this-to-a-random-secret
@@ -119,6 +125,58 @@ services:
     networks:
       - llm-proxy-network
 
+  # 4get metasearch engine; the alternative web-search backend.
+  # Configure it in Admin -> Web Search with base URL http://fourget
+  # (the service name on llm-proxy-network; no host port is published).
+  # BOT_PROTECTION and API_ENABLED are deliberately not set: the image already
+  # defaults to captcha-off and API-on, and gen_config.php writes env overrides
+  # as quoted PHP strings, which would break those constants' comparisons.
+  fourget:
+    image: luuul/4get:latest
+    container_name: fourget
+    environment:
+      - FOURGET_PROTO=http
+      - FOURGET_SERVER_NAME=fourget
+    # Uncomment to reach 4get from the host for debugging:
+    # ports:
+    #   - "8082:80"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - llm-proxy-network
+
 networks:
   llm-proxy-network:
     driver: bridge
+
+configs:
+  # SearXNG settings for the proxy's web search interception, mounted at
+  # /etc/searxng/settings.yml (inline content needs Docker Compose 2.23+).
+  # Only overrides are listed; everything else comes from SearXNG's defaults.
+  # server.* settings are set through environment variables on the service.
+  searxng_settings:
+    content: |
+      use_default_settings:
+        engines:
+          # wikidata's startup query is often rejected (HTTP 403); when its init
+          # fails, SearXNG errors on every "general" search ("search error").
+          remove:
+            - wikidata
+
+      outgoing:
+        # Per-engine timeout. The 3s default is too short for Brave, which then
+        # drops out of the results; keep it below the proxy's web search timeout
+        # (Admin -> Web Search, 10s by default) so SearXNG answers first.
+        request_timeout: 5.0
+        max_request_timeout: 8.0
+
+      search:
+        safe_search: 1
+        # The proxy calls /search?format=json; without "json" here SearXNG answers 403.
+        formats:
+          - html
+          - json

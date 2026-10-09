@@ -73,6 +73,7 @@ async def _check_model_exists(provider: object, model_name: str) -> str:
         return "cache_hit"
 
     # Cache miss — try a single live refresh to handle the staleness window.
+    started_at = time.time()
     try:
         fresh_models: List = await provider.get_available_models()
         if fresh_models:
@@ -85,6 +86,10 @@ async def _check_model_exists(provider: object, model_name: str) -> str:
                 # Fall back to the id prefix convention ({prefix}/{model}).
                 provider_prefix = fresh_models[0].id.split("/", 1)[0]
             await cache.update_provider_models(provider_prefix, fresh_models)
+            # The models are listed again, so clear any "hidden after failed sync" state.
+            provider_manager.record_sync_status(
+                provider_prefix, True, len(fresh_models), started_at=started_at
+            )
             if any(m.id == model_name for m in fresh_models):
                 return "live_refresh_hit"
     except Exception:

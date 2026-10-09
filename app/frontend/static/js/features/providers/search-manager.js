@@ -215,7 +215,7 @@ class SearchManager {
         const pk = esc(provider.provider_key);
 
         let html = `
-            <div class="unified-provider-card search-result ${!provider.enabled ? 'disabled' : ''}" id="search-provider-${pk}">
+            <div class="unified-provider-card search-result ${!provider.enabled ? 'disabled' : ''} ${window.ProviderManager.isSyncHidden(provider) ? 'sync-hidden' : ''}" id="search-provider-${pk}">
                 <div class="provider-card-header">
                     <div class="provider-info">
                         <div class="provider-title">
@@ -228,7 +228,7 @@ class SearchManager {
                             ${provider.modelMatches ? `<span class="badge bg-info ms-2"><i class="fas fa-cog"></i> ${provider.matchingModels.length} Model${provider.matchingModels.length !== 1 ? 's' : ''}</span>` : ''}
                         </div>
                         <div class="provider-stats">
-                            <span class="model-stats">Models: ${provider.model_count || 0} (${provider.enabled_model_count || 0} enabled)</span>
+                            ${window.ProviderManager.modelLine(provider)}
                         </div>
                     </div>
                     <div class="provider-actions">
@@ -248,6 +248,7 @@ class SearchManager {
                         </button>
                     </div>
                 </div>
+                ${window.ProviderManager.syncNotice(provider)}
         `;
 
         // Show matching models if any

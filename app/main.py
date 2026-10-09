@@ -130,7 +130,7 @@ async def shared_shutdown():
     from app.request_tracker import request_tracker
     from app.rate_limit import rate_limit_tracker
     from app.websearch.settings import websearch_settings_cache
-    from app.websearch.searxng import close_client as close_searxng_client
+    from app.websearch.client import close_client as close_search_client
 
     # Phase 1: Stop background tasks and caches (may be using provider clients)
     phase1_tasks = [
@@ -140,7 +140,7 @@ async def shared_shutdown():
         asyncio.create_task(request_tracker.stop()),
         asyncio.create_task(rate_limit_tracker.stop()),
         asyncio.create_task(websearch_settings_cache.stop()),
-        asyncio.create_task(close_searxng_client()),
+        asyncio.create_task(close_search_client()),
     ]
 
     try:

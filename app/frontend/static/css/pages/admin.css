@@ -505,9 +505,10 @@ input:checked + .model-toggle-slider:before {
     background-color: var(--success-600) !important;
 }
 
+/* success-600 is near-white in the monochrome palette, so the text must be dark */
 .badge.bg-success,
 .badge.bg-success * {
-    color: var(--mono-white) !important;
+    color: var(--mono-text-inverse) !important;
 }
 
 .badge.bg-info {
@@ -523,9 +524,10 @@ input:checked + .model-toggle-slider:before {
     background-color: var(--accent-500) !important;
 }
 
+/* accent-500 is white in the monochrome palette, so the text must be dark */
 .badge.bg-primary,
 .badge.bg-primary * {
-    color: var(--mono-white) !important;
+    color: var(--mono-text-inverse) !important;
 }
 
 /* Gap utilities */

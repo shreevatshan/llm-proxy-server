@@ -1,4 +1,4 @@
-"""Server-side web search interception (SearXNG).
+"""Server-side web search interception (SearXNG or 4get).
 
 Routes call the ``maybe_intercept_*`` helpers; each returns None when the
 feature is off for that surface/provider or the request carries no web search

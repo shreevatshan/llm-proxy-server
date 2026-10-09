@@ -98,6 +98,10 @@ Run with:
 docker-compose up -d
 ```
 
+This is the minimal single-service setup. `docker-compose.yaml.example` in the
+repository has the full stack, including the `searxng` and `fourget` search
+backends described under [Web Search Interception](#web-search-interception).
+
 ### Environment Variables
 
 | Variable | Required | Default | Description |
@@ -276,6 +280,73 @@ Examples:
 - `google:primary/gemini-2.0-flash-exp`
 - `openai:primary/gpt-4o`
 - `ollama:local/llama3.2`
+
+## Web Search Interception
+
+When a client sends a web search tool, the proxy can strip it, run the searches
+itself against a self-hosted metasearch engine, and feed the results back to the
+model. Two backends are supported and either can be selected at runtime:
+
+| Backend | Compose service | Base URL to configure |
+|---------|-----------------|-----------------------|
+| SearXNG | `searxng` | `http://searxng:8080` |
+| 4get | `fourget` | `http://fourget` |
+
+Both services are defined in `docker-compose.yaml.example` on
+`llm-proxy-network` with no host port published, so they are reachable only
+from the proxy container. SearXNG refuses to start without a real
+`SEARXNG_SECRET`; generate one with
+`python -c "import secrets; print(secrets.token_hex(32))"`. Its settings
+(JSON output enabled, engine timeouts, unreliable engines removed) are inlined
+as a compose `config`, which needs Docker Compose 2.23 or newer.
+
+### How it works
+
+1. A request arrives with a web search tool. Detected forms:
+   - **Anthropic Messages:** server tools such as `web_search_20250305`, or a
+     schema-less tool named `web_search` (as sent by Claude Code).
+   - **Chat Completions:** the `web_search_options` field.
+   - **Responses API:** any tool whose type starts with `web_search` (e.g. `web_search`, `web_search_preview`).
+   - On any surface, a function tool named `web_search_proxy` (or
+     `litellm_web_search`, for LiteLLM compatibility).
+2. The proxy replaces it with an internal `web_search_proxy` function tool and
+   calls the upstream model.
+3. When the model calls that tool, the proxy runs the queries concurrently on
+   the configured backend and feeds the results back, repeating until the model
+   answers or the round limit is reached. Duplicate queries are skipped.
+4. The client sees one request and one response. On the Anthropic and
+   Responses surfaces, searches come back as native `server_tool_use` /
+   `web_search_tool_result` blocks or `web_search_call` items, so clients
+   render them as they would a provider-hosted search. Streaming is supported,
+   and token usage is summed across all rounds.
+
+Intercepted responses carry an `x-llmproxy-websearch: rounds=<n>;queries=<n>`
+header.
+
+### Configuration
+
+**These settings are not environment variables.** Everything is configured in
+the admin dashboard under **Web Search**: pick the backend, enter its base URL,
+press *Run test* to confirm connectivity, then enable interception and choose
+which API surfaces and providers it applies to. Each backend stores its own URL
+and parameters, so switching between them keeps both configurations. Changes
+take effect immediately, without a restart.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| Apply to | all surfaces | Anthropic Messages, Chat Completions, Responses |
+| Providers | none | Provider instances interception applies to (`*` for all) |
+| Max results | 5 | Results returned per query |
+| Max snippet chars | 500 | Snippet length per result |
+| Timeout | 10s | Per-search timeout |
+| Max agentic loops | 3 | Search rounds before the model must answer |
+| Max queries per turn | 5 | Queries accepted from a single model turn |
+| SearXNG: categories / language / safesearch / time range / engines | `general` / `auto` / moderate / any / default | Passed through to SearXNG |
+| 4get: scraper / language / country | `ddg` / — / — | Upstream engine 4get scrapes, plus locale |
+
+Interception only runs when it is enabled, a base URL is set for the selected
+backend, and both the request's API surface and its provider are selected.
+Otherwise the web search tool is passed to the upstream provider unchanged.
 
 ## API Documentation
 

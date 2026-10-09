@@ -2,7 +2,7 @@
 
 Each loop takes a request whose web search tool was already rewritten to the
 internal function tool (see app.websearch.tools), calls the upstream model,
-runs any internal tool calls against SearXNG, feeds the results back and
+runs any internal tool calls against the configured search backend, feeds the results back and
 repeats until the model answers or the round limit is reached. The client
 sees one request and one response.
 
@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
 
 from app.tracing import add_span_attributes, create_span
-from app.websearch.searxng import SearchFailed, SearchOutcome, format_outcome_text, run_searches
+from app.websearch.backends import run_searches
+from app.websearch.results import SearchFailed, SearchOutcome, format_outcome_text
 from app.websearch.settings import WebSearchConfig
 from app.websearch.tools import (
     INTERNAL_TOOL_NAME,

@@ -64,7 +64,47 @@ class ProviderManager:
         # parallel syncs only parked connections on the write lock until the pool ran
         # dry; model fetches still run in parallel, only the short write is queued.
         self._db_write_lock = asyncio.Lock()
-    
+
+        # Outcome of each provider's last model fetch, keyed by provider_key, for the
+        # admin dashboard. In-memory only: resets on restart until the next sync.
+        self._sync_status: Dict[str, Dict[str, Any]] = {}
+
+    def record_sync_status(
+        self,
+        provider_key: str,
+        ok: bool,
+        model_count: int,
+        error: Optional[str] = None,
+        started_at: Optional[float] = None,
+    ) -> bool:
+        """Record the outcome of a model fetch for a provider.
+
+        ``started_at`` is when the fetch began. A fetch that began before the one
+        already recorded is stale (e.g. a slow startup fetch finishing after an
+        admin-triggered sync) and is dropped. Returns whether it was recorded.
+        """
+        now = time.time()
+        started_at = now if started_at is None else started_at
+        if self._sync_superseded(provider_key, started_at):
+            return False
+        self._sync_status[provider_key] = {
+            "state": "ok" if ok else "failed",
+            "model_count": model_count,
+            "error": error,
+            "last_sync_at": now,
+            "started_at": started_at,
+        }
+        return True
+
+    def _sync_superseded(self, provider_key: str, started_at: float) -> bool:
+        """Whether a fetch that began after ``started_at`` has already been recorded."""
+        current = self._sync_status.get(provider_key)
+        return current is not None and current["started_at"] > started_at
+
+    def get_sync_status(self, provider_key: str) -> Optional[Dict[str, Any]]:
+        """Outcome of the provider's last model fetch, or None if it hasn't been fetched yet."""
+        return self._sync_status.get(provider_key)
+
     def _track_task(self, task: asyncio.Task) -> None:
         """Track a background task for proper cleanup on shutdown."""
         self._background_tasks.add(task)
@@ -286,8 +326,15 @@ class ProviderManager:
         print(f"Total models fetched from all providers: {len(all_models)}")
         return all_models
     
-    async def _fetch_models_with_timeout(self, provider_name: str, provider: BaseProvider, timeout: int = MODEL_FETCH_TIMEOUT_SECONDS) -> List[ModelInfo]:
+    async def _fetch_models_with_timeout(
+        self,
+        provider_name: str,
+        provider: BaseProvider,
+        timeout: int = MODEL_FETCH_TIMEOUT_SECONDS,
+        started_at: Optional[float] = None,
+    ) -> List[ModelInfo]:
         """Fetch models from a single provider with timeout (3 minutes for all providers)."""
+        started_at = time.time() if started_at is None else started_at
         with create_span(
             "provider.fetch_models",
             attributes={
@@ -310,6 +357,12 @@ class ProviderManager:
                 )
                 
                 print(f"Successfully fetched {len(models)} models from {provider_name}")
+                if models:
+                    self.record_sync_status(provider_name, True, len(models), started_at=started_at)
+                else:
+                    self.record_sync_status(
+                        provider_name, False, 0, "Provider returned no models", started_at=started_at
+                    )
                 add_span_attributes(span, {
                     "provider.models_count": len(models),
                     "provider.status": "success"
@@ -319,6 +372,9 @@ class ProviderManager:
             except asyncio.TimeoutError:
                 error_msg = f"Timeout fetching models from {provider_name} after {timeout}s"
                 print(error_msg)
+                self.record_sync_status(
+                    provider_name, False, 0, f"Timeout after {timeout}s", started_at=started_at
+                )
                 add_span_attributes(span, {
                     "provider.models_count": 0,
                     "provider.status": "timeout"
@@ -342,6 +398,11 @@ class ProviderManager:
                             for deployment_name in provider.deployments:
                                 models.append(provider.create_model_info(deployment_name, "azure"))
                             print(f"Azure fallback created {len(models)} models")
+                            self.record_sync_status(
+                                provider_name, True, len(models),
+                                "Discovery failed; using configured deployments",
+                                started_at=started_at,
+                            )
                             add_span_attributes(span, {
                                 "provider.models_count": len(models),
                                 "provider.fallback_used": True,
@@ -354,6 +415,9 @@ class ProviderManager:
                             "provider.fallback_error": str(fallback_error)
                         })
                 
+                self.record_sync_status(
+                    provider_name, False, 0, str(e) or type(e).__name__, started_at=started_at
+                )
                 add_span_attributes(span, {
                     "provider.models_count": 0,
                     "provider.status": "error"
@@ -492,13 +556,29 @@ class ProviderManager:
                         return
                 
                 # Fetch models with timeout
-                models = await self._fetch_models_with_timeout(provider_name, provider)
-                
+                started_at = time.time()
+                models = await self._fetch_models_with_timeout(provider_name, provider, started_at=started_at)
+
+                # A sync that began after this fetch (e.g. an admin save during a slow
+                # startup) already wrote fresher models; don't clear or overwrite them.
+                if self._sync_superseded(provider_name, started_at):
+                    print(f"⏭️  Discarding stale fetch for {provider_name}: a newer sync has completed")
+                    add_span_attributes(span, {
+                        "provider.skipped": True,
+                        "provider.skip_reason": "superseded"
+                    })
+                    return
+
                 if not models:
-                    print(f"No models fetched from {provider_name}")
+                    # Fetch failed or returned nothing: hide this provider's models from
+                    # the listing until a later sync succeeds. DB rows (and their admin-set
+                    # enabled states) are kept so the models come back unchanged.
+                    await self.model_cache.update_provider_models(provider_name, [])
+                    print(f"No models fetched from {provider_name}; removed its models from the listing until the next successful sync")
                     add_span_attributes(span, {
                         "provider.models_fetched": 0,
-                        "provider.status": "no_models"
+                        "provider.status": "no_models",
+                        "provider.cache_cleared": True
                     })
                     return
                 
@@ -816,6 +896,8 @@ class ProviderManager:
             new_providers: Dict[str, BaseProvider] = {}
             await self._load_providers_from_database(target=new_providers)
             self.providers = new_providers
+            # Drop status for providers that were deleted or disabled.
+            self._sync_status = {k: v for k, v in self._sync_status.items() if k in new_providers}
 
             # Refresh model configurations (without fetching models from providers)
             await self._load_model_configurations()

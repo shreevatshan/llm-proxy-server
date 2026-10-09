@@ -7,6 +7,7 @@ that use deployment names instead of dynamic model discovery.
 """
 
 import asyncio
+import time
 from typing import List, Dict, Any, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -529,6 +530,10 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
                     "message": "Provider deleted, models cleaned up"
                 }
             
+            # When this sync began, so a slower fetch that started earlier can't
+            # overwrite its status or cache slice afterwards.
+            started_at = time.time()
+
             # For create and update, force a complete provider manager refresh first
             # This is crucial for handling provider renames. (The former
             # asyncio.sleep(0.1) "wait for refresh" here was dead — the refresh
@@ -547,7 +552,22 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
             result["action"] = action
             
             print(f"🔍 Sync result for {provider_key}: {result}")
-            
+
+            # This path doesn't go through _fetch_models_with_timeout, so record the
+            # outcome here for the dashboard's per-provider sync status.
+            synced = "error" not in result and bool(result.get("models"))
+            recorded = provider_manager.record_sync_status(
+                provider_key,
+                synced,
+                len(result.get("models") or []),
+                None if synced else (result.get("error") or "No models returned"),
+                started_at=started_at,
+            )
+            if recorded and not synced:
+                # Same policy as the startup fetch: a failed sync hides the provider's
+                # models from the listing until a later sync succeeds.
+                await provider_manager.model_cache.update_provider_models(provider_key, [])
+
             # Mark provider as synced to avoid re-syncing on startup
             if "error" not in result:
                 provider_manager.mark_provider_synced(provider_key)
@@ -562,8 +582,7 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
                     
                     if model_ids:
                         from app.openai_models import ModelInfo
-                        import time
-                        
+
                         synced_models = []
                         for model_id in model_ids:
                             synced_models.append(ModelInfo(

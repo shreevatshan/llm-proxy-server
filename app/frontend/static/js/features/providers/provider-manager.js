@@ -60,6 +60,62 @@ class ProviderManager {
         }
     }
 
+    // -- Last-sync display -------------------------------------------------
+    // Disabled providers aren't fetched, so they show no sync information.
+
+    isSyncHidden(provider) {
+        return provider.enabled && provider.sync_state === 'failed';
+    }
+
+    _syncAgo(provider) {
+        const when = new Date(provider.last_sync_at * 1000);
+        const mins = Math.max(0, Math.round((Date.now() - when.getTime()) / 60000));
+        const ago = mins < 1 ? 'just now'
+            : mins < 60 ? `${mins} min ago`
+            : mins < 1440 ? `${Math.round(mins / 60)} h ago`
+            : `${Math.round(mins / 1440)} d ago`;
+        return { ago, exact: when.toLocaleString() };
+    }
+
+    // The stats line: saved/enabled counts from the DB, then what users can see right now.
+    modelLine(provider) {
+        const esc = window.UIUtils.escapeHtml;
+        const saved = provider.model_count || 0;
+        const enabled = provider.enabled_model_count || 0;
+        let line = `<span class="model-stats">Models: ${saved} (${enabled} enabled)</span>`;
+        if (!provider.enabled) return line;
+
+        if (!provider.sync_state) {
+            return line + `<span class="sync-meta">Waiting for the first sync</span>`;
+        }
+        // A failed sync is explained by syncNotice() below the header instead.
+        if (provider.sync_state !== 'ok') return line;
+        const { ago, exact } = this._syncAgo(provider);
+        const note = provider.sync_error ? `\n${provider.sync_error}` : '';
+        return line + `<span class="sync-meta" title="${esc(`Last synced ${exact}${note}`)}">synced ${ago}</span>`;
+    }
+
+    // Shown only when the last sync failed: what happened and what happens next.
+    syncNotice(provider) {
+        if (!this.isSyncHidden(provider)) return '';
+        const esc = window.UIUtils.escapeHtml;
+        const { ago, exact } = this._syncAgo(provider);
+        const reason = provider.sync_error || 'The provider could not be reached';
+        return `
+            <div class="sync-notice" role="status">
+                <i class="fas fa-eye-slash sync-notice-icon"></i>
+                <div class="sync-notice-body">
+                    <p class="sync-notice-title">Models are hidden from users because the last sync failed.</p>
+                    <p class="sync-notice-reason">${esc(reason)}</p>
+                    <p class="sync-notice-hint">
+                        Checked <time datetime="${new Date(provider.last_sync_at * 1000).toISOString()}" title="${esc(exact)}">${ago}</time>.
+                        They come back on the next successful sync, with their settings kept.
+                    </p>
+                </div>
+            </div>
+        `;
+    }
+
     renderProvidersList(providers) {
         const listContainer = document.getElementById('providers-list');
 
@@ -109,6 +165,7 @@ class ProviderManager {
             }
             
             const enabledCount = typeProviders.filter(p => p.enabled).length;
+            const hiddenCount = typeProviders.filter(p => this.isSyncHidden(p)).length;
             const esc = window.UIUtils.escapeHtml;
 
             html += `
@@ -116,6 +173,7 @@ class ProviderManager {
                     <div class="provider-type-header" data-action="toggle-type" data-group-key="${esc(groupKey)}">
                         <i class="fas fa-chevron-down provider-type-icon" id="icon-${esc(groupKey)}"></i>
                         <h3>${esc(typeTitle)}</h3>
+                        ${hiddenCount ? `<span class="provider-count is-hidden" title="${hiddenCount} provider${hiddenCount === 1 ? '' : 's'} in this group failed the last sync">${hiddenCount} hidden</span>` : ''}
                         <span class="provider-count">${enabledCount}/${typeProviders.length}</span>
                     </div>
                     <div class="provider-type-content" id="content-${esc(groupKey)}">
@@ -145,7 +203,7 @@ class ProviderManager {
 
                 const pk = esc(provider.provider_key);
                 html += `
-                    <div class="unified-provider-card ${!provider.enabled ? 'disabled' : ''}" id="provider-${pk}">
+                    <div class="unified-provider-card ${!provider.enabled ? 'disabled' : ''} ${this.isSyncHidden(provider) ? 'sync-hidden' : ''}" id="provider-${pk}">
                         <div class="provider-card-header">
                             <div class="provider-info">
                                 <div class="provider-title">
@@ -156,7 +214,7 @@ class ProviderManager {
                                     <span class="status-badge ${statusClass}">${statusText}</span>
                                 </div>
                                 <div class="provider-stats">
-                                    <span class="model-stats">Models: ${provider.model_count || 0} (${provider.enabled_model_count || 0} enabled)</span>
+                                    ${this.modelLine(provider)}
                                 </div>
                             </div>
                             <div class="provider-actions">
@@ -173,6 +231,7 @@ class ProviderManager {
                                 </button>
                             </div>
                         </div>
+                        ${this.syncNotice(provider)}
                     </div>
                 `;
             });

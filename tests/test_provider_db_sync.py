@@ -204,6 +204,117 @@ class ProviderDbSyncTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["cleared"], 1)
         self.assertEqual(await self._rows("ollama:a"), {})
 
+    # -- failed sync hides models from the listing --------------------------
+
+    async def _periodic_sync(self, key, fetched):
+        provider = SimpleNamespace(provider_type="ollama")
+        with patch.object(self.pm, "_fetch_models_with_timeout", AsyncMock(return_value=fetched)):
+            await self.pm._fetch_and_sync_provider_models(key, provider)
+
+    def _cached_ids(self):
+        return {m.id for m in self.pm.model_cache.get_models()}
+
+    async def test_failed_fetch_clears_cache_keeps_db(self):
+        await self._add_provider("ollama:a")
+        a_models = _models("ollama:a", ["keep", "off"])
+        b_models = _models("ollama:b", ["other"])
+        await self.pm._sync_provider_to_database("ollama:a", a_models)
+        self.pm.model_cache.update_models(a_models + b_models)
+
+        async with self._factory() as db:
+            row = (await db.execute(
+                select(ModelConfiguration).where(ModelConfiguration.model_id == "ollama:a/off")
+            )).scalar_one()
+            row.is_enabled = False
+            await db.commit()
+
+        await self._periodic_sync("ollama:a", [])
+
+        self.assertEqual(self._cached_ids(), {"ollama:b/other"})
+        rows = await self._rows("ollama:a")
+        self.assertEqual(set(rows), {"ollama:a/keep", "ollama:a/off"})
+        self.assertFalse(rows["ollama:a/off"].is_enabled)
+
+    async def test_models_return_after_recovery(self):
+        await self._add_provider("ollama:a")
+        a_models = _models("ollama:a", ["keep", "off"])
+        await self.pm._sync_provider_to_database("ollama:a", a_models)
+        async with self._factory() as db:
+            row = (await db.execute(
+                select(ModelConfiguration).where(ModelConfiguration.model_id == "ollama:a/off")
+            )).scalar_one()
+            row.is_enabled = False
+            await db.commit()
+
+        await self._periodic_sync("ollama:a", [])
+        self.assertEqual(self._cached_ids(), set())
+
+        await self._periodic_sync("ollama:a", a_models)
+        self.assertEqual(self._cached_ids(), {"ollama:a/keep", "ollama:a/off"})
+        self.assertFalse((await self._rows("ollama:a"))["ollama:a/off"].is_enabled)
+
+    async def test_sync_status_recorded(self):
+        provider = SimpleNamespace(provider_type="ollama", get_available_models=AsyncMock())
+        self.assertIsNone(self.pm.get_sync_status("ollama:a"))
+
+        provider.get_available_models.return_value = _models("ollama:a", ["x", "y"])
+        await self.pm._fetch_models_with_timeout("ollama:a", provider)
+        status = self.pm.get_sync_status("ollama:a")
+        self.assertEqual((status["state"], status["model_count"], status["error"]), ("ok", 2, None))
+
+        provider.get_available_models.side_effect = RuntimeError("connection refused")
+        await self.pm._fetch_models_with_timeout("ollama:a", provider)
+        status = self.pm.get_sync_status("ollama:a")
+        self.assertEqual((status["state"], status["model_count"]), ("failed", 0))
+        self.assertIn("connection refused", status["error"])
+
+        provider.get_available_models.side_effect = None
+        provider.get_available_models.return_value = []
+        await self.pm._fetch_models_with_timeout("ollama:a", provider)
+        self.assertEqual(self.pm.get_sync_status("ollama:a")["state"], "failed")
+
+    async def test_stale_startup_fetch_does_not_clobber_newer_sync(self):
+        a_models = _models("ollama:a", ["fresh"])
+        self.pm.model_cache.update_models(a_models)
+        released = asyncio.Event()
+
+        async def slow_fetch():
+            await released.wait()
+            raise RuntimeError("timed out upstream")
+
+        provider = SimpleNamespace(provider_type="ollama", get_available_models=slow_fetch)
+        startup = asyncio.create_task(self.pm._fetch_and_sync_provider_models("ollama:a", provider))
+
+        # An admin sync starts and finishes while the startup fetch is still in flight.
+        await asyncio.sleep(0.01)
+        self.assertTrue(self.pm.record_sync_status("ollama:a", True, 1))
+        released.set()
+        await startup
+
+        self.assertEqual(self._cached_ids(), {"ollama:a/fresh"})
+        self.assertEqual(self.pm.get_sync_status("ollama:a")["state"], "ok")
+
+    async def _provider_change(self, key, result):
+        from app.providers import auto_sync
+
+        with patch.object(auto_sync, "provider_manager", self.pm), \
+             patch.object(self.pm, "refresh_providers_from_database", AsyncMock()), \
+             patch.object(self.pm, "refresh_model_configurations", AsyncMock()), \
+             patch.object(auto_sync, "sync_provider_models", AsyncMock(return_value=result)):
+            async with self._factory() as db:
+                return await auto_sync.auto_sync_on_provider_change(db, key, "update")
+
+    async def test_failed_admin_sync_hides_models(self):
+        self.pm.model_cache.update_models(_models("ollama:a", ["x"]) + _models("ollama:b", ["y"]))
+
+        await self._provider_change("ollama:a", {"error": "connection refused"})
+        self.assertEqual(self._cached_ids(), {"ollama:b/y"})
+        self.assertEqual(self.pm.get_sync_status("ollama:a")["state"], "failed")
+
+        await self._provider_change("ollama:a", {"models": ["ollama:a/x"], "message": "ok"})
+        self.assertEqual(self._cached_ids(), {"ollama:a/x", "ollama:b/y"})
+        self.assertEqual(self.pm.get_sync_status("ollama:a")["state"], "ok")
+
 
 if __name__ == "__main__":
     unittest.main()

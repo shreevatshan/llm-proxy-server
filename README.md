@@ -28,7 +28,10 @@ Effortlessly create autonomous agents, multi-agent frameworks, and complex workf
 **3. Supercharge AI Developer Tools**
 Easily plug into your favorite AI developer ecosystem tools! Seamlessly run terminal assistants and AI coding extensions like **Claude Code**, **Cline**, and others, effortlessly backing them with the best models via the proxy.
 
-**4. The Perfect Foundation for AI Applications**
+**4. Web Search for Any Model**
+Give every model live web access, even ones whose provider has no built-in search. When a client sends a web search tool (Claude Code's `web_search`, OpenAI's `web_search_options` or Responses `web_search` tool), the proxy runs the searches itself against a self-hosted **SearXNG** or **4get** instance and feeds the results back to the model. No search API keys or per-query fees are involved, and it all happens in a single request. Configure it from the admin dashboard under **Web Search**; see [DOCKER_README.md](DOCKER_README.md#web-search-interception) for setup.
+
+**5. The Perfect Foundation for AI Applications**
 Stop worrying about provider API updates breaking your app. Use this gateway as an ultra-stable backbone to quickly build out and scale features like:
 *   Automated PR Reviewers
 *   Intelligent Customer Chatbots

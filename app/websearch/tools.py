@@ -12,7 +12,7 @@ import json
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.websearch.searxng import SearchOutcome, format_outcome_text
+from app.websearch.results import SearchOutcome, format_outcome_text
 
 INTERNAL_TOOL_NAME = "web_search_proxy"
 # Also accepted from clients (LiteLLM compatibility).

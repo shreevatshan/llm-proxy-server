@@ -6,7 +6,11 @@ import logging
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from app.auth.models import WEBSEARCH_API_SURFACES, WEBSEARCH_DEFAULTS
+from app.auth.models import (
+    WEBSEARCH_API_SURFACES,
+    WEBSEARCH_DEFAULTS,
+    WEBSEARCH_PROVIDER_FOURGET,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +26,20 @@ _REFRESH_INTERVAL_SECONDS = 30
 @dataclass(frozen=True)
 class WebSearchConfig:
     enabled: bool = False
+    provider: str = WEBSEARCH_DEFAULTS["provider"]
+    # SearXNG backend
     searxng_base_url: Optional[str] = None
     engines: Optional[str] = None
     categories: Optional[str] = WEBSEARCH_DEFAULTS["categories"]
     language: Optional[str] = WEBSEARCH_DEFAULTS["language"]
     safesearch: int = WEBSEARCH_DEFAULTS["safesearch"]
     time_range: Optional[str] = None
+    # 4get backend
+    fourget_base_url: Optional[str] = None
+    fourget_scraper: Optional[str] = WEBSEARCH_DEFAULTS["fourget_scraper"]
+    fourget_lang: Optional[str] = None
+    fourget_country: Optional[str] = None
+    # Shared
     max_results: int = WEBSEARCH_DEFAULTS["max_results"]
     max_snippet_chars: int = WEBSEARCH_DEFAULTS["max_snippet_chars"]
     timeout_seconds: int = WEBSEARCH_DEFAULTS["timeout_seconds"]
@@ -35,6 +47,13 @@ class WebSearchConfig:
     max_queries_per_turn: int = WEBSEARCH_DEFAULTS["max_queries_per_turn"]
     apply_to: frozenset = field(default_factory=lambda: frozenset(WEBSEARCH_API_SURFACES))
     enabled_providers: frozenset = field(default_factory=frozenset)
+
+    @property
+    def base_url(self) -> Optional[str]:
+        """Connection URL of the selected backend."""
+        if self.provider == WEBSEARCH_PROVIDER_FOURGET:
+            return self.fourget_base_url
+        return self.searxng_base_url
 
     def with_overrides(self, **overrides) -> "WebSearchConfig":
         return replace(self, **overrides)
@@ -63,12 +82,17 @@ def config_from_row(row) -> WebSearchConfig:
         return WebSearchConfig()
     return WebSearchConfig(
         enabled=bool(row.enabled),
+        provider=_pick(row, "provider"),
         searxng_base_url=row.searxng_base_url or None,
         engines=row.engines or None,
         categories=_pick(row, "categories"),
         language=_pick(row, "language"),
         safesearch=_pick(row, "safesearch"),
         time_range=row.time_range or None,
+        fourget_base_url=row.fourget_base_url or None,
+        fourget_scraper=_pick(row, "fourget_scraper"),
+        fourget_lang=row.fourget_lang or None,
+        fourget_country=row.fourget_country or None,
         max_results=_pick(row, "max_results"),
         max_snippet_chars=_pick(row, "max_snippet_chars"),
         timeout_seconds=_pick(row, "timeout_seconds"),
@@ -125,7 +149,7 @@ class WebSearchSettingsCache:
     def is_active(self, surface: str, provider_key: Optional[str]) -> bool:
         """True when interception applies to this API surface and provider."""
         cfg = self._config
-        if not cfg.enabled or not cfg.searxng_base_url:
+        if not cfg.enabled or not cfg.base_url:
             return False
         if surface not in cfg.apply_to:
             return False

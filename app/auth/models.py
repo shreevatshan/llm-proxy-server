@@ -170,17 +170,29 @@ class GlobalRateLimit(Base):
 
 
 class WebSearchSettings(Base):
-    """Web search interception settings (SearXNG). Single row (id=1)."""
+    """Web search interception settings. Single row (id=1).
+
+    Each backend keeps its own connection and parameters, so switching
+    `provider` never discards the other one's configuration.
+    """
     __tablename__ = "websearch_settings"
 
     id = Column(Integer, primary_key=True)  # always 1
     enabled = Column(Boolean, default=False, nullable=False)
+    provider = Column(String(20), nullable=True)      # "searxng" | "fourget"
+    # SearXNG backend
     searxng_base_url = Column(String(500), nullable=True)
     engines = Column(String(500), nullable=True)
     categories = Column(String(200), nullable=True)
     language = Column(String(20), nullable=True)
     safesearch = Column(Integer, nullable=True)
     time_range = Column(String(10), nullable=True)
+    # 4get backend
+    fourget_base_url = Column(String(500), nullable=True)
+    fourget_scraper = Column(String(50), nullable=True)   # NULL -> ddg
+    fourget_lang = Column(String(20), nullable=True)
+    fourget_country = Column(String(32), nullable=True)
+    # Shared
     max_results = Column(Integer, nullable=True)
     max_snippet_chars = Column(Integer, nullable=True)
     timeout_seconds = Column(Integer, nullable=True)
@@ -776,15 +788,39 @@ WEBSEARCH_API_SURFACES = ("anthropic_messages", "chat_completions", "responses")
 WEBSEARCH_SAFESEARCH_VALUES = (0, 1, 2)
 WEBSEARCH_TIME_RANGES = ("day", "week", "month", "year")
 
+WEBSEARCH_PROVIDER_SEARXNG = "searxng"
+WEBSEARCH_PROVIDER_FOURGET = "fourget"
+# Display names, for messages and the admin UI.
+WEBSEARCH_PROVIDER_LABELS = {
+    WEBSEARCH_PROVIDER_SEARXNG: "SearXNG",
+    WEBSEARCH_PROVIDER_FOURGET: "4get",
+}
+WEBSEARCH_PROVIDERS = tuple(WEBSEARCH_PROVIDER_LABELS)
+
+# 4get scrapers that implement a web search (scraper/*.php with a web() method,
+# as listed by its own frontend). A scraper the instance does not know falls
+# back to its default silently, so the admin form validates against this.
+# Kept in 4get's order: the first entry is its own default and ours.
+FOURGET_WEB_SCRAPERS = (
+    "ddg", "brave", "google", "google_api", "google_cse", "startpage",
+    "yandex", "yahoo_japan", "yep", "mojeek", "mwmbl", "marginalia",
+    "naver", "baidu", "coccoc", "solofield", "purili", "wiby",
+)
+
 # Effective values used when a websearch_settings column is NULL.
 WEBSEARCH_DEFAULTS = {
     "enabled": False,
+    "provider": WEBSEARCH_PROVIDER_SEARXNG,
     "searxng_base_url": None,
     "engines": None,
     "categories": "general",
     "language": "auto",
     "safesearch": 1,
     "time_range": None,
+    "fourget_base_url": None,
+    "fourget_scraper": FOURGET_WEB_SCRAPERS[0],
+    "fourget_lang": None,
+    "fourget_country": None,
     "max_results": 5,
     "max_snippet_chars": 500,
     "timeout_seconds": 10,
@@ -797,12 +833,17 @@ WEBSEARCH_DEFAULTS = {
 
 class WebSearchSettingsResponse(BaseModel):
     enabled: bool = False
+    provider: str = WEBSEARCH_PROVIDER_SEARXNG
     searxng_base_url: Optional[str] = None
     engines: Optional[str] = None
     categories: Optional[str] = None
     language: Optional[str] = None
     safesearch: int = 1
     time_range: Optional[str] = None
+    fourget_base_url: Optional[str] = None
+    fourget_scraper: Optional[str] = None
+    fourget_lang: Optional[str] = None
+    fourget_country: Optional[str] = None
     max_results: int = 5
     max_snippet_chars: int = 500
     timeout_seconds: int = 10
@@ -817,12 +858,17 @@ class WebSearchSettingsResponse(BaseModel):
 class WebSearchSettingsUpdate(BaseModel):
     """Full replacement of the web search settings."""
     enabled: bool = False
+    provider: str = WEBSEARCH_PROVIDER_SEARXNG
     searxng_base_url: Optional[str] = None
     engines: Optional[str] = None
     categories: Optional[str] = None
     language: Optional[str] = None
     safesearch: int = 1
     time_range: Optional[str] = None
+    fourget_base_url: Optional[str] = None
+    fourget_scraper: Optional[str] = None
+    fourget_lang: Optional[str] = None
+    fourget_country: Optional[str] = None
     max_results: int = Field(default=5, ge=1, le=20)
     max_snippet_chars: int = Field(default=500, ge=50, le=5000)
     timeout_seconds: int = Field(default=10, ge=1, le=60)
@@ -831,7 +877,11 @@ class WebSearchSettingsUpdate(BaseModel):
     apply_to: List[str] = Field(default_factory=lambda: list(WEBSEARCH_API_SURFACES))
     enabled_providers: List[str] = Field(default_factory=list)
 
-    @field_validator("searxng_base_url", "engines", "categories", "language", "time_range", mode="before")
+    @field_validator(
+        "searxng_base_url", "engines", "categories", "language", "time_range",
+        "fourget_base_url", "fourget_scraper", "fourget_lang", "fourget_country",
+        mode="before",
+    )
     @classmethod
     def _blank_to_none(cls, v):
         if isinstance(v, str):
@@ -839,14 +889,37 @@ class WebSearchSettingsUpdate(BaseModel):
             return v or None
         return v
 
-    @field_validator("searxng_base_url")
+    @field_validator("searxng_base_url", "fourget_base_url")
     @classmethod
-    def _validate_url(cls, v):
+    def _validate_url(cls, v, info):
         if v is None:
             return v
         if not re.match(r"^https?://[^\s/]+", v):
-            raise ValueError("searxng_base_url must start with http:// or https://")
+            raise ValueError(f"{info.field_name} must start with http:// or https://")
         return v.rstrip("/")
+
+    @field_validator("provider")
+    @classmethod
+    def _validate_provider(cls, v):
+        if v not in WEBSEARCH_PROVIDERS:
+            raise ValueError(f"provider must be one of {', '.join(WEBSEARCH_PROVIDERS)}")
+        return v
+
+    @field_validator("fourget_scraper")
+    @classmethod
+    def _validate_fourget_scraper(cls, v):
+        # 4get does not reject an unknown scraper -- it quietly falls back to the
+        # instance default -- so the typo has to be caught here.
+        if v is not None and v not in FOURGET_WEB_SCRAPERS:
+            raise ValueError(f"fourget_scraper must be one of {', '.join(FOURGET_WEB_SCRAPERS)}")
+        return v
+
+    @field_validator("fourget_lang", "fourget_country")
+    @classmethod
+    def _validate_fourget_locale(cls, v, info):
+        if v is not None and not re.match(r"^[A-Za-z0-9_-]{2,16}$", v):
+            raise ValueError(f"{info.field_name} must be 2-16 letters, digits, '-' or '_'")
+        return v
 
     @field_validator("safesearch")
     @classmethod
@@ -877,8 +950,15 @@ class WebSearchSettingsUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _require_url_when_enabled(self):
-        if self.enabled and not self.searxng_base_url:
-            raise ValueError("searxng_base_url is required when web search is enabled")
+        if not self.enabled:
+            return self
+        field = (
+            "fourget_base_url"
+            if self.provider == WEBSEARCH_PROVIDER_FOURGET
+            else "searxng_base_url"
+        )
+        if not getattr(self, field):
+            raise ValueError(f"{field} is required when web search is enabled")
         return self
 
 
@@ -1409,6 +1489,10 @@ class ProviderConfigurationResponse(BaseModel):
     model_count: int
     enabled_model_count: int
     supported_apis: Optional[List[str]] = None
+    # Outcome of the last model sync (in-memory; None until the provider is first synced)
+    sync_state: Optional[str] = None  # "ok" | "failed"
+    sync_error: Optional[str] = None
+    last_sync_at: Optional[float] = None  # epoch seconds, so the browser renders it in local time
     created_at: datetime
     updated_at: datetime
 

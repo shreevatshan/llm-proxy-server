@@ -53,6 +53,7 @@ from app.auth.models import (
     ModelAliasUpsert, ModelAliasResponse,
     AdminPoolResponse,
     WebSearchSettingsResponse, WebSearchSettingsUpdate, WebSearchTestRequest, WebSearchEnginesRequest,
+    FOURGET_WEB_SCRAPERS, WEBSEARCH_PROVIDER_LABELS,
 )
 from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_admin_email
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -686,7 +687,10 @@ async def admin_dashboard(
             "users": users,
             "admin_email": get_admin_email(),
             "title": "Admin Dashboard - LLM Proxy Server",
-            "cache_version": str(int(time.time()))
+            "cache_version": str(int(time.time())),
+            # 4get has no discovery endpoint; this is the list the form validates against.
+            "fourget_scrapers": FOURGET_WEB_SCRAPERS,
+            "websearch_provider_labels": WEBSEARCH_PROVIDER_LABELS,
         }
     )
     
@@ -1249,7 +1253,7 @@ async def update_rate_limit_defaults(
     return GlobalRateLimitResponse.model_validate(row)
 
 
-# ==================== Web Search Interception (SearXNG) ====================
+# ==================== Web Search Interception (SearXNG / 4get) ====================
 
 def _websearch_response(row) -> WebSearchSettingsResponse:
     from app.websearch.settings import config_from_row
@@ -1257,12 +1261,17 @@ def _websearch_response(row) -> WebSearchSettingsResponse:
     cfg = config_from_row(row)
     return WebSearchSettingsResponse(
         enabled=cfg.enabled,
+        provider=cfg.provider,
         searxng_base_url=cfg.searxng_base_url,
         engines=cfg.engines,
         categories=cfg.categories,
         language=cfg.language,
         safesearch=cfg.safesearch,
         time_range=cfg.time_range,
+        fourget_base_url=cfg.fourget_base_url,
+        fourget_scraper=cfg.fourget_scraper,
+        fourget_lang=cfg.fourget_lang,
+        fourget_country=cfg.fourget_country,
         max_results=cfg.max_results,
         max_snippet_chars=cfg.max_snippet_chars,
         timeout_seconds=cfg.timeout_seconds,
@@ -1307,9 +1316,9 @@ async def test_websearch_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Run one live SearXNG query with stored or unsaved settings."""
+    """Run one live query against the selected backend, with stored or unsaved settings."""
     import time as _time
-    from app.websearch.searxng import search
+    from app.websearch.backends import search
     from app.websearch.settings import config_from_row
 
     stored = config_from_row(await get_websearch_settings(db))
@@ -1319,8 +1328,9 @@ async def test_websearch_endpoint(
         values["apply_to"] = frozenset(values["apply_to"])
         values["enabled_providers"] = frozenset(values["enabled_providers"])
         cfg = stored.with_overrides(**values)
-    if not cfg.searxng_base_url:
-        raise HTTPException(status_code=400, detail="SearXNG base URL is not configured")
+    if not cfg.base_url:
+        label = WEBSEARCH_PROVIDER_LABELS.get(cfg.provider, cfg.provider)
+        raise HTTPException(status_code=400, detail=f"{label} base URL is not configured")
 
     started = _time.monotonic()
     outcome = await search(body.query, cfg)
@@ -2423,6 +2433,8 @@ async def list_provider_credentials(
                 except json.JSONDecodeError:
                     deployments = None
             
+            sync_status = provider_manager.get_sync_status(cred.provider_key) or {}
+
             # Use ProviderConfigurationResponse which includes model_count fields
             response = ProviderConfigurationResponse(
                 id=cred.id,
@@ -2433,6 +2445,9 @@ async def list_provider_credentials(
                 enabled=cred.enabled,
                 model_count=len(provider_models),
                 enabled_model_count=len(enabled_models),
+                sync_state=sync_status.get("state"),
+                sync_error=sync_status.get("error"),
+                last_sync_at=sync_status.get("last_sync_at"),
                 created_at=cred.created_at,
                 updated_at=cred.updated_at
             )

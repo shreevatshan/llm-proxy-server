@@ -1,8 +1,9 @@
-"""Tests for web search interception (SearXNG)."""
+"""Tests for web search interception (SearXNG and 4get backends)."""
 
 import asyncio
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import httpx
@@ -19,9 +20,9 @@ from app.websearch import (
     settle_pending_responses_calls,
     synthesize_responses_stream,
 )
-from app.websearch import searxng, tools
+from app.websearch import backends, client, fourget, results, searxng, tools
 from app.websearch.loop import LIMIT_NUDGE, LIMIT_REACHED_TEXT, add_usage, iter_sse_events
-from app.websearch.searxng import SearchFailed, SearchResult, SearchSucceeded
+from app.websearch.results import SearchFailed, SearchResult, SearchSucceeded
 from app.websearch.settings import WebSearchConfig, websearch_settings_cache
 
 
@@ -75,8 +76,8 @@ class _ConfigMixin:
 class SearxngTests(unittest.TestCase):
     def _with_transport(self, handler):
         transport = httpx.MockTransport(handler)
-        searxng._client = httpx.AsyncClient(transport=transport)
-        self.addCleanup(lambda: run(searxng.close_client()))
+        client._client = httpx.AsyncClient(transport=transport)
+        self.addCleanup(lambda: run(client.close_client()))
 
     def test_parse_dedupe_truncate(self):
         seen = {}
@@ -118,13 +119,12 @@ class SearxngTests(unittest.TestCase):
         outcome = run(searxng.search("q", CFG))
         self.assertIn("json", outcome.message)
 
-    def test_timeout_and_empty_query(self):
+    def test_timeout(self):
         def handler(request):
             raise httpx.ReadTimeout("slow")
 
         self._with_transport(handler)
         self.assertEqual(run(searxng.search("q", CFG)).error_code, "unavailable")
-        self.assertEqual(run(searxng.search("  ", CFG)).error_code, "invalid_tool_input")
 
     def test_fetch_engines(self):
         seen = {}
@@ -161,12 +161,154 @@ class SearxngTests(unittest.TestCase):
         self.assertEqual(searxng.search_url("http://h/search"), "http://h/search")
 
     def test_format_text(self):
-        text = searxng.format_outcome_text(SearchSucceeded("q", [SearchResult("T", "https://u", "s", "d")]))
+        text = results.format_outcome_text(SearchSucceeded("q", [SearchResult("T", "https://u", "s", "d")]))
         self.assertEqual(text, "Title: T\nURL: https://u\nDate: d\nSnippet: s")
-        self.assertTrue(searxng.format_outcome_text(SearchFailed("q", "unavailable", "down")).startswith("Search failed"))
+        self.assertTrue(results.format_outcome_text(SearchFailed("q", "unavailable", "down")).startswith("Search failed"))
 
 
 # ==================== Tool detection / rewriting ====================
+
+# ==================== 4get client ====================
+
+FOURGET_CFG = CFG.with_overrides(
+    provider="fourget",
+    searxng_base_url=None,
+    fourget_base_url="http://fourget.test",
+    fourget_scraper="ddg",
+)
+
+FOURGET_PAYLOAD = {
+    "status": "ok",
+    "spelling": {"type": "no_correction"},
+    "web": [
+        {"title": "One", "description": "first snippet " * 10, "url": "https://a.example/1", "date": 1767225600},
+        {"title": "Dup", "description": "dup", "url": "https://a.example/1", "date": None},
+        {"title": "Two", "description": "second", "url": "https://b.example/2", "date": None},
+        {"title": "Three", "description": "third", "url": "https://c.example/3", "date": None},
+    ],
+    "image": [], "video": [], "news": [], "related": [], "answer": [],
+}
+
+
+class FourgetTests(unittest.TestCase):
+    def _with_transport(self, handler):
+        transport = httpx.MockTransport(handler)
+        client._client = httpx.AsyncClient(transport=transport)
+        self.addCleanup(lambda: run(client.close_client()))
+
+    def test_api_url(self):
+        self.assertEqual(fourget.api_url("http://h/"), "http://h/api/v1/web")
+        self.assertEqual(fourget.api_url("http://h/api/v1/web"), "http://h/api/v1/web")
+
+    def test_parse_dedupe_truncate(self):
+        seen = {}
+
+        def handler(request):
+            seen["url"] = str(request.url)
+            return httpx.Response(200, json=FOURGET_PAYLOAD)
+
+        self._with_transport(handler)
+        outcome = run(fourget.search("hello world", FOURGET_CFG.with_overrides(time_range="week")))
+        self.assertTrue(outcome.ok)
+        self.assertEqual([r.url for r in outcome.results], ["https://a.example/1", "https://b.example/2"])
+        self.assertLessEqual(len(outcome.results[0].snippet), 40)
+        self.assertEqual(outcome.results[0].date, "2026-01-01")
+        self.assertIn("/api/v1/web?", seen["url"])
+        self.assertIn("s=hello+world", seen["url"])
+        self.assertIn("scraper=ddg", seen["url"])
+        self.assertIn("nsfw=maybe", seen["url"])  # safesearch 1
+        expected = (datetime.now(timezone.utc).date() - timedelta(days=7)).isoformat()
+        self.assertIn(f"newer={expected}", seen["url"])
+
+    def test_optional_params_are_omitted(self):
+        seen = []
+        self._with_transport(lambda request: seen.append(str(request.url)) or httpx.Response(200, json=FOURGET_PAYLOAD))
+        run(fourget.search("q", FOURGET_CFG.with_overrides(fourget_scraper=None, safesearch=0)))
+        self.assertNotIn("scraper=", seen[0])
+        self.assertNotIn("newer=", seen[0])
+        self.assertNotIn("lang=", seen[0])
+        self.assertNotIn("country=", seen[0])
+        self.assertIn("nsfw=yes", seen[0])
+
+    def test_error_status_on_http_200(self):
+        # 4get never sets a status code; failures arrive as 200 + a status field.
+        self._with_transport(lambda request: httpx.Response(200, json={"status": "Invalid scraper"}))
+        outcome = run(fourget.search("q", FOURGET_CFG))
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_code, "unavailable")
+        self.assertIn("Invalid scraper", outcome.message)
+
+    def test_error_mapping(self):
+        self._with_transport(lambda request: httpx.Response(429, json={"status": "slow down"}))
+        self.assertEqual(run(fourget.search("q", FOURGET_CFG)).error_code, "too_many_requests")
+        self._with_transport(lambda request: httpx.Response(502, text="bad gateway"))
+        self.assertEqual(run(fourget.search("q", FOURGET_CFG)).error_code, "unavailable")
+        self._with_transport(lambda request: httpx.Response(200, text="not json"))
+        self.assertEqual(run(fourget.search("q", FOURGET_CFG)).error_code, "unavailable")
+
+    def test_non_string_fields_fall_back(self):
+        payload = {"status": "ok", "web": [
+            {"url": "https://a.example/1", "title": 42, "description": ["x"]},
+        ]}
+        self._with_transport(lambda request: httpx.Response(200, json=payload))
+        outcome = run(fourget.search("q", FOURGET_CFG))
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.results[0].title, "https://a.example/1")
+        self.assertEqual(outcome.results[0].snippet, "")
+
+    def test_malformed_payload_fails_without_raising(self):
+        self._with_transport(lambda request: httpx.Response(200, json={"status": "ok", "web": 5}))
+        outcome = run(fourget.search("q", FOURGET_CFG))
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_code, "unavailable")
+
+    def test_timeout_and_missing_url(self):
+        def handler(request):
+            raise httpx.TimeoutException("timed out")
+
+        self._with_transport(handler)
+        self.assertEqual(run(fourget.search("q", FOURGET_CFG)).error_code, "unavailable")
+        self.assertEqual(
+            run(fourget.search("q", FOURGET_CFG.with_overrides(fourget_base_url=None))).error_code,
+            "unavailable",
+        )
+
+    def test_date_variants(self):
+        # Usually a unix timestamp, sometimes an upstream string, often null.
+        self.assertEqual(fourget._format_date(1767225600), "2026-01-01")
+        self.assertEqual(fourget._format_date("1767225600"), "2026-01-01")
+        self.assertEqual(fourget._format_date("1767225600.0"), "2026-01-01")
+        self.assertEqual(fourget._format_date(1767225600.5), "2026-01-01")
+        self.assertEqual(fourget._format_date("last tuesday"), "last tuesday")
+        self.assertIsNone(fourget._format_date(None))
+        self.assertIsNone(fourget._format_date(""))
+        self.assertIsNone(fourget._format_date(True))
+        self.assertIsNone(fourget._format_date(10 ** 20))
+
+
+class BackendDispatchTests(unittest.TestCase):
+    def test_routes_by_provider(self):
+        calls = []
+
+        async def fake(name, query, cfg):
+            calls.append(name)
+            return SearchSucceeded(query)
+
+        with patch("app.websearch.searxng.search", lambda q, c: fake("searxng", q, c)), \
+             patch("app.websearch.fourget.search", lambda q, c: fake("fourget", q, c)):
+            run(backends.search("q", CFG))
+            run(backends.search("q", FOURGET_CFG))
+            run(backends.run_searches(["a", "b"], FOURGET_CFG))
+        self.assertEqual(calls, ["searxng", "fourget", "fourget", "fourget"])
+
+    def test_rejects_bad_queries_before_dispatch(self):
+        with patch("app.websearch.searxng.search") as sx, patch("app.websearch.fourget.search") as fg:
+            for cfg in (CFG, FOURGET_CFG):
+                self.assertEqual(run(backends.search("  ", cfg)).error_code, "invalid_tool_input")
+                self.assertEqual(run(backends.search("x" * 600, cfg)).error_code, "query_too_long")
+        sx.assert_not_called()
+        fg.assert_not_called()
+
 
 class ToolTests(unittest.TestCase):
     def test_anthropic_detection(self):
@@ -241,7 +383,7 @@ class ToolTests(unittest.TestCase):
         self.assertEqual(out[1]["content"][2]["type"], "tool_use")
         self.assertEqual(out[1]["content"][2]["name"], tools.INTERNAL_TOOL_NAME)
         self.assertEqual(out[2]["content"][0]["type"], "tool_result")
-        self.assertEqual(out[2]["content"][0]["content"], searxng.format_outcome_text(outcome))
+        self.assertEqual(out[2]["content"][0]["content"], results.format_outcome_text(outcome))
         self.assertEqual(out[3]["content"], [{"type": "text", "text": "Answer."}])
 
     def test_rehydration_merges_trailing_results_with_next_user(self):
@@ -800,9 +942,31 @@ class AdminSettingsTests(unittest.TestCase):
         self.assertEqual(ok.searxng_base_url, "http://s:8080")
         self.assertIsNone(ok.engines)
 
+    def test_backend_validation(self):
+        from pydantic import ValidationError
+        from app.auth.models import WebSearchSettingsUpdate
+
+        with self.assertRaises(ValidationError):
+            WebSearchSettingsUpdate(provider="bing")
+        with self.assertRaises(ValidationError):
+            WebSearchSettingsUpdate(fourget_scraper="not_a_scraper")
+        with self.assertRaises(ValidationError):
+            WebSearchSettingsUpdate(fourget_base_url="ftp://x")
+        with self.assertRaises(ValidationError):
+            WebSearchSettingsUpdate(fourget_country="a bad value")
+        # The *selected* backend's URL is the one that is required.
+        with self.assertRaises(ValidationError):
+            WebSearchSettingsUpdate(enabled=True, provider="fourget", searxng_base_url="http://s")
+        ok = WebSearchSettingsUpdate(
+            enabled=True, provider="fourget", fourget_base_url=" http://fourget/ ",
+            fourget_scraper="ddg", fourget_lang="en", fourget_country="us-en",
+        )
+        self.assertEqual(ok.fourget_base_url, "http://fourget")
+        self.assertIsNone(ok.searxng_base_url)
+
     def test_row_round_trip(self):
         from types import SimpleNamespace
-        from app.auth.models import WebSearchSettingsUpdate
+        from app.auth.models import FOURGET_WEB_SCRAPERS, WebSearchSettingsUpdate
         from app.routes.admin import _websearch_response, _websearch_values
         from app.websearch.settings import config_from_row
 
@@ -813,15 +977,51 @@ class AdminSettingsTests(unittest.TestCase):
             categories=None, language=None, safesearch=None, time_range=None, max_results=None,
             max_snippet_chars=None, timeout_seconds=None, max_agentic_loops=4, max_queries_per_turn=None,
             apply_to=json.dumps(["chat_completions"]), enabled_providers=json.dumps(["*"]),
+            provider=None, fourget_base_url=None, fourget_scraper=None, fourget_lang=None, fourget_country=None,
             updated_at=None, updated_by="admin",
         )
         cfg = config_from_row(row)
         self.assertEqual(cfg.max_agentic_loops, 4)
         self.assertEqual(cfg.max_results, 5)
         self.assertEqual(cfg.apply_to, frozenset({"chat_completions"}))
+        # A row predating the backend columns (NULL after the migration) defaults to SearXNG.
+        self.assertEqual(cfg.provider, "searxng")
+        self.assertIsNone(cfg.fourget_base_url)
+        self.assertEqual(cfg.fourget_scraper, FOURGET_WEB_SCRAPERS[0])
+        self.assertEqual(cfg.base_url, "http://s")
         response = _websearch_response(row)
         self.assertEqual(response.searxng_base_url, "http://s")
         self.assertIsNone(config_from_row(None).searxng_base_url)
+
+    def test_fourget_row_round_trip(self):
+        from types import SimpleNamespace
+        from app.auth.models import WebSearchSettingsUpdate
+        from app.routes.admin import _websearch_response, _websearch_values
+        from app.websearch.settings import config_from_row
+
+        values = _websearch_values(WebSearchSettingsUpdate(
+            enabled=True, provider="fourget", fourget_base_url="http://fourget",
+            fourget_scraper="brave", fourget_lang="en", fourget_country="us",
+        ))
+        # Every key must be both a column name and a WebSearchConfig field: the
+        # same dict is handed to upsert_websearch_settings and to with_overrides.
+        for key in ("provider", "fourget_base_url", "fourget_scraper", "fourget_lang", "fourget_country"):
+            self.assertIn(key, values)
+
+        row = SimpleNamespace(
+            enabled=True, provider="fourget", searxng_base_url=None, engines=None,
+            categories=None, language=None, safesearch=None, time_range=None,
+            fourget_base_url="http://fourget", fourget_scraper="brave",
+            fourget_lang="en", fourget_country="us",
+            max_results=None, max_snippet_chars=None, timeout_seconds=None,
+            max_agentic_loops=None, max_queries_per_turn=None,
+            apply_to=None, enabled_providers=json.dumps(["*"]),
+            updated_at=None, updated_by="admin",
+        )
+        cfg = config_from_row(row)
+        self.assertEqual(cfg.base_url, "http://fourget")
+        self.assertEqual(cfg.fourget_scraper, "brave")
+        self.assertEqual(_websearch_response(row).provider, "fourget")
 
     def test_is_active(self):
         from app.websearch.settings import WebSearchSettingsCache
@@ -830,6 +1030,12 @@ class AdminSettingsTests(unittest.TestCase):
         self.assertFalse(cache.is_active("anthropic_messages", "custom:test"))
         cache.set_config(CFG)
         self.assertTrue(cache.is_active("anthropic_messages", "custom:test"))
+        # The gate follows the selected backend's URL, not SearXNG's.
+        cache.set_config(CFG.with_overrides(provider="fourget"))
+        self.assertFalse(cache.is_active("anthropic_messages", "custom:test"))
+        cache.set_config(CFG.with_overrides(provider="fourget", fourget_base_url="http://fourget"))
+        self.assertTrue(cache.is_active("anthropic_messages", "custom:test"))
+        cache.set_config(CFG)
         self.assertFalse(cache.is_active("anthropic_messages", "bedrock:x"))
         cache.set_config(CFG.with_overrides(enabled_providers=frozenset({"*"}), apply_to=frozenset({"responses"})))
         self.assertTrue(cache.is_active("responses", "bedrock:x"))

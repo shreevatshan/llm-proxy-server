@@ -179,6 +179,9 @@
             <button class="btn btn-primary btn-sm tip" aria-label="Add Provider" onclick="showAddProviderForm()">
                 <i class="fas fa-plus"></i>
             </button>
+            <button class="btn btn-outline-secondary btn-sm tip" aria-label="Sync Models" onclick="syncModels()">
+                <i class="fas fa-sync-alt"></i>
+            </button>
             <button class="btn btn-outline-secondary btn-sm tip" aria-label="Export Config" onclick="exportProviderConfig()">
                 <i class="fas fa-download"></i>
             </button>
@@ -1126,29 +1129,50 @@
         </div>
     </div>
 
-    <!-- SearXNG connection -->
+    <!-- Search backend connection -->
     <div class="card ws-card">
         <div class="card-header ws-card__head">
             <button class="ws-card__toggle collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#ws-conn-body"
                     aria-expanded="false" aria-controls="ws-conn-body">
                 <i class="fas fa-chevron-right ws-chevron"></i>
-                <h5 class="mb-0"><i class="fas fa-plug me-2"></i>SearXNG connection</h5>
+                <h5 class="mb-0"><i class="fas fa-plug me-2"></i>Search backend</h5>
                 <span class="ws-card__summary" id="ws-conn-summary"></span>
             </button>
         </div>
         <div class="collapse" id="ws-conn-body">
             <div class="card-body">
                 <div class="row g-3">
-                    <div class="col-md-9">
-                        <label class="form-label" for="ws-base-url">Base URL</label>
-                        <input type="url" id="ws-base-url" class="form-control" placeholder="http://searxng:8080"
-                               oninput="window.WebSearchManager?.updateParamsVisibility()">
-                        <div class="form-text">
-                            Every query the model writes is sent here. The instance must list <code>json</code>
-                            under <code>search.formats</code> in its <code>settings.yml</code>.
+                    <div class="col-lg-4 col-md-5">
+                        <label class="form-label" id="ws-provider-label">Backend</label>
+                        <div class="btn-group ws-segmented" role="radiogroup" aria-labelledby="ws-provider-label">
+                            {% for value, label in websearch_provider_labels.items() %}
+                            <input type="radio" class="btn-check" name="ws-provider" id="ws-provider-{{ value }}" value="{{ value }}" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="ws-provider-{{ value }}">{{ label }}</label>
+                            {% endfor %}
+                        </div>
+                        <div class="form-text">Each backend keeps its own settings, so switching loses nothing.</div>
+                    </div>
+                    <div class="col-lg-5 col-md-4">
+                        <div id="ws-conn-searxng">
+                            <label class="form-label" for="ws-searxng-url">SearXNG base URL</label>
+                            <input type="url" id="ws-searxng-url" class="form-control" placeholder="http://searxng:8080"
+                                   oninput="window.WebSearchManager?.updateParamsVisibility()">
+                            <div class="form-text">
+                                Every query the model writes is sent here. The instance must list <code>json</code>
+                                under <code>search.formats</code> in its <code>settings.yml</code>.
+                            </div>
+                        </div>
+                        <div id="ws-conn-fourget">
+                            <label class="form-label" for="ws-fourget-url">4get base URL</label>
+                            <input type="url" id="ws-fourget-url" class="form-control" placeholder="http://fourget"
+                                   oninput="window.WebSearchManager?.updateParamsVisibility()">
+                            <div class="form-text">
+                                Queried at <code>/api/v1/web</code>. The instance must have its API enabled
+                                and bot protection off.
+                            </div>
                         </div>
                     </div>
-                    <div class="col-md-3">
+                    <div class="col-lg-3 col-md-3">
                         <label class="form-label" for="ws-timeout">Timeout (s)</label>
                         <input type="number" id="ws-timeout" class="form-control" min="1" max="60">
                     </div>
@@ -1156,7 +1180,7 @@
                 <div class="ws-test">
                     <label class="form-label" for="ws-test-query">Test with a query</label>
                     <div class="ws-test__row">
-                        <input type="text" id="ws-test-query" class="form-control" value="SearXNG">
+                        <input type="text" id="ws-test-query" class="form-control" value="web search">
                         <button class="btn btn-outline-secondary" id="ws-test-btn" onclick="window.WebSearchManager?.test()">
                             <i class="fas fa-vial me-1"></i>Run test
                         </button>
@@ -1184,35 +1208,65 @@
         </div>
         <div class="collapse show" id="ws-params-body">
             <div class="card-body">
-                <div class="row g-3">
-                    <div class="col-lg-4 col-md-5">
-                        <label class="form-label" id="ws-source-label">Search with</label>
-                        <div class="btn-group ws-segmented" role="radiogroup" aria-labelledby="ws-source-label">
-                            <input type="radio" class="btn-check" name="ws-source" id="ws-source-all" value="all" autocomplete="off">
-                            <label class="btn btn-outline-secondary" for="ws-source-all">All</label>
-                            <input type="radio" class="btn-check" name="ws-source" id="ws-source-categories" value="categories" autocomplete="off">
-                            <label class="btn btn-outline-secondary" for="ws-source-categories">Categories</label>
-                            <input type="radio" class="btn-check" name="ws-source" id="ws-source-engines" value="engines" autocomplete="off">
-                            <label class="btn btn-outline-secondary" for="ws-source-engines">Engines</label>
+                <div id="ws-params-searxng">
+                    <div class="row g-3">
+                        <div class="col-lg-4 col-md-5">
+                            <label class="form-label" id="ws-source-label">Search with</label>
+                            <div class="btn-group ws-segmented" role="radiogroup" aria-labelledby="ws-source-label">
+                                <input type="radio" class="btn-check" name="ws-source" id="ws-source-all" value="all" autocomplete="off">
+                                <label class="btn btn-outline-secondary" for="ws-source-all">All</label>
+                                <input type="radio" class="btn-check" name="ws-source" id="ws-source-categories" value="categories" autocomplete="off">
+                                <label class="btn btn-outline-secondary" for="ws-source-categories">Categories</label>
+                                <input type="radio" class="btn-check" name="ws-source" id="ws-source-engines" value="engines" autocomplete="off">
+                                <label class="btn btn-outline-secondary" for="ws-source-engines">Engines</label>
+                            </div>
+                        </div>
+                        <div class="col-lg-8 col-md-7">
+                            <div id="ws-source-all-field">
+                                <label class="form-label">Covers</label>
+                                <p class="ws-source-note" id="ws-source-all-note">Every category on the instance, using the engines it turns on by default.</p>
+                            </div>
+                            <div id="ws-source-categories-field">
+                                <label class="form-label" id="ws-categories-label" for="ws-categories">Categories</label>
+                                <input type="text" id="ws-categories" class="form-control" placeholder="general (comma-separated)"
+                                       oninput="window.WebSearchManager?.renderCategories()">
+                                <div class="dropdown ws-picker" id="ws-categories-picker" data-labelledby="ws-categories-label" hidden></div>
+                                <div class="form-text">Each category searches the engines the instance turns on for it.</div>
+                            </div>
+                            <div id="ws-source-engines-field">
+                                <label class="form-label" id="ws-engines-label" for="ws-engines">Engines</label>
+                                <input type="text" id="ws-engines" class="form-control" placeholder="Comma-separated, e.g. bing,duckduckgo">
+                                <div class="dropdown ws-picker" id="ws-engines-picker" data-labelledby="ws-engines-label" hidden></div>
+                                <div class="form-text">Only these engines are searched. With none picked, searches use the general category.</div>
+                            </div>
                         </div>
                     </div>
-                    <div class="col-lg-8 col-md-7">
-                        <div id="ws-source-all-field">
-                            <label class="form-label">Covers</label>
-                            <p class="ws-source-note" id="ws-source-all-note">Every category on the instance, using the engines it turns on by default.</p>
+                    <div class="row g-3 mt-0">
+                        <div class="col-lg-4 col-md-5 col-6">
+                            <label class="form-label" for="ws-language">Language</label>
+                            <input type="text" id="ws-language" class="form-control" placeholder="auto">
+                            <div class="form-text">SearXNG codes, e.g. <code>auto</code> or <code>en-US</code>.</div>
                         </div>
-                        <div id="ws-source-categories-field">
-                            <label class="form-label" id="ws-categories-label" for="ws-categories">Categories</label>
-                            <input type="text" id="ws-categories" class="form-control" placeholder="general (comma-separated)"
-                                   oninput="window.WebSearchManager?.renderCategories()">
-                            <div class="dropdown ws-picker" id="ws-categories-picker" data-labelledby="ws-categories-label" hidden></div>
-                            <div class="form-text">Each category searches the engines the instance turns on for it.</div>
+                    </div>
+                </div>
+
+                <div id="ws-params-fourget">
+                    <div class="row g-3">
+                        <div class="col-lg-4 col-md-6">
+                            <label class="form-label" for="ws-fourget-scraper">Scraper</label>
+                            <select id="ws-fourget-scraper" class="form-select">
+                                {% for name in fourget_scrapers %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+                            </select>
+                            <div class="form-text">The upstream engine 4get scrapes for each query. Some need credentials or are blocked from a datacenter IP &mdash; run a test before saving.</div>
                         </div>
-                        <div id="ws-source-engines-field">
-                            <label class="form-label" id="ws-engines-label" for="ws-engines">Engines</label>
-                            <input type="text" id="ws-engines" class="form-control" placeholder="Comma-separated, e.g. bing,duckduckgo">
-                            <div class="dropdown ws-picker" id="ws-engines-picker" data-labelledby="ws-engines-label" hidden></div>
-                            <div class="form-text">Only these engines are searched. With none picked, searches use the general category.</div>
+                        <div class="col-lg-4 col-md-3 col-6">
+                            <label class="form-label" for="ws-fourget-lang">Language</label>
+                            <input type="text" id="ws-fourget-lang" class="form-control" placeholder="any">
+                        </div>
+                        <div class="col-lg-4 col-md-3 col-6">
+                            <label class="form-label" for="ws-fourget-country">Country</label>
+                            <input type="text" id="ws-fourget-country" class="form-control" placeholder="any">
+                            <div class="form-text">Scraper-specific; ddg uses locales like <code>us-en</code>.</div>
                         </div>
                     </div>
                 </div>
@@ -1220,16 +1274,13 @@
                 <div class="ws-subhead">Results</div>
                 <div class="row g-3">
                     <div class="col-lg col-md-4 col-6">
-                        <label class="form-label" for="ws-language">Language</label>
-                        <input type="text" id="ws-language" class="form-control" placeholder="auto">
-                    </div>
-                    <div class="col-lg col-md-4 col-6">
                         <label class="form-label" for="ws-safesearch">Safe search</label>
                         <select id="ws-safesearch" class="form-select">
                             <option value="0">Off</option>
                             <option value="1">Moderate</option>
                             <option value="2">Strict</option>
                         </select>
+                        <div class="form-text" id="ws-safesearch-help">Sent as SearXNG's <code>safesearch</code>.</div>
                     </div>
                     <div class="col-lg col-md-4 col-6">
                         <label class="form-label" for="ws-time-range">Time range</label>
