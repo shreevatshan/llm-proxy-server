@@ -286,6 +286,13 @@ class ModelManager {
 
                 window.UIUtils.showToast(`Synced ${providersCount} providers and ${modelsCount} models`, 'success');
 
+                const failed = result.failed_providers || [];
+                if (failed.length > 0) {
+                    const esc = window.UIUtils.escapeHtml;
+                    const lines = failed.map(p => `${esc(p.provider_key)}: ${esc(p.error)}`).join('<br>');
+                    window.UIUtils.showToast(`Sync failed for ${failed.length} provider(s); their models are hidden:<br>${lines}`, 'warning', 10000);
+                }
+
                 if (window.SearchManager) {
                     window.SearchManager.clearModelsCache();
                 }
@@ -324,7 +331,7 @@ class ModelManager {
                             </button>
                         </div>
                         <div class="modal-body">
-                            <p class="mb-3">Found <strong>${staleModels.length}</strong> stale model(s) in the database that are no longer available from providers.</p>
+                            <p class="mb-3">Found <strong>${staleModels.length}</strong> stale model(s) in the database that are no longer available from providers. Providers that failed to sync or are disabled are not included.</p>
                             <div class="alert alert-info">
                                 <i class="fas fa-info-circle"></i> These models exist in your database but are not currently available from any provider. You can safely remove them.
                             </div>

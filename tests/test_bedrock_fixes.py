@@ -733,5 +733,99 @@ class ClaudeCapabilityScrubTests(unittest.TestCase):
         )
 
 
+def _summary(model_id, inference=("ON_DEMAND",), status="ACTIVE"):
+    return {
+        "modelId": model_id,
+        "modelLifecycle": {"status": status},
+        "inferenceTypesSupported": list(inference),
+        "inputModalities": ["TEXT"],
+    }
+
+
+class ModelListRefreshTests(unittest.IsolatedAsyncioTestCase):
+    """A failed model listing must raise, not pass a fallback/partial list off as success."""
+
+    def setUp(self):
+        import threading
+        p = _provider()
+        p.aws_region = "us-west-2"
+        p.enable_cross_region = True
+        p.enable_app_profiles = False
+        p.default_model = "anthropic.claude-3-sonnet-20240229-v1:0"
+        p.bedrock_model_list = {}
+        p._model_list_refresh_lock = threading.Lock()
+        p.full_provider_name = "bedrock:primary"
+        p.bedrock_client = mock.Mock()
+        p.bedrock_client.list_foundation_models.return_value = {
+            "modelSummaries": [_summary("anthropic.claude-x"), _summary("amazon.nova-lite")]
+        }
+        paginator = mock.Mock()
+        paginator.paginate.return_value = [
+            {"inferenceProfileSummaries": [
+                {"inferenceProfileId": "us.anthropic.claude-x"},
+                {"inferenceProfileId": "global.anthropic.claude-x"},
+            ]}
+        ]
+        p.bedrock_client.get_paginator.return_value = paginator
+        self.p = p
+        self.paginator = paginator
+
+    async def _ids(self):
+        return {m.id.split("/", 1)[-1] for m in await self.p.get_available_models()}
+
+    async def test_happy_path_lists_on_demand_and_profiles(self):
+        self.assertEqual(
+            await self._ids(),
+            {"anthropic.claude-x", "amazon.nova-lite", "us.anthropic.claude-x", "global.anthropic.claude-x"},
+        )
+
+    async def test_foundation_listing_failure_raises(self):
+        from botocore.exceptions import EndpointConnectionError
+        self.p.bedrock_client.list_foundation_models.side_effect = EndpointConnectionError(
+            endpoint_url="https://bedrock.us-west-2.amazonaws.com/foundation-models"
+        )
+        with self.assertRaises(EndpointConnectionError):
+            await self.p.get_available_models()
+        # No fake default-model fallback is installed.
+        self.assertEqual(self.p.bedrock_model_list, {})
+
+    async def test_failed_refresh_keeps_last_good_list(self):
+        await self.p.get_available_models()
+        good = dict(self.p.bedrock_model_list)
+        fetched_at = self.p._model_list_fetched_at
+
+        self.p.bedrock_client.list_foundation_models.side_effect = RuntimeError("boom")
+        with self.assertRaises(RuntimeError):
+            await self.p.refresh_models()
+        self.assertEqual(self.p.bedrock_model_list, good)
+        self.assertEqual(self.p._model_list_fetched_at, fetched_at)
+
+    async def test_profile_listing_failure_raises(self):
+        from botocore.exceptions import EndpointConnectionError
+        self.paginator.paginate.side_effect = EndpointConnectionError(
+            endpoint_url="https://bedrock.us-west-2.amazonaws.com/inference-profiles"
+        )
+        with self.assertRaises(EndpointConnectionError):
+            await self.p.get_available_models()
+
+    async def test_profile_access_denied_falls_back_to_on_demand(self):
+        from botocore.exceptions import ClientError
+        self.paginator.paginate.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "nope"}}, "ListInferenceProfiles"
+        )
+        self.assertEqual(await self._ids(), {"anthropic.claude-x", "amazon.nova-lite"})
+
+    async def test_no_usable_models_raises(self):
+        self.p.bedrock_client.list_foundation_models.return_value = {
+            "modelSummaries": [
+                _summary("old.model", status="EOL"),
+                _summary("provisioned.only", inference=("PROVISIONED",)),
+            ]
+        }
+        self.paginator.paginate.return_value = [{"inferenceProfileSummaries": []}]
+        with self.assertRaises(RuntimeError):
+            await self.p.get_available_models()
+
+
 if __name__ == "__main__":
     unittest.main()

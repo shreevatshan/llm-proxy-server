@@ -26,6 +26,51 @@ class UserManager {
         this._syncSelectionUI();
     }
 
+    // ==================== Account policies ====================
+
+    /** Saves the self-service deletion switch as soon as it is flipped. */
+    async setSelfDeleteAllowed(checkbox) {
+        const allowed = checkbox.checked;
+        const state = document.getElementById('self-delete-state');
+        const renderState = (on) => { if (state) state.textContent = on ? 'Allowed' : 'Blocked'; };
+
+        renderState(allowed);
+        checkbox.disabled = true;
+        try {
+            const response = await fetch('/admin/users/settings', {
+                method: 'PUT',
+                credentials: 'include',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ allow_self_delete: allowed })
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(result.detail || `Request failed (${response.status})`);
+            }
+
+            const meta = document.getElementById('self-delete-meta');
+            if (meta && result.updated_by) {
+                document.getElementById('self-delete-updated-by').textContent = result.updated_by;
+                // updated_at is naive UTC from the server; show it the way the template does.
+                document.getElementById('self-delete-updated-at').textContent =
+                    result.updated_at ? result.updated_at.slice(0, 16).replace('T', ' ') + ' UTC' : '';
+                meta.hidden = false;
+            }
+            window.UIUtils.showToast(
+                result.allow_self_delete ? 'Self-service deletion allowed' : 'Self-service deletion blocked',
+                'success'
+            );
+        } catch (error) {
+            checkbox.checked = !allowed;
+            renderState(!allowed);
+            window.UIUtils.showToast('Could not save account deletion setting: ' + error.message, 'error');
+        } finally {
+            checkbox.disabled = false;
+        }
+    }
+
     // ==================== Bulk selection ====================
 
     /** Checkboxes on rows the search filter is currently showing. */

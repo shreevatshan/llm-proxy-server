@@ -25,6 +25,7 @@ from app.auth.database import (
     count_usage_requests,
     usage_user_ids_for_pool,
     get_global_rate_limit, upsert_global_rate_limit,
+    load_user_management_settings, upsert_user_management_settings,
     get_user_rate_limit, upsert_user_rate_limit, delete_user_rate_limit,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
     set_group_members, get_model_group_limits, update_model_group_limits,
@@ -45,6 +46,7 @@ from app.auth.models import (
     ProviderCredentialsCreate, ProviderCredentialsUpdate, ProviderCredentialsResponse,
     AdminPasswordReset, AdminUserModify, VALID_AZURE_BACKENDS,
     GlobalRateLimitResponse, GlobalRateLimitUpdate,
+    UserManagementSettingsResponse, UserManagementSettingsUpdate,
     UserRateLimitResponse, UserRateLimitUpdate,
     ModelGroupCreate, ModelGroupUpdate, ModelGroupLimitsUpdate, ModelGroupMembersUpdate,
     ModelGroupResponse, UserModelGroupRateLimitResponse, UserModelGroupRateLimitUpdate,
@@ -353,10 +355,28 @@ async def sync_models_from_providers(
         # One commit for the whole sync rather than one write-lock acquisition per model.
         await db.commit()
 
+        # Providers that were fetched but listed nothing (error, timeout or empty),
+        # and providers that weren't fetched at all (disabled). Their saved models
+        # aren't stale — the provider just wasn't reached — so keep them out of the
+        # stale list, where "Remove" would drop their admin-set enabled states.
+        fetched_provider_keys = set(provider_manager.providers.keys())
+        failed_providers = []
+        for key in sorted((valid_provider_keys & fetched_provider_keys) - synced_providers):
+            sync_status = provider_manager.get_sync_status(key) or {}
+            failed_providers.append({
+                "provider_key": key,
+                "error": sync_status.get("error") or "No models returned",
+            })
+        unfetched_provider_keys = valid_provider_keys - fetched_provider_keys
+
         # Identify stale models (models in DB but not synced)
         from app.auth.database import identify_stale_models
-        stale_models = await identify_stale_models(db, synced_model_ids)
-        
+        stale_models = await identify_stale_models(
+            db,
+            synced_model_ids,
+            exclude_provider_keys={p["provider_key"] for p in failed_providers} | unfetched_provider_keys,
+        )
+
         # Determine the appropriate message
         if len(valid_provider_keys) == 0:
             message = "No providers found in database"
@@ -364,12 +384,16 @@ async def sync_models_from_providers(
             message = f"No models found from {len(valid_provider_keys)} providers in database"
         else:
             message = f"Synced {synced_models} models from {len(synced_providers)} providers"
+        if failed_providers:
+            message += f"; {len(failed_providers)} provider(s) failed to sync"
         
         logger.info(f"Sync completed: {message}")
         logger.info(f"Total providers in DB: {len(valid_provider_keys)}")
         logger.info(f"Providers with models: {len(synced_providers)}")
         logger.info(f"Models synced: {synced_models}")
         logger.info(f"Stale models found: {len(stale_models)}")
+        if failed_providers:
+            logger.warning(f"Providers failed to sync: {failed_providers}")
 
         # Update the cache with all synced models
         provider_manager.model_cache.update_models(valid_models)
@@ -381,7 +405,8 @@ async def sync_models_from_providers(
             "models_synced": synced_models,
             "total_providers_in_db": len(valid_provider_keys),
             "stale_models": stale_models,
-            "stale_count": len(stale_models)
+            "stale_count": len(stale_models),
+            "failed_providers": failed_providers,
         }
     except Exception as e:
         raise HTTPException(
@@ -676,7 +701,8 @@ async def admin_dashboard(
     # Get all users from database
     result = await db.execute(select(User))
     users = result.scalars().all()
-    
+    user_settings = await load_user_management_settings(db)
+
     import time
     # Create response with security headers to prevent caching
     response = templates.TemplateResponse(
@@ -685,6 +711,7 @@ async def admin_dashboard(
             "request": request,
             "admin": current_admin,
             "users": users,
+            "user_settings": user_settings,
             "admin_email": get_admin_email(),
             "title": "Admin Dashboard - LLM Proxy Server",
             "cache_version": str(int(time.time())),
@@ -726,6 +753,26 @@ async def admin_search_page(
     response.headers["Expires"] = "0"
     
     return response
+
+
+@router.get("/users/settings", response_model=UserManagementSettingsResponse)
+async def get_user_management_settings_endpoint(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get user account policies (e.g. whether users may delete their own account)."""
+    return await load_user_management_settings(db)
+
+
+@router.put("/users/settings", response_model=UserManagementSettingsResponse)
+async def update_user_management_settings_endpoint(
+    body: UserManagementSettingsUpdate,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update user account policies."""
+    row = await upsert_user_management_settings(db, body.allow_self_delete, current_admin.username)
+    return UserManagementSettingsResponse.model_validate(row)
 
 
 @router.get("/users", response_model=List[UserResponse])

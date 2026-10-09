@@ -1407,3 +1407,127 @@ input:checked + .model-toggle-slider:before {
         white-space: normal;
     }
 }
+
+/* ================================
+   ACCOUNT POLICIES (User Management)
+   ================================ */
+
+/* Square icon button at the far right of the User Management header. */
+.user-settings-btn {
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+}
+
+/* One setting per row inside the User settings modal. The state is spelled
+   out next to the switch so it never depends on the switch's fill alone. */
+.policy-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1.5rem;
+}
+
+.policy-row-text {
+    min-width: 0;
+}
+
+.policy-row-title {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-family: var(--font-family-display);
+    font-weight: 600;
+    color: var(--mono-text-primary);
+    cursor: pointer;
+}
+
+.policy-row-desc {
+    margin: 0;
+    font-size: var(--text-sm);
+    color: var(--mono-text-secondary);
+}
+
+.policy-row-meta {
+    margin: 1rem 0 0;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--mono-4);
+    font-size: var(--text-xs);
+    color: var(--mono-text-muted);
+}
+
+.policy-row-control {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-shrink: 0;
+}
+
+.policy-row-state {
+    min-width: 4.5em;
+    text-align: right;
+    font-size: var(--text-sm);
+    color: var(--mono-text-primary);
+}
+
+.policy-row .form-switch .form-check-input {
+    width: 2.5em;
+    height: 1.25em;
+    cursor: pointer;
+}
+
+.policy-row .form-check-input:disabled {
+    opacity: 0.5;
+    cursor: progress;
+}
+
+@media (max-width: 576px) {
+    .policy-row {
+        flex-direction: column;
+        gap: 0.75rem;
+    }
+
+    .policy-row-state {
+        min-width: 0;
+        text-align: left;
+    }
+}
+
+/* ================================
+   PROFILE: DELETION DISABLED BY ADMIN
+   ================================ */
+
+/* Neutral, not red: nothing destructive can happen here. */
+.danger-zone-locked-icon {
+    background: var(--mono-2);
+    border: 1px solid var(--mono-4);
+    color: var(--mono-text-secondary);
+}
+
+.delete-disabled-header {
+    background: var(--mono-2);
+    border-bottom: 1px solid var(--mono-4) !important;
+}
+
+.admin-contact {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: var(--mono-2);
+    border: 1px solid var(--mono-4);
+    border-radius: var(--radius-md);
+}
+
+.admin-contact-email {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-family: var(--font-family-mono);
+    font-size: var(--text-sm);
+    color: var(--mono-text-primary);
+    user-select: all;
+}

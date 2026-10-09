@@ -171,6 +171,33 @@
                     {% endif %}
 
                     <!-- Delete Account -->
+                    {% if not allow_self_delete %}
+                    <div class="card border-0 shadow-sm danger-zone-locked">
+                        <div class="card-header bg-white border-0 pb-0">
+                            <div class="d-flex align-items-center">
+                                <div class="rounded p-2 me-3 danger-zone-locked-icon">
+                                    <i class="fas fa-lock" aria-hidden="true"></i>
+                                </div>
+                                <div>
+                                    <h6 class="mb-0 fw-bold">Danger Zone</h6>
+                                    <small class="text-muted">Disabled by your administrator</small>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="card-body pt-3">
+                            <div class="row g-3 align-items-center">
+                                <div class="col-md-8">
+                                    <p class="mb-0 small text-muted">Your administrator has turned off self-service account deletion.</p>
+                                </div>
+                                <div class="col-md-4">
+                                    <button type="button" class="btn btn-outline-secondary w-100" id="deleteAccountBlockedBtn">
+                                        <i class="fas fa-lock me-2" aria-hidden="true"></i>Delete Account
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    {% else %}
                     <div class="card border-0 shadow-sm">
                         <div class="card-header bg-white border-0 pb-0">
                             <div class="d-flex align-items-center">
@@ -211,6 +238,7 @@
                             </form>
                         </div>
                     </div>
+                    {% endif %}
                     {% else %}
                     <!-- Admin Notice -->
                     <div class="card border-0 shadow-sm">
@@ -281,6 +309,38 @@
                 <button type="button" class="btn btn-danger px-4" id="confirmDeleteAccount">
                     <i class="fas fa-trash me-2"></i>Yes, Delete Forever
                 </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Account Deletion Disabled Modal (shown when the admin has turned off self-service deletion) -->
+<div class="modal fade" id="deleteDisabledModal" tabindex="-1" aria-labelledby="deleteDisabledTitle" aria-describedby="deleteDisabledMessage">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow">
+            <div class="modal-header border-0 py-3 delete-disabled-header">
+                <div class="d-flex align-items-center flex-grow-1">
+                    <div class="rounded p-2 me-3 danger-zone-locked-icon">
+                        <i class="fas fa-lock" aria-hidden="true"></i>
+                    </div>
+                    <h5 class="modal-title mb-0 fw-bold" id="deleteDisabledTitle">Account deletion is disabled</h5>
+                </div>
+                <button type="button" class="btn-close btn-close-white ms-2" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body p-4">
+                <p class="mb-4" id="deleteDisabledMessage">Your administrator has turned off self-service account deletion. To delete your account, contact the administrator.</p>
+                <div class="admin-contact">
+                    <span class="admin-contact-email" id="deleteDisabledAdminEmail">{{ admin_email }}</span>
+                    <button type="button" class="btn btn-sm btn-outline-secondary" id="copyAdminEmailBtn" data-email="{{ admin_email }}">
+                        <i class="fas fa-copy me-1" aria-hidden="true"></i><span>Copy</span>
+                    </button>
+                </div>
+            </div>
+            <div class="modal-footer border-0 pt-0 gap-2">
+                <button type="button" class="btn btn-secondary px-4" data-bs-dismiss="modal">Close</button>
+                <a class="btn btn-primary px-4" href="mailto:{{ admin_email }}?subject={{ 'Account deletion request'|urlencode }}">
+                    <i class="fas fa-envelope me-2" aria-hidden="true"></i>Email administrator
+                </a>
             </div>
         </div>
     </div>

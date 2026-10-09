@@ -1,8 +1,43 @@
 let deleteAccountModal;
+let deleteDisabledModal;
 let pendingDeleteConfirmation = '';
 
 document.addEventListener('DOMContentLoaded', function () {
     deleteAccountModal = new bootstrap.Modal(document.getElementById('deleteAccountModal'));
+    const disabledEl = document.getElementById('deleteDisabledModal');
+    if (disabledEl) {
+        deleteDisabledModal = new bootstrap.Modal(disabledEl);
+    }
+});
+
+// Explain that the admin has turned off self-service deletion. `message`
+// replaces the default copy when the server sent its own explanation.
+function showDeleteDisabledModal(message) {
+    if (!deleteDisabledModal) {
+        window.UIUtils.showToast(message || 'Account deletion has been disabled by the administrator.', 'error');
+        return;
+    }
+    if (message) {
+        document.getElementById('deleteDisabledMessage').textContent = message;
+    }
+    deleteDisabledModal.show();
+}
+
+// Delete Account button when deletion is blocked by the admin
+document.getElementById('deleteAccountBlockedBtn')?.addEventListener('click', function () {
+    showDeleteDisabledModal();
+});
+
+// Copy the admin's email address from the disabled-deletion modal
+document.getElementById('copyAdminEmailBtn')?.addEventListener('click', async function () {
+    const label = this.querySelector('span');
+    try {
+        await navigator.clipboard.writeText(this.dataset.email);
+        label.textContent = 'Copied';
+        setTimeout(() => { label.textContent = 'Copy'; }, 1500);
+    } catch (error) {
+        window.UIUtils.showToast('Could not copy. Select the address and copy it manually.', 'error');
+    }
 });
 
 // Update Profile Form
@@ -224,6 +259,10 @@ document.getElementById('confirmDeleteAccount')?.addEventListener('click', async
             setTimeout(() => {
                 window.location.href = '/login';
             }, 2000);
+        } else if (response.headers.get('X-Account-Deletion-Disabled') === 'true') {
+            // The admin turned deletion off after this page was loaded.
+            deleteAccountModal.hide();
+            showDeleteDisabledModal(data.detail);
         } else {
             window.UIUtils.showToast(data.detail || 'Failed to delete account', 'error');
             deleteAccountModal.hide();

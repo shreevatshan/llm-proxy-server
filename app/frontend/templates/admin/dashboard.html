@@ -63,7 +63,7 @@
             <div class="stat-label">Pending Approval</div>
         </div>
     </div>
-    
+
     <div class="section-header">
         <div class="d-flex align-items-center gap-2">
             <h2 class="section-title me-4">User Management</h2>
@@ -74,12 +74,19 @@
                     oninput="window.UserManager?.filterUsers(this.value)">
             </div>
         </div>
-        <div class="section-actions" id="user-bulk-actions" style="display:none;">
-            <span class="bulk-selection-status" id="user-bulk-count"></span>
-            <button class="btn btn-primary btn-sm" onclick="window.UserManager?.bulkApprove()">Approve</button>
-            <button class="btn btn-success btn-sm" onclick="window.UserManager?.bulkActivate()">Activate</button>
-            <button class="btn btn-danger btn-sm" onclick="window.UserManager?.bulkDeactivate()">Deactivate</button>
-            <button class="btn btn-danger btn-sm btn-remove" onclick="window.UserManager?.bulkRemove()">Remove</button>
+        <div class="d-flex align-items-center gap-3 ms-auto">
+            <div class="section-actions" id="user-bulk-actions" style="display:none;">
+                <span class="bulk-selection-status" id="user-bulk-count"></span>
+                <button class="btn btn-primary btn-sm" onclick="window.UserManager?.bulkApprove()">Approve</button>
+                <button class="btn btn-success btn-sm" onclick="window.UserManager?.bulkActivate()">Activate</button>
+                <button class="btn btn-danger btn-sm" onclick="window.UserManager?.bulkDeactivate()">Deactivate</button>
+                <button class="btn btn-danger btn-sm btn-remove" onclick="window.UserManager?.bulkRemove()">Remove</button>
+            </div>
+            <button type="button" class="btn btn-outline-secondary btn-sm user-settings-btn"
+                data-bs-toggle="modal" data-bs-target="#userSettingsModal"
+                title="User settings" aria-label="User settings">
+                <i class="fas fa-gear" aria-hidden="true"></i>
+            </button>
         </div>
     </div>
 
@@ -1041,6 +1048,46 @@
                     <i class="fas fa-save me-1"></i>
                     Save Changes
                 </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- User Settings Modal (opened from the gear in the User Management header) -->
+<div class="modal fade" id="userSettingsModal" tabindex="-1" aria-labelledby="userSettingsModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="userSettingsModalLabel">
+                    <i class="fas fa-gear me-2" aria-hidden="true"></i>
+                    User settings
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="policy-row">
+                    <div class="policy-row-text">
+                        <label class="policy-row-title" for="self-delete-toggle">Self-service account deletion</label>
+                        <p class="policy-row-desc" id="self-delete-desc">Users can permanently delete their own account from their profile. When turned off, they're asked to contact you instead.</p>
+                    </div>
+                    <div class="policy-row-control">
+                        <span class="policy-row-state" id="self-delete-state" aria-hidden="true">{{ 'Allowed' if user_settings.allow_self_delete else 'Blocked' }}</span>
+                        <div class="form-check form-switch m-0">
+                            <input class="form-check-input" type="checkbox" role="switch" id="self-delete-toggle"
+                                aria-describedby="self-delete-desc"
+                                {% if user_settings.allow_self_delete %}checked{% endif %}
+                                onchange="window.UserManager?.setSelfDeleteAllowed(this)">
+                        </div>
+                    </div>
+                </div>
+                <p class="policy-row-meta" id="self-delete-meta"{% if not user_settings.updated_by %} hidden{% endif %}>
+                    Last changed by <span id="self-delete-updated-by">{{ user_settings.updated_by or '' }}</span>
+                    on <span id="self-delete-updated-at">{{ user_settings.updated_at.strftime('%Y-%m-%d %H:%M') ~ ' UTC' if user_settings.updated_at else '' }}</span>
+                </p>
+            </div>
+            <div class="modal-footer">
+                <span class="me-auto small text-muted">Changes save immediately.</span>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Done</button>
             </div>
         </div>
     </div>

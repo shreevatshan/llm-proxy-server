@@ -123,6 +123,19 @@ class ProviderDbSyncTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rows["ollama:a/keep"].is_enabled)
         self.assertTrue(rows["ollama:a/new"].is_enabled)
 
+    async def test_stale_detection_skips_excluded_providers(self):
+        from app.auth.database import identify_stale_models
+        for key in ("ollama:a", "ollama:b"):
+            await self._add_provider(key)
+            await self.pm._sync_provider_to_database(key, _models(key, ["x", "y"]))
+
+        # ollama:a failed to sync (nothing listed); ollama:b listed only "x".
+        async with self._factory() as db:
+            stale = await identify_stale_models(
+                db, ["ollama:b/x"], exclude_provider_keys={"ollama:a"}
+            )
+        self.assertEqual({m["model_id"] for m in stale}, {"ollama:b/y"})
+
     async def test_parallel_provider_syncs_use_one_connection_at_a_time(self):
         keys = [f"ollama:p{i}" for i in range(8)]
         for key in keys:

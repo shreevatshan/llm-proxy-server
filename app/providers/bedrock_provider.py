@@ -72,6 +72,13 @@ def _get_positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _is_access_denied(error: Exception) -> bool:
+    """True if *error* is an AWS AccessDenied ClientError (missing IAM permission)."""
+    if not isinstance(error, ClientError):
+        return False
+    return error.response.get("Error", {}).get("Code") in ("AccessDeniedException", "AccessDenied")
+
+
 def _map_bedrock_error(error_code: str, error_message: str) -> Dict[str, Any]:
     """Map a Bedrock ClientError to an Anthropic-format error dict + HTTP status.
 
@@ -404,7 +411,12 @@ class BedrockProvider(BaseProvider):
                     for page in paginator.paginate(maxResults=1000, typeEquals="SYSTEM_DEFINED"):
                         profile_list.extend([p["inferenceProfileId"] for p in page["inferenceProfileSummaries"]])
                 except Exception as e:
-                    logger.warning(f"Error listing cross-region inference profiles: {e}")
+                    # A missing IAM permission is a stable config choice and yields the
+                    # same list every time. Anything else (e.g. endpoint unreachable)
+                    # would silently drop every cross-region model, so fail the refresh.
+                    if not _is_access_denied(e):
+                        raise
+                    logger.warning(f"Not permitted to list cross-region inference profiles: {e}")
             
             # Get application inference profiles
             if self.enable_app_profiles:
@@ -427,7 +439,9 @@ class BedrockProvider(BaseProvider):
                             except Exception as e:
                                 logger.warning(f"Error processing application profile: {e}")
                 except Exception as e:
-                    logger.warning(f"Error listing application inference profiles: {e}")
+                    if not _is_access_denied(e):
+                        raise
+                    logger.warning(f"Not permitted to list application inference profiles: {e}")
             
             # List foundation models - removed byOutputModality filter
             #response = self.bedrock_client.list_foundation_models(byOutputModality="TEXT")
@@ -465,9 +479,10 @@ class BedrockProvider(BaseProvider):
                         model_list[profile_arn] = {"modalities": input_modalities}
             
             if not model_list:
-                # Fallback to default model
-                model_list[self.default_model] = {"modalities": ["TEXT", "IMAGE"]}
-            
+                # Raise rather than return []: an empty fetch tells auto-sync to
+                # clear this provider's saved models.
+                raise RuntimeError("Bedrock returned no usable models")
+
             # Atomic swap — readers see old or new map whole, never partial.
             self.bedrock_model_list = model_list
             self._model_list_fetched_at = time.monotonic()
@@ -475,10 +490,11 @@ class BedrockProvider(BaseProvider):
 
         except Exception as e:
             logger.error(f"Error listing Bedrock models: {e}")
-            # Set a default model only if we have nothing cached; don't clobber a
-            # previously-good list on a transient control-plane failure.
-            if not self.bedrock_model_list:
-                self.bedrock_model_list = {self.default_model: {"modalities": ["TEXT", "IMAGE"]}}
+            # Re-raise so callers record the sync as failed instead of treating a
+            # fallback/partial list as success. The previously-good list (if any)
+            # is left in place for the request-path helpers, and
+            # _model_list_fetched_at is not bumped, so the next call retries.
+            raise
 
     async def get_available_models(self) -> List[ModelInfo]:
         """Get list of available models from Bedrock."""

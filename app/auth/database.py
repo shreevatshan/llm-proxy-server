@@ -14,7 +14,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -620,6 +620,41 @@ async def upsert_global_rate_limit(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+async def get_user_management_settings(db: AsyncSession) -> Optional[UserManagementSettings]:
+    """Return the singleton user management settings row (id=1), or None if never saved."""
+    result = await db.execute(select(UserManagementSettings).where(UserManagementSettings.id == 1))
+    return result.scalar_one_or_none()
+
+
+async def upsert_user_management_settings(
+    db: AsyncSession, allow_self_delete: bool, admin_username: str
+) -> UserManagementSettings:
+    """Create or update the user management settings singleton."""
+    row = await get_user_management_settings(db)
+    if row is None:
+        row = UserManagementSettings(id=1)
+        db.add(row)
+    row.allow_self_delete = allow_self_delete
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def load_user_management_settings(db: AsyncSession) -> UserManagementSettingsResponse:
+    """Effective user management settings: the saved row, or the model defaults if never saved."""
+    row = await get_user_management_settings(db)
+    if row is None:
+        return UserManagementSettingsResponse()
+    return UserManagementSettingsResponse.model_validate(row)
+
+
+async def is_self_delete_allowed(db: AsyncSession) -> bool:
+    """Whether regular users may delete their own account (allowed until an admin says otherwise)."""
+    return (await load_user_management_settings(db)).allow_self_delete
 
 
 async def get_websearch_settings(db: AsyncSession) -> Optional[WebSearchSettings]:
@@ -1506,14 +1541,26 @@ async def refresh_models_from_providers(db: AsyncSession, fresh_models: List[Dic
         raise e
 
 
-async def identify_stale_models(db: AsyncSession, current_model_ids: List[str]) -> List[Dict]:
-    """Identify models in database that are not in the current list of model IDs."""
+async def identify_stale_models(
+    db: AsyncSession,
+    current_model_ids: List[str],
+    exclude_provider_keys: Optional[set] = None,
+) -> List[Dict]:
+    """Identify models in database that are not in the current list of model IDs.
+
+    Models of providers in ``exclude_provider_keys`` (e.g. ones whose sync failed
+    or that are disabled) are never reported: they weren't listed because the
+    provider wasn't reached, not because they were removed upstream.
+    """
     try:
         all_models = await get_all_model_configurations(db)
         current_ids_set = set(current_model_ids)
-        
+        excluded = set(exclude_provider_keys or ())
+
         stale_models = []
         for model in all_models:
+            if model.provider_key in excluded:
+                continue
             if model.model_id not in current_ids_set:
                 stale_models.append({
                     "model_id": model.model_id,

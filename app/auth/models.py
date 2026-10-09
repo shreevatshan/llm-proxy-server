@@ -169,6 +169,16 @@ class GlobalRateLimit(Base):
     updated_by = Column(String(50), nullable=True)
 
 
+class UserManagementSettings(Base):
+    """Admin-managed user account policies. Single row (id=1); absent row = defaults."""
+    __tablename__ = "user_management_settings"
+
+    id = Column(Integer, primary_key=True)  # always 1
+    allow_self_delete = Column(Boolean, default=True, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+
 class WebSearchSettings(Base):
     """Web search interception settings. Single row (id=1).
 
@@ -769,6 +779,19 @@ class GlobalRateLimitResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class UserManagementSettingsResponse(BaseModel):
+    allow_self_delete: bool = True
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserManagementSettingsUpdate(BaseModel):
+    allow_self_delete: bool
 
 
 class GlobalRateLimitUpdate(BaseModel):

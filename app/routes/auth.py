@@ -14,7 +14,8 @@ from app.auth.database import (
     get_user_by_email, is_reserved_username,
     create_api_key, get_user_api_keys, delete_api_key,
     update_user_profile, update_user_password, permanently_delete_user, verify_password,
-    get_oauth_user_by_provider_id, create_oauth_user, update_oauth_user
+    get_oauth_user_by_provider_id, create_oauth_user, update_oauth_user,
+    is_self_delete_allowed,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.models import (
@@ -485,6 +486,19 @@ async def delete_account(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin users cannot delete account through this endpoint"
+        )
+
+    # Checked before the confirmation text (and outside the try below, whose
+    # broad except would turn this 403 into a 500).
+    if not await is_self_delete_allowed(db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Account deletion has been disabled by the administrator. "
+                f"Please contact {get_admin_email()} to delete your account."
+            ),
+            # Lets the profile page tell this apart from other 403s (e.g. CSRF).
+            headers={"X-Account-Deletion-Disabled": "true"},
         )
 
     # Verify confirmation text before deletion

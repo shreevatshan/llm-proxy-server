@@ -7,10 +7,10 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, List, Dict
 
-from app.auth.database import get_db
+from app.auth.database import get_db, is_self_delete_allowed
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin, get_current_user_optional
 from app.auth.models import User
-from app.auth.admin import AdminUser
+from app.auth.admin import AdminUser, get_admin_email
 from typing import Union
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -157,13 +157,14 @@ async def dashboard_home(
 @router.get("/profile", response_class=HTMLResponse)
 async def profile_page(
     request: Request,
-    current_user_or_admin: Union[User, AdminUser] = Depends(get_current_user_or_admin)
+    current_user_or_admin: Union[User, AdminUser] = Depends(get_current_user_or_admin),
+    db: AsyncSession = Depends(get_db)
 ):
     """User profile page (requires authentication). Redirects admin users to admin dashboard."""
     # If user is admin, redirect to admin dashboard
     if isinstance(current_user_or_admin, AdminUser):
         return RedirectResponse(url="/admin/dashboard", status_code=status.HTTP_302_FOUND)
-    
+
     import time
     # Regular user - show profile page
     return templates.TemplateResponse(
@@ -171,6 +172,8 @@ async def profile_page(
         {
             "request": request,
             "user": current_user_or_admin,
+            "allow_self_delete": await is_self_delete_allowed(db),
+            "admin_email": get_admin_email(),
             "title": "Profile - LLM Proxy Server",
             "cache_version": str(int(time.time()))
         }
