@@ -16,7 +16,8 @@ from app.auth.database import (
     get_db, get_user_by_username, get_user_by_email, create_user, get_user_by_id, permanently_delete_user,
     get_all_provider_configurations, get_all_model_configurations, get_models_by_provider,
     create_or_update_provider_configuration, create_or_update_model_configuration, get_model_configuration,
-    get_all_model_aliases, upsert_model_alias, delete_model_alias,
+    get_all_model_aliases, get_model_alias, get_model_alias_by_id, upsert_model_alias,
+    delete_model_alias, reorder_model_aliases,
     toggle_provider_configuration, toggle_model_configuration, bulk_toggle_all_models,
     search_models_and_providers, get_all_provider_credentials, get_provider_credentials,
     create_provider_credentials, update_provider_credentials, delete_provider_credentials,
@@ -52,7 +53,8 @@ from app.auth.models import (
     ModelGroupResponse, UserModelGroupRateLimitResponse, UserModelGroupRateLimitUpdate,
     InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupLimitsUpdate, InstanceGroupMembersUpdate,
     InstanceGroupResponse, UserInstanceGroupRateLimitResponse, UserInstanceGroupRateLimitUpdate,
-    ModelAliasUpsert, ModelAliasResponse,
+    ModelAliasUpsert, ModelAliasResponse, ModelAliasReorder, ModelAliasTestMatch,
+    MODEL_ALIAS_API_SURFACES, validate_alias_pattern,
     AdminPoolResponse,
     WebSearchSettingsResponse, WebSearchSettingsUpdate, WebSearchTestRequest, WebSearchEnginesRequest,
     FOURGET_WEB_SCRAPERS, WEBSEARCH_PROVIDER_LABELS,
@@ -1564,16 +1566,95 @@ async def upsert_model_alias_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create or update an alias after validating its canonical target."""
+    """Create or update an alias after validating its pattern and canonical target.
+
+    With `id`, that row is updated in place (and may be renamed); otherwise the
+    row is matched by its alias text, as before.
+    """
+    from sqlalchemy.exc import IntegrityError
+    if body.id is not None:
+        existing = await get_model_alias_by_id(db, body.id)
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
+    else:
+        existing = await get_model_alias(db, body.alias)
+
+    # The schema only validates the pattern when match_type is sent; re-check it
+    # against the type the row will actually have.
+    effective_type = body.match_type or (existing.match_type if existing else None) or "exact"
+    try:
+        validate_alias_pattern(body.alias, body.target_model_id, effective_type)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     if await get_model_configuration(db, body.target_model_id) is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown target model: {body.target_model_id}",
         )
-    row = await upsert_model_alias(db, body.alias, body.target_model_id, body.enabled, body.apis)
+    # Passing the loaded row's id lets upsert_model_alias reuse it from the
+    # session. A rename onto another row's alias trips the unique constraint.
+    try:
+        row = await upsert_model_alias(
+            db, body.alias, body.target_model_id, body.enabled, body.apis,
+            match_type=body.match_type, alias_id=existing.id if existing else None,
+        )
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A mapping for '{body.alias}' already exists",
+        )
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
     from app.model_alias import model_alias_resolver
     await model_alias_resolver.load_from_database()
     return ModelAliasResponse.model_validate(row)
+
+
+@router.put("/model-aliases/order", response_model=List[ModelAliasResponse])
+async def reorder_model_aliases_endpoint(
+    body: ModelAliasReorder,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set the evaluation order; `ids` must list every alias exactly once."""
+    if not await reorder_model_aliases(db, body.ids):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Mapping list changed — refresh and retry",
+        )
+    from app.model_alias import model_alias_resolver
+    await model_alias_resolver.load_from_database()
+    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db)]
+
+
+@router.get("/model-aliases/test", response_model=List[ModelAliasTestMatch])
+async def match_model_alias_endpoint(
+    model: str = Query(..., min_length=1),
+    api: Optional[str] = Query(None),
+    current_admin: AdminUser = Depends(get_current_admin),
+):
+    """Report which enabled mapping *model* would hit, per API surface.
+
+    Uses the live resolver, so the answer is exactly what requests get. Without
+    `api`, every surface is reported (rather than an unscoped match, which
+    ignores API scoping and so never happens for a real request).
+    """
+    if api is not None and api not in MODEL_ALIAS_API_SURFACES:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown API surface: {api}")
+    from app.model_alias import model_alias_resolver
+    results = []
+    for surface in ([api] if api else MODEL_ALIAS_API_SURFACES):
+        rule = model_alias_resolver.match(model, surface)
+        if rule is None:
+            results.append(ModelAliasTestMatch(api=surface, matched=False, resolved_model=model))
+        else:
+            results.append(ModelAliasTestMatch(
+                api=surface, matched=True, resolved_model=rule.target, id=rule.id,
+                alias=rule.pattern, match_type=rule.match_type, target_model_id=rule.target,
+            ))
+    return results
 
 
 @router.delete("/model-aliases/{alias:path}")

@@ -39,7 +39,7 @@ from typing import Dict, List, Optional, Tuple
 from app.api_envelope import envelope_for
 from app.auth.admin import AdminUser
 from app.model_access_dep import ModelAccessDenied
-from app.model_alias import current_api_surface, original_model_name
+from app.model_alias import apply_alias, current_api_surface, original_model_name
 from app.providers.provider_manager import provider_manager
 
 logger = logging.getLogger(__name__)
@@ -248,14 +248,17 @@ async def resolve_model_for_request(
 ) -> Optional[str]:
     """Resolve a client-supplied model name to a canonical '{provider_key}/{name}' id.
 
-    Assumes admin aliases have already been applied (middleware, or apply_alias in
-    the handler). Raises ModelUnavailable (404) when nothing serves the model, and
-    ModelAccessDenied (403) when candidates exist but the caller may use none of
-    them -- so a user asking for 'gpt-5.4' gets the same answer they would get
-    asking for 'azure:foundry/gpt-5.4'.
+    Applies admin aliases first. That is usually a no-op (the middleware or the
+    handler already applied them, and apply_alias never re-maps its own output),
+    but it covers paths the middleware skips, such as /openai/v1/* and
+    /v1/messages/count_tokens. Raises ModelUnavailable (404) when nothing serves
+    the model, and ModelAccessDenied (403) when candidates exist but the caller
+    may use none of them -- so a user asking for 'gpt-5.4' gets the same answer
+    they would get asking for 'azure:foundry/gpt-5.4'.
     """
     if not model:
         return model
+    model = apply_alias(model)
 
     cache = provider_manager.model_cache
     if cache.has_model_id(model):

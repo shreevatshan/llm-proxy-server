@@ -333,8 +333,9 @@ def _add_request_tracking(app: FastAPI, server_name: str):
         # Tag the API surface first, before the _TRACKED_PREFIXES gate: paths
         # outside it (e.g. /openai/v1/audio/*, /openai/v1/images/*) skip the
         # alias block below but still call apply_alias() inside their handlers.
-        from app.model_alias import current_api_surface
+        from app.model_alias import current_api_surface, alias_resolved_name
         current_api_surface.set(server_name)
+        alias_resolved_name.set(None)
 
         # Open the request's identity holder here, in the *outer* middleware task,
         # before the _TRACKED_PREFIXES gate below and long before auth has run.

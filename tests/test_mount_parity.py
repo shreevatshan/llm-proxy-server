@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from app.api_envelope import envelope_for
 from app.asgi_mount import MOUNTED_API_PREFIXES, CORSExceptPrefixes, MountedApp, _under
 from app.main import _add_request_tracking
-from app.model_alias import model_alias_resolver
+from app.model_alias import build_rule, model_alias_resolver, rules_from_mapping
 from app.request_tracker import RequestTracker
 
 ALL_SURFACES = frozenset({"openai", "anthropic", "azure_openai"})
@@ -32,17 +32,20 @@ def mount(sub_app, prefix):
 
 
 class _AliasSnapshot:
-    """Swap in an alias table for the duration of a test."""
+    """Swap in alias rules for the duration of a test.
+
+    Accepts exact mappings as {alias: (target, apis)} or a list of AliasRule.
+    """
 
     def __init__(self, aliases):
-        self.aliases = aliases
+        self.rules = rules_from_mapping(aliases) if isinstance(aliases, dict) else list(aliases)
 
     def __enter__(self):
-        self.saved = model_alias_resolver._aliases
-        model_alias_resolver._aliases = self.aliases
+        self.saved = model_alias_resolver._snapshot
+        model_alias_resolver.set_rules(self.rules)
 
     def __exit__(self, *exc):
-        model_alias_resolver._aliases = self.saved
+        model_alias_resolver._snapshot = self.saved
 
 
 def build_openai_sub():
@@ -156,6 +159,18 @@ class TrackingParityTests(unittest.TestCase):
         # ...and it is the mapped name that gets recorded against usage.
         self.assertEqual(mounted_call["model"], direct_call["model"])
         self.assertEqual(mounted_call["model"], "prov/real-model")
+
+    def test_contains_mapping_rewrites_body_model(self):
+        rules = [build_rule("opus", "prov/opus-target", match_type="contains")]
+        with _AliasSnapshot(rules):
+            (direct, direct_call), (mounted, mounted_call) = self._both(
+                json={"model": "Claude-Opus-4", "stream": False}
+            )
+        for payload in (direct.json(), mounted.json()):
+            self.assertEqual(payload["model_seen"], "prov/opus-target")
+            self.assertEqual(payload["state_model"], "prov/opus-target")
+        self.assertEqual(direct_call["model"], "prov/opus-target")
+        self.assertEqual(mounted_call["model"], direct_call["model"])
 
     def test_alias_retains_client_facing_name_for_echo(self):
         """echo_model_name must still return what the client asked for."""
@@ -349,6 +364,38 @@ class AzureParityTests(unittest.TestCase):
             _, mounted_call = post(mount(build_azure_sub(), "/azure-openai"),
                                    "/azure-openai" + path, json={"model": "friendly"})
         self.assertEqual(direct_call["model"], "prov/real-model")
+        self.assertEqual(mounted_call["model"], direct_call["model"])
+
+    def test_responses_pattern_rules_do_not_chain(self):
+        """The route re-applies aliases (azure_openai.py) after the middleware did.
+
+        With pattern rules a second pass would chain mini -> gpt-4o -> gpt-4.1 and
+        overwrite the echoed name; it must be a no-op instead.
+        """
+        from app.model_alias import apply_alias, original_model_name
+
+        def build():
+            sub = FastAPI()
+            _add_request_tracking(sub, "azure_openai")
+
+            @sub.post("/openai/deployments/{provider}/responses")
+            async def responses(provider: str, body: dict):
+                return {"routed": apply_alias(body.get("model")), "echo": original_model_name.get()}
+
+            return sub
+
+        rules = [
+            build_rule("mini", "prov/gpt-4o", match_type="contains", priority=0, rule_id=1),
+            build_rule("gpt-4o", "prov/gpt-4.1", match_type="contains", priority=1, rule_id=2),
+        ]
+        path = "/openai/deployments/prov/responses"
+        with _AliasSnapshot(rules):
+            direct, direct_call = post(build(), path, json={"model": "gpt-4o-mini"})
+            mounted, mounted_call = post(mount(build(), "/azure-openai"),
+                                         "/azure-openai" + path, json={"model": "gpt-4o-mini"})
+        self.assertEqual(direct.json(), {"routed": "prov/gpt-4o", "echo": "gpt-4o-mini"})
+        self.assertEqual(mounted.json(), direct.json())
+        self.assertEqual(direct_call["model"], "prov/gpt-4o")
         self.assertEqual(mounted_call["model"], direct_call["model"])
 
 

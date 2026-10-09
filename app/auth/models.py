@@ -6,8 +6,10 @@ from sqlalchemy.orm import relationship
 from datetime import datetime, date
 import re
 import json
+import math
+from re import _constants as _sre, _parser as _sre_parse
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 VALID_AZURE_BACKENDS = {"openai", "foundry"}
 DEPLOYMENT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
@@ -114,6 +116,110 @@ class ModelConfiguration(Base):
 # strings passed to _add_request_tracking in app/main.py.
 MODEL_ALIAS_API_SURFACES = ("openai", "anthropic", "azure_openai")
 
+# How a model alias's `alias` text is compared with the requested model name.
+# exact is case-sensitive; contains and regex (re.search) are case-insensitive.
+MODEL_ALIAS_MATCH_TYPES = ("exact", "contains", "regex")
+
+# Python's re has no timeout and regex aliases run on the event loop against
+# client-supplied model names (up to 256 characters, see app.model_alias), so
+# patterns whose worst-case backtracking could stall the server are refused.
+# The check works on the parsed pattern, not its text, so groups, alternation
+# and {n,} are all seen. Two shapes are refused:
+#  - a repeated group that can itself match in more than one way, e.g. (a+)+,
+#    ((a)+)+, (a|aa)+, (a{1,})+: exponential in the name length;
+#  - too many choices overall, estimated in bits (log2 of tries): a wide
+#    quantifier (*, +, {0,50}) costs about 7 bits, a narrow one (?, {1,3}) log2
+#    of its choices, an alternation log2 of its branches, and a pattern not
+#    anchored with ^ another 7 bits for the start positions re.search tries.
+#    21 bits admits ".*opus.*" or "^a*b*c*" and stays near 0.1 s worst case.
+_REGEX_WIDE_BITS = 7.0
+_REGEX_BUDGET_BITS = 21.0
+_REPEATS = (_sre.MAX_REPEAT, _sre.MIN_REPEAT, _sre.POSSESSIVE_REPEAT)
+
+
+def _regex_children(op, av) -> list:
+    """The nested sub-patterns of one parsed regex item."""
+    if op in _REPEATS:
+        return [av[2]]
+    if op is _sre.SUBPATTERN:
+        return [av[3]]
+    if op in (_sre.ASSERT, _sre.ASSERT_NOT):
+        return [av[1]]
+    if op is _sre.ATOMIC_GROUP:
+        return [av]
+    if op is _sre.BRANCH:
+        return list(av[1])
+    if op is _sre.GROUPREF_EXISTS:
+        return [p for p in av[1:] if p is not None]
+    return []
+
+
+def _regex_has_choice(parsed) -> bool:
+    """True if *parsed* can match the same text in more than one way."""
+    for op, av in parsed:
+        if op in (_sre.BRANCH, _sre.GROUPREF_EXISTS):
+            return True
+        if op in _REPEATS and av[0] != av[1]:
+            return True
+        if any(_regex_has_choice(p) for p in _regex_children(op, av)):
+            return True
+    return False
+
+
+def _regex_cost_bits(parsed) -> float:
+    """Estimated log2 of backtracking tries from one start position."""
+    bits = 0.0
+    for op, av in parsed:
+        if op in _REPEATS:
+            low, high, body = av
+            if high > 1 and _regex_has_choice(body):
+                raise ValueError(
+                    "regex repeats a group that itself contains a quantifier or alternation "
+                    "(e.g. (a+)+ or (a|aa)+), which can hang the server; use a character "
+                    "class such as [a-z0-9.-]+ instead"
+                )
+            if high > low:
+                bits += min(math.log2(high - low + 1), _REGEX_WIDE_BITS)
+            bits += _regex_cost_bits(body)
+        elif op in (_sre.BRANCH, _sre.GROUPREF_EXISTS):
+            branches = [2 ** _regex_cost_bits(p) for p in _regex_children(op, av)]
+            if op is _sre.GROUPREF_EXISTS and av[2] is None:
+                branches.append(1)   # the implicit empty "no" branch
+            bits += math.log2(sum(branches))
+        else:
+            bits += sum(_regex_cost_bits(p) for p in _regex_children(op, av))
+    return bits
+
+
+def _check_regex_cost(alias: str) -> None:
+    parsed = _sre_parse.parse(alias, re.IGNORECASE)
+    bits = _regex_cost_bits(parsed)
+    anchored = bool(parsed.data) and parsed.data[0] in (
+        (_sre.AT, _sre.AT_BEGINNING), (_sre.AT, _sre.AT_BEGINNING_STRING),
+    )
+    if not anchored:
+        bits += _REGEX_WIDE_BITS
+    if bits > _REGEX_BUDGET_BITS:
+        raise ValueError(
+            "regex is too open-ended to run safely on every request: use fewer "
+            "quantifiers, anchor it with ^, or drop a leading or trailing .* "
+            "(patterns already match anywhere in the name)"
+        )
+
+
+def validate_alias_pattern(alias: str, target_model_id: str, match_type: str) -> None:
+    """Raise ValueError if *alias* is not a usable pattern for *match_type*."""
+    if match_type not in MODEL_ALIAS_MATCH_TYPES:
+        raise ValueError(f"unknown match type: {match_type}")
+    if match_type == "exact" and alias == target_model_id:
+        raise ValueError("alias must differ from target_model_id")
+    if match_type == "regex":
+        try:
+            re.compile(alias, re.IGNORECASE)
+        except re.error as e:
+            raise ValueError(f"invalid regex: {e}")
+        _check_regex_cost(alias)
+
 
 class ModelAlias(Base):
     """Admin-managed client-facing alias for a canonical model identifier."""
@@ -126,6 +232,11 @@ class ModelAlias(Base):
     # JSON array of API surfaces this alias applies to. NULL (legacy rows) means
     # "all surfaces". Mirrors ProviderCredentials.supported_apis.
     apis = Column(Text, nullable=True, default='["openai", "anthropic", "azure_openai"]')
+    # One of MODEL_ALIAS_MATCH_TYPES.
+    match_type = Column(String(16), nullable=False, default="exact", server_default="exact")
+    # Evaluation order: lowest first, ties broken by id. Not contiguous (deletes
+    # leave gaps); the admin UI shows row position instead.
+    priority = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1443,10 +1554,15 @@ class UserInstanceGroupRateLimitUpdate(BaseModel):
 
 
 class ModelAliasUpsert(BaseModel):
+    # When set, update this row in place (allows renaming the alias text).
+    id: Optional[int] = None
     alias: str
     target_model_id: str
     enabled: bool = True
     apis: List[str] = Field(default_factory=lambda: list(MODEL_ALIAS_API_SURFACES))
+    # None keeps an existing row's type ("exact" for a new row). The endpoint
+    # re-validates against that effective type, since it is unknown here.
+    match_type: Optional[Literal[MODEL_ALIAS_MATCH_TYPES]] = None
 
     @model_validator(mode="after")
     def validate_fields(self):
@@ -1456,8 +1572,8 @@ class ModelAliasUpsert(BaseModel):
             raise ValueError("alias must be 1–200 characters")
         if not self.target_model_id or len(self.target_model_id) > 200:
             raise ValueError("target_model_id must be 1–200 characters")
-        if self.alias == self.target_model_id:
-            raise ValueError("alias must differ from target_model_id")
+        if self.match_type is not None:
+            validate_alias_pattern(self.alias, self.target_model_id, self.match_type)
         # Normalise APIs: strip, dedupe, reject unknown, preserve canonical order.
         seen = {a.strip() for a in self.apis}
         unknown = seen - set(MODEL_ALIAS_API_SURFACES)
@@ -1475,6 +1591,8 @@ class ModelAliasResponse(BaseModel):
     target_model_id: str
     enabled: bool
     apis: List[str]
+    match_type: str
+    priority: int
     created_at: datetime
     updated_at: datetime
 
@@ -1497,6 +1615,30 @@ class ModelAliasResponse(BaseModel):
         if not isinstance(decoded, list) or not decoded:
             return list(MODEL_ALIAS_API_SURFACES)
         return [a for a in MODEL_ALIAS_API_SURFACES if a in set(decoded)] or list(MODEL_ALIAS_API_SURFACES)
+
+
+class ModelAliasReorder(BaseModel):
+    """Every alias id, in the desired evaluation order (highest priority first)."""
+    ids: List[int]
+
+    @model_validator(mode="after")
+    def validate_ids(self):
+        if not self.ids:
+            raise ValueError("ids must not be empty")
+        if len(set(self.ids)) != len(self.ids):
+            raise ValueError("ids must not contain duplicates")
+        return self
+
+
+class ModelAliasTestMatch(BaseModel):
+    """Which mapping (if any) a model name hits on one API surface."""
+    api: str
+    matched: bool
+    resolved_model: str
+    id: Optional[int] = None
+    alias: Optional[str] = None
+    match_type: Optional[str] = None
+    target_model_id: Optional[str] = None
 
 
 # Model Management Pydantic models (updated to use ProviderCredentials)

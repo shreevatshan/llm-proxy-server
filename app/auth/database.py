@@ -989,8 +989,8 @@ async def get_all_model_configurations(db: AsyncSession) -> List[ModelConfigurat
 
 
 async def get_all_model_aliases(db: AsyncSession) -> List[ModelAlias]:
-    """Return all model aliases in stable display order."""
-    result = await db.execute(select(ModelAlias).order_by(ModelAlias.alias))
+    """Return all model aliases in evaluation (priority) order."""
+    result = await db.execute(select(ModelAlias).order_by(ModelAlias.priority, ModelAlias.id))
     return list(result.scalars().all())
 
 
@@ -1000,14 +1000,40 @@ async def get_model_alias(db: AsyncSession, alias: str) -> Optional[ModelAlias]:
     return result.scalar_one_or_none()
 
 
+async def get_model_alias_by_id(db: AsyncSession, alias_id: int) -> Optional[ModelAlias]:
+    """Return an alias by primary key (from the session's identity map if already loaded)."""
+    return await db.get(ModelAlias, alias_id)
+
+
 async def upsert_model_alias(
-    db: AsyncSession, alias: str, target_model_id: str, enabled: bool, apis
-) -> ModelAlias:
-    """Create or update a model alias."""
-    row = await get_model_alias(db, alias)
+    db: AsyncSession, alias: str, target_model_id: str, enabled: bool, apis,
+    match_type: Optional[str] = None, alias_id: Optional[int] = None,
+) -> Optional[ModelAlias]:
+    """Create or update a model alias.
+
+    With *alias_id*, that row is updated (and may be renamed); returns None if it
+    does not exist. Otherwise the row is looked up by *alias*. New rows go to the
+    bottom of the priority order. A *match_type* of None keeps an existing row's
+    type. Two concurrent creates may share a priority; ties break by id.
+    """
+    from sqlalchemy import func
+    if alias_id is not None:
+        row = await get_model_alias_by_id(db, alias_id)
+        if row is None:
+            return None
+        row.alias = alias
+    else:
+        row = await get_model_alias(db, alias)
     if row is None:
-        row = ModelAlias(alias=alias)
+        max_priority = (await db.execute(select(func.max(ModelAlias.priority)))).scalar()
+        row = ModelAlias(
+            alias=alias,
+            match_type=match_type or "exact",
+            priority=(max_priority if max_priority is not None else -1) + 1,
+        )
         db.add(row)
+    elif match_type is not None:
+        row.match_type = match_type
     row.target_model_id = target_model_id
     row.enabled = enabled
     row.apis = json.dumps(list(apis))
@@ -1015,6 +1041,22 @@ async def upsert_model_alias(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+async def reorder_model_aliases(db: AsyncSession, ids: List[int]) -> bool:
+    """Set priorities to the order of *ids*, which must name every alias exactly once.
+
+    Returns False (writing nothing) when *ids* does not match the stored rows, so a
+    client working from a stale list cannot silently drop rows from the order.
+    """
+    rows = list((await db.execute(select(ModelAlias))).scalars().all())
+    by_id = {row.id: row for row in rows}
+    if len(ids) != len(rows) or set(ids) != set(by_id):
+        return False
+    for position, alias_id in enumerate(ids):
+        by_id[alias_id].priority = position
+    await db.commit()
+    return True
 
 
 async def delete_model_alias(db: AsyncSession, alias: str) -> bool:
@@ -3018,6 +3060,34 @@ async def _run_auto_migrations():
                 logger.info("Auto-migration: 'apis' column added successfully")
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add apis column to model_aliases: {e}")
+
+        # Add 'match_type' and 'priority' to model_aliases for pattern mappings
+        # evaluated in admin-defined order. Existing rows become exact matches and
+        # keep their previous (alphabetical) display order as their priority.
+        try:
+            result = await conn.execute(text("PRAGMA table_info(model_aliases)"))
+            columns = [row[1] for row in result.fetchall()]
+
+            if columns and 'match_type' not in columns:
+                logger.info("Auto-migration: Adding 'match_type' column to model_aliases")
+                await conn.execute(text(
+                    "ALTER TABLE model_aliases ADD COLUMN match_type VARCHAR(16) NOT NULL DEFAULT 'exact'"
+                ))
+            if columns and 'priority' not in columns:
+                logger.info("Auto-migration: Adding 'priority' column to model_aliases")
+                await conn.execute(text(
+                    "ALTER TABLE model_aliases ADD COLUMN priority INTEGER NOT NULL DEFAULT 0"
+                ))
+                ids = [row[0] for row in (await conn.execute(
+                    text("SELECT id FROM model_aliases ORDER BY alias")
+                )).fetchall()]
+                for position, alias_id in enumerate(ids):
+                    await conn.execute(
+                        text("UPDATE model_aliases SET priority = :p WHERE id = :id"),
+                        {"p": position, "id": alias_id},
+                    )
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not add match_type/priority columns to model_aliases: {e}")
 
         try:
             result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))

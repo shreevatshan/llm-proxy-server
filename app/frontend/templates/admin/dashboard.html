@@ -925,15 +925,19 @@
 <!-- Model Mapping Section -->
 <div class="section tab-content" id="model-mapping-tab" style="display: none;">
     <div class="card mb-4">
-        <div class="card-header"><h5 class="mb-0"><i class="fas fa-plus me-2"></i>Add or Update Mapping</h5></div>
+        <div class="card-header"><h5 class="mb-0" id="model-alias-form-title"><i class="fas fa-plus me-2"></i>Add or Update Mapping</h5></div>
         <div class="card-body">
             <form onsubmit="window.ModelAliasManager?.save(event); return false;">
                 <div class="row g-3 align-items-end">
-                    <div class="col-md-4">
-                        <label class="form-label" for="model-alias-name">Friendly name</label>
+                    <div class="col-md-2">
+                        <label class="form-label" for="model-alias-match-type">Match type</label>
+                        <select id="model-alias-match-type" class="form-select" onchange="window.ModelAliasManager?.updateMatchHelp()"></select>
+                    </div>
+                    <div class="col-md-3">
+                        <label class="form-label" for="model-alias-name">Model name / pattern</label>
                         <input id="model-alias-name" class="form-control" placeholder="e.g. gpt-5.5" required maxlength="200">
                     </div>
-                    <div class="col-md-4">
+                    <div class="col-md-3">
                         <label class="form-label" for="model-alias-target">Canonical target</label>
                         <div class="alias-combobox" id="model-alias-combobox">
                             <input id="model-alias-target" class="form-control" placeholder="Search a canonical model…" autocomplete="off" role="combobox" aria-autocomplete="list" aria-expanded="false" required>
@@ -957,7 +961,32 @@
                             </div>
                         </div>
                     </div>
-                    <div class="col-12"><button class="btn btn-primary" type="submit"><i class="fas fa-save me-1"></i>Save</button></div>
+                    <div class="col-12"><p id="model-alias-match-help" class="alias-help mb-0"></p></div>
+                    <div class="col-12 d-flex gap-2">
+                        <button class="btn btn-primary" type="submit" id="model-alias-save-btn"><i class="fas fa-save me-1"></i>Save</button>
+                        <button class="btn btn-outline-secondary" type="button" id="model-alias-cancel-btn" style="display: none;" onclick="window.ModelAliasManager?.cancelEdit()">Cancel edit</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+    <div class="card mb-4">
+        <div class="card-header"><h5 class="mb-0"><i class="fas fa-vial me-2"></i>Test a Model Name</h5></div>
+        <div class="card-body">
+            <form onsubmit="window.ModelAliasManager?.test(event); return false;">
+                <div class="row g-3 align-items-end">
+                    <div class="col-md-5">
+                        <label class="form-label" for="model-alias-test-name">Requested model</label>
+                        <input id="model-alias-test-name" class="form-control" placeholder="e.g. claude-opus-4-1" required maxlength="512">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label" for="model-alias-test-api">API</label>
+                        <select id="model-alias-test-api" class="form-select">
+                            <option value="">All APIs</option>
+                        </select>
+                    </div>
+                    <div class="col-md-3"><button class="btn btn-outline-secondary w-100" type="submit"><i class="fas fa-search me-1"></i>Test</button></div>
+                    <div class="col-12"><ul id="model-alias-test-result" class="alias-test-result list-unstyled mb-0"></ul></div>
                 </div>
             </form>
         </div>
@@ -972,10 +1001,11 @@
                         placeholder="Search mappings" aria-label="Search mappings"
                         oninput="window.ModelAliasManager?.filter(this.value)">
                 </div>
+                <span id="model-alias-reorder-hint" class="alias-help" style="display: none;">Clear search to reorder</span>
             </div>
             <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelAliasManager?.load()"><i class="fas fa-sync-alt me-1"></i>Refresh</button>
         </div>
-        <div class="card-body p-0"><div class="table-responsive" style="max-height:60vh;overflow-y:auto;"><table class="table table-hover mb-0"><thead><tr><th>Friendly name</th><th>Canonical target</th><th>APIs</th><th>Status</th><th>Actions</th></tr></thead><tbody id="model-aliases-tbody"><tr><td colspan="5" class="text-center text-muted py-4">Open this tab to load mappings.</td></tr></tbody></table></div></div>
+        <div class="card-body p-0"><div class="table-responsive" style="max-height:60vh;overflow-y:auto;"><table class="table table-hover mb-0"><thead><tr><th title="Mappings are checked top to bottom; the first match wins. Drag to reorder.">Priority</th><th>Model name / pattern</th><th>Match</th><th>Canonical target</th><th>APIs</th><th>Status</th><th>Actions</th></tr></thead><tbody id="model-aliases-tbody"><tr><td colspan="7" class="text-center text-muted py-4">Open this tab to load mappings.</td></tr></tbody></table></div></div>
     </div>
 </div>
 
