@@ -85,6 +85,9 @@ class AnthropicImageSource(BaseModel):
     data: Optional[str] = None  # base64-encoded image data
     url: Optional[str] = None  # URL for url type
 
+    class Config:
+        extra = "allow"  # keep e.g. file_id for Files-API ("file") sources
+
     @model_validator(mode="after")
     def _require_matching_field(self) -> "AnthropicImageSource":
         """A base64 source needs data; a url source needs url.
@@ -103,6 +106,9 @@ class AnthropicImageBlock(BaseModel):
     """Image content block."""
     type: Literal["image"] = "image"
     source: AnthropicImageSource
+
+    class Config:
+        extra = "allow"
 
 
 class AnthropicToolUseBlock(BaseModel):

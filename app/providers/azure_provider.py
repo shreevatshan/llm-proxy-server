@@ -28,7 +28,7 @@ from app.openai_models import (
 from app.providers.anthropic_adapter import (
     anthropic_adapter_messages,
     anthropic_adapter_messages_stream,
-    prepare_anthropic_adapter_request,
+    anthropic_adapter_metadata,
 )
 from app.providers.anthropic_compatible import (
     # Azure Foundry native Anthropic streams intentionally share the same
@@ -53,7 +53,18 @@ from app.model_capabilities import (
 )
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
 from app.conversion.anthropic_openai import _is_codex_model
-from app.providers.azure_deployments import merge_azure_deployments
+from app.providers.azure_deployments import (
+    API_ANTHROPIC,
+    API_CHAT,
+    API_COMPLETIONS,
+    API_EMBEDDINGS,
+    API_IMAGES,
+    API_RESPONSES,
+    API_SPEECH,
+    API_TRANSCRIPTION,
+    CONVERSATIONAL_APIS,
+    merge_azure_deployments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,15 +139,24 @@ class AzureProvider(OpenAICompatibleProvider):
     ```
     """
 
+    # Azure OpenAI / Foundry reject unknown body params such as top_k.
+    anthropic_adapter_supports_top_k = False
+
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
         self.endpoint = config.get('endpoint', '').rstrip('/')
         self.api_key = config.get('api_key')
         self.discovery_api_version = config.get('discovery_api_version')
         self.azure_backend = (config.get('azure_backend') or 'openai').lower()
+        # Azure OpenAI accepts PDF `file` parts; Foundry's other model
+        # families are not guaranteed to.
+        self.anthropic_adapter_supports_file_parts = self.azure_backend == 'openai'
         self.deployments = config.get('deployments', [])
         self.openai_deployments = config.get('openai_deployments', [])
         self.anthropic_deployments = config.get('anthropic_deployments', [])
+        self.responses_deployments = config.get('responses_deployments', [])
+        # Deployment -> APIs selected for it in the admin form (listed ones only).
+        self.deployment_apis = config.get('deployment_apis') or {}
         self.dynamic_discovery = config.get('dynamic_discovery', True)
         self._anthropic_client = None
 
@@ -332,7 +352,19 @@ class AzureProvider(OpenAICompatibleProvider):
         return self._is_claude_model(model_name)
 
     def _get_adapter_transport(self, model_name: str) -> str:
-        if not self._is_foundry_backend() and _is_codex_model(model_name):
+        # Codex models, and deployments the admin marked as Responses-only
+        # (e.g. models that reject function tools on chat completions), use
+        # /openai/v1/responses on both backends (Foundry serves it off the
+        # same v1 client).
+        deployment = self.get_model_id(model_name)
+        apis = self.deployment_apis.get(deployment)
+        if apis is not None:
+            # A listed deployment uses what its row selects, chat first.
+            return "chat" if API_CHAT in apis or API_RESPONSES not in apis else "responses"
+        if deployment in (self.responses_deployments or []):
+            # Legacy Responses-only marker (no APIs selected).
+            return "responses"
+        if _is_codex_model(model_name):
             return "responses"
         return "chat"
 
@@ -556,15 +588,31 @@ class AzureProvider(OpenAICompatibleProvider):
         return ["openai", "azure_openai", "anthropic"]
 
     def get_supported_apis_for_model(self, model_name: str) -> List[str]:
-        """On Foundry, enforce strict separation using the configured deployment
-        buckets: Anthropic deployments are Anthropic-only; everything else is
-        OpenAI / Azure OpenAI only. Non-Foundry defers to base behavior."""
+        """On Foundry, route by the configured deployment buckets: Anthropic
+        deployments are Anthropic-only (native); other chat deployments serve
+        OpenAI / Azure OpenAI natively and Anthropic through the adapter.
+        Non-Foundry defers to base behavior.
+
+        A deployment listed in the admin form's rows follows them exactly: it is
+        offered on the OpenAI surfaces when any OpenAI path is selected, and on
+        the Anthropic surface when /messages, /chat/completions or /responses is
+        (natively or through the adapter)."""
+        apis = self.deployment_apis.get(self.get_model_id(model_name))
+        if apis is not None:
+            supported = []
+            if set(apis) - {API_ANTHROPIC}:
+                supported.extend(["openai", "azure_openai"])
+            if CONVERSATIONAL_APIS.intersection(apis):
+                supported.append("anthropic")
+            return supported
         if not self._is_foundry_backend():
             return super().get_supported_apis_for_model(model_name)
         if self._is_anthropic_deployment(model_name):
             if self._is_chat_capable_model(model_name):
                 return ["anthropic"]
             return []
+        if self._is_chat_capable_model(model_name):
+            return ["openai", "azure_openai", "anthropic"]
         return ["openai", "azure_openai"]
 
     def get_supported_endpoints(self) -> List[str]:
@@ -596,11 +644,19 @@ class AzureProvider(OpenAICompatibleProvider):
         endpoints.append("/v1/responses")
         return endpoints
 
+    def _is_chat_capable_model(self, model_name: str) -> bool:
+        # A listed deployment is conversational only if its row selects a
+        # chat-style API; unlisted (e.g. discovered) ones fall back to the name.
+        apis = self.deployment_apis.get(self.get_model_id(model_name))
+        if apis is not None:
+            return bool(CONVERSATIONAL_APIS.intersection(apis))
+        return super()._is_chat_capable_model(model_name)
+
     def get_anthropic_mode_for_model(self, model_name: str) -> str:
         if not self._is_chat_capable_model(model_name):
             return "unsupported"
-        if self._is_foundry_backend():
-            return "native" if self._is_anthropic_deployment(model_name) else "unsupported"
+        if self._is_foundry_backend() and self._is_anthropic_deployment(model_name):
+            return "native"
         return "adapter"
 
     def get_anthropic_request_metadata(self, request, anthropic_beta=None) -> AnthropicRequestMetadata:
@@ -623,14 +679,118 @@ class AzureProvider(OpenAICompatibleProvider):
                 dropped_fields=dropped_fields,
             )
 
-        transport = self._get_adapter_transport(request.model)
-        _, metadata = prepare_anthropic_adapter_request(
+        return anthropic_adapter_metadata(
+            self,
             request,
-            transport=transport,
-            allow_thinking=False,
+            transport=self._get_adapter_transport(request.model),
+            allow_thinking=True,
             anthropic_beta=anthropic_beta,
         )
-        return metadata
+
+    # ==================== Per-deployment API gating ====================
+
+    _API_LABELS = {
+        API_CHAT: "/chat/completions",
+        API_RESPONSES: "/responses",
+        API_COMPLETIONS: "/completions",
+        API_EMBEDDINGS: "/embeddings",
+        API_IMAGES: "/images/*",
+        API_SPEECH: "/audio/speech",
+        API_TRANSCRIPTION: "/audio/transcriptions",
+        API_ANTHROPIC: "/messages",
+    }
+
+    def _deployment_api_error(self, model_name: str, api: str) -> Optional[ProviderHTTPError]:
+        """Error for a listed deployment whose row does not select ``api``.
+
+        Deployments not listed in any row (e.g. discovered ones) are not gated.
+        """
+        deployment = self.get_model_id(model_name)
+        apis = self.deployment_apis.get(deployment)
+        if apis is None or api in apis:
+            return None
+        allowed = ", ".join(self._API_LABELS.get(a, a) for a in apis) or "none"
+        message = (
+            f"Deployment '{deployment}' is not configured for {self._API_LABELS.get(api, api)} "
+            f"on this provider (allowed: {allowed})."
+        )
+        return ProviderHTTPError(
+            400,
+            message,
+            {"error": {"message": message, "type": "invalid_request_error", "param": "model", "code": "unsupported_api"}},
+        )
+
+    def _require_deployment_api(self, model_name: str, api: str) -> None:
+        error = self._deployment_api_error(model_name, api)
+        if error is not None:
+            raise error
+
+    async def chat_completion(self, request):
+        self._require_deployment_api(request.model, API_CHAT)
+        return await super().chat_completion(request)
+
+    async def chat_completion_stream(self, request):
+        error = self._deployment_api_error(request.model, API_CHAT)
+        if error is not None:
+            yield self.format_sse_data({"error": {**error.body["error"], "code": 400}})
+            yield self.format_sse_done()
+            return
+        async for chunk in super().chat_completion_stream(request):
+            yield chunk
+
+    async def completion(self, request):
+        self._require_deployment_api(request.model, API_COMPLETIONS)
+        return await super().completion(request)
+
+    async def completion_stream(self, request):
+        error = self._deployment_api_error(request.model, API_COMPLETIONS)
+        if error is not None:
+            yield self.format_sse_data({"error": {**error.body["error"], "code": 400}})
+            yield self.format_sse_done()
+            return
+        async for chunk in super().completion_stream(request):
+            yield chunk
+
+    async def responses_create(self, request):
+        self._require_deployment_api(request.model, API_RESPONSES)
+        return await super().responses_create(request)
+
+    async def responses_create_stream(self, request):
+        error = self._deployment_api_error(request.model, API_RESPONSES)
+        if error is not None:
+            # Responses streams carry errors as an `error` event (no [DONE]).
+            yield self.format_sse_event("error", {"error": {**error.body["error"], "code": 400}})
+            return
+        async for chunk in super().responses_create_stream(request):
+            yield chunk
+
+    async def embeddings(self, request):
+        self._require_deployment_api(request.model, API_EMBEDDINGS)
+        return await super().embeddings(request)
+
+    async def image_generation(self, request):
+        self._require_deployment_api(request.model, API_IMAGES)
+        return await super().image_generation(request)
+
+    async def image_edit(self, request):
+        self._require_deployment_api(request.model, API_IMAGES)
+        return await super().image_edit(request)
+
+    async def image_variation(self, request):
+        self._require_deployment_api(request.model, API_IMAGES)
+        return await super().image_variation(request)
+
+    async def audio_speech(self, request):
+        self._require_deployment_api(request.model, API_SPEECH)
+        return await super().audio_speech(request)
+
+    async def audio_transcription(self, request):
+        self._require_deployment_api(request.model, API_TRANSCRIPTION)
+        return await super().audio_transcription(request)
+
+    async def audio_translation(self, request):
+        self._require_deployment_api(request.model, API_TRANSCRIPTION)
+        return await super().audio_translation(request)
 
     # ==================== Anthropic Messages API ====================
 
@@ -674,7 +834,7 @@ class AzureProvider(OpenAICompatibleProvider):
             self,
             request,
             transport=transport,
-            allow_thinking=False,
+            allow_thinking=True,
             anthropic_beta=anthropic_beta,
         )
 
@@ -725,7 +885,7 @@ class AzureProvider(OpenAICompatibleProvider):
             self,
             request,
             transport=transport,
-            allow_thinking=False,
+            allow_thinking=True,
             anthropic_beta=anthropic_beta,
         ):
             yield chunk

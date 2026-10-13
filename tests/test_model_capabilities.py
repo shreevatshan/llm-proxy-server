@@ -105,7 +105,7 @@ class RejectedParamsTests(unittest.TestCase):
                 with self.subTest(model=model, surface=surface):
                     self.assertEqual(
                         rejected_params(model, surface),
-                        frozenset({"temperature", "top_p"}),
+                        frozenset({"temperature", "top_p", "stop"}),
                     )
 
     def test_gpt_oss_and_older_gpt_unrestricted(self):
@@ -203,6 +203,21 @@ class ThinkingStyleTests(unittest.TestCase):
         )
         self.assertEqual(thinking, {"type": "adaptive", "display": "summarized"})
         self.assertEqual(dropped, ["thinking.budget_tokens"])
+
+    def test_invalid_display_is_dropped(self):
+        # display is forwarded as an extra; a value outside summarized/omitted
+        # 400s upstream, even on an already-adaptive config.
+        thinking, dropped = normalize_thinking(
+            {"type": "adaptive", "display": "full"}, "claude-opus-5-5"
+        )
+        self.assertEqual(thinking, {"type": "adaptive"})
+        self.assertEqual(dropped, ["thinking.display"])
+
+        thinking, dropped = normalize_thinking(
+            {"type": "adaptive", "display": "omitted"}, "claude-opus-5-5"
+        )
+        self.assertEqual(thinking, {"type": "adaptive", "display": "omitted"})
+        self.assertEqual(dropped, [])
 
     def test_enabled_without_budget_still_becomes_adaptive(self):
         thinking, dropped = normalize_thinking({"type": "enabled"}, "claude-opus-5")

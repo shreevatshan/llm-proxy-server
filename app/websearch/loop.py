@@ -21,12 +21,14 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Iterator, Lis
 
 from app.tracing import add_span_attributes, create_span
 from app.websearch.backends import run_searches
-from app.websearch.results import SearchFailed, SearchOutcome, format_outcome_text
+from app.websearch.results import SearchFailed, SearchOutcome, SearchResult, format_outcome_text
 from app.websearch.settings import WebSearchConfig
 from app.websearch.tools import (
     INTERNAL_TOOL_NAME,
     INTERNAL_TOOL_NAMES,
     build_native_blocks,
+    anthropic_search_shortcut_allowed,
+    citations_for_text,
     new_responses_call_id,
     new_server_tool_id,
     query_from_input,
@@ -47,6 +49,7 @@ class LoopStats:
     rounds: int = 0
     queries: int = 0
     failures: int = 0
+    executed: int = 0  # searches actually sent to the backend
 
     def header_value(self) -> str:
         return f"rounds={self.rounds};queries={self.queries}"
@@ -84,6 +87,8 @@ class _QueryGuard:
         self.cfg = cfg
         self.stats = stats
         self._fingerprints = set()
+        # Successful results across rounds (citations are matched against them).
+        self.results: List[SearchResult] = []
 
     def allowed(self, queries: List[str]) -> bool:
         if self.stats.rounds >= self.cfg.max_agentic_loops:
@@ -101,15 +106,25 @@ class _QueryGuard:
 
     async def search(self, queries: List[str]) -> List[SearchOutcome]:
         limit = self.cfg.max_queries_per_turn
+        run_count = min(len(queries), limit)
+        if self.cfg.max_uses is not None:
+            # The client's web_search max_uses caps searches across the turn.
+            run_count = min(run_count, max(self.cfg.max_uses - self.stats.executed, 0))
         with create_span("websearch.round") as span:
             started = time.monotonic()
-            outcomes = await run_searches(queries[:limit], self.cfg)
+            outcomes = list(await run_searches(queries[:run_count], self.cfg)) if run_count else []
+            for q in queries[run_count:limit]:
+                outcomes.append(SearchFailed(q, "max_uses_exceeded", "Maximum number of web searches reached"))
             outcomes += [
                 SearchFailed(q, "too_many_requests", f"At most {limit} searches are run per turn")
-                for q in queries[limit:]
+                for q in queries[max(limit, run_count):]
             ]
             self.stats.rounds += 1
             self.stats.queries += len(queries)
+            self.stats.executed += run_count
+            for outcome in outcomes:
+                if outcome.ok:
+                    self.results.extend(outcome.results)
             self.stats.failures += sum(1 for o in outcomes if not o.ok)
             add_span_attributes(span, {
                 "websearch.round": self.stats.rounds,
@@ -215,12 +230,17 @@ class AnthropicWebSearchLoop:
         cfg: WebSearchConfig,
         emit_native: bool,
         anthropic_beta: Optional[str] = None,
+        shortcircuit_query: Optional[str] = None,
     ):
         self.request = request
         self.provider = provider
         self.cfg = cfg
         self.emit_native = emit_native
         self.anthropic_beta = anthropic_beta
+        # Claude Code's standalone WebSearch request: search first, then one
+        # tool-less model call summarizes (no round trip to ask for the search).
+        self.shortcircuit_query = shortcircuit_query
+        self._no_more_tools = False
         self.stats = LoopStats()
         self._guard = _QueryGuard(cfg, self.stats)
         self._has_client_tools = any(
@@ -239,11 +259,39 @@ class AnthropicWebSearchLoop:
         update: Dict[str, Any] = {
             "messages": [AnthropicMessage.model_validate(m) for m in messages],
         }
-        if round_index > 0:
+        if self._no_more_tools:
+            update["tool_choice"] = {"type": "none"}
+        elif round_index > 0:
             update["tool_choice"] = _relax_anthropic_tool_choice(
                 self.request.tool_choice, self._has_client_tools
             )
         return self.request.model_copy(update=update)
+
+    async def _run_shortcircuit(self, messages: List[dict]) -> List[Tuple[str, SearchOutcome]]:
+        """Run the pre-extracted query and append it to the history as if the
+        model had called the search tool itself."""
+        if not anthropic_search_shortcut_allowed(self.request.tool_choice):
+            return []
+        query = self.shortcircuit_query or ""
+        outcomes = await self._guard.search([query])
+        tool_id = new_server_tool_id()
+        call = {"type": "tool_use", "id": tool_id, "name": INTERNAL_TOOL_NAME, "input": {"query": query}}
+        messages.append({"role": "assistant", "content": [call]})
+        messages.append({"role": "user", "content": self._tool_results([call], outcomes, True)})
+        self._no_more_tools = True
+        return [(tool_id, outcomes[0])]
+
+    def _with_citations(self, block: Dict[str, Any]) -> Dict[str, Any]:
+        if not (self.emit_native and self.cfg.emit_citations and self._guard.results):
+            return block
+        if not isinstance(block, dict) or block.get("type") != "text":
+            return block
+        citations = citations_for_text(block.get("text", ""), self._guard.results)
+        if not citations:
+            return block
+        known = {c.get("url") for c in block.get("citations") or [] if isinstance(c, dict)}
+        merged = list(block.get("citations") or []) + [c for c in citations if c["url"] not in known]
+        return {**block, "citations": merged}
 
     def _tool_results(self, calls: List[dict], outcomes: List[SearchOutcome], last: bool) -> List[dict]:
         return [
@@ -260,9 +308,9 @@ class AnthropicWebSearchLoop:
         usage = dict(usage_total)
         usage.setdefault("input_tokens", 0)
         usage.setdefault("output_tokens", 0)
-        if self.emit_native and self.stats.queries:
+        if self.emit_native and self.stats.executed:
             server = dict(usage.get("server_tool_use") or {})
-            server["web_search_requests"] = self.stats.queries
+            server["web_search_requests"] = self.stats.executed
             usage["server_tool_use"] = server
         return usage
 
@@ -273,6 +321,9 @@ class AnthropicWebSearchLoop:
         usage_total: Dict[str, Any] = {}
         emitted: List[dict] = []  # visible blocks of earlier rounds
         round_index = 0
+        if self.shortcircuit_query:
+            for tool_id, outcome in await self._run_shortcircuit(messages):
+                emitted.extend(build_native_blocks(tool_id, outcome))
         while True:
             response = _to_dict(
                 await self.provider.anthropic_messages(
@@ -316,7 +367,7 @@ class AnthropicWebSearchLoop:
 
     def _finish(self, response: Dict[str, Any], blocks: List[dict], stop_reason, usage_total) -> Dict[str, Any]:
         final = dict(response)
-        final["content"] = blocks
+        final["content"] = [self._with_citations(b) for b in blocks]
         final["stop_reason"] = stop_reason
         final["usage"] = self._final_usage(usage_total)
         return final
@@ -330,6 +381,9 @@ class AnthropicWebSearchLoop:
         next_out_index = 0
         visible_text_seen = False
         round_index = 0
+        preamble: List[Tuple[str, SearchOutcome]] = []
+        if self.shortcircuit_query:
+            preamble = await self._run_shortcircuit(messages)
         while True:
             states: Dict[int, _StreamBlock] = {}
             order: List[int] = []
@@ -353,6 +407,10 @@ class AnthropicWebSearchLoop:
                         if not started:
                             started = True
                             yield raw
+                            for tool_id, outcome in preamble:
+                                for event in self._native_block_events(next_out_index, tool_id, outcome):
+                                    yield event
+                                next_out_index += 2
                     elif etype == "content_block_start":
                         idx = payload.get("index", 0)
                         block = copy.deepcopy(payload.get("content_block") or {})
@@ -378,6 +436,8 @@ class AnthropicWebSearchLoop:
                             continue
                         state.finish()
                         if not state.internal:
+                            for event in self._citation_events(state):
+                                yield event
                             yield _anthropic_sse("content_block_stop", {**payload, "index": state.out_index})
                     elif etype == "message_delta":
                         delta = payload.get("delta") or {}
@@ -426,27 +486,47 @@ class AnthropicWebSearchLoop:
             messages.append({"role": "user", "content": self._tool_results(internal, outcomes, last)})
 
             if self.emit_native:
-                for call, outcome in zip(internal, outcomes):
-                    server_use, result = build_native_blocks(new_server_tool_id(), outcome)
-                    yield _anthropic_sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": next_out_index,
-                        "content_block": {**server_use, "input": {}},
-                    })
-                    yield _anthropic_sse("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": next_out_index,
-                        "delta": {"type": "input_json_delta", "partial_json": json.dumps(server_use["input"])},
-                    })
-                    yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": next_out_index})
-                    next_out_index += 1
-                    yield _anthropic_sse("content_block_start", {
-                        "type": "content_block_start",
-                        "index": next_out_index,
-                        "content_block": result,
-                    })
-                    yield _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": next_out_index})
-                    next_out_index += 1
+                for outcome in outcomes:
+                    for event in self._native_block_events(next_out_index, new_server_tool_id(), outcome):
+                        yield event
+                    next_out_index += 2
+
+    def _native_block_events(self, index: int, tool_id: str, outcome: SearchOutcome) -> List[str]:
+        """server_tool_use + web_search_tool_result events at index, index+1."""
+        server_use, result = build_native_blocks(tool_id, outcome)
+        return [
+            _anthropic_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {**server_use, "input": {}},
+            }),
+            _anthropic_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "input_json_delta", "partial_json": json.dumps(server_use["input"])},
+            }),
+            _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index}),
+            _anthropic_sse("content_block_start", {
+                "type": "content_block_start",
+                "index": index + 1,
+                "content_block": result,
+            }),
+            _anthropic_sse("content_block_stop", {"type": "content_block_stop", "index": index + 1}),
+        ]
+
+    def _citation_events(self, state: "_StreamBlock") -> List[str]:
+        """citations_delta events for a finished visible text block."""
+        if state.block.get("type") != "text":
+            return []
+        cited = self._with_citations({"type": "text", "text": state.block.get("text", "")})
+        return [
+            _anthropic_sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": state.out_index,
+                "delta": {"type": "citations_delta", "citation": citation},
+            })
+            for citation in cited.get("citations") or []
+        ]
 
     def _text_block_events(self, index: int, text: str) -> List[str]:
         return [

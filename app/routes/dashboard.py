@@ -80,6 +80,16 @@ def _extract_endpoints_from_routers(routers, prefix: str = "", tag_suffix: str =
     return endpoints
 
 
+def _anthropic_mode(provider, model_id: str, supported_apis) -> Optional[str]:
+    """"native" or "adapter" (served via the OpenAI converter) for badges."""
+    if provider is None or "anthropic" not in (supported_apis or []):
+        return None
+    try:
+        return provider.get_anthropic_mode_for_model(model_id)
+    except Exception:
+        return None
+
+
 @router.get("/", response_class=HTMLResponse)
 async def dashboard_home(
     request: Request,
@@ -131,6 +141,7 @@ async def dashboard_home(
             "created": model.created,
             "owned_by": model.owned_by,
             "supported_apis": supported_apis,
+            "anthropic_mode": _anthropic_mode(provider, model.id, supported_apis),
         })
 
     # Regular user - show normal dashboard
@@ -285,5 +296,6 @@ async def list_models_for_dashboard(
             "created": model.created,
             "owned_by": model.owned_by,
             "supported_apis": supported_apis,
+            "anthropic_mode": _anthropic_mode(provider, model.id, supported_apis),
         })
     return {"data": result}

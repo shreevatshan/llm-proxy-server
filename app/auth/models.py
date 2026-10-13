@@ -585,6 +585,9 @@ class UserModelAccessException(Base):
     )
 
 
+ANTHROPIC_AUTH_STYLES = ("x-api-key", "bearer")
+
+
 class ProviderCredentials(Base):
     """Provider credentials model for storing provider configurations."""
     __tablename__ = "provider_credentials"
@@ -611,6 +614,11 @@ class ProviderCredentials(Base):
     
     # Supported API formats for custom providers (JSON array, e.g., '["openai", "anthropic"]')
     supported_apis = Column(Text, nullable=True, default='["openai"]')
+    # Custom providers with a native Anthropic endpoint: its base URL when it
+    # differs from base_url (e.g. https://api.deepseek.com/anthropic), and the
+    # auth header style ("x-api-key" default, or "bearer").
+    anthropic_base_url = Column(String(500), nullable=True)
+    anthropic_auth_style = Column(String(20), nullable=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -1700,6 +1708,79 @@ class ModelSearchResponse(BaseModel):
 
 
 # Provider Credentials Pydantic models
+class AzureDeploymentGroup(BaseModel):
+    """One row of Azure deployments and the upstream APIs they support.
+
+    A ``legacy_mode`` row comes from the per-bucket lists that predate
+    deployment groups: it classifies its deployments without selecting APIs,
+    so ``apis`` stays empty and nothing is restricted.
+    """
+    deployments: List[str]
+    apis: List[str] = []
+    legacy_mode: Optional[Literal["openai", "responses", "anthropic"]] = None
+
+    @field_validator('deployments')
+    @classmethod
+    def validate_names(cls, v):
+        for name in v:
+            stripped = name.strip()
+            if stripped and not DEPLOYMENT_NAME_PATTERN.match(stripped):
+                raise ValueError(
+                    f"Invalid deployment name '{stripped}'. "
+                    "Names must start with alphanumeric and contain only letters, digits, hyphens, underscores, or dots."
+                )
+        return v
+
+    @field_validator('apis')
+    @classmethod
+    def validate_apis(cls, v):
+        from app.providers.azure_deployments import DEPLOYMENT_APIS
+        unknown = [a for a in v if a not in DEPLOYMENT_APIS]
+        if unknown:
+            raise ValueError(f"Unknown API(s) {', '.join(unknown)}; must be one of {', '.join(DEPLOYMENT_APIS)}")
+        return v
+
+    @model_validator(mode='after')
+    def validate_row(self):
+        if self.legacy_mode is not None and self.apis:
+            raise ValueError(
+                f"A legacy deployment row cannot also select APIs: {', '.join(self.deployments)}"
+            )
+        if any(d.strip() for d in self.deployments) and not self.apis and self.legacy_mode is None:
+            raise ValueError(f"Select at least one API for deployments: {', '.join(self.deployments)}")
+        return self
+
+
+_DEPLOYMENT_LIST_FIELDS = ("deployments", "openai_deployments", "anthropic_deployments")
+
+
+def _drop_shadowed_deployment_lists(data):
+    """Ignore the per-bucket lists when ``deployment_groups`` is given.
+
+    The groups (even ``[]``) are then the only deployment source, so stale
+    lists sent alongside them must neither fail validation nor survive.
+    """
+    if isinstance(data, dict) and data.get("deployment_groups") is not None:
+        data = {k: v for k, v in data.items() if k not in _DEPLOYMENT_LIST_FIELDS}
+    return data
+
+
+def _apply_deployment_groups(model) -> None:
+    """Fill all three deployment lists from ``deployment_groups``."""
+    if model.deployment_groups is None:
+        return
+    from app.providers.azure_deployments import (
+        merge_azure_deployments,
+        normalize_azure_deployments,
+        normalize_deployment_groups,
+    )
+    rows = normalize_deployment_groups(model.deployment_groups, strict=True)
+    derived = normalize_azure_deployments({"groups": rows})
+    model.openai_deployments = derived["openai"]
+    model.anthropic_deployments = derived["anthropic"]
+    model.deployments = merge_azure_deployments(derived)
+
+
 class ProviderCredentialsCreate(BaseModel):
     provider_type: str
     instance_name: str
@@ -1718,10 +1799,37 @@ class ProviderCredentialsCreate(BaseModel):
     deployments: Optional[List[str]] = None  # Will be converted to JSON
     openai_deployments: Optional[List[str]] = None
     anthropic_deployments: Optional[List[str]] = None
+    # Azure: rows of deployments + the upstream APIs they support. When given,
+    # openai_deployments / anthropic_deployments are derived from it.
+    deployment_groups: Optional[List["AzureDeploymentGroup"]] = None
     dynamic_discovery: Optional[bool] = None
 
     # Supported API formats for custom providers
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
+    anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
+    anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
+
+    @field_validator('anthropic_auth_style')
+    @classmethod
+    def validate_anthropic_auth_style(cls, v):
+        if v in (None, ""):
+            return v
+        v = v.strip().lower()
+        if v not in ANTHROPIC_AUTH_STYLES:
+            raise ValueError(f"anthropic_auth_style must be one of {', '.join(ANTHROPIC_AUTH_STYLES)}")
+        return v
+
+    @field_validator('anthropic_base_url')
+    @classmethod
+    def validate_anthropic_base_url(cls, v):
+        if v in (None, ""):
+            return v
+        from urllib.parse import urlparse
+        v = v.strip()
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("anthropic_base_url must be an http(s) URL with a host")
+        return v
 
     @field_validator('azure_backend')
     @classmethod
@@ -1744,8 +1852,14 @@ class ProviderCredentialsCreate(BaseModel):
                 )
         return v
 
+    @model_validator(mode='before')
+    @classmethod
+    def drop_shadowed_deployment_lists(cls, data):
+        return _drop_shadowed_deployment_lists(data)
+
     @model_validator(mode='after')
     def validate_discovery_deployments(self):
+        _apply_deployment_groups(self)
         if self.dynamic_discovery is True:
             has_deployments = (
                 (self.deployments and len(self.deployments) > 0)
@@ -1783,11 +1897,38 @@ class ProviderCredentialsUpdate(BaseModel):
     deployments: Optional[List[str]] = None  # Will be converted to JSON
     openai_deployments: Optional[List[str]] = None
     anthropic_deployments: Optional[List[str]] = None
+    # Azure: rows of deployments + the upstream APIs they support. When given,
+    # openai_deployments / anthropic_deployments are derived from it.
+    deployment_groups: Optional[List["AzureDeploymentGroup"]] = None
     provider_name: Optional[str] = None  # OpenAI-compatible provider name (e.g., "ollama", "llamacpp", "openai")
     dynamic_discovery: Optional[bool] = None
 
     # Supported API formats for custom providers
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
+    anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
+    anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
+
+    @field_validator('anthropic_auth_style')
+    @classmethod
+    def validate_anthropic_auth_style(cls, v):
+        if v in (None, ""):
+            return v
+        v = v.strip().lower()
+        if v not in ANTHROPIC_AUTH_STYLES:
+            raise ValueError(f"anthropic_auth_style must be one of {', '.join(ANTHROPIC_AUTH_STYLES)}")
+        return v
+
+    @field_validator('anthropic_base_url')
+    @classmethod
+    def validate_anthropic_base_url(cls, v):
+        if v in (None, ""):
+            return v
+        from urllib.parse import urlparse
+        v = v.strip()
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("anthropic_base_url must be an http(s) URL with a host")
+        return v
 
     @field_validator('azure_backend')
     @classmethod
@@ -1810,8 +1951,14 @@ class ProviderCredentialsUpdate(BaseModel):
                 )
         return v
 
+    @model_validator(mode='before')
+    @classmethod
+    def drop_shadowed_deployment_lists(cls, data):
+        return _drop_shadowed_deployment_lists(data)
+
     @model_validator(mode='after')
     def validate_discovery_deployments(self):
+        _apply_deployment_groups(self)
         if self.dynamic_discovery is True:
             has_deployments = (
                 (self.deployments and len(self.deployments) > 0)
@@ -1853,11 +2000,16 @@ class ProviderCredentialsResponse(BaseModel):
     deployments: Optional[List[str]] = None  # Parsed from JSON
     openai_deployments: Optional[List[str]] = None
     anthropic_deployments: Optional[List[str]] = None
+    # Azure: rows of deployments + the upstream APIs they support. When given,
+    # openai_deployments / anthropic_deployments are derived from it.
+    deployment_groups: Optional[List["AzureDeploymentGroup"]] = None
     provider_name: str  # Provider name (e.g., "ollama", "azure", "openai", "bedrock", "google")
     dynamic_discovery: Optional[bool] = None
     
     # Supported API formats for custom providers
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
+    anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
+    anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
     
     created_at: datetime
     updated_at: datetime

@@ -7,8 +7,13 @@ Supports both OpenAI and Anthropic API compatibility when configured.
 import json
 from typing import List, Dict, Any
 
+from app.providers.anthropic_adapter import (
+    anthropic_adapter_messages,
+    anthropic_adapter_messages_stream,
+    anthropic_adapter_metadata,
+)
 from app.providers.anthropic_compatible import AnthropicCompatibleProvider
-from app.providers.base import BaseProvider
+from app.providers.base import AnthropicRequestMetadata, BaseProvider
 from app.providers.openai_compatible import OpenAICompatibleProvider
 from app.openai_models import ModelInfo
 
@@ -22,9 +27,18 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
 
     Configuration:
         custom_provider_name: Identifier for the provider (required)
-        base_url:             Server URL including /v1 path (required)
+        base_url:             OpenAI-compatible server URL including /v1 path
+                              (required unless anthropic_base_url is set)
         api_key:              API key for authentication (optional)
-        supported_apis:       List of API formats, e.g. ["openai", "anthropic"]
+        supported_apis:       List of API formats, e.g. ["openai", "anthropic"].
+                              "anthropic" means the upstream serves a native
+                              /v1/messages; without it, OpenAI-capable models
+                              are served on /v1/messages through the adapter.
+        anthropic_base_url:   Native Anthropic base URL when it differs from
+                              base_url (e.g. https://api.deepseek.com/anthropic)
+        anthropic_auth_style: "x-api-key" (default) or "bearer"
+        split_think_tags:     Route <think>...</think> content to thinking
+                              blocks in adapter mode (default off)
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -32,9 +46,13 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
 
         self.custom_provider_name = config.get('custom_provider_name', 'custom').lower()
 
-        self.base_url = config.get('base_url') or config.get('endpoint')
+        # An Anthropic-only provider has no OpenAI base URL; fall back to the
+        # Anthropic one so base_url is always a usable upstream address.
+        self.base_url = config.get('base_url') or config.get('endpoint') or config.get('anthropic_base_url')
         if not self.base_url:
-            raise ValueError(f"base_url is required for custom provider '{self.custom_provider_name}'")
+            raise ValueError(
+                f"base_url or anthropic_base_url is required for custom provider '{self.custom_provider_name}'"
+            )
 
         # Reject non-http(s) base URLs up front (SSRF hardening): the URL is
         # admin-supplied and used for outbound requests.
@@ -47,7 +65,11 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
             )
 
         self.api_key = config.get('api_key')
+        # The configured list: "anthropic" here means a native upstream
+        # endpoint. get_supported_apis() additionally advertises "anthropic"
+        # for OpenAI-only providers, which are served through the adapter.
         self._supported_apis = self._parse_supported_apis(config.get('supported_apis', ['openai']))
+        self.split_think_tags = bool(config.get('split_think_tags', False))
         # Keep provider_type as the class-derived type ("custom"); the
         # user-chosen instance name is exposed via instance_name /
         # full_provider_name (set by BaseProvider.__init__). Overwriting
@@ -91,13 +113,65 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
     # ==================== Public API ====================
 
     def get_supported_apis(self) -> List[str]:
-        """Return the configured supported API formats."""
-        return self._supported_apis
+        """Return the configured API formats, plus "anthropic" (via the
+        adapter) for OpenAI-capable providers."""
+        apis = list(self._supported_apis)
+        if "openai" in apis and "anthropic" not in apis:
+            apis.append("anthropic")
+        return apis
+
+    def _has_native_anthropic(self) -> bool:
+        return "anthropic" in self._supported_apis
 
     def get_anthropic_mode_for_model(self, model_name: str) -> str:
-        if "anthropic" in self._supported_apis and self._is_chat_capable_model(model_name):
+        if not self._is_chat_capable_model(model_name):
+            return "unsupported"
+        if self._has_native_anthropic():
             return "native"
+        if "openai" in self._supported_apis:
+            return "adapter"
         return "unsupported"
+
+    def get_anthropic_request_metadata(self, request, anthropic_beta=None) -> AnthropicRequestMetadata:
+        if self.get_anthropic_mode_for_model(request.model) == "adapter":
+            return anthropic_adapter_metadata(
+                self,
+                request,
+                transport="chat",
+                allow_thinking=True,
+                echo_reasoning=True,
+                anthropic_beta=anthropic_beta,
+            )
+        return super().get_anthropic_request_metadata(request, anthropic_beta=anthropic_beta)
+
+    async def anthropic_messages(self, request, anthropic_beta=None):
+        """Native passthrough, or the chat-completions adapter for OpenAI-only upstreams."""
+        if self.get_anthropic_mode_for_model(request.model) == "adapter":
+            return await anthropic_adapter_messages(
+                self,
+                request,
+                transport="chat",
+                allow_thinking=True,
+                echo_reasoning=True,
+                anthropic_beta=anthropic_beta,
+            )
+        return await super().anthropic_messages(request, anthropic_beta=anthropic_beta)
+
+    async def anthropic_messages_stream(self, request, anthropic_beta=None):
+        """Streaming variant of :meth:`anthropic_messages`."""
+        if self.get_anthropic_mode_for_model(request.model) == "adapter":
+            stream = anthropic_adapter_messages_stream(
+                self,
+                request,
+                transport="chat",
+                allow_thinking=True,
+                echo_reasoning=True,
+                anthropic_beta=anthropic_beta,
+            )
+        else:
+            stream = super().anthropic_messages_stream(request, anthropic_beta=anthropic_beta)
+        async for chunk in stream:
+            yield chunk
 
     def get_supported_endpoints(self) -> List[str]:
         """Custom providers support endpoints based on their configured APIs."""
@@ -112,7 +186,7 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
                 "/v1/audio/transcriptions",
                 "/v1/responses",
             ])
-        if "anthropic" in self._supported_apis and self._anthropic_client:
+        if ("anthropic" in self._supported_apis and getattr(self, "_anthropic_client", None)) or "openai" in self._supported_apis:
             endpoints.append("/v1/messages")
         return endpoints
 

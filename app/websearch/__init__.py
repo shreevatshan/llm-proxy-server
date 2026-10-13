@@ -22,9 +22,11 @@ from app.websearch.settings import (
     websearch_settings_cache,
 )
 from app.websearch import tools as _tools
+from app.websearch.tools import WebSearchRequestError
 
 __all__ = [
     "HEADER_NAME",
+    "WebSearchRequestError",
     "maybe_intercept_anthropic",
     "maybe_intercept_chat",
     "maybe_intercept_responses",
@@ -44,7 +46,10 @@ def _anthropic_messages_dicts(messages) -> list:
 
 
 def maybe_intercept_anthropic(request, provider, anthropic_beta: Optional[str] = None) -> Optional[AnthropicWebSearchLoop]:
-    """Rewrite an Anthropic Messages request for interception, or return None."""
+    """Rewrite an Anthropic Messages request for interception, or return None.
+
+    Raises WebSearchRequestError (HTTP 400) for an invalid web_search tool.
+    """
     if not websearch_settings_cache.is_active(SURFACE_ANTHROPIC_MESSAGES, _provider_key(provider)):
         return None
     tools, found, had_native = _tools.rewrite_anthropic_tools(request.tools)
@@ -52,6 +57,18 @@ def maybe_intercept_anthropic(request, provider, anthropic_beta: Optional[str] =
     replayed = _tools.history_has_replayed_blocks(messages)
     if not found and not replayed:
         return None
+
+    cfg = websearch_settings_cache.config
+    overrides = _tools.native_tool_options(request.tools)
+    if overrides:
+        cfg = cfg.with_overrides(**overrides)
+    shortcircuit_query = None
+    if (
+        cfg.claude_code_shortcircuit
+        and not replayed
+        and _tools.anthropic_search_shortcut_allowed(request.tool_choice)
+    ):
+        shortcircuit_query = _tools.claude_code_search_query(request.tools, messages)
 
     from app.anthropic_models import AnthropicMessage
 
@@ -66,9 +83,10 @@ def maybe_intercept_anthropic(request, provider, anthropic_beta: Optional[str] =
     return AnthropicWebSearchLoop(
         rewritten,
         provider,
-        websearch_settings_cache.config,
+        cfg,
         emit_native=had_native or replayed,
         anthropic_beta=anthropic_beta,
+        shortcircuit_query=shortcircuit_query,
     )
 
 

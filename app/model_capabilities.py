@@ -133,6 +133,9 @@ def is_openai_reasoning_gpt(model_id: str) -> bool:
 THINKING_BUDGET = "budget"      # {"type": "enabled", "budget_tokens": N}
 THINKING_ADAPTIVE = "adaptive"  # {"type": "adaptive"} — budget_tokens is rejected
 
+# The only thinking.display values the API accepts; anything else 400s.
+_THINKING_DISPLAY_VALUES = frozenset({"summarized", "omitted"})
+
 
 @dataclass(frozen=True)
 class CapabilityRule:
@@ -181,11 +184,13 @@ RULES: Tuple[CapabilityRule, ...] = (
         note="Grok on Bedrock accepts only maxTokens in inferenceConfig",
     ),
     # OpenAI's GPT >= 5 reasoning models reject the sampling knobs outright
-    # ("This model doesn't support the temperature field").
+    # ("This model doesn't support the temperature field"), and the chat
+    # completions ``stop`` list ("Unsupported parameter: 'stop' is not
+    # supported with this model") that Anthropic stop_sequences map to.
     CapabilityRule(
         match=is_openai_reasoning_gpt,
-        rejects=frozenset({"temperature", "top_p"}),
-        note="OpenAI GPT >= 5 reasoning models reject temperature/top_p",
+        rejects=frozenset({"temperature", "top_p", "stop"}),
+        note="OpenAI GPT >= 5 reasoning models reject temperature/top_p/stop",
     ),
 )
 
@@ -259,17 +264,32 @@ def normalize_thinking(
     default on these models the client would get empty thinking blocks instead
     of the summary it asked for, with nothing reported in ``dropped``.
 
+    ``display`` is forwarded as a client extra, so a value the API does not
+    accept (anything but ``summarized``/``omitted``) is removed here rather than
+    400ing upstream. This applies to every model and thinking type.
+
     Returns the config to send and the list of dropped field names.
     """
     if not isinstance(thinking, dict):
         return thinking, []
-    if thinking_style(model_id) != THINKING_ADAPTIVE:
-        return thinking, []
-    if thinking.get("type") != "enabled":
-        return thinking, []
 
-    dropped = ["thinking.budget_tokens"] if "budget_tokens" in thinking else []
-    if dropped:
+    dropped: List[str] = []
+    if "display" in thinking and thinking["display"] not in _THINKING_DISPLAY_VALUES:
+        logger.debug(
+            "Dropping unsupported thinking.display=%r for %s",
+            thinking["display"],
+            model_id,
+        )
+        thinking = {k: v for k, v in thinking.items() if k != "display"}
+        dropped.append("thinking.display")
+
+    if thinking_style(model_id) != THINKING_ADAPTIVE:
+        return thinking, dropped
+    if thinking.get("type") != "enabled":
+        return thinking, dropped
+
+    if "budget_tokens" in thinking:
+        dropped.append("thinking.budget_tokens")
         logger.debug(
             "Converted thinking budget to adaptive for %s (budget_tokens is rejected)",
             model_id,

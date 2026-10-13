@@ -9,7 +9,7 @@ from app.openai_models import ChatCompletionRequest, ModelInfo
 from app.providers.anthropic_adapter import (
     anthropic_adapter_messages,
     anthropic_adapter_messages_stream,
-    prepare_anthropic_adapter_request,
+    anthropic_adapter_metadata,
 )
 from app.providers.base import AnthropicRequestMetadata
 from app.providers.openai_compatible import OpenAICompatibleProvider
@@ -18,6 +18,9 @@ from app.providers.openai_compatible import OpenAICompatibleProvider
 class GoogleProvider(OpenAICompatibleProvider):
     """Google Generative AI provider using OpenAI SDK with Google's OpenAI-compatible API."""
     
+    # Google's OpenAI-compatible endpoint rejects unknown body params (top_k).
+    anthropic_adapter_supports_top_k = False
+
     # Parameters not supported by Google's API
     UNSUPPORTED_PARAMS = {
         'frequency_penalty',
@@ -34,7 +37,9 @@ class GoogleProvider(OpenAICompatibleProvider):
         'parallel_tool_calls',
         'response_format',
     }
-    
+    # The adapter drops (and reports) the Anthropic fields these would carry.
+    anthropic_adapter_unforwarded_params = UNSUPPORTED_PARAMS
+
     
     def __init__(self, config: Dict[str, Any]):
         """Initialize Google provider with OpenAI-compatible configuration."""
@@ -124,13 +129,13 @@ class GoogleProvider(OpenAICompatibleProvider):
         return "adapter"
 
     def get_anthropic_request_metadata(self, request, anthropic_beta=None) -> AnthropicRequestMetadata:
-        _, metadata = prepare_anthropic_adapter_request(
+        return anthropic_adapter_metadata(
+            self,
             request,
             transport="chat",
             allow_thinking=False,
             anthropic_beta=anthropic_beta,
         )
-        return metadata
 
     async def get_available_models(self) -> List[ModelInfo]:
         """Get available Google models using OpenAI-compatible API."""

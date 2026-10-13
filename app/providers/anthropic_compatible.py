@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import time
-from typing import List, Any, AsyncGenerator, Optional
+from typing import List, Any, AsyncGenerator, Dict, Optional
 
 from app.anthropic_models import (
     AnthropicMessagesRequest,
@@ -205,6 +205,23 @@ async def stream_anthropic_sdk_events(
         )
 
 
+def _anthropic_base_url(url: str) -> str:
+    """Normalize a base URL for the Anthropic SDK, which appends /v1/messages.
+
+    Raises ValueError for non-http(s) URLs (the URL is admin-supplied and
+    used for outbound requests).
+    """
+    from urllib.parse import urlparse
+
+    base_url = (url or "").strip().rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"Invalid Anthropic base URL (must be http(s) with a host): {url!r}")
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    return base_url
+
+
 class AnthropicCompatibleProvider(BaseProvider):
     """
     Base class for providers that use the Anthropic SDK for API calls.
@@ -230,15 +247,29 @@ class AnthropicCompatibleProvider(BaseProvider):
         try:
             from anthropic import AsyncAnthropic
 
-            # Strip /v1 suffix — the Anthropic SDK appends its own path
-            base_url = (self.base_url or "").rstrip("/")
-            if base_url.endswith("/v1"):
-                base_url = base_url[:-3]
+            # Vendors such as DeepSeek/Kimi/z.ai/MiniMax host their Anthropic
+            # API under a different path than the OpenAI one; an explicit
+            # anthropic_base_url overrides the derived default.
+            config = getattr(self, "config", None) or {}
+            base_url = _anthropic_base_url(config.get("anthropic_base_url") or self.base_url or "")
 
-            self._anthropic_client = AsyncAnthropic(
-                base_url=base_url,
-                api_key=self.api_key or _DEFAULT_API_KEY,
-            )
+            client_kwargs: Dict[str, Any] = {"base_url": base_url}
+            if (config.get("anthropic_auth_style") or "").lower() == "bearer":
+                # e.g. OpenRouter: Authorization: Bearer, and no X-Api-Key.
+                client_kwargs["api_key"] = None
+                client_kwargs["auth_token"] = self.api_key or _DEFAULT_API_KEY
+            else:
+                client_kwargs["api_key"] = self.api_key or _DEFAULT_API_KEY
+
+            client = AsyncAnthropic(**client_kwargs)
+            # The SDK fills a None api_key/auth_token from ANTHROPIC_API_KEY /
+            # ANTHROPIC_AUTH_TOKEN; clear the unused one so the proxy's own
+            # credentials never reach a third-party upstream.
+            if "auth_token" in client_kwargs:
+                client.api_key = None
+            else:
+                client.auth_token = None
+            self._anthropic_client = client
             logger.info(f"Anthropic client initialized for {self.custom_provider_name}")
         except ImportError:
             logger.warning(

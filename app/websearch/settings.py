@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field, replace
-from typing import Optional
+from typing import Optional, Tuple
 
 from app.auth.models import (
     WEBSEARCH_API_SURFACES,
@@ -47,6 +47,16 @@ class WebSearchConfig:
     max_queries_per_turn: int = WEBSEARCH_DEFAULTS["max_queries_per_turn"]
     apply_to: frozenset = field(default_factory=lambda: frozenset(WEBSEARCH_API_SURFACES))
     enabled_providers: frozenset = field(default_factory=frozenset)
+    # Per-request overrides taken from the client's native Anthropic
+    # web_search tool (max_uses, allowed_domains, blocked_domains).
+    max_uses: Optional[int] = None
+    allowed_domains: Tuple[str, ...] = ()
+    blocked_domains: Tuple[str, ...] = ()
+    # Attach web_search_result_location citations to answer text that links a
+    # search result, and answer Claude Code's standalone WebSearch request
+    # with one search + one summarizing model call.
+    emit_citations: bool = True
+    claude_code_shortcircuit: bool = True
 
     @property
     def base_url(self) -> Optional[str]:

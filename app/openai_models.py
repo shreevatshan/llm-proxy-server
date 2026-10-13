@@ -1,5 +1,5 @@
 from typing import List, Optional, Dict, Any, Union
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PrivateAttr
 
 
 # Content types for complex message handling
@@ -28,15 +28,18 @@ class Function(BaseModel):
     name: str
     description: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
 
 
 class ResponseFunction(BaseModel):
-    name: str
-    arguments: str
+    # Some OpenAI-compatible backends omit name/arguments on non-streamed tool
+    # calls; tolerate that here and let the caller repair or drop the call.
+    name: Optional[str] = None
+    arguments: Optional[str] = None
 
 
 class ToolCall(BaseModel):
-    id: str
+    id: Optional[str] = None
     type: str = "function"
     function: ResponseFunction
     index: Optional[int] = None
@@ -51,7 +54,9 @@ class Tool(BaseModel):
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: str
-    content: Optional[Union[str, List[Union[TextContent, ImageContent, ToolContent]]]] = None
+    # Dict fallback keeps content parts these models don't describe (e.g.
+    # {"type": "file", ...}) instead of failing validation.
+    content: Optional[Union[str, List[Union[TextContent, ImageContent, ToolContent, Dict[str, Any]]]]] = None
     tool_calls: Optional[List[ToolCall]] = None
     tool_call_id: Optional[str] = None
     reasoning_content: Optional[str] = None
@@ -59,13 +64,13 @@ class ChatMessage(BaseModel):
 
 class UserMessage(BaseModel):
     role: str = "user"
-    content: Union[str, List[Union[TextContent, ImageContent]]]
+    content: Union[str, List[Union[TextContent, ImageContent, Dict[str, Any]]]]
 
 
 class AssistantMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
     role: str = "assistant"
-    content: Optional[Union[str, List[Union[TextContent, ImageContent]]]] = None
+    content: Optional[Union[str, List[Union[TextContent, ImageContent, Dict[str, Any]]]]] = None
     tool_calls: Optional[List[ToolCall]] = None
     reasoning_content: Optional[str] = None
 
@@ -118,7 +123,11 @@ class ChatCompletionRequest(BaseModel):
     logprobs: Optional[bool] = None
     top_logprobs: Optional[int] = None
     user: Optional[str] = None
-    
+
+    # Request-local, never serialized: the upstream rejected stream_options for
+    # this model, so the streaming path must not inject its usage default.
+    _omit_stream_options: bool = PrivateAttr(default=False)
+
     class Config:
         extra = "allow"  # Allow extra fields to be passed through - handles ALL future parameters
 
@@ -183,9 +192,9 @@ class CompletionStreamChoice(BaseModel):
 
 class Usage(BaseModel):
     model_config = ConfigDict(extra="allow")
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
 
 
 class ChatCompletionResponse(BaseModel):

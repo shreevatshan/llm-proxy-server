@@ -6,6 +6,7 @@ Supports both streaming and non-streaming responses.
 
 import logging
 import time
+import asyncio
 import json
 from typing import Any, Dict, List, Optional, Union
 
@@ -24,6 +25,7 @@ from app.anthropic_models import (
 from app.providers.provider_manager import provider_manager
 from app.providers.custom_providers import CustomProvider
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
+from app.conversion.token_estimate import estimate_anthropic_input_tokens
 from app.auth.middleware import authenticate_anthropic_request
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
@@ -47,6 +49,7 @@ from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.websearch import (
     HEADER_NAME as WEBSEARCH_HEADER,
+    WebSearchRequestError,
     maybe_intercept_anthropic,
     rewrite_anthropic_count_tokens_payload,
 )
@@ -246,9 +249,13 @@ async def create_message(
             })
 
             # Web search interception rewrites the tools (and replayed history)
-            # before metadata is computed, so neither the dropped-fields header
-            # nor any adapter ever sees the server-side web search tool.
-            websearch_loop = maybe_intercept_anthropic(request, provider, anthropic_beta)
+            # before metadata is computed: the server-side web search tool is
+            # replaced by the plain "web_search_proxy" function tool, which
+            # adapters forward like any other client tool.
+            try:
+                websearch_loop = maybe_intercept_anthropic(request, provider, anthropic_beta)
+            except WebSearchRequestError as e:
+                return _anthropic_error(400, "invalid_request_error", str(e))
             if websearch_loop is not None:
                 request = websearch_loop.request
                 add_span_attributes(span, {"anthropic.websearch_interception": True})
@@ -479,67 +486,13 @@ async def create_message(
             )
 
 
-def _estimate_text_tokens(text: str) -> int:
-    """Rough local estimate: ~4 chars per token. Under-counts CJK, over-counts short texts."""
-    if not text:
-        return 0
-    return (len(text) + 3) // 4
-
-
-def _extract_content_text(content) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, dict):
-        return json.dumps(content, ensure_ascii=False, sort_keys=True)
-    if not isinstance(content, list):
-        return ""
-
-    parts = []
-    for block in content:
-        if hasattr(block, "model_dump"):
-            data = block.model_dump(exclude_none=True)
-        elif isinstance(block, dict):
-            data = block
-        else:
-            parts.append(str(block))
-            continue
-
-        block_type = data.get("type")
-        if block_type == "text":
-            parts.append(data.get("text", ""))
-        elif block_type == "image":
-            source = data.get("source", {}) or {}
-            parts.append(source.get("data", ""))
-            parts.append(source.get("url", ""))
-        elif block_type == "tool_use":
-            parts.append(data.get("id", ""))
-            parts.append(data.get("name", ""))
-            parts.append(json.dumps(data.get("input", {}), ensure_ascii=False, sort_keys=True))
-        elif block_type == "tool_result":
-            parts.append(data.get("tool_use_id", ""))
-            value = data.get("content")
-            if isinstance(value, str):
-                parts.append(value)
-            elif isinstance(value, list):
-                parts.append(json.dumps(value, ensure_ascii=False, sort_keys=True))
-        elif block_type == "thinking":
-            parts.append(data.get("thinking", ""))
-            parts.append(data.get("signature", ""))
-        elif block_type == "redacted_thinking":
-            parts.append(data.get("data", ""))
-        else:
-            parts.append(json.dumps(data, ensure_ascii=False, sort_keys=True))
-
-    return "".join(parts)
-
-
 @router.post("/v1/messages/count_tokens", response_model=AnthropicCountTokensResponse, tags=["anthropic"])
 async def count_message_tokens(
     request_obj: Request,
     payload: Dict[str, Any] = Body(...),
     auth: Union[User, AdminUser, APIKey] = Depends(authenticate_anthropic_request),
 ):
-    """Estimate input tokens for Anthropic Messages payload locally (~4 chars/token heuristic)."""
+    """Count input tokens: provider-backed when supported, else a local estimate."""
     with create_span("anthropic_messages_count_tokens", kind=trace.SpanKind.INTERNAL) as span:
         try:
             if not isinstance(payload, dict):
@@ -600,43 +553,7 @@ async def count_message_tokens(
                         e,
                     )
 
-            total_text_parts = []
-
-            system = payload.get("system")
-            if system is not None:
-                if isinstance(system, str):
-                    total_text_parts.append(system)
-                else:
-                    total_text_parts.append(_extract_content_text(system))
-
-            messages = payload.get("messages")
-            if isinstance(messages, list):
-                for msg in messages:
-                    if isinstance(msg, dict):
-                        total_text_parts.append(str(msg.get("role", "")))
-                        total_text_parts.append(_extract_content_text(msg.get("content")))
-                    else:
-                        total_text_parts.append(str(msg))
-
-            tools = payload.get("tools")
-            if tools is not None:
-                total_text_parts.append(json.dumps(tools, ensure_ascii=False, sort_keys=True))
-
-            if payload.get("tool_choice") is not None:
-                total_text_parts.append(json.dumps(payload.get("tool_choice"), ensure_ascii=False, sort_keys=True))
-
-            if payload.get("thinking") is not None:
-                total_text_parts.append(json.dumps(payload.get("thinking"), ensure_ascii=False, sort_keys=True))
-
-            extra_payload = {
-                k: v for k, v in payload.items()
-                if k not in {"model", "messages", "system", "tools", "tool_choice", "thinking"}
-            }
-            if extra_payload:
-                total_text_parts.append(json.dumps(extra_payload, ensure_ascii=False, sort_keys=True))
-
-            combined = "\n".join(total_text_parts)
-            input_tokens = _estimate_text_tokens(combined)
+            input_tokens = await asyncio.to_thread(estimate_anthropic_input_tokens, payload)
             add_span_attributes(span, {
                 "anthropic.count_tokens_mode": "local_estimate",
             })

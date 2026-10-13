@@ -295,6 +295,8 @@ class ProviderManager:
                 'base_url': cred.base_url or cred.endpoint,
                 'api_key': cred.api_key,
                 'supported_apis': supported_apis,
+                'anthropic_base_url': getattr(cred, 'anthropic_base_url', None),
+                'anthropic_auth_style': getattr(cred, 'anthropic_auth_style', None),
             })
         
         return config_dict

@@ -9,10 +9,11 @@ import base64
 import binascii
 import copy
 import json
+import re
 import secrets
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from app.websearch.results import SearchOutcome, format_outcome_text
+from app.websearch.results import SearchOutcome, SearchResult, format_outcome_text
 
 INTERNAL_TOOL_NAME = "web_search_proxy"
 # Also accepted from clients (LiteLLM compatibility).
@@ -66,6 +67,87 @@ def query_from_input(tool_input: Any) -> str:
 
 
 # ==================== Anthropic Messages ====================
+
+class WebSearchRequestError(ValueError):
+    """The client's web search tool definition is invalid (-> HTTP 400)."""
+
+
+def _domain_list(value: Any) -> Tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(v).strip() for v in value if isinstance(v, str) and v.strip())
+
+
+def native_tool_options(tools: Optional[List[Any]]) -> Dict[str, Any]:
+    """Per-request search limits from the client's native web_search tool.
+
+    Returns ``WebSearchConfig.with_overrides`` keyword arguments for
+    ``max_uses``, ``allowed_domains``, ``blocked_domains`` and the 4get
+    ``country`` taken from ``user_location``.
+    """
+    for tool in tools or []:
+        tool = _as_dict(tool)
+        if not (isinstance(tool, dict) and is_native_web_search_tool_anthropic(tool)):
+            continue
+        allowed = _domain_list(tool.get("allowed_domains"))
+        blocked = _domain_list(tool.get("blocked_domains"))
+        if allowed and blocked:
+            raise WebSearchRequestError(
+                "web_search tool: use either allowed_domains or blocked_domains, not both"
+            )
+        overrides: Dict[str, Any] = {}
+        max_uses = tool.get("max_uses")
+        if isinstance(max_uses, int) and not isinstance(max_uses, bool):
+            if max_uses < 1:
+                raise WebSearchRequestError("web_search tool: max_uses must be at least 1")
+            overrides["max_uses"] = max_uses
+        if allowed:
+            overrides["allowed_domains"] = allowed
+        if blocked:
+            overrides["blocked_domains"] = blocked
+        location = tool.get("user_location")
+        if isinstance(location, dict) and isinstance(location.get("country"), str) and location["country"].strip():
+            overrides["fourget_country"] = location["country"].strip().lower()
+        return overrides
+    return {}
+
+
+# Claude Code's WebSearch tool sends a standalone request whose only tool is
+# the native web search and whose user text is this fixed prompt.
+_CLAUDE_CODE_SEARCH_PROMPT = re.compile(
+    r"^\s*Perform a web search for the query:\s*(?P<query>.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _last_user_text(messages: List[dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+            )
+        return ""
+    return ""
+
+
+def claude_code_search_query(tools: Optional[List[Any]], messages: List[dict]) -> Optional[str]:
+    """The query of a Claude Code WebSearch sub-request, else None."""
+    tools = [_as_dict(t) for t in tools or []]
+    if len(tools) != 1 or not is_native_web_search_tool_anthropic(tools[0]):
+        return None
+    if sum(1 for m in messages if m.get("role") == "user") != 1:
+        return None
+    match = _CLAUDE_CODE_SEARCH_PROMPT.match(_last_user_text(messages))
+    if not match:
+        return None
+    query = match.group("query").strip().strip('"').strip()
+    return query or None
+
 
 def anthropic_internal_tool() -> dict:
     return {
@@ -131,6 +213,18 @@ def remap_anthropic_tool_choice(tool_choice: Any) -> Any:
     ):
         return {**tc, "name": INTERNAL_TOOL_NAME}
     return tool_choice
+
+
+def anthropic_search_shortcut_allowed(tool_choice: Any) -> bool:
+    """Only bypass model tool selection when the client permits search."""
+    if tool_choice is None:
+        return True
+    tc = _as_dict(remap_anthropic_tool_choice(tool_choice))
+    if not isinstance(tc, dict):
+        return False
+    if tc.get("type") in ("auto", "any"):
+        return True
+    return tc.get("type") == "tool" and tc.get("name") == INTERNAL_TOOL_NAME
 
 
 def _encode_text(text: str) -> str:
@@ -207,14 +301,65 @@ def _is_ours(block: Any, key: str) -> bool:
     )
 
 
+def _is_our_citation(citation: Any) -> bool:
+    return (
+        isinstance(citation, dict)
+        and isinstance(citation.get("encrypted_index"), str)
+        and citation["encrypted_index"].startswith(_ENCRYPTED_PREFIX)
+    )
+
+
 def history_has_replayed_blocks(messages: List[dict]) -> bool:
     for msg in messages:
         content = msg.get("content")
         if isinstance(content, list):
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "server_tool_use" and _is_ours(block, "id"):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "server_tool_use" and _is_ours(block, "id"):
+                    return True
+                if block.get("type") == "text" and any(_is_our_citation(c) for c in block.get("citations") or []):
                     return True
     return False
+
+
+def citations_for_text(text: str, results: Iterable[SearchResult]) -> List[dict]:
+    """``web_search_result_location`` citations for results the text links.
+
+    Matching is by URL only: the answer has to mention the result's URL.
+    """
+    citations: List[dict] = []
+    if not text:
+        return citations
+    seen = set()
+    for result in results:
+        url = result.url
+        if not url or url in seen:
+            continue
+        variants = {url, url.rstrip("/")}
+        if not any(v and v in text for v in variants):
+            continue
+        seen.add(url)
+        citations.append({
+            "type": "web_search_result_location",
+            "url": url,
+            "title": result.title or url,
+            "encrypted_index": _encode_text(url),
+            "cited_text": (result.snippet or "")[:150],
+        })
+    return citations
+
+
+def _strip_our_citations(block: Any) -> Any:
+    if not (isinstance(block, dict) and block.get("type") == "text" and block.get("citations")):
+        return block
+    kept = [c for c in block["citations"] if not _is_our_citation(c)]
+    block = dict(block)
+    if kept:
+        block["citations"] = kept
+    else:
+        block.pop("citations", None)
+    return block
 
 
 def _content_list(content: Any) -> List[Any]:
@@ -280,7 +425,7 @@ def rehydrate_anthropic_messages(messages: List[dict]) -> List[dict]:
                     out.append({"role": "assistant", "content": segment})
                     out.append({"role": "user", "content": pending_results})
                     segment, pending_results = [], []
-                segment.append(block)
+                segment.append(_strip_our_citations(block))
         if pending_results:
             out.append({"role": "assistant", "content": segment})
             out.append({"role": "user", "content": pending_results})

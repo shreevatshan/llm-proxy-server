@@ -63,7 +63,7 @@ from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.providers.provider_manager import provider_manager
 from app.providers.auto_sync import auto_sync_on_provider_change, sync_provider_models
-from app.providers.azure_deployments import merge_azure_deployments, normalize_azure_deployments, validate_deployment_names
+from app.providers.azure_deployments import merge_azure_deployments, normalize_azure_deployments, normalize_deployment_groups, validate_deployment_names
 from datetime import timedelta, datetime
 from pydantic import BaseModel
 import asyncio
@@ -111,6 +111,24 @@ def _strip_masked_secrets(update_data: dict) -> dict:
     for field in _MASKED_SECRET_FIELDS:
         if update_data.get(field) == _SECRET_MASK:
             update_data.pop(field)
+    return update_data
+
+
+def _provider_update_data(provider_data: BaseModel, *, exclude: tuple = ()) -> dict:
+    """Column values an update/upsert request writes.
+
+    Only fields the client set (or validators derived) that are not None;
+    masked secrets mean "unchanged" and are dropped; ``supported_apis`` is
+    stored as JSON text.
+    """
+    update_data = {
+        field: value
+        for field, value in provider_data.model_dump(exclude_unset=True).items()
+        if value is not None and field not in exclude
+    }
+    _strip_masked_secrets(update_data)
+    if isinstance(update_data.get('supported_apis'), list):
+        update_data['supported_apis'] = json.dumps(update_data['supported_apis'])
     return update_data
 
 
@@ -2644,9 +2662,12 @@ async def get_provider_credential(
             deployments=deployments,
             openai_deployments=deployment_groups.get("openai", []),
             anthropic_deployments=deployment_groups.get("anthropic", []),
+            deployment_groups=deployment_groups.get("groups", []),
             provider_name=credentials.provider_name,
             dynamic_discovery=dynamic_discovery,
             supported_apis=supported_apis,
+            anthropic_base_url=credentials.anthropic_base_url,
+            anthropic_auth_style=credentials.anthropic_auth_style,
             created_at=credentials.created_at,
             updated_at=credentials.updated_at
         )
@@ -2669,7 +2690,11 @@ async def create_provider_credential(
 ):
     """Create new provider credentials."""
     try:
-        logging.info(f"🚀 Creating provider with data: {provider_data}, upsert={upsert}")
+        logging.info(
+            "Creating provider %s:%s (type=%s, upsert=%s)",
+            provider_data.provider_name, provider_data.instance_name,
+            provider_data.provider_type, upsert,
+        )
         
         # Ensure provider_name is set - if not provided, default to provider_type for specialized providers
         if not provider_data.provider_name:
@@ -2695,15 +2720,8 @@ async def create_provider_credential(
                         inferred_apis.append("anthropic")
                     provider_data.supported_apis = inferred_apis
 
-                # Convert create data to update data
-                update_data = {}
-                for field, value in provider_data.dict(exclude_unset=True).items():
-                    if value is not None and field != "provider_type":  # Don't update provider_type
-                        update_data[field] = value
-
-                # A masked secret round-tripped from a detail response means
-                # "leave unchanged" — never persist the placeholder itself.
-                _strip_masked_secrets(update_data)
+                # Convert create data to update data (provider_type is fixed)
+                update_data = _provider_update_data(provider_data, exclude=("provider_type",))
 
                 credentials = await update_provider_credentials(db, provider_key, **update_data)
                 if not credentials:
@@ -2760,8 +2778,11 @@ async def create_provider_credential(
                 deployments=provider_data.deployments,
                 openai_deployments=provider_data.openai_deployments,
                 anthropic_deployments=provider_data.anthropic_deployments,
+                deployment_groups=provider_data.deployment_groups,
                 dynamic_discovery=provider_data.dynamic_discovery,
-                supported_apis=supported_apis_json
+                supported_apis=supported_apis_json,
+                anthropic_base_url=provider_data.anthropic_base_url,
+                anthropic_auth_style=provider_data.anthropic_auth_style,
             )
             
             logging.info(f"✅ Provider credentials created: {credentials.provider_key}")
@@ -2800,8 +2821,11 @@ async def create_provider_credential(
             deployments=deployments,
             openai_deployments=deployment_groups.get("openai", []),
             anthropic_deployments=deployment_groups.get("anthropic", []),
+            deployment_groups=deployment_groups.get("groups", []),
             dynamic_discovery=credentials.dynamic_discovery,
             supported_apis=supported_apis,
+            anthropic_base_url=credentials.anthropic_base_url,
+            anthropic_auth_style=credentials.anthropic_auth_style,
             created_at=credentials.created_at,
             updated_at=credentials.updated_at
         )
@@ -2847,20 +2871,8 @@ async def update_provider_credential(
         # URL decode the provider_key
         decoded_provider_key = urllib.parse.unquote(provider_key)
         
-        # Prepare update data (only include non-None values)
-        update_data = {}
-        for field, value in provider_data.dict(exclude_unset=True).items():
-            if value is not None:
-                update_data[field] = value
+        update_data = _provider_update_data(provider_data)
 
-        # A masked secret round-tripped from a detail response means
-        # "leave unchanged" — never persist the placeholder itself.
-        _strip_masked_secrets(update_data)
-
-        # Serialize supported_apis list to JSON string for storage
-        if 'supported_apis' in update_data and isinstance(update_data['supported_apis'], list):
-            update_data['supported_apis'] = json.dumps(update_data['supported_apis'])
-        
         credentials = await update_provider_credentials(db, decoded_provider_key, **update_data)
         if not credentials:
             raise HTTPException(
@@ -2901,8 +2913,11 @@ async def update_provider_credential(
             deployments=deployments,
             openai_deployments=deployment_groups.get("openai", []),
             anthropic_deployments=deployment_groups.get("anthropic", []),
+            deployment_groups=deployment_groups.get("groups", []),
             dynamic_discovery=credentials.dynamic_discovery,
             supported_apis=supported_apis,
+            anthropic_base_url=credentials.anthropic_base_url,
+            anthropic_auth_style=credentials.anthropic_auth_style,
             created_at=credentials.created_at,
             updated_at=credentials.updated_at
         )
@@ -3002,8 +3017,11 @@ async def export_provider_config(
                 "deployments": deployments,
                 "openai_deployments": deployment_groups.get("openai", []),
                 "anthropic_deployments": deployment_groups.get("anthropic", []),
+                "deployment_groups": deployment_groups.get("groups", []),
                 "dynamic_discovery": cred.dynamic_discovery,
                 "supported_apis": supported_apis,
+                "anthropic_base_url": cred.anthropic_base_url,
+                "anthropic_auth_style": cred.anthropic_auth_style,
             })
 
         models_export = [
@@ -3089,23 +3107,34 @@ async def import_provider_config(
                         errors.append(f"Provider '{provider_key}': invalid azure_backend '{ab}', must be one of {VALID_AZURE_BACKENDS}")
                         continue
 
+                    try:
+                        if provider_data.get("deployment_groups") is not None:
+                            # Groups (even []) are the only deployment source;
+                            # the per-bucket lists alongside them are derived.
+                            groups = normalize_deployment_groups(provider_data["deployment_groups"], strict=True)
+                            derived = normalize_azure_deployments({"groups": groups})
+                            provider_data["deployment_groups"] = groups
+                            provider_data["openai_deployments"] = derived["openai"]
+                            provider_data["anthropic_deployments"] = derived["anthropic"]
+                            provider_data["deployments"] = merge_azure_deployments(derived)
+                        else:
+                            validate_deployment_names(provider_data.get("openai_deployments"))
+                            validate_deployment_names(provider_data.get("anthropic_deployments"))
+                            validate_deployment_names(provider_data.get("deployments"))
+                    except ValueError as e:
+                        errors.append(f"Provider '{provider_key}': {str(e)}")
+                        continue
+
                     if provider_data.get("dynamic_discovery") is True:
                         has_deps = (
                             provider_data.get("deployments")
                             or provider_data.get("openai_deployments")
                             or provider_data.get("anthropic_deployments")
+                            or provider_data.get("deployment_groups")
                         )
                         if has_deps:
                             errors.append(f"Provider '{provider_key}': cannot specify deployments with dynamic_discovery enabled")
                             continue
-
-                    try:
-                        validate_deployment_names(provider_data.get("openai_deployments"))
-                        validate_deployment_names(provider_data.get("anthropic_deployments"))
-                        validate_deployment_names(provider_data.get("deployments"))
-                    except ValueError as e:
-                        errors.append(f"Provider '{provider_key}': {str(e)}")
-                        continue
 
                 existing = await get_provider_credentials(db, provider_key)
 
@@ -3141,8 +3170,11 @@ async def import_provider_config(
                     deployments=provider_data.get("deployments"),
                     openai_deployments=provider_data.get("openai_deployments"),
                     anthropic_deployments=provider_data.get("anthropic_deployments"),
+                    deployment_groups=provider_data.get("deployment_groups"),
                     dynamic_discovery=provider_data.get("dynamic_discovery"),
                     supported_apis=supported_apis_json,
+                    anthropic_base_url=provider_data.get("anthropic_base_url"),
+                    anthropic_auth_style=provider_data.get("anthropic_auth_style"),
                 )
 
                 if existing and overwrite:

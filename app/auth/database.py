@@ -1285,16 +1285,22 @@ async def create_provider_credentials(
     deployments = kwargs.pop('deployments', None)
     openai_deployments = kwargs.pop('openai_deployments', None)
     anthropic_deployments = kwargs.pop('anthropic_deployments', None)
+    deployment_groups = kwargs.pop('deployment_groups', None)
     deployments_json = None
     if provider_type == "azure":
         deployments_json = serialize_azure_deployments(
             deployments=deployments,
             openai_deployments=openai_deployments,
             anthropic_deployments=anthropic_deployments,
+            deployment_groups=deployment_groups,
         )
     elif deployments:
         deployments_json = json.dumps(deployments)
     
+    for field in _CLEARABLE_PROVIDER_FIELDS:
+        if kwargs.get(field) == "":
+            kwargs[field] = None
+
     credentials = ProviderCredentials(
         provider_key=provider_key,
         provider_type=provider_type,
@@ -1358,31 +1364,12 @@ async def update_provider_credentials(
             
             # Perform provider rename with model migration
             return await _rename_provider_with_models(db, provider_key, new_provider_key, **kwargs)
-        
+
         # Normal update (no provider key change)
-        # Handle deployments JSON conversion
-        deployments = kwargs.pop('deployments', None)
-        openai_deployments = kwargs.pop('openai_deployments', None)
-        anthropic_deployments = kwargs.pop('anthropic_deployments', None)
-        if credentials.provider_type == "azure":
-            if (
-                deployments is not None
-                or openai_deployments is not None
-                or anthropic_deployments is not None
-            ):
-                kwargs['deployments_json'] = serialize_azure_deployments(
-                    deployments=deployments,
-                    openai_deployments=openai_deployments,
-                    anthropic_deployments=anthropic_deployments,
-                )
-        elif deployments is not None:
-            kwargs['deployments_json'] = json.dumps(deployments)
-        
-        # Update fields
-        for field, value in kwargs.items():
-            if value is not None and hasattr(credentials, field):
+        for field, value in _provider_update_fields(credentials.provider_type, kwargs).items():
+            if hasattr(credentials, field):
                 setattr(credentials, field, value)
-        
+
         credentials.updated_at = datetime.utcnow()
         await db.commit()
         await db.refresh(credentials)
@@ -1390,6 +1377,54 @@ async def update_provider_credentials(
     except Exception as e:
         await db.rollback()
         raise e
+
+
+# Optional provider fields where an empty string from the admin form means
+# "clear this override" rather than "leave unchanged".
+_CLEARABLE_PROVIDER_FIELDS = frozenset({"anthropic_base_url", "anthropic_auth_style"})
+
+
+def _provider_update_fields(provider_type: str, kwargs: dict) -> dict:
+    """The column values an update writes, shared by update and rename.
+
+    ``None`` means "leave unchanged" and is dropped (so an import that omits
+    secrets keeps the stored ones); an empty string clears the optional
+    overrides in _CLEARABLE_PROVIDER_FIELDS. The deployment inputs are folded
+    into ``deployments_json``: once any of them is supplied it is always
+    written, so an empty configuration (e.g. ``deployment_groups=[]`` when
+    switching to discovery) stores NULL instead of keeping the old rows.
+    """
+    import json
+
+    kwargs = dict(kwargs)
+    deployments = kwargs.pop('deployments', None)
+    openai_deployments = kwargs.pop('openai_deployments', None)
+    anthropic_deployments = kwargs.pop('anthropic_deployments', None)
+    deployment_groups = kwargs.pop('deployment_groups', None)
+
+    fields = {}
+    for field, value in kwargs.items():
+        if field in _CLEARABLE_PROVIDER_FIELDS and value == "":
+            fields[field] = None
+        elif value is not None:
+            fields[field] = value
+
+    if provider_type == "azure":
+        if (
+            deployments is not None
+            or openai_deployments is not None
+            or anthropic_deployments is not None
+            or deployment_groups is not None
+        ):
+            fields['deployments_json'] = serialize_azure_deployments(
+                deployments=deployments,
+                openai_deployments=openai_deployments,
+                anthropic_deployments=anthropic_deployments,
+                deployment_groups=deployment_groups,
+            )
+    elif deployments is not None:
+        fields['deployments_json'] = json.dumps(deployments)
+    return fields
 
 
 async def _rename_provider_with_models(
@@ -1409,43 +1444,30 @@ async def _rename_provider_with_models(
     try:
         # Get all models associated with the old provider
         models = await get_models_by_provider(db, old_provider_key)
-        
-        # Handle deployments JSON conversion
-        deployments = kwargs.pop('deployments', None)
-        openai_deployments = kwargs.pop('openai_deployments', None)
-        anthropic_deployments = kwargs.pop('anthropic_deployments', None)
-        if old_credentials.provider_type == "azure":
-            if (
-                deployments is not None
-                or openai_deployments is not None
-                or anthropic_deployments is not None
-            ):
-                kwargs['deployments_json'] = serialize_azure_deployments(
-                    deployments=deployments,
-                    openai_deployments=openai_deployments,
-                    anthropic_deployments=anthropic_deployments,
-                )
-        elif deployments is not None:
-            kwargs['deployments_json'] = json.dumps(deployments)
-        
+
+        # Same field semantics as a normal update: None keeps the old value.
+        fields = _provider_update_fields(old_credentials.provider_type, kwargs)
+
         # Create new provider credentials with updated key
         new_credentials = ProviderCredentials(
             provider_key=new_provider_key,
             provider_type=old_credentials.provider_type,
-            instance_name=kwargs.get('instance_name', old_credentials.instance_name),
-            enabled=kwargs.get('enabled', old_credentials.enabled),
-            endpoint=kwargs.get('endpoint', old_credentials.endpoint),
-            api_key=kwargs.get('api_key', old_credentials.api_key),
-            discovery_api_version=kwargs.get('discovery_api_version', old_credentials.discovery_api_version),
-            azure_backend=kwargs.get('azure_backend', old_credentials.azure_backend),
-            region=kwargs.get('region', old_credentials.region),
-            access_key_id=kwargs.get('access_key_id', old_credentials.access_key_id),
-            secret_access_key=kwargs.get('secret_access_key', old_credentials.secret_access_key),
-            base_url=kwargs.get('base_url', old_credentials.base_url),
-            deployments_json=kwargs.get('deployments_json', old_credentials.deployments_json),
-            provider_name=kwargs.get('provider_name', old_credentials.provider_name),
-            dynamic_discovery=kwargs.get('dynamic_discovery', old_credentials.dynamic_discovery),
-            supported_apis=kwargs.get('supported_apis', old_credentials.supported_apis),
+            instance_name=fields.get('instance_name', old_credentials.instance_name),
+            enabled=fields.get('enabled', old_credentials.enabled),
+            endpoint=fields.get('endpoint', old_credentials.endpoint),
+            api_key=fields.get('api_key', old_credentials.api_key),
+            discovery_api_version=fields.get('discovery_api_version', old_credentials.discovery_api_version),
+            azure_backend=fields.get('azure_backend', old_credentials.azure_backend),
+            region=fields.get('region', old_credentials.region),
+            access_key_id=fields.get('access_key_id', old_credentials.access_key_id),
+            secret_access_key=fields.get('secret_access_key', old_credentials.secret_access_key),
+            base_url=fields.get('base_url', old_credentials.base_url),
+            deployments_json=fields.get('deployments_json', old_credentials.deployments_json),
+            provider_name=fields.get('provider_name', old_credentials.provider_name),
+            dynamic_discovery=fields.get('dynamic_discovery', old_credentials.dynamic_discovery),
+            supported_apis=fields.get('supported_apis', old_credentials.supported_apis),
+            anthropic_base_url=fields.get('anthropic_base_url', old_credentials.anthropic_base_url),
+            anthropic_auth_style=fields.get('anthropic_auth_style', old_credentials.anthropic_auth_style),
         )
         
         # Add new provider to session
@@ -3045,6 +3067,19 @@ async def _run_auto_migrations():
                 logger.info("Auto-migration: 'supported_apis' column added successfully")
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add supported_apis column: {e}")
+
+        # Native-Anthropic overrides for custom providers.
+        for column_name, column_type in (("anthropic_base_url", "VARCHAR(500)"), ("anthropic_auth_style", "VARCHAR(20)")):
+            try:
+                result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))
+                columns = [row[1] for row in result.fetchall()]
+                if column_name not in columns:
+                    logger.info("Auto-migration: Adding '%s' column to provider_credentials", column_name)
+                    await conn.execute(text(
+                        f"ALTER TABLE provider_credentials ADD COLUMN {column_name} {column_type}"
+                    ))
+            except Exception as e:
+                logger.warning("Auto-migration: Could not add %s column: %s", column_name, e)
 
         # Add 'apis' column to model_aliases so mappings can be scoped to
         # specific API surfaces. NULL (legacy rows) means "all surfaces".

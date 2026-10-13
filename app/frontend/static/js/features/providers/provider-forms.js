@@ -113,21 +113,21 @@ class ProviderFormManager {
                 
                 <!-- Manual Deployments (shown when dynamic discovery is disabled) -->
                 <div id="manual-deployments" class="mb-3" style="display: block;">
-                    <div class="mb-3">
-                        <label for="openai_deployments" class="form-label">
-                            <i class="fas fa-robot"></i> OpenAI Deployments
-                        </label>
-                        <input type="text" id="openai_deployments" class="form-control" 
-                               placeholder="gpt-4o, gpt-4.1, o4-mini">
-                        <div class="form-text">Comma-separated Azure OpenAI or Foundry chat model deployments.</div>
-                    </div>
-                    <div class="mb-3" id="anthropic-deployments-group" style="display: none;">
-                        <label for="anthropic_deployments" class="form-label">
-                            <i class="fas fa-brain"></i> Anthropic Deployments
-                        </label>
-                        <input type="text" id="anthropic_deployments" class="form-control" 
-                               placeholder="claude-sonnet-4-5, claude-3-7-sonnet">
-                        <div class="form-text">Comma-separated Claude / Anthropic model deployments for Azure Foundry.</div>
+                    <label class="form-label">
+                        <i class="fas fa-robot"></i> Deployments
+                    </label>
+                    <div id="deployment-groups" class="deployment-groups"></div>
+                    <button type="button" class="btn btn-outline-secondary btn-sm mt-2" id="add-deployment-group"
+                            onclick="window.AzureManager.addDeploymentGroup()" title="Add deployment row">
+                        <i class="fas fa-plus"></i> Add
+                    </button>
+                    <div class="form-text">
+                        Comma-separated deployments per row, served only over the APIs selected for that row.
+                        Calls to unselected APIs are rejected. Only rows with <code>/chat/completions</code>,
+                        <code>/responses</code> or <code>/messages</code> are offered on <code>/v1/messages</code>;
+                        without <code>/messages</code> those requests are adapted onto <code>/chat/completions</code>,
+                        or <code>/responses</code> when chat is not selected. <code>/messages</code> (Foundry) calls
+                        the deployment natively.
                     </div>
                 </div>
                 
@@ -190,45 +190,52 @@ class ProviderFormManager {
                     Enter a name to identify this provider type (e.g., openai, ollama, llamacpp, or any custom name).
                 </div>
             </div>
+            <div class="form-text mb-3">Fill in the base URL for each API the server supports natively; at least one is required.
+                OpenAI-only providers are still served on the Anthropic Messages API through the built-in converter.</div>
             <div class="row">
                 <div class="col-md-6">
                     <div class="mb-3">
                         <label for="base_url" class="form-label">
-                            <i class="fas fa-link"></i> Base URL <span class="text-danger">*</span>
+                            <i class="fas fa-robot"></i> OpenAI base URL
                         </label>
-                        <input type="text" id="base_url" class="form-control" 
-                               placeholder="e.g., https://api.openai.com/v1 or http://localhost:11434/v1" required>
-                        <div class="form-text">Complete server URL including /v1 path</div>
+                        <input type="url" id="base_url" class="form-control"
+                               placeholder="e.g., https://api.openai.com/v1 or http://localhost:11434/v1">
+                        <div class="form-text">Complete server URL including /v1 path. Leave blank if the server has no OpenAI API.</div>
                     </div>
                 </div>
+            </div>
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="mb-3">
+                        <label for="anthropic_base_url" class="form-label">
+                            <i class="fas fa-brain"></i> Anthropic base URL
+                        </label>
+                        <input type="url" id="anthropic_base_url" class="form-control"
+                               placeholder="e.g., https://api.deepseek.com/anthropic">
+                        <div class="form-text">Complete server URL without the /v1/messages path. Leave blank if the server has no Anthropic API.</div>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="mb-3">
+                        <label for="anthropic_auth_style" class="form-label">
+                            <i class="fas fa-key"></i> Anthropic auth header
+                        </label>
+                        <select id="anthropic_auth_style" class="form-control form-select">
+                            <option value="">x-api-key:</option>
+                            <option value="bearer">Authorization: Bearer</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            <div class="row">
                 <div class="col-md-6">
                     <div class="mb-3">
                         <label for="api_key" class="form-label">
                             <i class="fas fa-key"></i> API Key
                         </label>
-                        <input type="password" id="api_key" class="form-control" 
+                        <input type="password" id="api_key" class="form-control"
                                placeholder="Optional (leave blank if not required)">
                         <div class="form-text">Leave blank if your server doesn't require authentication</div>
-                    </div>
-                </div>
-            </div>
-            <div class="mb-3">
-                <label class="form-label">
-                    <i class="fas fa-plug"></i> Supported APIs <span class="text-danger">*</span>
-                </label>
-                <div class="form-text mb-2">Select which API formats this provider supports</div>
-                <div class="d-flex gap-3">
-                    <div class="form-check">
-                        <input class="form-check-input" type="checkbox" id="supported_api_openai" value="openai" checked>
-                        <label class="form-check-label" for="supported_api_openai">
-                            <i class="fas fa-robot me-1"></i> OpenAI API
-                        </label>
-                    </div>
-                    <div class="form-check">
-                        <input class="form-check-input" type="checkbox" id="supported_api_anthropic" value="anthropic">
-                        <label class="form-check-label" for="supported_api_anthropic">
-                            <i class="fas fa-brain me-1"></i> Anthropic API
-                        </label>
                     </div>
                 </div>
             </div>
@@ -383,18 +390,13 @@ class ProviderFormManager {
                     }
                 });
 
-                const openaiDeploymentsElement = document.getElementById('openai_deployments');
-                const anthropicDeploymentsElement = document.getElementById('anthropic_deployments');
-                const openaiDeployments = openaiDeploymentsElement && openaiDeploymentsElement.value.trim()
-                    ? openaiDeploymentsElement.value.split(',').map(d => d.trim()).filter(d => d)
-                    : [];
-                const anthropicDeployments = anthropicDeploymentsElement && anthropicDeploymentsElement.value.trim()
-                    ? anthropicDeploymentsElement.value.split(',').map(d => d.trim()).filter(d => d)
-                    : [];
+                const deploymentGroups = formData.dynamic_discovery === true
+                    ? []
+                    : window.AzureManager.getDeploymentGroups();
+                const allDeployments = deploymentGroups.flatMap(group => group.deployments);
 
                 // Validate deployment name format
                 const deploymentNamePattern = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
-                const allDeployments = [...openaiDeployments, ...anthropicDeployments];
                 const invalidNames = allDeployments.filter(d => !deploymentNamePattern.test(d));
                 if (invalidNames.length > 0) {
                     this.showFormAlert('danger', `Invalid deployment name(s): ${invalidNames.join(', ')}. Names must start with a letter or digit and contain only letters, digits, hyphens, underscores, or dots.`);
@@ -402,37 +404,40 @@ class ProviderFormManager {
                     return;
                 }
 
-                if (formData.dynamic_discovery !== true) {
-                    if (formData.azure_backend === 'openai' && openaiDeployments.length === 0) {
-                        this.showFormAlert('danger', 'Please provide at least one OpenAI deployment when manual discovery is selected.');
-                        this.resetButtonState(submitBtn, btnContent, btnLoading);
-                        return;
-                    }
-                    if (formData.azure_backend === 'foundry' && openaiDeployments.length === 0 && anthropicDeployments.length === 0) {
-                        this.showFormAlert('danger', 'Please provide at least one OpenAI or Anthropic deployment when manual discovery is selected.');
-                        this.resetButtonState(submitBtn, btnContent, btnLoading);
-                        return;
-                    }
-                }
-
-                formData.openai_deployments = openaiDeployments;
-                formData.anthropic_deployments = anthropicDeployments;
-                formData.deployments = [...openaiDeployments, ...anthropicDeployments.filter(d => !openaiDeployments.includes(d))];
-            }
-
-            // Handle supported APIs checkboxes (for custom provider type)
-            if (providerType === 'custom') {
-                const supportedApis = [];
-                const openaiCheck = document.getElementById('supported_api_openai');
-                const anthropicCheck = document.getElementById('supported_api_anthropic');
-                if (openaiCheck && openaiCheck.checked) supportedApis.push('openai');
-                if (anthropicCheck && anthropicCheck.checked) supportedApis.push('anthropic');
-                if (supportedApis.length === 0) {
-                    this.showFormAlert('danger', 'Please select at least one supported API');
+                const noApis = deploymentGroups.filter(group => group.apis.length === 0 && !group.legacy_mode);
+                if (noApis.length > 0) {
+                    this.showFormAlert('danger', `Select at least one API for: ${noApis.flatMap(group => group.deployments).join(', ')}`);
                     this.resetButtonState(submitBtn, btnContent, btnLoading);
                     return;
                 }
+
+                if (formData.dynamic_discovery !== true && allDeployments.length === 0) {
+                    this.showFormAlert('danger', 'Please provide at least one deployment when manual discovery is selected.');
+                    this.resetButtonState(submitBtn, btnContent, btnLoading);
+                    return;
+                }
+
+                formData.deployment_groups = deploymentGroups;
+            }
+
+            // Custom providers: a filled base URL means that API is supported natively.
+            if (providerType === 'custom') {
+                const openaiBaseUrl = (document.getElementById('base_url')?.value || '').trim();
+                const anthropicBaseUrl = (document.getElementById('anthropic_base_url')?.value || '').trim();
+                if (!openaiBaseUrl && !anthropicBaseUrl) {
+                    this.showFormAlert('danger', 'Please provide an OpenAI base URL, an Anthropic base URL, or both');
+                    this.resetButtonState(submitBtn, btnContent, btnLoading);
+                    return;
+                }
+                const supportedApis = [];
+                if (openaiBaseUrl) supportedApis.push('openai');
+                if (anthropicBaseUrl) supportedApis.push('anthropic');
                 formData.supported_apis = supportedApis;
+                // Empty strings clear previously saved values.
+                formData.base_url = openaiBaseUrl;
+                formData.anthropic_base_url = anthropicBaseUrl;
+                const anthropicAuthStyle = document.getElementById('anthropic_auth_style');
+                formData.anthropic_auth_style = anthropicAuthStyle ? anthropicAuthStyle.value : '';
             }
 
             const url = isEdit && window.currentEditingProvider ? 
@@ -459,11 +464,18 @@ class ProviderFormManager {
                 console.log('✅ Success response:', result);
 
                 let successMsg = `Provider ${isEdit ? 'updated' : 'created'} successfully.`;
-                if (result.openai_deployments && result.openai_deployments.length > 0) {
-                    successMsg += `<br>OpenAI deployments: ${result.openai_deployments.join(', ')}`;
-                }
-                if (result.anthropic_deployments && result.anthropic_deployments.length > 0) {
-                    successMsg += `<br>Anthropic deployments: ${result.anthropic_deployments.join(', ')}`;
+                if (Array.isArray(result.deployment_groups)) {
+                    const apiLabels = {
+                        chat: '/chat/completions', responses: '/responses', anthropic: '/messages',
+                        completions: '/completions', embeddings: '/embeddings', images: '/images/*',
+                        speech: '/audio/speech', transcription: '/audio/transcriptions',
+                    };
+                    result.deployment_groups.forEach(group => {
+                        const apis = (group.apis || []).length
+                            ? group.apis.map(api => apiLabels[api] || api).join(', ')
+                            : `legacy ${group.legacy_mode || ''} (all APIs)`;
+                        successMsg += `<br>${apis}: ${(group.deployments || []).join(', ')}`;
+                    });
                 }
                 if (result.supported_apis && result.supported_apis.length > 0) {
                     successMsg += `<br>Supported APIs: ${result.supported_apis.join(', ')}`;
@@ -670,25 +682,29 @@ class ProviderFormManager {
                 }
             });
 
-            const openaiDeploymentsElement = document.getElementById('openai_deployments');
-            if (openaiDeploymentsElement && provider.openai_deployments && Array.isArray(provider.openai_deployments)) {
-                openaiDeploymentsElement.value = provider.openai_deployments.join(', ');
-            }
-            const anthropicDeploymentsElement = document.getElementById('anthropic_deployments');
-            if (anthropicDeploymentsElement && provider.anthropic_deployments && Array.isArray(provider.anthropic_deployments)) {
-                anthropicDeploymentsElement.value = provider.anthropic_deployments.join(', ');
+            if (provider.dynamic_discovery !== true) {
+                window.AzureManager.setDeploymentGroups(provider.deployment_groups);
             }
         }
 
-        // Handle supported APIs checkboxes for custom providers
-        if (provider.provider_type === 'custom' && provider.supported_apis) {
-            const apis = Array.isArray(provider.supported_apis) ? provider.supported_apis : [];
-            const openaiCheck = document.getElementById('supported_api_openai');
-            const anthropicCheck = document.getElementById('supported_api_anthropic');
-            if (openaiCheck) openaiCheck.checked = apis.includes('openai');
-            if (anthropicCheck) anthropicCheck.checked = apis.includes('anthropic');
+        // Custom providers: each filled base URL marks a natively supported API.
+        if (provider.provider_type === 'custom') {
+            const apis = Array.isArray(provider.supported_apis) ? provider.supported_apis : ['openai'];
+            const baseUrl = document.getElementById('base_url');
+            const anthropicBaseUrl = document.getElementById('anthropic_base_url');
+            const anthropicAuthStyle = document.getElementById('anthropic_auth_style');
+            if (baseUrl) baseUrl.value = apis.includes('openai') ? (provider.base_url || '') : '';
+            if (anthropicBaseUrl) {
+                // Older records enabled native Anthropic without a separate URL
+                // (it was derived from base_url); show that URL explicitly.
+                anthropicBaseUrl.value = apis.includes('anthropic')
+                    ? (provider.anthropic_base_url || provider.base_url || '')
+                    : '';
+            }
+            if (anthropicAuthStyle) anthropicAuthStyle.value = provider.anthropic_auth_style || '';
         }
     }
+
 
 
 }

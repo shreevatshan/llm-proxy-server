@@ -92,7 +92,7 @@ class ModelAliasManager {
         const last = this.aliases.length - 1;
         tbody.innerHTML = rows.map(({ row, index }) => {
             const type = row.match_type || 'exact';
-            const name = type === 'exact' ? esc(row.alias) : `<code>${esc(row.alias)}</code>`;
+            const name = esc(row.alias);
             return `
             <tr data-id="${row.id}">
             <td class="alias-order-cell">

@@ -94,13 +94,20 @@ class ConvertRequestTests(unittest.TestCase):
         names = [t.function.name for t in out.tools]
         self.assertEqual(names, ["real"])
 
+    _F_TOOL = [{"name": "f", "input_schema": {"type": "object"}}]
+
     def test_tool_choice_any_maps_to_required(self):
-        out = self.c.convert_request(_req(tool_choice={"type": "any"}), "m")
+        out = self.c.convert_request(_req(tools=self._F_TOOL, tool_choice={"type": "any"}), "m")
         self.assertEqual(out.tool_choice, "required")
 
     def test_tool_choice_specific_tool(self):
-        out = self.c.convert_request(_req(tool_choice={"type": "tool", "name": "f"}), "m")
+        out = self.c.convert_request(_req(tools=self._F_TOOL, tool_choice={"type": "tool", "name": "f"}), "m")
         self.assertEqual(out.tool_choice, {"type": "function", "function": {"name": "f"}})
+
+    def test_tool_choice_dropped_without_tools(self):
+        # OpenAI rejects tool_choice without tools.
+        out = self.c.convert_request(_req(tool_choice={"type": "any"}), "m")
+        self.assertIsNone(out.tool_choice)
 
     def test_image_block_base64_to_data_url(self):
         req = _req(messages=[{

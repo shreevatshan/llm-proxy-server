@@ -226,6 +226,21 @@ class OpenAICompatibleProvider(BaseProvider):
                 k: v for k, v in request_dict["response_format"].items() if v is not None
             }
 
+        # Function declares description/parameters/strict as Optional, so an
+        # unset field dumps as null. Strict backends reject that ("strict:
+        # Expected boolean, received null"); omit the keys instead.
+        if isinstance(request_dict.get("tools"), list):
+            cleaned_tools = []
+            for tool in request_dict["tools"]:
+                if isinstance(tool, dict):
+                    tool = {k: v for k, v in tool.items() if v is not None}
+                    if isinstance(tool.get("function"), dict):
+                        tool["function"] = {
+                            k: v for k, v in tool["function"].items() if v is not None
+                        }
+                cleaned_tools.append(tool)
+            request_dict["tools"] = cleaned_tools
+
         # If max_tokens is set, replace it with max_completion_tokens for newer
         # chat models (GPT-4o, o1, etc.) that reject max_tokens.
         # ONLY for chat completions: the legacy Completions API
@@ -371,8 +386,9 @@ class OpenAICompatibleProvider(BaseProvider):
 
         # Ensure stream_options includes usage by default if not explicitly set.
         # Skipped when the provider declares stream_options unsupported so the
-        # subclass filter is not undone here.
-        if self._supports_stream_options():
+        # subclass filter is not undone here, or when the upstream already
+        # rejected it for this model.
+        if self._supports_stream_options() and not getattr(request, "_omit_stream_options", False):
             if "stream_options" not in request_dict or request_dict["stream_options"] is None:
                 request_dict["stream_options"] = {"include_usage": True}
             elif isinstance(request_dict["stream_options"], dict) and "include_usage" not in request_dict["stream_options"]:
@@ -690,8 +706,10 @@ class OpenAICompatibleProvider(BaseProvider):
                 response_dict["model"] = echo_model_name(request)
             
             return ResponseObject(**response_dict)
+        except (ValueError, ProviderHTTPError):
+            raise
         except Exception as e:
-            raise Exception(f"{self.provider_type} responses create error: {str(e)}")
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
     
     async def responses_create_stream(self, request: ResponsesCreateRequest) -> AsyncGenerator[str, None]:
         """Handle streaming Responses API create request using OpenAI SDK."""
