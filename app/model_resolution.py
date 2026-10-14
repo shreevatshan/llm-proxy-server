@@ -39,7 +39,8 @@ from typing import Dict, List, Optional, Tuple
 from app.api_envelope import envelope_for
 from app.auth.admin import AdminUser
 from app.model_access_dep import ModelAccessDenied
-from app.model_alias import apply_alias, current_api_surface, original_model_name
+from app.model_alias import apply_alias, current_api_surface, current_profile_id, original_model_name
+from app.profiles import profile_id_for_auth
 from app.providers.provider_manager import provider_manager
 
 logger = logging.getLogger(__name__)
@@ -258,6 +259,9 @@ async def resolve_model_for_request(
     """
     if not model:
         return model
+    # Normally bound at auth already; repeated here for auth paths that bypass
+    # _update_tracking_identity (e.g. overridden dependencies). Idempotent.
+    current_profile_id.set(profile_id_for_auth(auth))
     model = apply_alias(model)
 
     cache = provider_manager.model_cache

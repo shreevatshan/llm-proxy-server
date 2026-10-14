@@ -23,6 +23,18 @@ class ModelAliasManager {
         this._drop = null;
         this._orderSaving = false;
         this._orderDirty = false;
+        // The profile whose mappings are shown. Each profile has its own list; its
+        // members are mapped with that list alone.
+        this._profileId = window.ProfileStore.DEFAULT_ID;
+        document.addEventListener('profiles:changed', () => this._onProfilesChanged());
+    }
+
+    async _onProfilesChanged() {
+        const before = this._profileId;
+        await this._fillScope();
+        // The shown profile was deleted and the picker fell back to Default: show
+        // Default's mappings, not the deleted profile's.
+        if (this._profileId !== before) await this.setScope(this._profileId);
     }
 
     async load() {
@@ -30,14 +42,52 @@ class ModelAliasManager {
         this._initCombobox();
         this._initDragAndDrop();
         this.updateMatchHelp();
+        this._profileId = window.ProfileStore.selected('model-mapping', window.ProfileStore.DEFAULT_ID);
+        await this._fillScope();
         await Promise.all([this._loadAliases(), this._loadModels()]);
+    }
+
+    async _fillScope() {
+        const sel = document.getElementById('model-alias-scope');
+        await window.ProfileStore.fillSelect(sel, { selectedId: this._profileId, showCounts: false });
+        if (sel && sel.value) this._profileId = parseInt(sel.value, 10);
+        if (!window.ProfileStore.byId(this._profileId)) this._profileId = window.ProfileStore.DEFAULT_ID;
+        this._syncScopeHint();
+    }
+
+    _syncScopeHint() {
+        const hint = document.getElementById('model-alias-scope-hint');
+        if (!hint) return;
+        const p = window.ProfileStore.byId(this._profileId);
+        const esc = window.UIUtils?.escapeHtml || (v => v);
+        hint.innerHTML = p
+            ? `Mappings for members of <strong>${esc(p.name)}</strong> only. Other profiles have their own lists.`
+            : '';
+    }
+
+    async setScope(value) {
+        this._profileId = value ? parseInt(value, 10) : window.ProfileStore.DEFAULT_ID;
+        window.ProfileStore.select('model-mapping', this._profileId);
+        this._resetForm();
+        this._search = '';
+        const search = document.getElementById('model-alias-search');
+        if (search) search.value = '';
+        const out = document.getElementById('model-alias-test-result');
+        if (out) out.innerHTML = '';
+        this._syncScopeHint();
+        await this._loadAliases();
+    }
+
+    /** Query string selecting the shown profile's list. */
+    _scopeQuery(prefix = '?') {
+        return `${prefix}profile_id=${this._profileId}`;
     }
 
     async _loadAliases() {
         const tbody = document.getElementById('model-aliases-tbody');
         if (!tbody) return;
         try {
-            const response = await fetch('/admin/model-aliases', { credentials: 'include' });
+            const response = await fetch(`/admin/model-aliases${this._scopeQuery()}`, { credentials: 'include' });
             if (!response.ok) throw new Error('load failed');
             this.aliases = await response.json();
             this._render();
@@ -223,7 +273,7 @@ class ModelAliasManager {
                 this._orderDirty = false;
                 const response = await fetch('/admin/model-aliases/order', {
                     method: 'PUT', credentials: 'include', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ids: this.aliases.map(row => row.id) }),
+                    body: JSON.stringify({ ids: this.aliases.map(row => row.id), profile_id: this._profileId }),
                 });
                 const result = await response.json().catch(() => ({}));
                 if (!response.ok) throw new Error(this._errorMessage(result, 'Failed to save mapping order.'));
@@ -428,7 +478,7 @@ class ModelAliasManager {
             if (!confirmed) return;
         }
         const enabled = existing ? existing.enabled : true;
-        const payload = { alias, target_model_id, enabled, apis, match_type };
+        const payload = { alias, target_model_id, enabled, apis, match_type, profile_id: this._profileId };
         if (this._editingId !== null) payload.id = this._editingId;
         try {
             const response = await fetch('/admin/model-aliases', {
@@ -468,6 +518,7 @@ class ModelAliasManager {
                 body: JSON.stringify({
                     id: row.id, alias: row.alias, target_model_id: row.target_model_id,
                     enabled: !row.enabled, apis: row.apis, match_type: row.match_type || 'exact',
+                    profile_id: this._profileId,
                 }),
             });
             const result = await response.json().catch(() => ({}));
@@ -487,7 +538,7 @@ class ModelAliasManager {
         const confirmed = await window.UIUtils?.showConfirmModal('Delete Model Mapping', `Delete mapping '${alias}'?`, 'danger');
         if (!confirmed) return;
         try {
-            const response = await fetch(`/admin/model-aliases/${encodeURIComponent(alias)}`, { method: 'DELETE', credentials: 'include' });
+            const response = await fetch(`/admin/model-aliases/${encodeURIComponent(alias)}${this._scopeQuery()}`, { method: 'DELETE', credentials: 'include' });
             if (!response.ok) throw new Error((await response.json()).detail || 'Failed to delete mapping.');
             window.UIUtils?.showToast(`Mapping '${alias}' deleted.`, 'success');
             if (this._editingId === row.id) this._resetForm();
@@ -506,6 +557,7 @@ class ModelAliasManager {
         const esc = window.UIUtils?.escapeHtml || (value => value);
         const params = new URLSearchParams({ model });
         if (api) params.set('api', api);
+        params.set('profile_id', this._profileId);
         try {
             const response = await fetch(`/admin/model-aliases/test?${params}`, { credentials: 'include' });
             const result = await response.json().catch(() => ({}));

@@ -213,7 +213,7 @@ class PoolUsageVisibilityTests(PoolTestCase):
         self.assertEqual(overall.limit, 200)
         self.assertEqual(overall.remaining, 200 - overall.used)
 
-    async def test_idle_group_is_listed_so_a_per_user_override_is_visible(self):
+    async def test_idle_group_is_listed_so_a_profile_group_limit_is_visible(self):
         """A group with no traffic still has to appear, with each member's own limit.
 
         The Quotas tab lists every group unconditionally, so an admin who lowers one
@@ -225,16 +225,10 @@ class PoolUsageVisibilityTests(PoolTestCase):
         bob = await self.make_user("bob", rpd_limit=1500)
         pool = await self.make_pool("shared-usage", alice, [bob])
 
-        group = ModelGroup(name="opus", rpm_default=None, rpd_default=1500)
-        self.db.add(group)
-        await self.db.flush()
-        self.db.add_all([
-            ModelGroupMember(group_id=group.id, model_id="anthropic/opus"),
-            UserModelGroupRateLimit(user_id=alice.id, group_id=group.id,
-                                    rpm_limit=None, rpd_limit=1),
-        ])
-        await self.db.commit()
-        await self.refresh()
+        group = await self.make_model_group("opus", "anthropic/opus", rpd_default=1500)
+        tight = await self.make_profile("tight", rpd_limit=1500)
+        await self.set_group_limit(tight.id, group, rpd=1)
+        await self.set_profile(alice, tight.id)
 
         members, scopes, _detail, _users = await pool_routes._render_pool(self.db, pool)
         opus = next(s for s in scopes if s.name == "opus")

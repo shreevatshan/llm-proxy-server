@@ -160,6 +160,10 @@ function showTab(tabName) {
         window.ModelAliasManager?.load();
     }
 
+    if (tabName === 'profiles') {
+        window.ProfileManager?.load();
+    }
+
     if (tabName === 'websearch') {
         window.WebSearchManager?.load();
     }

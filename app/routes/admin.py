@@ -25,34 +25,30 @@ from app.auth.database import (
     delete_usage_records,
     count_usage_requests,
     usage_user_ids_for_pool,
-    get_global_rate_limit, upsert_global_rate_limit,
     load_user_management_settings, upsert_user_management_settings,
-    get_user_rate_limit, upsert_user_rate_limit, delete_user_rate_limit,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
-    set_group_members, get_model_group_limits, update_model_group_limits,
-    list_user_group_rate_limits, upsert_user_group_rate_limit, delete_user_group_rate_limit,
+    set_group_members, get_model_group_limits,
     list_instance_groups, create_instance_group, update_instance_group, delete_instance_group,
-    set_instance_group_members, get_instance_group_limits, update_instance_group_limits,
-    list_user_instance_group_rate_limits, upsert_user_instance_group_rate_limit, delete_user_instance_group_rate_limit,
-    get_user_model_policy, upsert_user_model_policy,
-    list_user_model_exceptions, get_user_model_exception, upsert_user_model_exception,
-    delete_user_model_exception, set_user_model_exceptions_bulk,
+    set_instance_group_members, get_instance_group_limits,
     get_websearch_settings, upsert_websearch_settings,
+    normalize_new_username, get_profile, get_profile_by_name, list_profiles, create_profile,
+    update_profile, delete_profile, assign_users_profile, list_profile_member_ids, list_profile_members,
+    upsert_profile_limits, upsert_profile_group_limit, set_group_limit_for_all_profiles,
+    get_profile_limits, set_profile_model_mode, list_profile_model_exceptions,
+    upsert_profile_model_exception, delete_profile_model_exception, set_profile_model_exceptions_bulk,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
 from app.auth.models import (
-    User, UserCreate, UserResponse, ProviderConfigurationResponse, ModelConfigurationResponse,
+    User, AdminUserCreate, UserResponse, DEFAULT_PROFILE_ID,
+    ProfileCreate, ProfileUpdate, ProfileResponse, ProfileLimitsUpdate, ProfileLimitsResponse,
+    ProfileMemberResponse, UserProfileAssign, ProviderConfigurationResponse, ModelConfigurationResponse,
     ModelManagementTree, ToggleRequest, BulkToggleRequest, BulkUserActionRequest, ModelSearchResponse,
     ProviderCredentialsCreate, ProviderCredentialsUpdate, ProviderCredentialsResponse,
     AdminPasswordReset, AdminUserModify, VALID_AZURE_BACKENDS,
-    GlobalRateLimitResponse, GlobalRateLimitUpdate,
     UserManagementSettingsResponse, UserManagementSettingsUpdate,
-    UserRateLimitResponse, UserRateLimitUpdate,
-    ModelGroupCreate, ModelGroupUpdate, ModelGroupLimitsUpdate, ModelGroupMembersUpdate,
-    ModelGroupResponse, UserModelGroupRateLimitResponse, UserModelGroupRateLimitUpdate,
-    InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupLimitsUpdate, InstanceGroupMembersUpdate,
-    InstanceGroupResponse, UserInstanceGroupRateLimitResponse, UserInstanceGroupRateLimitUpdate,
+    ModelGroupCreate, ModelGroupUpdate, ModelGroupMembersUpdate, ModelGroupResponse,
+    InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupMembersUpdate, InstanceGroupResponse,
     ModelAliasUpsert, ModelAliasResponse, ModelAliasReorder, ModelAliasTestMatch,
     MODEL_ALIAS_API_SURFACES, validate_alias_pattern,
     AdminPoolResponse,
@@ -808,12 +804,19 @@ async def list_users(
 
 @router.post("/users", response_model=UserResponse)
 async def create_user_admin(
-    user_data: UserCreate,
+    user_data: AdminUserCreate,
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Create a new user (admin only)."""
+    """Create a new, already-active user in a profile (Default when none is given)."""
     from app.auth.database import is_reserved_username
+
+    # Same normalisation as signup, so both paths store and compare the same string.
+    try:
+        user_data.username = normalize_new_username(user_data.username)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    user_data.email = user_data.email.strip()
 
     # Check if username already exists. The config-based admin is not in the users
     # table but owns its name for usage/quota purposes (is_reserved_username).
@@ -837,26 +840,71 @@ async def create_user_admin(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Password must be at least 6 characters long"
         )
-    
-    # Create user
+
+    profile_id = user_data.profile_id or DEFAULT_PROFILE_ID
+    if await get_profile(db, profile_id) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Profile not found")
+
     try:
-        user = await create_user(db, user_data.username, user_data.email, user_data.password)
-
-        # Send signup webhook notification
-        await send_signup_webhook(
-            username=user.username,
-            email=user.email,
-            signup_mode="admin_created",
-            user_id=user.id,
-            is_pending=False
+        user = await create_user(
+            db, user_data.username, user_data.email, user_data.password, profile_id=profile_id,
         )
-
-        return UserResponse.from_orm(user)
-    except Exception as e:
+    except Exception:
+        logger.exception("Admin user creation failed for %s", user_data.username)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to create user"
         )
+    from app.profiles import profile_registry
+    from app.rate_limit import rate_limit_tracker
+    profile_registry.set_users_profile([user.id], profile_id)
+    # A periodic reload whose SELECT predates the INSERT could install its user map
+    # over the patch above; reloading under the tracker's lock settles it.
+    await rate_limit_tracker.reload_config()
+
+    # Send signup webhook notification
+    await send_signup_webhook(
+        username=user.username,
+        email=user.email,
+        signup_mode="admin_created",
+        user_id=user.id,
+        is_pending=False
+    )
+    return UserResponse.from_orm(user)
+
+
+async def _move_users_to_profile(db: AsyncSession, user_ids: List[int], profile_id: int) -> List[int]:
+    """Assign users to a profile, and make the move visible to enforcement at once.
+
+    A pool's daily limit is the sum of its members' limits, so moving a member changes
+    their pool's limit too: the pools are resettled, which also reloads the snapshot.
+    """
+    from app.profiles import profile_registry
+    from app.routes.pools import resettle_pools_after_commit
+
+    moved = await assign_users_profile(db, user_ids, profile_id)
+    profile_registry.set_users_profile(moved, profile_id)
+    if moved:
+        await resettle_pools_after_commit(db, user_ids=moved)
+    return moved
+
+
+@router.put("/users/profile", response_model=UserResponse)
+async def set_user_profile_endpoint(
+    body: UserProfileAssign,
+    user_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Move one user to another profile."""
+    user = await get_user_by_id(db, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    if await get_profile(db, body.profile_id) is None:
+        raise HTTPException(status_code=400, detail="Profile not found")
+    await _move_users_to_profile(db, [user_id], body.profile_id)
+    await db.refresh(user)
+    return UserResponse.from_orm(user)
 
 
 @router.delete("/users")
@@ -1159,18 +1207,21 @@ async def bulk_user_action(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Apply approve/deactivate/activate/delete to several users at once (admin only).
+    """Apply approve/deactivate/activate/delete/assign_profile to several users at once (admin only).
 
     Mirrors the single-user endpoints above so bulk and single behaviour never
     diverge. A well-formed request always returns 200: per-user problems are
     reported in ``failed`` rather than failing the whole batch.
     """
     action = bulk_data.action
-    if action not in ("approve", "deactivate", "activate", "delete"):
+    if action not in ("approve", "deactivate", "activate", "delete", "assign_profile"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Action must be 'approve', 'deactivate', 'activate' or 'delete'"
+            detail="Action must be 'approve', 'deactivate', 'activate', 'delete' or 'assign_profile'"
         )
+    if action == "assign_profile":
+        if bulk_data.profile_id is None or await get_profile(db, bulk_data.profile_id) is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Profile not found")
 
     # Dedupe while preserving the order the admin selected them in.
     user_ids = list(dict.fromkeys(bulk_data.user_ids))
@@ -1190,7 +1241,14 @@ async def bulk_user_action(
     succeeded: List[dict] = []
     failed: List[dict] = []
 
-    if action == "delete":
+    if action == "assign_profile":
+        found = set(await _move_users_to_profile(db, user_ids, bulk_data.profile_id))
+        for user_id in user_ids:
+            if user_id in found:
+                succeeded.append({"id": user_id, "username": None})
+            else:
+                failed.append({"id": user_id, "username": None, "error": "User not found"})
+    elif action == "delete":
         # permanently_delete_user commits internally, so this cannot be one
         # transaction; partial completion is possible and is reported per user.
         from app.routes.pools import delete_user_account
@@ -1276,6 +1334,7 @@ async def bulk_user_action(
         "deactivate": "deactivated",
         "activate": "activated",
         "delete": "deleted",
+        "assign_profile": "moved",
     }[action]
     message = f"{len(succeeded)} user{'' if len(succeeded) == 1 else 's'} {past_tense}"
     if failed:
@@ -1291,33 +1350,253 @@ async def bulk_user_action(
     }
 
 
-# ==================== Rate Limit Management API Endpoints ====================
+# ==================== User Profile API Endpoints ====================
+#
+# A profile carries everything that used to be global or per-user: overall and group
+# rate limits, model access, and its own model mappings. Every user is in exactly one.
 
-@router.get("/rate-limits/defaults", response_model=GlobalRateLimitResponse)
-async def get_rate_limit_defaults(
+async def _require_profile(db: AsyncSession, profile_id: int):
+    profile = await get_profile(db, profile_id)
+    if profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    return profile
+
+
+async def _profile_response(db: AsyncSession, profile_id: int) -> ProfileResponse:
+    rows = await list_profiles(db, profile_id=profile_id)
+    if not rows:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile not found")
+    return ProfileResponse(**rows[0])
+
+
+async def _resettle_profile(db: AsyncSession, profile_id: int) -> None:
+    """A profile's limits changed: re-apportion every pool one of its members is in.
+
+    resettle_pools_after_commit refreshes the tracker (and so the profile snapshot)
+    before settling, which is what makes the new limits apply on the next request.
+    """
+    from app.routes.pools import resettle_pools_after_commit
+    member_ids = await list_profile_member_ids(db, [profile_id])
+    if member_ids:
+        await resettle_pools_after_commit(db, user_ids=member_ids)
+    else:
+        from app.rate_limit import rate_limit_tracker
+        await rate_limit_tracker.refresh_now()
+
+
+@router.get("/profiles", response_model=List[ProfileResponse])
+async def list_profiles_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get global rate limit defaults."""
-    row = await get_global_rate_limit(db)
-    if row is None:
-        return GlobalRateLimitResponse()
-    return GlobalRateLimitResponse.model_validate(row)
+    """Every profile with its member count, limits, access mode and mapping count."""
+    return [ProfileResponse(**row) for row in await list_profiles(db)]
 
 
-@router.put("/rate-limits/defaults", response_model=GlobalRateLimitResponse)
-async def update_rate_limit_defaults(
-    body: GlobalRateLimitUpdate,
+@router.post("/profiles", response_model=ProfileResponse)
+async def create_profile_endpoint(
+    body: ProfileCreate,
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update global rate limit defaults."""
-    row = await upsert_global_rate_limit(db, body.rpm_default, body.rpd_default, current_admin.username)
+    """Create a profile, optionally as a copy of another (limits, access, mappings)."""
+    from sqlalchemy.exc import IntegrityError
+    if await get_profile_by_name(db, body.name):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Profile '{body.name}' already exists")
+    if body.clone_from_id is not None:
+        await _require_profile(db, body.clone_from_id)
+    try:
+        row = await create_profile(db, body.name, body.description, current_admin.username,
+                                   clone_from_id=body.clone_from_id)
+    except IntegrityError:
+        # Lost a race with a concurrent create of the same (case-folded) name.
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Profile '{body.name}' already exists")
     from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_defaults()
+    await rate_limit_tracker.reload_config()  # no members yet: no counts change
+    if body.clone_from_id is not None:
+        from app.model_alias import model_alias_resolver
+        await model_alias_resolver.load_from_database()
+    return await _profile_response(db, row.id)
+
+
+@router.put("/profiles", response_model=ProfileResponse)
+async def update_profile_endpoint(
+    body: ProfileUpdate,
+    profile_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rename a profile or change its description."""
+    from sqlalchemy.exc import IntegrityError
+    await _require_profile(db, profile_id)
+    fields = body.model_dump(exclude_unset=True)
+    if "name" in fields:
+        clash = await get_profile_by_name(db, fields["name"])
+        if clash is not None and clash.id != profile_id:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Profile '{fields['name']}' already exists")
+    try:
+        await update_profile(db, profile_id, fields, current_admin.username)
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Profile name already exists")
+    from app.rate_limit import rate_limit_tracker
+    await rate_limit_tracker.reload_config()
+    return await _profile_response(db, profile_id)
+
+
+@router.delete("/profiles")
+async def delete_profile_endpoint(
+    profile_id: int = Query(...),
+    reassign_to: int = Query(DEFAULT_PROFILE_ID, description="Profile that receives the members"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a profile; its members move to `reassign_to` (Default unless given)."""
+    if profile_id == DEFAULT_PROFILE_ID:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The default profile cannot be deleted")
+    if reassign_to == profile_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Members cannot be reassigned to the profile being deleted")
+    profile = await _require_profile(db, profile_id)
+    if await get_profile(db, reassign_to) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reassignment profile not found")
+
+    moved = await delete_profile(db, profile_id, reassign_to)
+
+    from app.profiles import profile_registry
+    from app.model_alias import model_alias_resolver
+    from app.routes.pools import resettle_pools_after_commit
+    profile_registry.set_users_profile(moved, reassign_to)
+    if moved:
+        await resettle_pools_after_commit(db, user_ids=moved)
+    else:
+        from app.rate_limit import rate_limit_tracker
+        await rate_limit_tracker.refresh_now()
+    await model_alias_resolver.load_from_database()
+    return {"message": f"Profile '{profile.name}' deleted", "moved_count": len(moved)}
+
+
+@router.get("/profiles/limits", response_model=ProfileLimitsResponse)
+async def get_profile_limits_endpoint(
+    profile_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """A profile's overall limits plus its limit for every model and instance group."""
+    await _require_profile(db, profile_id)
+    groups = await get_profile_limits(db, profile_id)
+    return ProfileLimitsResponse(profile=await _profile_response(db, profile_id), **groups)
+
+
+@router.put("/profiles/limits", response_model=ProfileResponse)
+async def update_profile_limits_endpoint(
+    body: ProfileLimitsUpdate,
+    profile_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a profile's overall RPM/RPD (null = unlimited; omitted = unchanged)."""
+    await _require_profile(db, profile_id)
+    await upsert_profile_limits(db, profile_id, body.rpm_limit, body.rpd_limit,
+                                current_admin.username, body.model_fields_set)
+    await _resettle_profile(db, profile_id)
+    return await _profile_response(db, profile_id)
+
+
+async def _set_profile_group_limit(db, admin, profile_id, group_id, body, instance: bool):
+    await _require_profile(db, profile_id)
+    getter = get_instance_group_limits if instance else get_model_group_limits
+    if await getter(db, group_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=("Instance" if instance else "Model") + " group not found")
+    await upsert_profile_group_limit(db, profile_id, group_id, body.rpm_limit, body.rpd_limit,
+                                     admin.username, body.model_fields_set, instance=instance)
+    await _resettle_profile(db, profile_id)
+    groups = await get_profile_limits(db, profile_id)
+    return ProfileLimitsResponse(profile=await _profile_response(db, profile_id), **groups)
+
+
+async def _set_group_limit_everywhere(db, admin, group_id, body, instance: bool):
+    getter = get_instance_group_limits if instance else get_model_group_limits
+    if await getter(db, group_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=("Instance" if instance else "Model") + " group not found")
+    await set_group_limit_for_all_profiles(db, group_id, body.rpm_limit, body.rpd_limit,
+                                           admin.username, instance=instance,
+                                           fields_set=body.model_fields_set)
     from app.routes.pools import resettle_pools_after_commit
     await resettle_pools_after_commit(db, all_pools=True)
-    return GlobalRateLimitResponse.model_validate(row)
+    # Echo only what changed: an omitted field kept each profile's own value, and
+    # reporting it as null would read as "set to unlimited".
+    return {"group_id": group_id, **body.model_dump(include=body.model_fields_set)}
+
+
+@router.put("/profiles/model-group-limits", response_model=ProfileLimitsResponse)
+async def update_profile_model_group_limit_endpoint(
+    body: ProfileLimitsUpdate,
+    profile_id: int = Query(...),
+    group_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set one profile's RPM/RPD for a model group (null = unlimited)."""
+    return await _set_profile_group_limit(db, current_admin, profile_id, group_id, body, instance=False)
+
+
+@router.put("/profiles/instance-group-limits", response_model=ProfileLimitsResponse)
+async def update_profile_instance_group_limit_endpoint(
+    body: ProfileLimitsUpdate,
+    profile_id: int = Query(...),
+    group_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set one profile's RPM/RPD for an instance group (null = unlimited)."""
+    return await _set_profile_group_limit(db, current_admin, profile_id, group_id, body, instance=True)
+
+
+@router.put("/profiles/model-group-limits/all")
+async def update_model_group_limit_all_profiles_endpoint(
+    body: ProfileLimitsUpdate,
+    group_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Give every profile the same limits for one model group."""
+    return await _set_group_limit_everywhere(db, current_admin, group_id, body, instance=False)
+
+
+@router.put("/profiles/instance-group-limits/all")
+async def update_instance_group_limit_all_profiles_endpoint(
+    body: ProfileLimitsUpdate,
+    group_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Give every profile the same limits for one instance group."""
+    return await _set_group_limit_everywhere(db, current_admin, group_id, body, instance=True)
+
+
+@router.get("/profiles/members", response_model=List[ProfileMemberResponse])
+async def list_profile_members_endpoint(
+    profile_id: int = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """The profile's members with their live per-minute and today's request counts."""
+    from app.rate_limit import rate_limit_tracker
+    await _require_profile(db, profile_id)
+    users = await list_profile_members(db, profile_id)
+    out = []
+    # Sequential: one AsyncSession must not be used concurrently.
+    for u in users:
+        st = await rate_limit_tracker.get_user_status(u.id, u.username)
+        out.append(ProfileMemberResponse(
+            user_id=u.id, username=u.username, email=u.email, is_active=bool(u.is_active),
+            current_rpm_count=st.rpm_count, current_rpd_count=st.rpd_count,
+        ))
+    return out
 
 
 # ==================== Web Search Interception (SearXNG / 4get) ====================
@@ -1450,113 +1729,6 @@ async def list_websearch_providers(
     return {"providers": items}
 
 
-@router.get("/rate-limits/users")
-async def get_rate_limit_users(
-    user_id: Optional[int] = Query(None, description="User ID to get limits for (omit for all users)"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get rate limit settings for one user (user_id provided) or all users."""
-    from app.rate_limit import rate_limit_tracker
-    from sqlalchemy.future import select as sa_select
-
-    global_row = await get_global_rate_limit(db)
-    rpm_default = global_row.rpm_default if global_row else None
-    rpd_default = global_row.rpd_default if global_row else None
-
-    async def _build_response(user: User) -> UserRateLimitResponse:
-        override = await get_user_rate_limit(db, user.id)
-        effective_rpm = (override.rpm_limit if override and override.rpm_limit is not None else rpm_default)
-        effective_rpd = (override.rpd_limit if override and override.rpd_limit is not None else rpd_default)
-        status_obj = await rate_limit_tracker.get_user_status(user.id, user.username)
-        return UserRateLimitResponse(
-            user_id=user.id,
-            username=user.username,
-            email=user.email,
-            rpm_limit=override.rpm_limit if override else None,
-            rpd_limit=override.rpd_limit if override else None,
-            effective_rpm=effective_rpm,
-            effective_rpd=effective_rpd,
-            current_rpm_count=status_obj.rpm_count,
-            current_rpd_count=status_obj.rpd_count,
-        )
-
-    if user_id is not None:
-        user = await get_user_by_id(db, user_id)
-        if not user:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-        return await _build_response(user)
-
-    result = await db.execute(sa_select(User))
-    users = result.scalars().all()
-    # Build sequentially: a single AsyncSession is not safe for concurrent use
-    # (asyncio.gather over the same session raises InvalidRequestError).
-    return [await _build_response(u) for u in users]
-
-
-@router.put("/rate-limits/users", response_model=UserRateLimitResponse)
-async def update_user_rate_limit(
-    body: UserRateLimitUpdate,
-    user_id: int = Query(..., description="User ID to update rate limit for"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Set or update per-user rate limit override."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    override = await upsert_user_rate_limit(
-        db, user_id,
-        rpm=body.rpm_limit,
-        rpd=body.rpd_limit,
-        admin_username=current_admin.username,
-        fields_set=body.model_fields_set,
-    )
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_user(user_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, user_ids=[user_id])
-
-    global_row = await get_global_rate_limit(db)
-    rpm_default = global_row.rpm_default if global_row else None
-    rpd_default = global_row.rpd_default if global_row else None
-    effective_rpm = override.rpm_limit if override.rpm_limit is not None else rpm_default
-    effective_rpd = override.rpd_limit if override.rpd_limit is not None else rpd_default
-
-    return UserRateLimitResponse(
-        user_id=user.id,
-        username=user.username,
-        email=user.email,
-        rpm_limit=override.rpm_limit,
-        rpd_limit=override.rpd_limit,
-        effective_rpm=effective_rpm,
-        effective_rpd=effective_rpd,
-    )
-
-
-@router.delete("/rate-limits/users")
-async def delete_user_rate_limit_override(
-    user_id: int = Query(..., description="User ID to remove rate limit override for"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Remove per-user rate limit override; user falls back to global defaults."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    await delete_user_rate_limit(db, user_id)
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_user(user_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, user_ids=[user_id])
-
-    return {"message": f"Rate limit override removed for user {user.username}"}
-
-
 @router.get("/models/all", response_model=List[ModelConfigurationResponse])
 async def get_all_models(
     current_admin: AdminUser = Depends(get_current_admin),
@@ -1568,14 +1740,19 @@ async def get_all_models(
 
 
 # ==================== Model Alias Management API Endpoints ====================
+#
+# Every mapping belongs to a profile, and a profile's members are mapped with its
+# list alone. `profile_id` defaults to Default throughout.
 
 @router.get("/model-aliases", response_model=List[ModelAliasResponse])
 async def list_model_aliases_endpoint(
+    profile_id: int = Query(DEFAULT_PROFILE_ID, description="Profile whose mappings to list"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all configured aliases, including disabled aliases."""
-    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db)]
+    """List one profile's aliases, including disabled aliases."""
+    await _require_profile(db, profile_id)
+    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db, profile_id)]
 
 
 @router.post("/model-aliases", response_model=ModelAliasResponse)
@@ -1587,15 +1764,16 @@ async def upsert_model_alias_endpoint(
     """Create or update an alias after validating its pattern and canonical target.
 
     With `id`, that row is updated in place (and may be renamed); otherwise the
-    row is matched by its alias text, as before.
+    row is matched by its alias text within the profile's list.
     """
     from sqlalchemy.exc import IntegrityError
+    await _require_profile(db, body.profile_id)
     if body.id is not None:
         existing = await get_model_alias_by_id(db, body.id)
-        if existing is None:
+        if existing is None or existing.profile_id != body.profile_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
     else:
-        existing = await get_model_alias(db, body.alias)
+        existing = await get_model_alias(db, body.alias, body.profile_id)
 
     # The schema only validates the pattern when match_type is sent; re-check it
     # against the type the row will actually have.
@@ -1616,6 +1794,7 @@ async def upsert_model_alias_endpoint(
         row = await upsert_model_alias(
             db, body.alias, body.target_model_id, body.enabled, body.apis,
             match_type=body.match_type, alias_id=existing.id if existing else None,
+            profile_id=body.profile_id,
         )
     except IntegrityError:
         await db.rollback()
@@ -1636,35 +1815,40 @@ async def reorder_model_aliases_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set the evaluation order; `ids` must list every alias exactly once."""
-    if not await reorder_model_aliases(db, body.ids):
+    """Set one profile's evaluation order; `ids` must list every alias of it exactly once."""
+    await _require_profile(db, body.profile_id)
+    if not await reorder_model_aliases(db, body.ids, body.profile_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Mapping list changed — refresh and retry",
         )
     from app.model_alias import model_alias_resolver
     await model_alias_resolver.load_from_database()
-    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db)]
+    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db, body.profile_id)]
 
 
 @router.get("/model-aliases/test", response_model=List[ModelAliasTestMatch])
 async def match_model_alias_endpoint(
     model: str = Query(..., min_length=1),
     api: Optional[str] = Query(None),
+    profile_id: int = Query(DEFAULT_PROFILE_ID, description="Test as a member of this profile"),
     current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
 ):
     """Report which enabled mapping *model* would hit, per API surface.
 
     Uses the live resolver, so the answer is exactly what requests get. Without
     `api`, every surface is reported (rather than an unscoped match, which
-    ignores API scoping and so never happens for a real request).
+    ignores API scoping and so never happens for a real request). Only
+    `profile_id`'s own mappings are tried, as for its members.
     """
     if api is not None and api not in MODEL_ALIAS_API_SURFACES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown API surface: {api}")
+    await _require_profile(db, profile_id)
     from app.model_alias import model_alias_resolver
     results = []
     for surface in ([api] if api else MODEL_ALIAS_API_SURFACES):
-        rule = model_alias_resolver.match(model, surface)
+        rule = model_alias_resolver.match(model, surface, profile_id)
         if rule is None:
             results.append(ModelAliasTestMatch(api=surface, matched=False, resolved_model=model))
         else:
@@ -1678,11 +1862,12 @@ async def match_model_alias_endpoint(
 @router.delete("/model-aliases/{alias:path}")
 async def delete_model_alias_endpoint(
     alias: str,
+    profile_id: int = Query(DEFAULT_PROFILE_ID, description="Profile whose list holds the alias"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete an alias and reload the in-memory resolver immediately."""
-    if not await delete_model_alias(db, alias):
+    if not await delete_model_alias(db, alias, profile_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
     from app.model_alias import model_alias_resolver
     await model_alias_resolver.load_from_database()
@@ -1703,8 +1888,6 @@ async def get_model_groups(
             id=g.id,
             name=g.name,
             description=g.description,
-            rpm_default=g.rpm_default,
-            rpd_default=g.rpd_default,
             member_count=len(g.members),
             members=[m.model_id for m in g.members],
             updated_at=g.updated_at,
@@ -1737,16 +1920,21 @@ async def create_model_group_endpoint(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Model group '{body.name}' already exists")
 
-    group = await create_model_group(db, body.name, body.description, body.rpm_default, body.rpd_default, current_admin.username)
+    group = await create_model_group(db, body.name, body.description, current_admin.username)
+    # Limits live on profiles. The create form's values (if any) apply to every
+    # profile, so a new group is never silently unlimited for everyone.
+    if body.rpm_default is not None or body.rpd_default is not None:
+        await set_group_limit_for_all_profiles(
+            db, group.id, body.rpm_default, body.rpd_default, current_admin.username,
+        )
 
     from app.rate_limit import rate_limit_tracker
     # No re-settle: a group created now has no members, so scope_for_model maps
     # nothing into it, its usage is 0 and settlement would find delta == 0.
-    # Its rpd_default starts mattering when set_model_group_members_endpoint runs.
+    # Its limits start mattering when set_model_group_members_endpoint runs.
 
     return ModelGroupResponse(
         id=group.id, name=group.name, description=group.description,
-        rpm_default=group.rpm_default, rpd_default=group.rpd_default,
         member_count=0, members=[], updated_at=group.updated_at, updated_by=group.updated_by,
     )
 
@@ -1788,7 +1976,6 @@ async def update_model_group_endpoint(
     refreshed = await list_model_groups(db, group_id=group_id)
     return ModelGroupResponse(
         id=refreshed.id, name=refreshed.name, description=refreshed.description,
-        rpm_default=refreshed.rpm_default, rpd_default=refreshed.rpd_default,
         member_count=len(refreshed.members), members=[m.model_id for m in refreshed.members],
         updated_at=refreshed.updated_at, updated_by=refreshed.updated_by,
     )
@@ -1867,141 +2054,7 @@ async def set_model_group_members_endpoint(
     return {"group_id": group_id, "model_ids": model_ids}
 
 
-@router.get("/model-groups/limits")
-async def get_model_group_limits_endpoint(
-    group_id: int = Query(..., description="Group ID"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get the RPM/RPD defaults for a model group."""
-    row = await get_model_group_limits(db, group_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
-    return {"group_id": group_id, "rpm_default": row.rpm_default, "rpd_default": row.rpd_default}
-
-
-@router.put("/model-groups/limits")
-async def update_model_group_limits_endpoint(
-    group_id: int = Query(..., description="Group ID"),
-    body: ModelGroupLimitsUpdate = None,
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Update the RPM/RPD defaults for a model group."""
-    rpm = body.rpm_default if body else None
-    rpd = body.rpd_default if body else None
-
-    group = await update_model_group_limits(db, group_id, rpm, rpd, current_admin.username)
-    if group is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_group(group_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, all_pools=True)
-
-    return {"group_id": group_id, "rpm_default": group.rpm_default, "rpd_default": group.rpd_default}
-
-
-@router.get("/model-groups/users")
-async def get_model_group_user_overrides(
-    group_id: int = Query(..., description="Group ID"),
-    user_id: Optional[int] = Query(None, description="User ID (omit for all users in this group)"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """List per-user overrides for a model group."""
-    group_row = await get_model_group_limits(db, group_id)
-    if group_row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
-
-    overrides = await list_user_group_rate_limits(db, group_id, user_id=user_id)
-
-
-    async def _build(ov):
-        user = await get_user_by_id(db, ov.user_id)
-        if not user:
-            return None
-        effective_rpm = ov.rpm_limit if ov.rpm_limit is not None else group_row.rpm_default
-        effective_rpd = ov.rpd_limit if ov.rpd_limit is not None else group_row.rpd_default
-        return UserModelGroupRateLimitResponse(
-            user_id=user.id, username=user.username, email=user.email,
-            group_id=group_id,
-            rpm_limit=ov.rpm_limit, rpd_limit=ov.rpd_limit,
-            effective_rpm=effective_rpm, effective_rpd=effective_rpd,
-        )
-
-    # Build sequentially: a single AsyncSession is not safe for concurrent use.
-    results = [await _build(ov) for ov in overrides]
-    return [r for r in results if r is not None]
-
-
-@router.put("/model-groups/users")
-async def upsert_model_group_user_override(
-    group_id: int = Query(..., description="Group ID"),
-    user_id: int = Query(..., description="User ID"),
-    body: UserModelGroupRateLimitUpdate = None,
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Set or update a per-user rate limit override for a model group."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    group_row = await get_model_group_limits(db, group_id)
-    if group_row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
-
-    rpm = body.rpm_limit if body else None
-    rpd = body.rpd_limit if body else None
-    fields_set = body.model_fields_set if body else set()
-
-    override = await upsert_user_group_rate_limit(
-        db, user_id, group_id, rpm, rpd, current_admin.username, fields_set
-    )
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_user_group(user_id, group_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, user_ids=[user_id])
-
-    effective_rpm = override.rpm_limit if override.rpm_limit is not None else group_row.rpm_default
-    effective_rpd = override.rpd_limit if override.rpd_limit is not None else group_row.rpd_default
-
-    return UserModelGroupRateLimitResponse(
-        user_id=user.id, username=user.username, email=user.email,
-        group_id=group_id,
-        rpm_limit=override.rpm_limit, rpd_limit=override.rpd_limit,
-        effective_rpm=effective_rpm, effective_rpd=effective_rpd,
-    )
-
-
-@router.delete("/model-groups/users")
-async def delete_model_group_user_override(
-    group_id: int = Query(..., description="Group ID"),
-    user_id: int = Query(..., description="User ID"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Remove per-user override; user reverts to group default."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    deleted = await delete_user_group_rate_limit(db, user_id, group_id)
-    if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No override found for this user and group")
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_user_group(user_id, group_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, user_ids=[user_id])
-
-    return {"message": f"Override removed for user {user.username} on group {group_id}"}
-
-
-# ==================== Per-User Model Access API Endpoints ====================
+# ==================== Profile Model Access API Endpoints ====================
 
 class UserModelAccessItem(BaseModel):
     model_config = {"protected_namespaces": ()}
@@ -2010,18 +2063,18 @@ class UserModelAccessItem(BaseModel):
     model_name: str
     provider_key: str
     globally_enabled: bool          # ModelConfiguration.is_enabled
-    is_exception: bool              # explicit per-user override exists
+    is_exception: bool              # explicit profile override exists
     is_allowed: Optional[bool]      # exception value; None if no exception
     effective_allowed: bool         # final decision (global AND policy/exception)
 
 
-class UserModelAccessResponse(BaseModel):
+class ProfileModelAccessResponse(BaseModel):
     model_config = {"protected_namespaces": ()}
 
-    user_id: int
-    username: str
-    email: Optional[str] = None
-    mode: str                       # default|allow|deny|custom (absent row -> "default")
+    profile_id: int
+    name: str
+    member_count: int = 0
+    mode: str                       # default|allow|deny|custom
     models: List[UserModelAccessItem]
 
 
@@ -2040,7 +2093,7 @@ def _global_ok(model: ModelConfigurationResponse) -> bool:
     its own enabled flag AND its provider's enabled flag are both on. Checking just
     ``model.is_enabled`` here would disagree with the cache whenever a whole provider is
     globally disabled, causing every follow-global override to be mis-flagged as a
-    per-user exception (spurious pencils)."""
+    profile exception (spurious pencils)."""
     return provider_manager.model_cache._passes_global_gate(model.model_id)
 
 
@@ -2049,7 +2102,7 @@ def _compute_access_item(
     mode: str,
     exception_map: dict,
 ) -> UserModelAccessItem:
-    """Build one model's access state for a user, mirroring the cache decision."""
+    """Build one model's access state under a profile, mirroring the cache decision."""
     has_override = model.model_id in exception_map
     exc_val = exception_map.get(model.model_id)
 
@@ -2060,7 +2113,7 @@ def _compute_access_item(
         effective = False
         is_exception = False
     elif mode == "custom":
-        # Any stored override is a per-user exception (pencil); otherwise follow global.
+        # Any stored override is a profile exception (pencil); otherwise follow global.
         if has_override:
             effective = bool(exc_val)
             is_exception = True
@@ -2082,134 +2135,103 @@ def _compute_access_item(
     )
 
 
-async def _build_user_model_access(db: AsyncSession, user: User) -> UserModelAccessResponse:
-    """Assemble the full per-user model-access view."""
+async def _build_profile_model_access(db: AsyncSession, profile_id: int) -> ProfileModelAccessResponse:
+    """Assemble the full model-access view of one profile."""
+    profile = await _profile_response(db, profile_id)
     models = await get_all_model_configurations(db)
-    policy = await get_user_model_policy(db, user.id)
-    mode = (policy.mode if policy else "default") or "default"
-    exceptions = await list_user_model_exceptions(db, user.id)
-    exception_map = {e.model_id: e.is_allowed for e in exceptions}
-
+    exception_map = await list_profile_model_exceptions(db, profile_id)
     items = [
-        _compute_access_item(ModelConfigurationResponse.from_orm(m), mode, exception_map)
+        _compute_access_item(ModelConfigurationResponse.from_orm(m), profile.model_access_mode, exception_map)
         for m in models
     ]
-    return UserModelAccessResponse(
-        user_id=user.id,
-        username=user.username,
-        email=user.email,
-        mode=mode,
-        models=items,
+    return ProfileModelAccessResponse(
+        profile_id=profile.id, name=profile.name, member_count=profile.member_count,
+        mode=profile.model_access_mode, models=items,
     )
 
 
-@router.get("/users/model-access", response_model=UserModelAccessResponse)
-async def get_user_model_access(
-    user_id: int = Query(..., description="User ID to get model access for"),
+async def _reload_access() -> None:
+    """Access rules are read from the profile snapshot; reload it after an edit."""
+    from app.rate_limit import rate_limit_tracker
+    await rate_limit_tracker.reload_config()
+
+
+@router.get("/profiles/model-access", response_model=ProfileModelAccessResponse)
+async def get_profile_model_access(
+    profile_id: int = Query(...),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return a user's default policy plus per-model effective access."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return await _build_user_model_access(db, user)
+    """Return a profile's access mode plus per-model effective access."""
+    await _require_profile(db, profile_id)
+    return await _build_profile_model_access(db, profile_id)
 
 
-@router.put("/users/model-access/policy", response_model=UserModelAccessResponse)
-async def update_user_model_policy(
+@router.put("/profiles/model-access/policy", response_model=ProfileModelAccessResponse)
+async def update_profile_model_policy(
     body: UserModelPolicyUpdate,
-    user_id: int = Query(..., description="User ID to update access mode for"),
+    profile_id: int = Query(...),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set the user's model-access mode (default | allow | deny | custom).
+    """Set the profile's model-access mode (default | allow | deny | custom).
 
     Stored per-model overrides are kept but only consulted in 'custom' mode; switching
     to allow/deny/default leaves them inert, and returning to custom reactivates them.
     """
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    await upsert_user_model_policy(db, user_id, body.mode, current_admin.username)
-    provider_manager.model_cache.set_user_model_mode(user_id, body.mode)
-
-    return await _build_user_model_access(db, user)
+    await _require_profile(db, profile_id)
+    await set_profile_model_mode(db, profile_id, body.mode, current_admin.username)
+    await _reload_access()
+    return await _build_profile_model_access(db, profile_id)
 
 
-@router.put("/users/model-access", response_model=UserModelAccessResponse)
-async def upsert_user_model_access_exception(
+@router.put("/profiles/model-access", response_model=ProfileModelAccessResponse)
+async def upsert_profile_model_access_exception(
     body: UserModelExceptionUpdate,
-    user_id: int = Query(..., description="User ID"),
+    profile_id: int = Query(...),
     model_id: str = Query(..., description="Model ID, e.g. 'azure:primary/gpt-4'"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set an explicit per-model access override for a user.
+    """Set an explicit per-model access override for a profile.
 
-    Toggling an individual model always puts the user in 'custom' mode. When the user
+    Toggling an individual model always puts the profile in 'custom' mode. When it
     was previously in allow/deny, the current effective state of every model is first
     seeded as explicit overrides so the switch is loss-less (e.g. 'deny all' then
     enabling one model leaves only that model on). From 'default'/'custom' no seeding
     is needed — untoggled models keep following the global config.
     """
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    model = await get_model_configuration(db, model_id)
-    if not model:
+    profile = await _require_profile(db, profile_id)
+    if not await get_model_configuration(db, model_id):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
 
-    policy = await get_user_model_policy(db, user_id)
-    prev_mode = (policy.mode if policy else "default") or "default"
-
+    prev_mode = profile.model_access_mode or "default"
     if prev_mode in ("allow", "deny"):
-        # Seed a fresh custom baseline from the old blanket mode, then apply this toggle.
-        # Every model gets an explicit override so the previous blanket state is preserved
-        # loss-lessly (e.g. 'deny all' then enabling one model leaves only that one on).
         all_models = await get_all_model_configurations(db)
-        seed_val = prev_mode == "allow"
-        overrides = {m.model_id: seed_val for m in all_models}
+        overrides = {m.model_id: prev_mode == "allow" for m in all_models}
         overrides[model_id] = body.is_allowed
-        await set_user_model_exceptions_bulk(
-            db, user_id, overrides, current_admin.username, replace=True
-        )
-        await upsert_user_model_policy(db, user_id, "custom", current_admin.username)
-        # Mirror into cache.
-        provider_manager.model_cache.update_user_model_access_for_user(
-            user_id, "custom", overrides
-        )
+        await set_profile_model_exceptions_bulk(db, profile_id, overrides, current_admin.username)
     else:
-        # 'default' or already 'custom': just set/replace this one override.
-        await upsert_user_model_exception(db, user_id, model_id, body.is_allowed, current_admin.username)
-        provider_manager.model_cache.set_user_model_exception(user_id, model_id, body.is_allowed)
-        if prev_mode != "custom":
-            await upsert_user_model_policy(db, user_id, "custom", current_admin.username)
-            provider_manager.model_cache.set_user_model_mode(user_id, "custom")
-
-    return await _build_user_model_access(db, user)
+        await upsert_profile_model_exception(db, profile_id, model_id, body.is_allowed, current_admin.username)
+    if prev_mode != "custom":
+        await set_profile_model_mode(db, profile_id, "custom", current_admin.username)
+    await _reload_access()
+    return await _build_profile_model_access(db, profile_id)
 
 
-@router.delete("/users/model-access")
-async def delete_user_model_access_exception(
-    user_id: int = Query(..., description="User ID"),
-    model_id: str = Query(..., description="Model ID to reset to policy default"),
+@router.delete("/profiles/model-access")
+async def delete_profile_model_access_exception(
+    profile_id: int = Query(...),
+    model_id: str = Query(..., description="Model ID to reset to the profile's default"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Remove an explicit per-model override; the model reverts to the user's default."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    deleted = await delete_user_model_exception(db, user_id, model_id)
-    provider_manager.model_cache.clear_user_model_exception(user_id, model_id)
-    if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No override found for this user and model")
-
-    return {"message": f"Override removed for user {user.username} on model {model_id}"}
+    """Remove an explicit per-model override; the model reverts to the profile's default."""
+    profile = await _require_profile(db, profile_id)
+    if not await delete_profile_model_exception(db, profile_id, model_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No override found for this profile and model")
+    await _reload_access()
+    return {"message": f"Override removed for profile {profile.name} on model {model_id}"}
 
 
 # ==================== Instance Group Management API Endpoints ====================
@@ -2226,8 +2248,6 @@ async def get_instance_groups(
             id=g.id,
             name=g.name,
             description=g.description,
-            rpm_default=g.rpm_default,
-            rpd_default=g.rpd_default,
             member_count=len(g.members),
             members=[m.provider_key for m in g.members],
             updated_at=g.updated_at,
@@ -2260,7 +2280,11 @@ async def create_instance_group_endpoint(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Instance group '{body.name}' already exists")
 
-    group = await create_instance_group(db, body.name, body.description, body.rpm_default, body.rpd_default, current_admin.username)
+    group = await create_instance_group(db, body.name, body.description, current_admin.username)
+    if body.rpm_default is not None or body.rpd_default is not None:
+        await set_group_limit_for_all_profiles(
+            db, group.id, body.rpm_default, body.rpd_default, current_admin.username, instance=True,
+        )
 
     from app.rate_limit import rate_limit_tracker
     # No re-settle: an empty group folds no usage into its scope, so delta == 0.
@@ -2268,7 +2292,6 @@ async def create_instance_group_endpoint(
 
     return InstanceGroupResponse(
         id=group.id, name=group.name, description=group.description,
-        rpm_default=group.rpm_default, rpd_default=group.rpd_default,
         member_count=0, members=[], updated_at=group.updated_at, updated_by=group.updated_by,
     )
 
@@ -2309,7 +2332,6 @@ async def update_instance_group_endpoint(
     refreshed = await list_instance_groups(db, group_id=group_id)
     return InstanceGroupResponse(
         id=refreshed.id, name=refreshed.name, description=refreshed.description,
-        rpm_default=refreshed.rpm_default, rpd_default=refreshed.rpd_default,
         member_count=len(refreshed.members), members=[m.provider_key for m in refreshed.members],
         updated_at=refreshed.updated_at, updated_by=refreshed.updated_by,
     )
@@ -2386,139 +2408,6 @@ async def set_instance_group_members_endpoint(
     await resettle_pools_after_commit(db, all_pools=True)
 
     return {"group_id": group_id, "provider_keys": provider_keys}
-
-
-@router.get("/instance-groups/limits")
-async def get_instance_group_limits_endpoint(
-    group_id: int = Query(..., description="Group ID"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Get the RPM/RPD defaults for an instance group."""
-    row = await get_instance_group_limits(db, group_id)
-    if row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-    return {"group_id": group_id, "rpm_default": row.rpm_default, "rpd_default": row.rpd_default}
-
-
-@router.put("/instance-groups/limits")
-async def update_instance_group_limits_endpoint(
-    group_id: int = Query(..., description="Group ID"),
-    body: InstanceGroupLimitsUpdate = None,
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Update the RPM/RPD defaults for an instance group."""
-    rpm = body.rpm_default if body else None
-    rpd = body.rpd_default if body else None
-
-    group = await update_instance_group_limits(db, group_id, rpm, rpd, current_admin.username)
-    if group is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_instance_group(group_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, all_pools=True)
-
-    return {"group_id": group_id, "rpm_default": group.rpm_default, "rpd_default": group.rpd_default}
-
-
-@router.get("/instance-groups/users")
-async def get_instance_group_user_overrides(
-    group_id: int = Query(..., description="Group ID"),
-    user_id: Optional[int] = Query(None, description="User ID (omit for all users in this group)"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """List per-user overrides for an instance group."""
-    group_row = await get_instance_group_limits(db, group_id)
-    if group_row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-
-    overrides = await list_user_instance_group_rate_limits(db, group_id, user_id=user_id)
-
-    async def _build(ov):
-        user = await get_user_by_id(db, ov.user_id)
-        if not user:
-            return None
-        effective_rpm = ov.rpm_limit if ov.rpm_limit is not None else group_row.rpm_default
-        effective_rpd = ov.rpd_limit if ov.rpd_limit is not None else group_row.rpd_default
-        return UserInstanceGroupRateLimitResponse(
-            user_id=user.id, username=user.username, email=user.email,
-            group_id=group_id,
-            rpm_limit=ov.rpm_limit, rpd_limit=ov.rpd_limit,
-            effective_rpm=effective_rpm, effective_rpd=effective_rpd,
-        )
-
-    # Build sequentially: a single AsyncSession is not safe for concurrent use.
-    results = [await _build(ov) for ov in overrides]
-    return [r for r in results if r is not None]
-
-
-@router.put("/instance-groups/users")
-async def upsert_instance_group_user_override(
-    group_id: int = Query(..., description="Group ID"),
-    user_id: int = Query(..., description="User ID"),
-    body: UserInstanceGroupRateLimitUpdate = None,
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Set or update a per-user rate limit override for an instance group."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    group_row = await get_instance_group_limits(db, group_id)
-    if group_row is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-
-    rpm = body.rpm_limit if body else None
-    rpd = body.rpd_limit if body else None
-    fields_set = body.model_fields_set if body else set()
-
-    override = await upsert_user_instance_group_rate_limit(
-        db, user_id, group_id, rpm, rpd, current_admin.username, fields_set
-    )
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_user_instance_group(user_id, group_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, user_ids=[user_id])
-
-    effective_rpm = override.rpm_limit if override.rpm_limit is not None else group_row.rpm_default
-    effective_rpd = override.rpd_limit if override.rpd_limit is not None else group_row.rpd_default
-
-    return UserInstanceGroupRateLimitResponse(
-        user_id=user.id, username=user.username, email=user.email,
-        group_id=group_id,
-        rpm_limit=override.rpm_limit, rpd_limit=override.rpd_limit,
-        effective_rpm=effective_rpm, effective_rpd=effective_rpd,
-    )
-
-
-@router.delete("/instance-groups/users")
-async def delete_instance_group_user_override(
-    group_id: int = Query(..., description="Group ID"),
-    user_id: int = Query(..., description="User ID"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Remove per-user override; user reverts to instance-group default."""
-    user = await get_user_by_id(db, user_id)
-    if not user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-    deleted = await delete_user_instance_group_rate_limit(db, user_id, group_id)
-    if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No override found for this user and group")
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_user_instance_group(user_id, group_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, user_ids=[user_id])
-
-    return {"message": f"Override removed for user {user.username} on instance group {group_id}"}
 
 
 @router.post("/logout")

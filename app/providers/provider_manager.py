@@ -736,8 +736,6 @@ class ProviderManager:
                     AsyncSessionLocal,
                     get_model_configurations_dict,
                     get_provider_configurations_dict,
-                    get_all_user_model_policies,
-                    get_all_user_model_exceptions,
                 )
 
                 # Create database session directly using session factory
@@ -750,19 +748,10 @@ class ProviderManager:
                         # Update cache
                         self.model_cache.update_model_configurations(model_configs, provider_configs)
 
-                        # Load per-user model access (policies + exceptions)
-                        user_policies = {
-                            p.user_id: (p.mode or "default")
-                            for p in await get_all_user_model_policies(db)
-                        }
-                        user_exceptions: dict = {}
-                        for ex in await get_all_user_model_exceptions(db):
-                            user_exceptions.setdefault(ex.user_id, {})[ex.model_id] = ex.is_allowed
-                        self.model_cache.update_user_model_access(user_policies, user_exceptions)
-
+                        # Per-profile access rules live in app.profiles, loaded
+                        # by the rate limiter; only the global gate is loaded here.
                         print(f"Loaded {len(model_configs)} model configs and {len(provider_configs)} provider configs")
-                        print(f"Loaded model access for {len(user_policies)} user policies and {len(user_exceptions)} users with exceptions")
-                        
+
                         add_span_attributes(span, {
                             "config.models_loaded_count": len(model_configs),
                             "config.providers_loaded_count": len(provider_configs),

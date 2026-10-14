@@ -23,6 +23,9 @@
     <button class="tab-button active" onclick="showTab('users')">
         <i class="fas fa-users"></i> User Management
     </button>
+    <button class="tab-button" onclick="showTab('profiles')">
+        <i class="fas fa-id-badge"></i> Profiles
+    </button>
     <button class="tab-button" onclick="showTab('providers')">
         <i class="fas fa-server"></i> Providers
     </button>
@@ -82,6 +85,9 @@
                 <button class="btn btn-danger btn-sm" onclick="window.UserManager?.bulkDeactivate()">Deactivate</button>
                 <button class="btn btn-danger btn-sm btn-remove" onclick="window.UserManager?.bulkRemove()">Remove</button>
             </div>
+            <button type="button" class="btn btn-primary btn-sm" onclick="window.UserManager?.openCreateUser()">
+                <i class="fas fa-user-plus me-1"></i>Create user
+            </button>
             <button type="button" class="btn btn-outline-secondary btn-sm user-settings-btn"
                 data-bs-toggle="modal" data-bs-target="#userSettingsModal"
                 title="User settings" aria-label="User settings">
@@ -166,6 +172,84 @@
         <p>No users have been created yet.</p>
     </div>
     {% endif %}
+</div>
+
+<!-- Profiles Section -->
+<div class="section tab-content" id="profiles-tab" style="display: none;">
+    <div class="section-header">
+        <div>
+            <h2 class="section-title">User Profiles</h2>
+            <p class="text-muted small mb-0">Every user belongs to one profile. A profile sets its members' rate limits,
+                model access and model mappings. New users join <strong>Default</strong>.</p>
+        </div>
+        <div class="d-flex gap-2 ms-auto">
+            <button class="btn btn-outline-secondary btn-sm" onclick="window.ProfileManager?.load()">
+                <i class="fas fa-sync-alt me-1"></i>Refresh
+            </button>
+            <button class="btn btn-primary btn-sm" onclick="window.ProfileManager?.openCreate()">
+                <i class="fas fa-plus me-1"></i>New profile
+            </button>
+        </div>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Members</th>
+                    <th>Mappings</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="profiles-tbody">
+                <tr><td colspan="4" class="text-center text-muted py-4">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Members: which profile each user is in -->
+    <div class="section-header mt-5">
+        <div class="d-flex align-items-center gap-2 flex-wrap">
+            <h2 class="section-title me-4">Members</h2>
+            <div class="position-relative flex-shrink-0" style="width: 240px;">
+                <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                <input type="text" id="profile-members-search" class="form-control form-control-sm ps-5"
+                    placeholder="Search users"
+                    oninput="window.ProfileManager?.filterMembers()">
+            </div>
+            <select id="profile-members-filter" class="form-select form-select-sm profile-members-filter"
+                aria-label="Show members of"
+                onchange="window.ProfileManager?.filterMembers()"></select>
+        </div>
+        <div class="section-actions ms-auto" id="profile-members-bulk" style="display:none;">
+            <span class="bulk-selection-status" id="profile-members-count"></span>
+            <select id="profile-members-target" class="form-select form-select-sm profile-members-filter"
+                aria-label="Move selected users to"></select>
+            <button class="btn btn-primary btn-sm" onclick="window.ProfileManager?.moveSelected()">
+                <i class="fas fa-arrow-right me-1"></i>Move
+            </button>
+        </div>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th class="col-select">
+                        <input type="checkbox" class="form-check-input" id="profile-members-select-all"
+                            aria-label="Select all shown users"
+                            onchange="window.ProfileManager?.toggleAllMembers(this.checked)">
+                    </th>
+                    <th>Username</th>
+                    <th>Email</th>
+                    <th>Status</th>
+                    <th>Profile</th>
+                </tr>
+            </thead>
+            <tbody id="profile-members-tbody">
+                <tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>
+            </tbody>
+        </table>
+    </div>
 </div>
 
 <!-- Providers Section -->
@@ -456,6 +540,14 @@
 
 <!-- Rate Limits Section -->
 <div class="section tab-content" id="rate-limits-tab" style="display: none;">
+    <!-- Profile picker: every pane below edits this profile's limits -->
+    <div class="profile-bar mb-3">
+        <label for="rl-profile-select" class="form-label mb-0 fw-semibold"><i class="fas fa-id-badge me-1"></i>Profile</label>
+        <select id="rl-profile-select" class="form-select form-select-sm"
+            onchange="window.RateLimitManager?.onProfileChange(this.value)"></select>
+        <span class="text-muted small">Limits apply to every member of the selected profile. Empty means unlimited.</span>
+    </div>
+
     <!-- Sub-tab nav -->
     <div class="subtab-navigation mb-4" id="rateLimitSubTabs" role="tablist">
         <button class="subtab-button active" id="rl-subtab-request-btn" onclick="showRateLimitSubTab('request')" type="button" role="tab">
@@ -471,34 +563,35 @@
 
     <!-- Sub-pane: Request Rate Limits -->
     <div id="rl-subtab-request">
-        <!-- Global Defaults Card -->
+        <!-- Profile overall limits -->
         <div class="card mb-4">
             <div class="card-header d-flex align-items-center justify-content-between">
-                <h5 class="mb-0"><i class="fas fa-globe me-2"></i>Global Defaults</h5>
-                <button class="btn btn-primary btn-sm" onclick="window.RateLimitManager?.saveDefaults()">
+                <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Overall limits — <span id="rl-profile-title"></span>
+                    <span class="text-muted small fw-normal ms-2" id="rl-profile-members"></span></h5>
+                <button class="btn btn-primary btn-sm" onclick="window.RateLimitManager?.saveProfileLimits()">
                     <i class="fas fa-save me-1"></i>Save
                 </button>
             </div>
             <div class="card-body">
-                <p class="text-muted small mb-3">Applies to all users without a per-user override. Leave empty for no limit.</p>
+                <p class="text-muted small mb-3">Applies to models outside any model or instance group. Leave empty for no limit.</p>
                 <div class="row g-3">
                     <div class="col-md-4">
-                        <label class="form-label">Requests per Minute (RPM)</label>
-                        <input type="number" id="rl-default-rpm" class="form-control" min="0" placeholder="Unlimited">
+                        <label class="form-label" for="rl-profile-rpm">Requests per Minute (RPM)</label>
+                        <input type="number" id="rl-profile-rpm" class="form-control" min="0" placeholder="Unlimited">
                     </div>
                     <div class="col-md-4">
-                        <label class="form-label">Requests per Day (RPD)</label>
-                        <input type="number" id="rl-default-rpd" class="form-control" min="0" placeholder="Unlimited">
+                        <label class="form-label" for="rl-profile-rpd">Requests per Day (RPD)</label>
+                        <input type="number" id="rl-profile-rpd" class="form-control" min="0" placeholder="Unlimited">
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Per-User Limits Card -->
+        <!-- Members and live usage -->
         <div class="card">
             <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
                 <div class="d-flex align-items-center gap-2">
-                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
+                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Members</h5>
                     <div class="position-relative flex-shrink-0" style="width: 240px;">
                         <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
                         <input type="text" id="rl-user-search" class="form-control form-control-sm ps-5"
@@ -516,13 +609,12 @@
                         <thead>
                             <tr>
                                 <th>User</th>
-                                <th>RPM Limit</th>
-                                <th>RPD Limit</th>
-                                <th>Actions</th>
+                                <th>Requests this minute</th>
+                                <th>Requests today</th>
                             </tr>
                         </thead>
                         <tbody id="rate-limits-tbody">
-                            <tr><td colspan="4" class="text-center text-muted py-4">Loading…</td></tr>
+                            <tr><td colspan="3" class="text-center text-muted py-4">Loading…</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -553,54 +645,36 @@
                             <tr>
                                 <th>Name</th>
                                 <th>Models</th>
-                                <th>RPM Default</th>
-                                <th>RPD Default</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="model-groups-tbody">
-                            <tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>
+                            <tr><td colspan="3" class="text-center text-muted py-4">Loading…</td></tr>
                         </tbody>
                     </table>
                 </div>
             </div>
         </div>
 
-        <!-- Per-User Overrides card -->
+        <!-- Limits for the selected profile -->
         <div class="card">
             <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                <div class="d-flex align-items-center gap-2">
-                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
-                    <div class="position-relative flex-shrink-0" style="width: 240px;">
-                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
-                        <input type="text" id="mg-user-search" class="form-control form-control-sm ps-5"
-                            placeholder="Search users"
-                            oninput="window.ModelGroupManager?.filterUserOverrides()">
-                    </div>
-                </div>
-                <div class="d-flex align-items-center gap-2">
-                    <select id="mg-user-group-select" class="form-select form-select-sm me-2" style="width:auto"
-                        onchange="window.ModelGroupManager?.onGroupSelect(this.value)">
-                        <option value="">— Select a model group —</option>
-                    </select>
-                    <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelGroupManager?.refreshUserOverrides()">
-                        <i class="fas fa-sync-alt me-1"></i>Refresh
-                    </button>
-                </div>
+                <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Limits for <span id="mg-profile-name"></span></h5>
+                <span class="text-muted small">A grouped model is governed only by its group limit. Empty means unlimited.</span>
             </div>
             <div class="card-body p-0">
                 <div class="table-responsive">
                     <table class="table table-hover mb-0">
                         <thead>
                             <tr>
-                                <th>User</th>
+                                <th>Group</th>
                                 <th>RPM Limit</th>
                                 <th>RPD Limit</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
-                        <tbody id="mg-user-overrides-tbody">
-                            <tr><td colspan="4" class="text-center text-muted py-4">Select a model group to manage per-user overrides.</td></tr>
+                        <tbody id="mg-profile-limits-tbody">
+                            <tr><td colspan="4" class="text-center text-muted py-4">Select a profile above.</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -630,54 +704,36 @@
                             <tr>
                                 <th>Name</th>
                                 <th>Instances</th>
-                                <th>RPM Default</th>
-                                <th>RPD Default</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="instance-groups-tbody">
-                            <tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>
+                            <tr><td colspan="3" class="text-center text-muted py-4">Loading…</td></tr>
                         </tbody>
                     </table>
                 </div>
             </div>
         </div>
 
-        <!-- Per-User Overrides card -->
+        <!-- Limits for the selected profile -->
         <div class="card">
             <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                <div class="d-flex align-items-center gap-2">
-                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Per-User Overrides</h5>
-                    <div class="position-relative flex-shrink-0" style="width: 240px;">
-                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
-                        <input type="text" id="ig-user-search" class="form-control form-control-sm ps-5"
-                            placeholder="Search users"
-                            oninput="window.InstanceGroupManager?.filterUserOverrides()">
-                    </div>
-                </div>
-                <div class="d-flex align-items-center gap-2">
-                    <select id="ig-user-group-select" class="form-select form-select-sm me-2" style="width:auto"
-                        onchange="window.InstanceGroupManager?.onGroupSelect(this.value)">
-                        <option value="">— Select an instance group —</option>
-                    </select>
-                    <button class="btn btn-outline-secondary btn-sm" onclick="window.InstanceGroupManager?.refreshUserOverrides()">
-                        <i class="fas fa-sync-alt me-1"></i>Refresh
-                    </button>
-                </div>
+                <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Limits for <span id="ig-profile-name"></span></h5>
+                <span class="text-muted small">A grouped instance is governed only by its group limit. Empty means unlimited.</span>
             </div>
             <div class="card-body p-0">
                 <div class="table-responsive">
                     <table class="table table-hover mb-0">
                         <thead>
                             <tr>
-                                <th>User</th>
+                                <th>Group</th>
                                 <th>RPM Limit</th>
                                 <th>RPD Limit</th>
                                 <th>Actions</th>
                             </tr>
                         </thead>
-                        <tbody id="ig-user-overrides-tbody">
-                            <tr><td colspan="4" class="text-center text-muted py-4">Select an instance group to manage per-user overrides.</td></tr>
+                        <tbody id="ig-profile-limits-tbody">
+                            <tr><td colspan="4" class="text-center text-muted py-4">Select a profile above.</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -686,10 +742,10 @@
     </div>
 </div>
 
-<!-- Models Section (unified global + per-user management) -->
+<!-- Models Section (unified global + per-profile management) -->
 <div class="section tab-content" id="models-tab" style="display: none;">
     <div class="row g-3 model-access-grid">
-        <!-- Left: scope picker (Global + users) -->
+        <!-- Left: scope picker (Global + profiles) -->
         <div class="col-lg-4">
             <div class="card h-100">
                 <div class="card-header d-flex align-items-center justify-content-between">
@@ -712,21 +768,21 @@
                         <span class="ma-editing-flag"><i class="fas fa-pen me-1"></i>Editing</span>
                     </button>
 
-                    <div class="ma-scope-group-label"></div>
+                    <div class="ma-scope-group-label">Profiles</div>
                     <div class="position-relative mb-3">
                         <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
-                        <input type="text" id="ma-user-search" class="form-control form-control-sm ps-5"
-                            placeholder="Search users"
-                            oninput="window.ModelsManager?.filterUsers()">
+                        <input type="text" id="ma-profile-search" class="form-control form-control-sm ps-5"
+                            placeholder="Search profiles"
+                            oninput="window.ModelsManager?.filterProfiles()">
                     </div>
-                    <div id="ma-user-list" class="ma-user-list">
+                    <div id="ma-profile-list" class="ma-user-list">
                         <div class="text-muted small py-3 text-center">Loading…</div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Right: global availability OR per-user policy + models -->
+        <!-- Right: global availability OR per-profile policy + models -->
         <div class="col-lg-8">
             <!-- Scope banner — states in words which scope is being edited -->
             <div id="ma-scope-banner" class="ma-scope-banner" style="display: none;"></div>
@@ -735,7 +791,7 @@
             <div id="ma-empty" class="card" style="display: none;">
                 <div class="card-body empty-state text-center py-5">
                     <i class="fas fa-cubes fa-2x mb-3 text-muted"></i>
-                    <p class="text-muted mb-0">Select Global or a user to manage models.</p>
+                    <p class="text-muted mb-0">Select Global or a profile to manage models.</p>
                 </div>
             </div>
 
@@ -771,13 +827,14 @@
                 </div>
             </div>
 
-            <!-- Per-user scope (shown once a user is picked) -->
+            <!-- Profile scope (shown once a profile is picked) -->
             <div id="ma-detail" style="display: none;">
                 <!-- Access policy card -->
                 <div class="card mb-3">
                     <div class="card-header">
                         <h5 class="mb-0"><i class="fas fa-sliders-h me-2"></i>Access policy —
-                            <span id="ma-selected-username" class="text-accent"></span></h5>
+                            <span id="ma-selected-username" class="text-accent"></span>
+                            <span id="ma-selected-members" class="text-muted small fw-normal ms-2"></span></h5>
                     </div>
                     <div class="card-body">
                         <div class="d-flex align-items-center gap-3 flex-wrap">
@@ -840,13 +897,15 @@
                         <input type="text" id="ig-description" class="form-control" maxlength="256" placeholder="Optional">
                     </div>
                     <div class="col-md-3">
-                        <label class="form-label">RPM Default</label>
-                        <input type="number" id="ig-rpm" class="form-control" min="0" placeholder="Unlimited">
+                        <label class="form-label" for="ig-rpm">RPM for all profiles</label>
+                        <input type="number" id="ig-rpm" class="form-control" min="0" placeholder="Leave as is">
                     </div>
                     <div class="col-md-3">
-                        <label class="form-label">RPD Default</label>
-                        <input type="number" id="ig-rpd" class="form-control" min="0" placeholder="Unlimited">
+                        <label class="form-label" for="ig-rpd">RPD for all profiles</label>
+                        <input type="number" id="ig-rpd" class="form-control" min="0" placeholder="Leave as is">
                     </div>
+                    <div class="col-12 form-text mt-1">Optional. When filled in, every profile gets this limit for the group;
+                        adjust individual profiles afterwards. A group with no limit is unlimited for that profile.</div>
                     <div class="col-12">
                         <label class="form-label">Instances in this group</label>
                         <input type="text" id="ig-instance-search" class="form-control form-control-sm mb-2"
@@ -889,13 +948,15 @@
                         <input type="text" id="mg-description" class="form-control" maxlength="256" placeholder="Optional">
                     </div>
                     <div class="col-md-3">
-                        <label class="form-label">RPM Default</label>
-                        <input type="number" id="mg-rpm" class="form-control" min="0" placeholder="Unlimited">
+                        <label class="form-label" for="mg-rpm">RPM for all profiles</label>
+                        <input type="number" id="mg-rpm" class="form-control" min="0" placeholder="Leave as is">
                     </div>
                     <div class="col-md-3">
-                        <label class="form-label">RPD Default</label>
-                        <input type="number" id="mg-rpd" class="form-control" min="0" placeholder="Unlimited">
+                        <label class="form-label" for="mg-rpd">RPD for all profiles</label>
+                        <input type="number" id="mg-rpd" class="form-control" min="0" placeholder="Leave as is">
                     </div>
+                    <div class="col-12 form-text mt-1">Optional. When filled in, every profile gets this limit for the group;
+                        adjust individual profiles afterwards. A group with no limit is unlimited for that profile.</div>
                     <div class="col-12">
                         <label class="form-label">Models in this group</label>
                         <input type="text" id="mg-model-search" class="form-control form-control-sm mb-2"
@@ -924,6 +985,12 @@
 
 <!-- Model Mapping Section -->
 <div class="section tab-content" id="model-mapping-tab" style="display: none;">
+    <div class="profile-bar mb-3">
+        <label for="model-alias-scope" class="form-label mb-0 fw-semibold"><i class="fas fa-id-badge me-1"></i>Mappings for</label>
+        <select id="model-alias-scope" class="form-select form-select-sm"
+            onchange="window.ModelAliasManager?.setScope(this.value)"></select>
+        <span id="model-alias-scope-hint" class="text-muted small"></span>
+    </div>
     <div class="card mb-4">
         <div class="card-header"><h5 class="mb-0" id="model-alias-form-title"><i class="fas fa-plus me-2"></i>Add or Update Mapping</h5></div>
         <div class="card-body">
@@ -1078,6 +1145,104 @@
                     <i class="fas fa-save me-1"></i>
                     Save Changes
                 </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Create User Modal -->
+<div class="modal fade" id="createUserModal" tabindex="-1" aria-labelledby="createUserModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <form onsubmit="window.UserManager?.submitCreateUser(event); return false;">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="createUserModalLabel">
+                        <i class="fas fa-user-plus text-primary me-2"></i>Create User
+                    </h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label for="createUsernameInput" class="form-label">Username</label>
+                        <input type="text" class="form-control" id="createUsernameInput" maxlength="50" autocomplete="off" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="createEmailInput" class="form-label">Email</label>
+                        <input type="email" class="form-control" id="createEmailInput" autocomplete="off" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="createPasswordInput" class="form-label">Password</label>
+                        <input type="password" class="form-control" id="createPasswordInput" placeholder="Minimum 6 characters" autocomplete="new-password" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="createConfirmPasswordInput" class="form-label">Confirm Password</label>
+                        <input type="password" class="form-control" id="createConfirmPasswordInput" autocomplete="new-password" required>
+                    </div>
+                    <div class="form-text mb-2">The account is active immediately and joins the Default profile.</div>
+                    <div id="createUserError" class="alert alert-danger d-none" role="alert"></div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary" id="createUserConfirmBtn">
+                        <i class="fas fa-user-plus me-1"></i>Create
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Profile Create/Edit Modal -->
+<div class="modal fade" id="profileModal" tabindex="-1" aria-labelledby="profileModalTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <form onsubmit="window.ProfileManager?.save(); return false;">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="profileModalTitle">New Profile</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="profile-id">
+                    <div class="mb-3">
+                        <label class="form-label" for="profile-name">Name <span class="text-danger">*</span></label>
+                        <input type="text" id="profile-name" class="form-control" maxlength="64" required>
+                        <div class="form-text">Letters, digits, spaces, hyphens, underscores. Max 64 chars.</div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label" for="profile-description">Description</label>
+                        <input type="text" id="profile-description" class="form-control" maxlength="256" placeholder="Optional">
+                    </div>
+                    <div class="mb-1" id="profile-clone-row">
+                        <label class="form-label" for="profile-clone-from">Copy settings from</label>
+                        <select id="profile-clone-from" class="form-select" onchange="window.ProfileManager?.onCloneChange()"></select>
+                        <div class="form-text" id="profile-clone-hint"></div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary"><i class="fas fa-save me-1"></i>Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<!-- Delete Profile Modal -->
+<div class="modal fade" id="deleteProfileModal" tabindex="-1" aria-labelledby="deleteProfileModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="deleteProfileModalLabel"><i class="fas fa-trash text-danger me-2"></i>Delete Profile</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <p id="profile-delete-message"></p>
+                <label class="form-label" for="profile-delete-reassign">Move members to</label>
+                <select id="profile-delete-reassign" class="form-select"></select>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-danger" onclick="window.ProfileManager?.confirmDelete()">Delete</button>
             </div>
         </div>
     </div>
@@ -1389,6 +1554,7 @@
 {% block extra_js %}
 <!-- Modular JavaScript files -->
 <script src="/static/js/core/ui-utils.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/profile-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/provider-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/provider-forms.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/model-manager.js?v={{ cache_version }}"></script>
@@ -1398,6 +1564,7 @@
 <script src="/static/js/features/tracking/request-tracker.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/tracking/usage-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/rate-limit-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/profile-group-limits.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-group-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/instance-group-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-access-manager.js?v={{ cache_version }}"></script>

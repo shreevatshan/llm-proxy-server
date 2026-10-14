@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from app import time_utils
 from app.concurrency import TaskReentrantLock, lock_in_use
+from app.profiles import profile_registry
 
 logger = logging.getLogger(__name__)
 
@@ -88,50 +89,17 @@ class _MinuteBucket:
 
 
 @dataclass
-class _UserOverride:
-    user_id: int
-    rpm_limit: Optional[int]
-    rpd_limit: Optional[int]
-
-
-@dataclass
-class _GlobalDefaults:
-    rpm_default: Optional[int]
-    rpd_default: Optional[int]
-
-
-@dataclass
 class _ModelGroupSnapshot:
     group_id: int
     name: str
-    rpm_default: Optional[int]
-    rpd_default: Optional[int]
     model_ids: List[str]
-
-
-@dataclass
-class _UserGroupOverride:
-    user_id: int
-    group_id: int
-    rpm_limit: Optional[int]
-    rpd_limit: Optional[int]
 
 
 @dataclass
 class _InstanceGroupSnapshot:
     group_id: int
     name: str
-    rpm_default: Optional[int]
-    rpd_default: Optional[int]
     provider_keys: List[str]
-
-
-@dataclass
-class _UserInstanceGroupOverride:
-    user_id: int
-    group_id: int
-    rpm_limit: Optional[int]
-    rpd_limit: Optional[int]
 
 
 @dataclass
@@ -304,8 +272,6 @@ class RateLimitTracker:
         self._minute_buckets: Dict[int, _MinuteBucket] = {}
         # Group RPM buckets keyed by (user_id, group_id)
         self._group_minute_buckets: Dict[Tuple[int, int], _MinuteBucket] = {}
-        self._overrides: Dict[int, _UserOverride] = {}
-        self._defaults = _GlobalDefaults(rpm_default=None, rpd_default=None)
         self._rpd_cache: Dict[str, _RpdCacheEntry] = {}            # scope_key → entry
         # Group RPD cache keyed by (scope_key, group_id)
         self._group_rpd_cache: Dict[Tuple[str, int], _RpdCacheEntry] = {}
@@ -318,18 +284,19 @@ class RateLimitTracker:
         # pool_lock() for the ordering rule that makes it safe.
         self._pool_locks: Dict[int, TaskReentrantLock] = {}
         self._db_session_factory: Optional[Callable] = None
+        # Serialises _load_config: a periodic reload whose SELECTs predate an admin's
+        # commit must not install its stale snapshot after that admin's refresh_now.
+        self._reload_lock: Optional[asyncio.Lock] = None
         self._running = False
         self._refresh_task: Optional[asyncio.Task] = None
         # Model-group state
         self._groups: Dict[int, _ModelGroupSnapshot] = {}        # group_id → snapshot
         self._model_to_group: Dict[str, int] = {}               # model_id → group_id
-        self._user_group_overrides: Dict[Tuple[int, int], _UserGroupOverride] = {}  # (user_id, group_id)
         # Instance-group state (keyed on provider_key)
         self._instance_groups: Dict[int, _InstanceGroupSnapshot] = {}    # group_id → snapshot
         self._provider_to_group: Dict[str, int] = {}                     # provider_key → group_id
         self._instance_group_minute_buckets: Dict[Tuple[int, int], _MinuteBucket] = {}  # (user_id, group_id)
         self._instance_group_rpd_cache: Dict[Tuple[str, int], _RpdCacheEntry] = {}      # (scope_key, group_id)
-        self._user_instance_group_overrides: Dict[Tuple[int, int], _UserInstanceGroupOverride] = {}  # (user_id, group_id)
         # Request-pool state. Only RPD is pooled; every RPM structure above stays
         # strictly per-user. RPD counting itself goes through the member user ids
         # (RequestUsage.user_id); usernames are cached alongside them so
@@ -381,6 +348,7 @@ class RateLimitTracker:
 
     async def start(self) -> None:
         self._lock = asyncio.Lock()
+        self._reload_lock = asyncio.Lock()
         self._running = True
         await self._load_config()
         self._refresh_task = asyncio.create_task(self._refresh_loop())
@@ -405,21 +373,25 @@ class RateLimitTracker:
     async def _load_config(self) -> None:
         if self._db_session_factory is None:
             return
+        if self._reload_lock is None:
+            self._reload_lock = asyncio.Lock()
+        async with self._reload_lock:
+            await self._load_config_locked()
+
+    async def _load_config_locked(self) -> None:
         try:
-            from app.auth.database import get_global_rate_limit, AsyncSessionLocal
             from app.auth.models import (
-                UserRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit,
-                InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit,
-                RequestPool, RequestPoolMember, User, UserRpdCarry,
+                ModelGroup, InstanceGroup, RequestPoolMember, User, UserRpdCarry,
             )
+            from app.profiles import profile_registry
             from app import time_utils
             from sqlalchemy.future import select
             from sqlalchemy.orm import selectinload
 
             async with self._db_session_factory() as db:
-                global_row = await get_global_rate_limit(db)
-                result = await db.execute(select(UserRateLimit))
-                override_rows = result.scalars().all()
+                # Every limit value comes from the user's profile; the registry is
+                # shared with model access, so reloading it here keeps both in step.
+                await profile_registry.load(db)
 
                 # Load model groups with members
                 result = await db.execute(
@@ -427,19 +399,11 @@ class RateLimitTracker:
                 )
                 group_rows = result.scalars().all()
 
-                # Load per-user group overrides
-                result = await db.execute(select(UserModelGroupRateLimit))
-                user_group_rows = result.scalars().all()
-
                 # Load instance groups with members
                 result = await db.execute(
                     select(InstanceGroup).options(selectinload(InstanceGroup.members))
                 )
                 instance_group_rows = result.scalars().all()
-
-                # Load per-user instance-group overrides
-                result = await db.execute(select(UserInstanceGroupRateLimit))
-                user_instance_group_rows = result.scalars().all()
 
                 # Load pool membership joined to User for the usernames the RPD
                 # counters are keyed by.
@@ -463,25 +427,10 @@ class RateLimitTracker:
 
             lock = await self._get_lock()
             async with lock:
-                if global_row:
-                    self._defaults = _GlobalDefaults(
-                        rpm_default=global_row.rpm_default,
-                        rpd_default=global_row.rpd_default,
-                    )
-                self._overrides = {
-                    row.user_id: _UserOverride(
-                        user_id=row.user_id,
-                        rpm_limit=row.rpm_limit,
-                        rpd_limit=row.rpd_limit,
-                    )
-                    for row in override_rows
-                }
                 self._groups = {
                     g.id: _ModelGroupSnapshot(
                         group_id=g.id,
                         name=g.name,
-                        rpm_default=g.rpm_default,
-                        rpd_default=g.rpd_default,
                         model_ids=[m.model_id for m in g.members],
                     )
                     for g in group_rows
@@ -491,21 +440,10 @@ class RateLimitTracker:
                     for g in group_rows
                     for m in g.members
                 }
-                self._user_group_overrides = {
-                    (row.user_id, row.group_id): _UserGroupOverride(
-                        user_id=row.user_id,
-                        group_id=row.group_id,
-                        rpm_limit=row.rpm_limit,
-                        rpd_limit=row.rpd_limit,
-                    )
-                    for row in user_group_rows
-                }
                 self._instance_groups = {
                     g.id: _InstanceGroupSnapshot(
                         group_id=g.id,
                         name=g.name,
-                        rpm_default=g.rpm_default,
-                        rpd_default=g.rpd_default,
                         provider_keys=[m.provider_key for m in g.members],
                     )
                     for g in instance_group_rows
@@ -514,15 +452,6 @@ class RateLimitTracker:
                     m.provider_key: g.id
                     for g in instance_group_rows
                     for m in g.members
-                }
-                self._user_instance_group_overrides = {
-                    (row.user_id, row.group_id): _UserInstanceGroupOverride(
-                        user_id=row.user_id,
-                        group_id=row.group_id,
-                        rpm_limit=row.rpm_limit,
-                        rpd_limit=row.rpd_limit,
-                    )
-                    for row in user_instance_group_rows
                 }
                 pool_members: Dict[int, List[Tuple[int, str]]] = {}
                 user_to_pool: Dict[int, int] = {}
@@ -583,13 +512,6 @@ class RateLimitTracker:
         for pid in [p for p, lk in self._pool_locks.items() if not lk.in_use()]:
             del self._pool_locks[pid]
 
-    def invalidate_user(self, user_id: int) -> None:
-        self._overrides.pop(user_id, None)
-        self._minute_buckets.pop(user_id, None)
-
-    def invalidate_defaults(self) -> None:
-        self._defaults = _GlobalDefaults(rpm_default=None, rpd_default=None)
-
     def invalidate_group(self, group_id: int) -> None:
         """Remove cached group snapshot and all related RPM buckets."""
         snap = self._groups.pop(group_id, None)
@@ -605,17 +527,6 @@ class RateLimitTracker:
         for k in stale_rpd:
             del self._group_rpd_cache[k]
 
-    def invalidate_user_group(self, user_id: int, group_id: int) -> None:
-        self._user_group_overrides.pop((user_id, group_id), None)
-        self._group_minute_buckets.pop((user_id, group_id), None)
-        # The RPD cache is keyed by (scope_key, group_id), where scope_key is "user:{name}"
-        # or "pool:{id}" — never str(user_id), so a targeted pop cannot match. Drop every
-        # entry for the group instead: over-broad, but correct, and it repopulates on the
-        # next request. Without this, lowering a user's group limit stayed invisible for
-        # the length of the TTL.
-        for key in [k for k in self._group_rpd_cache if k[1] == group_id]:
-            self._group_rpd_cache.pop(key, None)
-
     def invalidate_instance_group(self, group_id: int) -> None:
         """Remove cached instance-group snapshot and all related RPM buckets."""
         snap = self._instance_groups.pop(group_id, None)
@@ -628,13 +539,6 @@ class RateLimitTracker:
         stale_rpd = [k for k in self._instance_group_rpd_cache if k[1] == group_id]
         for k in stale_rpd:
             del self._instance_group_rpd_cache[k]
-
-    def invalidate_user_instance_group(self, user_id: int, group_id: int) -> None:
-        self._user_instance_group_overrides.pop((user_id, group_id), None)
-        self._instance_group_minute_buckets.pop((user_id, group_id), None)
-        # Same keying mismatch as invalidate_user_group — see the note there.
-        for key in [k for k in self._instance_group_rpd_cache if k[1] == group_id]:
-            self._instance_group_rpd_cache.pop(key, None)
 
     async def refresh_now(self) -> None:
         """Force an immediate config reload from DB (called after admin edits).
@@ -651,6 +555,15 @@ class RateLimitTracker:
         """
         await self._load_config()
         self.invalidate_all_rpd()
+
+    async def reload_config(self) -> None:
+        """Reload config from DB but keep the cached RPD counts.
+
+        For admin edits no count depends on -- access rules, profile names, a new
+        user or an empty new profile. Limit, composition and usage changes must use
+        refresh_now instead.
+        """
+        await self._load_config()
 
     def model_belongs_to_group(self, model_id: str) -> bool:
         """True if the model is mapped to a configured model group."""
@@ -669,23 +582,34 @@ class RateLimitTracker:
         """
         return set(self._model_to_group.keys()), set(self._provider_to_group.keys())
 
+    # -- limit values -------------------------------------------------------
+    #
+    # Every limit is the user's profile's (app.profiles); None means unlimited. These
+    # four are the only readers, so enforcement, pooling and settlement can never
+    # disagree about a user's limit.
+
+    def _own_rpm_limit(self, user_id: int) -> Optional[int]:
+        """One user's own overall RPM — their profile's."""
+        return profile_registry.for_user(user_id).rpm
+
     def _resolve_group_limits(
         self, user_id: int, group: _ModelGroupSnapshot
     ) -> Tuple[Optional[int], Optional[int]]:
         """Return (effective_group_rpm, effective_group_rpd) for user_id in group."""
-        override = self._user_group_overrides.get((user_id, group.group_id))
-        g_rpm = override.rpm_limit if (override and override.rpm_limit is not None) else group.rpm_default
-        g_rpd = override.rpd_limit if (override and override.rpd_limit is not None) else group.rpd_default
-        return g_rpm, g_rpd
+        return self.group_limits_for(user_id, group.group_id)
 
     def _resolve_instance_group_limits(
         self, user_id: int, group: _InstanceGroupSnapshot
     ) -> Tuple[Optional[int], Optional[int]]:
         """Return (effective_group_rpm, effective_group_rpd) for user_id in an instance group."""
-        override = self._user_instance_group_overrides.get((user_id, group.group_id))
-        g_rpm = override.rpm_limit if (override and override.rpm_limit is not None) else group.rpm_default
-        g_rpd = override.rpd_limit if (override and override.rpd_limit is not None) else group.rpd_default
-        return g_rpm, g_rpd
+        return self.group_limits_for(user_id, group.group_id, instance=True)
+
+    def group_limits_for(
+        self, user_id: int, group_id: int, instance: bool = False
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """(rpm, rpd) this user's profile sets for a group; the one lookup enforcement and display share."""
+        snap = profile_registry.for_user(user_id)
+        return snap.instance_group_limit(group_id) if instance else snap.model_group_limit(group_id)
 
     # -- request pooling ---------------------------------------------------
     #
@@ -722,11 +646,8 @@ class RateLimitTracker:
         return self._user_to_pool.get(user_id) or 0
 
     def _own_rpd_limit(self, user_id: int) -> Optional[int]:
-        """One user's own effective overall RPD — their override, else the global default."""
-        override = self._overrides.get(user_id)
-        if override and override.rpd_limit is not None:
-            return override.rpd_limit
-        return self._defaults.rpd_default
+        """One user's own effective overall RPD — their profile's."""
+        return profile_registry.for_user(user_id).rpd
 
     def _pooled_rpd_limit(self, member_ids: List[int], per_member) -> Optional[int]:
         """Sum the per-member effective RPD. None from any member ⇒ unlimited pool.
@@ -783,12 +704,11 @@ class RateLimitTracker:
         """Read-only — returns current usage without incrementing."""
         lock = await self._get_lock()
         async with lock:
-            override = self._overrides.get(user_id)
-            rpm = override.rpm_limit if (override and override.rpm_limit is not None) else self._defaults.rpm_default
+            rpm = self._own_rpm_limit(user_id)
 
             scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
             if pool_id is None:
-                rpd = override.rpd_limit if (override and override.rpd_limit is not None) else self._defaults.rpd_default
+                rpd = self._own_rpd_limit(user_id)
             else:
                 rpd = self._pooled_rpd_limit(member_ids, self._own_rpd_limit)
 
@@ -1019,13 +939,12 @@ class RateLimitTracker:
         """
         global_lock = await self._get_lock()
         async with global_lock:
-            override = self._overrides.get(user_id)
-            rpm = override.rpm_limit if (override and override.rpm_limit is not None) else self._defaults.rpm_default
+            rpm = self._own_rpm_limit(user_id)
 
             # RPD may be pooled; RPM above is always this user's own.
             scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
             if pool_id is None:
-                rpd = override.rpd_limit if (override and override.rpd_limit is not None) else self._defaults.rpd_default
+                rpd = self._own_rpd_limit(user_id)
             else:
                 rpd = self._pooled_rpd_limit(member_ids, self._own_rpd_limit)
 
@@ -1181,9 +1100,9 @@ class RateLimitTracker:
     ) -> Optional[int]:
         """One member's own effective RPD on a scope. None means unlimited.
 
-        A group the user is not a member of still resolves through the group's default,
-        exactly as enforcement does -- the group's membership is over models/instances,
-        not users.
+        A group the user is not a member of still resolves through their profile's limit
+        for it, exactly as enforcement does -- the group's membership is over
+        models/instances, not users.
         """
         if scope_kind == "overall":
             return self._own_rpd_limit(user_id)

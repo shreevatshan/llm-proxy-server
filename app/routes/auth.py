@@ -15,7 +15,7 @@ from app.auth.database import (
     create_api_key, get_user_api_keys, delete_api_key,
     update_user_profile, update_user_password, permanently_delete_user, verify_password,
     get_oauth_user_by_provider_id, create_oauth_user, update_oauth_user,
-    is_self_delete_allowed,
+    is_self_delete_allowed, normalize_new_username,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.models import (
@@ -23,7 +23,6 @@ from app.auth.models import (
     APIKeyResponse, APIKeyListResponse, UserUpdate, PasswordUpdate, AccountDelete,
     ZohoOAuthCallback,
     MyQuotasResponse, QuotaSectionResponse, PoolSummary,
-    USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH,
 )
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin
@@ -63,19 +62,10 @@ async def signup(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         # length bound, the uniqueness checks and the stored name all talking about
         # the same string. Validated before any lookup so a bad name fails fast
         # rather than at INSERT time on a length-enforcing DB backend.
-        user_data.username = user_data.username.strip()
-        username_length = len(user_data.username)
-        if username_length < USERNAME_MIN_LENGTH:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Username must be at least {USERNAME_MIN_LENGTH} characters long"
-            )
-
-        if username_length > USERNAME_MAX_LENGTH:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Username must be at most {USERNAME_MAX_LENGTH} characters long"
-            )
+        try:
+            user_data.username = normalize_new_username(user_data.username)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
         # Check if username already exists. The config-based admin is not in the
         # users table but owns its name for usage/quota purposes (is_reserved_username).
@@ -596,10 +586,8 @@ async def get_my_quotas(
     Model groups and instance groups are not distinguished in the response — the UI
     renders them identically. Admins are exempt and receive is_admin=True, sections=[].
     """
-    from app.auth.database import (
-        list_model_groups, get_user_group_rate_limit,
-        list_instance_groups, get_user_instance_group_rate_limit,
-    )
+    from app.auth.database import list_model_groups, list_instance_groups
+    from app.profiles import profile_registry
     from app.rate_limit import rate_limit_tracker
     from app.providers.provider_manager import provider_manager
 
@@ -614,11 +602,6 @@ async def get_my_quotas(
 
     claimed: set[str] = set()  # model ids already placed in a section (precedence tracking)
     named_sections: list[QuotaSectionResponse] = []
-
-    def _effective(ov, group):
-        eff_rpm = ov.rpm_limit if (ov and ov.rpm_limit is not None) else group.rpm_default
-        eff_rpd = ov.rpd_limit if (ov and ov.rpd_limit is not None) else group.rpd_default
-        return eff_rpm, eff_rpd
 
     # Pool membership, resolved once. When pooled, the daily limit of every section is
     # the sum of the members' limits for that same section and the count covers them
@@ -648,8 +631,8 @@ async def get_my_quotas(
         if not section_models:
             continue
         claimed.update(section_models)
-        ov = await get_user_instance_group_rate_limit(db, current_user.id, group.id)
-        eff_rpm, eff_rpd = _effective(ov, group)
+        # From the same profile snapshot enforcement reads, so the two never disagree.
+        eff_rpm, eff_rpd = rate_limit_tracker.group_limits_for(current_user.id, group.id, instance=True)
         # Count is enforced across the group's full member set (matches enforcement).
         cnt = await rate_limit_tracker.get_instance_group_rpd_count(
             current_user.id, current_user.username,
@@ -677,8 +660,7 @@ async def get_my_quotas(
         if not section_models:
             continue
         claimed.update(section_models)
-        ov = await get_user_group_rate_limit(db, current_user.id, group.id)
-        eff_rpm, eff_rpd = _effective(ov, group)
+        eff_rpm, eff_rpd = rate_limit_tracker.group_limits_for(current_user.id, group.id)
         # Count is enforced across the group's full member set (matches enforcement).
         cnt = await rate_limit_tracker.get_group_rpd_count(
             current_user.id, current_user.username,
@@ -733,7 +715,10 @@ async def get_my_quotas(
                 id=pool_obj.id, name=pool_obj.name, member_count=member_count
             )
 
-    return MyQuotasResponse(is_admin=False, sections=sections, pool=pool_summary)
+    return MyQuotasResponse(
+        is_admin=False, sections=sections, pool=pool_summary,
+        profile_name=profile_registry.for_user(current_user.id).name,
+    )
 
 
 # ZOHO OAuth Routes

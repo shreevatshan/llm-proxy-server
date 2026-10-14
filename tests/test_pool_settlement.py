@@ -747,13 +747,14 @@ class GroupScopeSettlementTests(PoolTestCase):
                          "charged her own group limit, not zero and not all nine")
         self.assertEqual(await self.carry(alice.id, scope), 4 - 9)
 
-    async def test_a_per_user_group_override_sets_the_apportionment_weight(self):
+    async def test_a_profile_group_limit_sets_the_apportionment_weight(self):
         alice = await self.make_user("alice", rpd_limit=100)
         bob = await self.make_user("bob", rpd_limit=100)
         mg = await self.make_model_group("grouped", "openai/gpt-4o", rpd_default=10)
-        # Bob is worth three times Alice on this scope only.
-        self.db.add(UserModelGroupRateLimit(user_id=bob.id, group_id=mg.id, rpd_limit=30))
-        await self.db.commit()
+        # Bob's profile is worth three times Alice's on this scope only.
+        heavy = await self.make_profile("heavy", rpd_limit=100)
+        await self.set_group_limit(heavy.id, mg, rpd=30)
+        await self.set_profile(bob, heavy.id)
         pool = await self.make_pool("team", alice, [bob])
         await self.seed_usage("alice", 8, model="openai/gpt-4o")
 

@@ -14,7 +14,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileInstanceGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -237,8 +237,26 @@ def is_reserved_username(username: str) -> bool:
     return is_admin_enabled() and username == get_admin_username()
 
 
+def normalize_new_username(username: str) -> str:
+    """Strip a username for a new account and check its length; raises ValueError.
+
+    Normalised before anything reads the name: forms trim client-side, so validating,
+    looking up and storing the stripped value keeps the length bound, the uniqueness
+    checks and the stored name all talking about the same string.
+    """
+    username = username.strip()
+    if len(username) < USERNAME_MIN_LENGTH:
+        raise ValueError(f"Username must be at least {USERNAME_MIN_LENGTH} characters long")
+    if len(username) > USERNAME_MAX_LENGTH:
+        raise ValueError(f"Username must be at most {USERNAME_MAX_LENGTH} characters long")
+    return username
+
+
 @with_db_retry()
-async def create_user(db: AsyncSession, username: str, email: str, password: str, is_pending: bool = False) -> User:
+async def create_user(
+    db: AsyncSession, username: str, email: str, password: str, is_pending: bool = False,
+    profile_id: Optional[int] = None,
+) -> User:
     """Create a new user. If is_pending=True, the account requires admin approval before it becomes active."""
     hashed_password = get_password_hash(password)
     db_user = User(
@@ -246,7 +264,8 @@ async def create_user(db: AsyncSession, username: str, email: str, password: str
         email=email,
         hashed_password=hashed_password,
         is_active=not is_pending,
-        is_pending_approval=is_pending
+        is_pending_approval=is_pending,
+        profile_id=profile_id or DEFAULT_PROFILE_ID,
     )
     db.add(db_user)
     await db.commit()
@@ -599,29 +618,6 @@ async def admin_reset_user_password(db: AsyncSession, user_id: int, new_password
         raise e
 
 
-async def get_global_rate_limit(db: AsyncSession) -> Optional[GlobalRateLimit]:
-    """Return the singleton global rate limit row (id=1), or None if not yet seeded."""
-    result = await db.execute(select(GlobalRateLimit).where(GlobalRateLimit.id == 1))
-    return result.scalar_one_or_none()
-
-
-async def upsert_global_rate_limit(
-    db: AsyncSession, rpm: Optional[int], rpd: Optional[int], admin_username: str
-) -> GlobalRateLimit:
-    """Create or update the global rate limit singleton."""
-    row = await get_global_rate_limit(db)
-    if row is None:
-        row = GlobalRateLimit(id=1)
-        db.add(row)
-    row.rpm_default = rpm
-    row.rpd_default = rpd
-    row.updated_by = admin_username
-    row.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
 async def get_user_management_settings(db: AsyncSession) -> Optional[UserManagementSettings]:
     """Return the singleton user management settings row (id=1), or None if never saved."""
     result = await db.execute(select(UserManagementSettings).where(UserManagementSettings.id == 1))
@@ -684,196 +680,6 @@ async def upsert_websearch_settings(
     await db.commit()
     await db.refresh(row)
     return row
-
-
-async def get_user_rate_limit(db: AsyncSession, user_id: int) -> Optional[UserRateLimit]:
-    """Return the per-user rate limit override for the given user, or None."""
-    result = await db.execute(select(UserRateLimit).where(UserRateLimit.user_id == user_id))
-    return result.scalar_one_or_none()
-
-
-async def upsert_user_rate_limit(
-    db: AsyncSession,
-    user_id: int,
-    rpm: Optional[int],
-    rpd: Optional[int],
-    admin_username: str,
-    fields_set: set,
-) -> UserRateLimit:
-    """Create or update a per-user rate limit override.
-
-    Only updates fields present in fields_set so callers can distinguish
-    "set to null (clear)" from "field not provided (no change)".
-    """
-    row = await get_user_rate_limit(db, user_id)
-    if row is None:
-        row = UserRateLimit(user_id=user_id)
-        db.add(row)
-    if "rpm_limit" in fields_set:
-        row.rpm_limit = rpm
-    if "rpd_limit" in fields_set:
-        row.rpd_limit = rpd
-    row.updated_by = admin_username
-    row.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-async def delete_user_rate_limit(db: AsyncSession, user_id: int) -> bool:
-    """Remove the per-user rate limit override; user falls back to global defaults."""
-    row = await get_user_rate_limit(db, user_id)
-    if row is None:
-        return False
-    await db.delete(row)
-    await db.commit()
-    return True
-
-
-# ==================== Per-User Model Access ====================
-
-async def get_user_model_policy(db: AsyncSession, user_id: int) -> Optional[UserModelAccessPolicy]:
-    """Return the per-user model-access default policy, or None (⇒ allow-all)."""
-    result = await db.execute(
-        select(UserModelAccessPolicy).where(UserModelAccessPolicy.user_id == user_id)
-    )
-    return result.scalar_one_or_none()
-
-
-async def upsert_user_model_policy(
-    db: AsyncSession,
-    user_id: int,
-    mode: str,
-    admin_username: str,
-) -> UserModelAccessPolicy:
-    """Create or update a user's model-access policy mode (default|allow|deny|custom)."""
-    row = await get_user_model_policy(db, user_id)
-    if row is None:
-        row = UserModelAccessPolicy(user_id=user_id)
-        db.add(row)
-    row.mode = mode
-    # Keep the legacy boolean roughly in sync for any old readers.
-    row.default_allow = mode in ("allow", "default")
-    row.updated_by = admin_username
-    row.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-async def delete_user_model_policy(db: AsyncSession, user_id: int) -> bool:
-    """Remove a user's policy row; user reverts to the allow-all default."""
-    row = await get_user_model_policy(db, user_id)
-    if row is None:
-        return False
-    await db.delete(row)
-    await db.commit()
-    return True
-
-
-async def list_user_model_exceptions(db: AsyncSession, user_id: int) -> List[UserModelAccessException]:
-    """Return all explicit per-model access exceptions for a user."""
-    result = await db.execute(
-        select(UserModelAccessException).where(UserModelAccessException.user_id == user_id)
-    )
-    return list(result.scalars().all())
-
-
-async def get_user_model_exception(
-    db: AsyncSession, user_id: int, model_id: str
-) -> Optional[UserModelAccessException]:
-    """Return the explicit exception for (user, model), or None."""
-    result = await db.execute(
-        select(UserModelAccessException).where(
-            UserModelAccessException.user_id == user_id,
-            UserModelAccessException.model_id == model_id,
-        )
-    )
-    return result.scalar_one_or_none()
-
-
-async def upsert_user_model_exception(
-    db: AsyncSession,
-    user_id: int,
-    model_id: str,
-    is_allowed: bool,
-    admin_username: str,
-) -> UserModelAccessException:
-    """Create or update an explicit per-model access exception for a user."""
-    row = await get_user_model_exception(db, user_id, model_id)
-    if row is None:
-        row = UserModelAccessException(user_id=user_id, model_id=model_id)
-        db.add(row)
-    row.is_allowed = is_allowed
-    row.updated_by = admin_username
-    row.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-async def delete_user_model_exception(db: AsyncSession, user_id: int, model_id: str) -> bool:
-    """Remove an explicit exception; the (user, model) reverts to policy default."""
-    row = await get_user_model_exception(db, user_id, model_id)
-    if row is None:
-        return False
-    await db.delete(row)
-    await db.commit()
-    return True
-
-
-async def set_user_model_exceptions_bulk(
-    db: AsyncSession,
-    user_id: int,
-    overrides: Dict[str, bool],
-    admin_username: str,
-    replace: bool = False,
-) -> None:
-    """Upsert many per-model overrides in one transaction.
-
-    When replace=True, clears all existing exceptions for the user first (used when
-    seeding a fresh 'custom' baseline from allow/deny). Otherwise merges in place.
-    """
-    if replace:
-        existing = await list_user_model_exceptions(db, user_id)
-        for row in existing:
-            await db.delete(row)
-        await db.flush()
-
-    now = datetime.utcnow()
-    if replace:
-        # Fresh slate: insert directly, no per-row lookup needed.
-        for model_id, is_allowed in overrides.items():
-            db.add(UserModelAccessException(
-                user_id=user_id,
-                model_id=model_id,
-                is_allowed=is_allowed,
-                updated_by=admin_username,
-                updated_at=now,
-            ))
-    else:
-        for model_id, is_allowed in overrides.items():
-            row = await get_user_model_exception(db, user_id, model_id)
-            if row is None:
-                row = UserModelAccessException(user_id=user_id, model_id=model_id)
-                db.add(row)
-            row.is_allowed = is_allowed
-            row.updated_by = admin_username
-            row.updated_at = now
-
-    await db.commit()
-
-
-async def get_all_user_model_policies(db: AsyncSession) -> List[UserModelAccessPolicy]:
-    """Return every user's model-access policy row (for cache warm-up)."""
-    result = await db.execute(select(UserModelAccessPolicy))
-    return list(result.scalars().all())
-
-
-async def get_all_user_model_exceptions(db: AsyncSession) -> List[UserModelAccessException]:
-    """Return every per-model access exception across all users (for cache warm-up)."""
-    result = await db.execute(select(UserModelAccessException))
-    return list(result.scalars().all())
 
 
 async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
@@ -988,15 +794,25 @@ async def get_all_model_configurations(db: AsyncSession) -> List[ModelConfigurat
     return result.scalars().all()
 
 
-async def get_all_model_aliases(db: AsyncSession) -> List[ModelAlias]:
-    """Return all model aliases in evaluation (priority) order."""
-    result = await db.execute(select(ModelAlias).order_by(ModelAlias.priority, ModelAlias.id))
+async def get_all_model_aliases(
+    db: AsyncSession, profile_id: int = DEFAULT_PROFILE_ID, all_profiles: bool = False,
+) -> List[ModelAlias]:
+    """Return one profile's model aliases (Default's unless given) in evaluation order.
+
+    all_profiles=True returns every profile's rows, for the resolver.
+    """
+    q = select(ModelAlias)
+    if not all_profiles:
+        q = q.where(ModelAlias.profile_id == profile_id)
+    result = await db.execute(q.order_by(ModelAlias.priority, ModelAlias.id))
     return list(result.scalars().all())
 
 
-async def get_model_alias(db: AsyncSession, alias: str) -> Optional[ModelAlias]:
-    """Return an alias by its exact client-facing name."""
-    result = await db.execute(select(ModelAlias).where(ModelAlias.alias == alias))
+async def get_model_alias(db: AsyncSession, alias: str, profile_id: int = DEFAULT_PROFILE_ID) -> Optional[ModelAlias]:
+    """Return an alias by its exact client-facing name within one profile's list."""
+    result = await db.execute(
+        select(ModelAlias).where(ModelAlias.alias == alias, ModelAlias.profile_id == profile_id)
+    )
     return result.scalar_one_or_none()
 
 
@@ -1008,26 +824,30 @@ async def get_model_alias_by_id(db: AsyncSession, alias_id: int) -> Optional[Mod
 async def upsert_model_alias(
     db: AsyncSession, alias: str, target_model_id: str, enabled: bool, apis,
     match_type: Optional[str] = None, alias_id: Optional[int] = None,
+    profile_id: int = DEFAULT_PROFILE_ID,
 ) -> Optional[ModelAlias]:
-    """Create or update a model alias.
+    """Create or update a model alias in *profile_id*'s list.
 
     With *alias_id*, that row is updated (and may be renamed); returns None if it
-    does not exist. Otherwise the row is looked up by *alias*. New rows go to the
-    bottom of the priority order. A *match_type* of None keeps an existing row's
-    type. Two concurrent creates may share a priority; ties break by id.
+    does not exist in this profile. Otherwise the row is looked up by *alias*. New rows
+    go to the bottom of their profile's priority order. A *match_type* of None keeps an
+    existing row's type. Two concurrent creates may share a priority; ties break by id.
     """
     from sqlalchemy import func
     if alias_id is not None:
         row = await get_model_alias_by_id(db, alias_id)
-        if row is None:
+        if row is None or row.profile_id != profile_id:
             return None
         row.alias = alias
     else:
-        row = await get_model_alias(db, alias)
+        row = await get_model_alias(db, alias, profile_id)
     if row is None:
-        max_priority = (await db.execute(select(func.max(ModelAlias.priority)))).scalar()
+        max_priority = (await db.execute(
+            select(func.max(ModelAlias.priority)).where(ModelAlias.profile_id == profile_id)
+        )).scalar()
         row = ModelAlias(
             alias=alias,
+            profile_id=profile_id,
             match_type=match_type or "exact",
             priority=(max_priority if max_priority is not None else -1) + 1,
         )
@@ -1043,13 +863,15 @@ async def upsert_model_alias(
     return row
 
 
-async def reorder_model_aliases(db: AsyncSession, ids: List[int]) -> bool:
-    """Set priorities to the order of *ids*, which must name every alias exactly once.
+async def reorder_model_aliases(db: AsyncSession, ids: List[int], profile_id: int = DEFAULT_PROFILE_ID) -> bool:
+    """Set priorities to the order of *ids*, which must name every alias of the profile once.
 
     Returns False (writing nothing) when *ids* does not match the stored rows, so a
     client working from a stale list cannot silently drop rows from the order.
     """
-    rows = list((await db.execute(select(ModelAlias))).scalars().all())
+    rows = list((await db.execute(
+        select(ModelAlias).where(ModelAlias.profile_id == profile_id)
+    )).scalars().all())
     by_id = {row.id: row for row in rows}
     if len(ids) != len(rows) or set(ids) != set(by_id):
         return False
@@ -1059,9 +881,9 @@ async def reorder_model_aliases(db: AsyncSession, ids: List[int]) -> bool:
     return True
 
 
-async def delete_model_alias(db: AsyncSession, alias: str) -> bool:
-    """Delete a model alias by name."""
-    row = await get_model_alias(db, alias)
+async def delete_model_alias(db: AsyncSession, alias: str, profile_id: int = DEFAULT_PROFILE_ID) -> bool:
+    """Delete a model alias by name from one profile's list."""
+    row = await get_model_alias(db, alias, profile_id)
     if row is None:
         return False
     await db.delete(row)
@@ -3004,6 +2826,18 @@ async def _run_auto_migrations():
             )
         logger.info("Auto-migration: database backed up to %s", backup)
 
+    # Moving everyone onto profiles retires the per-user overrides and global
+    # defaults. Nothing is deleted, so a failed backup only warns.
+    async with engine.connect() as conn:
+        profiles_pending = await _users_need_profile_column(conn)
+    if profiles_pending:
+        try:
+            backup = await asyncio.to_thread(_backup_sqlite_file, "pre-profiles")
+            if backup:
+                logger.info("Auto-migration: database backed up to %s", backup)
+        except Exception as e:
+            logger.warning("Auto-migration: pre-profiles backup failed: %s", e)
+
     async with engine.begin() as conn:
         # Check if is_pending_approval column exists on users table
         try:
@@ -3388,6 +3222,8 @@ async def _run_auto_migrations():
                 "exist; rename one of them to enforce uniqueness: %s", e
             )
 
+        await _migrate_profiles(conn, profiles_pending)
+
         # Rebuild the usage tables onto (user_id, pool_id) keys. Runs last: it needs
         # the users, api_keys and pool_membership_intervals tables in their final
         # shape, and the backup was taken before this block opened. Not wrapped in a
@@ -3413,6 +3249,152 @@ async def _run_auto_migrations():
             await _seed_pool_id_high_water(conn)
         except Exception as e:
             logger.warning(f"Auto-migration: could not seed the pool id high-water mark: {e}")
+
+
+async def _users_need_profile_column(conn) -> bool:
+    """True when the users table exists but predates user profiles."""
+    from sqlalchemy import text
+
+    columns = [r[1] for r in (await conn.execute(text("PRAGMA table_info(users)"))).fetchall()]
+    return bool(columns) and "profile_id" not in columns
+
+
+_MODEL_ALIAS_COLUMNS = (
+    "id, alias, target_model_id, enabled, apis, match_type, priority, created_at, updated_at"
+)
+
+
+async def _make_aliases_profile_scoped(conn) -> None:
+    """Add model_aliases.profile_id and move alias uniqueness to (profile, alias).
+
+    Safe to run on every start. The mappings that predate profiles were the one list
+    every user had, so they become Default's. Deployments carry the old uniqueness as a
+    separate UNIQUE index, which is simply dropped. A column-level UNIQUE (very old DDL)
+    cannot be dropped in SQLite, so that table is rebuilt from the current model.
+    """
+    from sqlalchemy import text
+
+    columns = [r[1] for r in (await conn.execute(text("PRAGMA table_info(model_aliases)"))).fetchall()]
+    if not columns:
+        return
+    if "profile_id" not in columns:
+        logger.info("Auto-migration: Adding 'profile_id' column to model_aliases (all mappings -> Default)")
+        # SQLite cannot ADD a NOT NULL REFERENCES column; the UPDATE below fills it.
+        await conn.execute(text(
+            "ALTER TABLE model_aliases ADD COLUMN profile_id INTEGER "
+            "REFERENCES user_profiles(id) ON DELETE CASCADE"
+        ))
+    # Before any rebuild: the rebuilt table's profile_id is NOT NULL.
+    await conn.execute(text(
+        "UPDATE model_aliases SET profile_id = :id WHERE profile_id IS NULL"
+    ), {"id": DEFAULT_PROFILE_ID})
+
+    rebuild = False
+    for _seq, name, unique, origin, *_ in (await conn.execute(text("PRAGMA index_list(model_aliases)"))).fetchall():
+        if not unique:
+            continue
+        index_cols = [r[2] for r in (await conn.execute(text(f"PRAGMA index_info('{name}')"))).fetchall()]
+        if index_cols != ["alias"]:
+            continue
+        if origin == "c":
+            logger.info("Auto-migration: Making %s non-unique (aliases are unique per profile)", name)
+            await conn.execute(text(f'DROP INDEX "{name}"'))
+        else:
+            rebuild = True
+
+    if rebuild:
+        logger.info("Auto-migration: Rebuilding model_aliases to drop column-level UNIQUE(alias)")
+        await conn.execute(text("DROP TABLE IF EXISTS model_aliases_mig"))
+        await conn.execute(text(
+            f"CREATE TABLE model_aliases_mig AS SELECT {_MODEL_ALIAS_COLUMNS}, profile_id FROM model_aliases"
+        ))
+        await conn.execute(text("DROP TABLE model_aliases"))
+        await conn.run_sync(lambda sc: Base.metadata.tables["model_aliases"].create(sc))
+        await conn.execute(text(
+            f"INSERT INTO model_aliases ({_MODEL_ALIAS_COLUMNS}, profile_id) "
+            f"SELECT {_MODEL_ALIAS_COLUMNS}, profile_id FROM model_aliases_mig"
+        ))
+        await conn.execute(text("DROP TABLE model_aliases_mig"))
+
+    await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_model_aliases_alias ON model_aliases (alias)"))
+    await conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_aliases_scope_alias "
+        "ON model_aliases (profile_id, alias)"
+    ))
+
+
+async def _migrate_profiles(conn, profiles_pending: bool) -> None:
+    """Bring a database onto user profiles.
+
+    The one-time part runs only when users.profile_id is missing, and is deliberately
+    not wrapped in a swallow-all try: until that column exists every User query fails,
+    so a failure must abort startup with the transaction rolled back. The ALTER comes
+    last, so a failure anywhere earlier leaves the trigger in place for the next start.
+
+    Seeding Default from the old global and group defaults keeps every existing user's
+    limits as they were. Per-user overrides are not carried over -- profiles replace
+    them -- and the rows are left in place, unread, with a count logged.
+    """
+    from sqlalchemy import text
+
+    await conn.execute(text(
+        "INSERT OR IGNORE INTO user_profiles (id, name, description, model_access_mode, created_at, updated_at) "
+        "VALUES (:id, 'Default', 'Built-in profile for new users', 'default', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+    ), {"id": DEFAULT_PROFILE_ID})
+    await conn.execute(text(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_profiles_name_lower ON user_profiles (lower(name))"
+    ))
+
+    await _make_aliases_profile_scoped(conn)
+
+    if profiles_pending:
+        tables = {r[0] for r in (await conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type = 'table'")
+        )).fetchall()}
+        if "global_rate_limits" in tables:
+            await conn.execute(text(
+                "UPDATE user_profiles SET "
+                "rpm_limit = (SELECT rpm_default FROM global_rate_limits WHERE id = 1), "
+                "rpd_limit = (SELECT rpd_default FROM global_rate_limits WHERE id = 1) "
+                "WHERE id = :id"
+            ), {"id": DEFAULT_PROFILE_ID})
+        for groups, limits in (
+            ("model_groups", "profile_model_group_limits"),
+            ("instance_groups", "profile_instance_group_limits"),
+        ):
+            if groups in tables:
+                await conn.execute(text(
+                    f"INSERT OR IGNORE INTO {limits} "
+                    f"(profile_id, group_id, rpm_limit, rpd_limit, updated_at, updated_by) "
+                    f"SELECT :id, id, rpm_default, rpd_default, CURRENT_TIMESTAMP, 'migration' "
+                    f"FROM {groups} WHERE rpm_default IS NOT NULL OR rpd_default IS NOT NULL"
+                ), {"id": DEFAULT_PROFILE_ID})
+
+        dropped = {}
+        for table in ("user_rate_limits", "user_model_group_rate_limits",
+                      "user_instance_group_rate_limits", "user_model_access_policies",
+                      "user_model_access_exceptions"):
+            if table in tables:
+                count = (await conn.execute(text(f"SELECT COUNT(*) FROM {table}"))).scalar()
+                if count:
+                    dropped[table] = count
+        if dropped:
+            logger.warning(
+                "Auto-migration: user profiles replace per-user overrides; these rows are "
+                "kept but no longer applied: %s", dropped,
+            )
+
+        logger.info("Auto-migration: Adding 'profile_id' column to users (all users -> Default)")
+        await conn.execute(text(
+            "ALTER TABLE users ADD COLUMN profile_id INTEGER REFERENCES user_profiles(id)"
+        ))
+
+    await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_users_profile_id ON users (profile_id)"))
+    # Cheap repair on every start: nothing may point at a profile that is not there.
+    await conn.execute(text(
+        "UPDATE users SET profile_id = :id "
+        "WHERE profile_id IS NULL OR profile_id NOT IN (SELECT id FROM user_profiles)"
+    ), {"id": DEFAULT_PROFILE_ID})
 
 
 def init_database_sync():
@@ -3447,14 +3429,10 @@ async def list_model_groups(db: AsyncSession, group_id: Optional[int] = None):
 
 
 async def create_model_group(
-    db: AsyncSession, name: str, description: Optional[str],
-    rpm_default: Optional[int], rpd_default: Optional[int], admin_username: str,
+    db: AsyncSession, name: str, description: Optional[str], admin_username: str,
 ) -> ModelGroup:
-    row = ModelGroup(
-        name=name, description=description,
-        rpm_default=rpm_default, rpd_default=rpd_default,
-        updated_by=admin_username,
-    )
+    """Create an empty group. Its limits are set per profile (see set_group_limit_for_all_profiles)."""
+    row = ModelGroup(name=name, description=description, updated_by=admin_username)
     db.add(row)
     await db.commit()
     await db.refresh(row)
@@ -3502,68 +3480,6 @@ async def get_model_group_limits(db: AsyncSession, group_id: int) -> Optional[Mo
     return result.scalar_one_or_none()
 
 
-async def update_model_group_limits(
-    db: AsyncSession, group_id: int, rpm_default: Optional[int], rpd_default: Optional[int],
-    admin_username: str,
-) -> Optional[ModelGroup]:
-    return await update_model_group(
-        db, group_id,
-        {"rpm_default": rpm_default, "rpd_default": rpd_default},
-        admin_username,
-    )
-
-
-async def get_user_group_rate_limit(
-    db: AsyncSession, user_id: int, group_id: int,
-) -> Optional[UserModelGroupRateLimit]:
-    result = await db.execute(
-        select(UserModelGroupRateLimit).where(
-            UserModelGroupRateLimit.user_id == user_id,
-            UserModelGroupRateLimit.group_id == group_id,
-        )
-    )
-    return result.scalar_one_or_none()
-
-
-async def list_user_group_rate_limits(
-    db: AsyncSession, group_id: int, user_id: Optional[int] = None,
-):
-    q = select(UserModelGroupRateLimit).where(UserModelGroupRateLimit.group_id == group_id)
-    if user_id is not None:
-        q = q.where(UserModelGroupRateLimit.user_id == user_id)
-    result = await db.execute(q)
-    return result.scalars().all()
-
-
-async def upsert_user_group_rate_limit(
-    db: AsyncSession, user_id: int, group_id: int,
-    rpm: Optional[int], rpd: Optional[int],
-    admin_username: str, fields_set: set,
-) -> UserModelGroupRateLimit:
-    row = await get_user_group_rate_limit(db, user_id, group_id)
-    if row is None:
-        row = UserModelGroupRateLimit(user_id=user_id, group_id=group_id)
-        db.add(row)
-    if "rpm_limit" in fields_set:
-        row.rpm_limit = rpm
-    if "rpd_limit" in fields_set:
-        row.rpd_limit = rpd
-    row.updated_by = admin_username
-    row.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-async def delete_user_group_rate_limit(db: AsyncSession, user_id: int, group_id: int) -> bool:
-    row = await get_user_group_rate_limit(db, user_id, group_id)
-    if row is None:
-        return False
-    await db.delete(row)
-    await db.commit()
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Instance-group helpers (mirror the model-group helpers, keyed on provider_key)
 # ---------------------------------------------------------------------------
@@ -3580,14 +3496,10 @@ async def list_instance_groups(db: AsyncSession, group_id: Optional[int] = None)
 
 
 async def create_instance_group(
-    db: AsyncSession, name: str, description: Optional[str],
-    rpm_default: Optional[int], rpd_default: Optional[int], admin_username: str,
+    db: AsyncSession, name: str, description: Optional[str], admin_username: str,
 ) -> InstanceGroup:
-    row = InstanceGroup(
-        name=name, description=description,
-        rpm_default=rpm_default, rpd_default=rpd_default,
-        updated_by=admin_username,
-    )
+    """Create an empty group. Its limits are set per profile (see set_group_limit_for_all_profiles)."""
+    row = InstanceGroup(name=name, description=description, updated_by=admin_username)
     db.add(row)
     await db.commit()
     await db.refresh(row)
@@ -3635,52 +3547,110 @@ async def get_instance_group_limits(db: AsyncSession, group_id: int) -> Optional
     return result.scalar_one_or_none()
 
 
-async def update_instance_group_limits(
-    db: AsyncSession, group_id: int, rpm_default: Optional[int], rpd_default: Optional[int],
-    admin_username: str,
-) -> Optional[InstanceGroup]:
-    return await update_instance_group(
-        db, group_id,
-        {"rpm_default": rpm_default, "rpd_default": rpd_default},
-        admin_username,
-    )
+# ---------------------------------------------------------------------------
+# User-profile helpers. (Not "user_profile": update_user_profile above is the
+# username/email edit and predates these.)
+# ---------------------------------------------------------------------------
+
+def _profile_id_expr():
+    """users.profile_id with NULL read as the default profile."""
+    from sqlalchemy import func
+    return func.coalesce(User.profile_id, DEFAULT_PROFILE_ID)
 
 
-async def get_user_instance_group_rate_limit(
-    db: AsyncSession, user_id: int, group_id: int,
-) -> Optional[UserInstanceGroupRateLimit]:
-    result = await db.execute(
-        select(UserInstanceGroupRateLimit).where(
-            UserInstanceGroupRateLimit.user_id == user_id,
-            UserInstanceGroupRateLimit.group_id == group_id,
-        )
-    )
+async def get_profile(db: AsyncSession, profile_id: int) -> Optional[UserProfile]:
+    result = await db.execute(select(UserProfile).where(UserProfile.id == profile_id))
     return result.scalar_one_or_none()
 
 
-async def list_user_instance_group_rate_limits(
-    db: AsyncSession, group_id: int, user_id: Optional[int] = None,
-):
-    q = select(UserInstanceGroupRateLimit).where(UserInstanceGroupRateLimit.group_id == group_id)
-    if user_id is not None:
-        q = q.where(UserInstanceGroupRateLimit.user_id == user_id)
-    result = await db.execute(q)
-    return result.scalars().all()
+async def get_profile_by_name(db: AsyncSession, name: str) -> Optional[UserProfile]:
+    """Case-insensitive lookup, matching the uniqueness index."""
+    from sqlalchemy import func
+    result = await db.execute(select(UserProfile).where(func.lower(UserProfile.name) == name.lower()))
+    return result.scalar_one_or_none()
 
 
-async def upsert_user_instance_group_rate_limit(
-    db: AsyncSession, user_id: int, group_id: int,
-    rpm: Optional[int], rpd: Optional[int],
-    admin_username: str, fields_set: set,
-) -> UserInstanceGroupRateLimit:
-    row = await get_user_instance_group_rate_limit(db, user_id, group_id)
+async def list_profiles(db: AsyncSession, profile_id: Optional[int] = None) -> List[dict]:
+    """Every profile (or just `profile_id`) with its member, exception and mapping
+    counts, Default first."""
+    from sqlalchemy import func
+
+    def only(query, column):
+        return query if profile_id is None else query.where(column == profile_id)
+
+    profiles = (await db.execute(
+        only(select(UserProfile), UserProfile.id).order_by(UserProfile.id)
+    )).scalars().all()
+    members = dict((await db.execute(
+        only(select(_profile_id_expr(), func.count()).select_from(User), _profile_id_expr())
+        .group_by(_profile_id_expr())
+    )).all())
+    exceptions = dict((await db.execute(
+        only(select(ProfileModelAccessException.profile_id, func.count()),
+             ProfileModelAccessException.profile_id)
+        .group_by(ProfileModelAccessException.profile_id)
+    )).all())
+    aliases = dict((await db.execute(
+        only(select(ModelAlias.profile_id, func.count()), ModelAlias.profile_id)
+        .group_by(ModelAlias.profile_id)
+    )).all())
+    return [
+        {
+            "id": p.id, "name": p.name, "description": p.description,
+            "is_default": p.id == DEFAULT_PROFILE_ID,
+            "member_count": members.get(p.id, 0),
+            "rpm_limit": p.rpm_limit, "rpd_limit": p.rpd_limit,
+            "model_access_mode": p.model_access_mode or "default",
+            "exception_count": exceptions.get(p.id, 0),
+            "alias_count": aliases.get(p.id, 0),
+            "updated_at": p.updated_at, "updated_by": p.updated_by,
+        }
+        for p in profiles
+    ]
+
+
+async def create_profile(
+    db: AsyncSession, name: str, description: Optional[str], admin_username: str,
+    clone_from_id: Optional[int] = None,
+) -> UserProfile:
+    """Create a profile, optionally copying everything another profile configures.
+
+    A clone copies the overall limits, the access mode and exceptions, every group
+    limit and the profile's own model mappings, in one transaction.
+    """
+    row = UserProfile(name=name, description=description, updated_by=admin_username)
+    db.add(row)
+    await db.flush()
+    if clone_from_id is not None:
+        src = await get_profile(db, clone_from_id)
+        if src is not None:
+            row.rpm_limit, row.rpd_limit = src.rpm_limit, src.rpd_limit
+            row.model_access_mode = src.model_access_mode
+            for model in (ProfileModelGroupLimit, ProfileInstanceGroupLimit):
+                for lim in (await db.execute(select(model).where(model.profile_id == src.id))).scalars():
+                    db.add(model(profile_id=row.id, group_id=lim.group_id, rpm_limit=lim.rpm_limit,
+                                 rpd_limit=lim.rpd_limit, updated_by=admin_username))
+            for ex in (await db.execute(select(ProfileModelAccessException)
+                                        .where(ProfileModelAccessException.profile_id == src.id))).scalars():
+                db.add(ProfileModelAccessException(profile_id=row.id, model_id=ex.model_id,
+                                                   is_allowed=ex.is_allowed, updated_by=admin_username))
+            for al in await get_all_model_aliases(db, profile_id=src.id):
+                db.add(ModelAlias(profile_id=row.id, alias=al.alias, target_model_id=al.target_model_id,
+                                  enabled=al.enabled, apis=al.apis, match_type=al.match_type,
+                                  priority=al.priority))
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def update_profile(
+    db: AsyncSession, profile_id: int, fields: dict, admin_username: str,
+) -> Optional[UserProfile]:
+    row = await get_profile(db, profile_id)
     if row is None:
-        row = UserInstanceGroupRateLimit(user_id=user_id, group_id=group_id)
-        db.add(row)
-    if "rpm_limit" in fields_set:
-        row.rpm_limit = rpm
-    if "rpd_limit" in fields_set:
-        row.rpd_limit = rpd
+        return None
+    for k, v in fields.items():
+        setattr(row, k, v)
     row.updated_by = admin_username
     row.updated_at = datetime.utcnow()
     await db.commit()
@@ -3688,10 +3658,195 @@ async def upsert_user_instance_group_rate_limit(
     return row
 
 
-async def delete_user_instance_group_rate_limit(db: AsyncSession, user_id: int, group_id: int) -> bool:
-    row = await get_user_instance_group_rate_limit(db, user_id, group_id)
-    if row is None:
-        return False
-    await db.delete(row)
+async def delete_profile(db: AsyncSession, profile_id: int, reassign_to: int) -> List[int]:
+    """Move a profile's members to *reassign_to*, then delete it with everything it owns.
+
+    Returns the ids of the users moved. Callers validate both ids first; the default
+    profile is refused here too, as the last line of defence. Child rows are deleted
+    explicitly rather than trusted to ON DELETE CASCADE (see permanently_delete_user).
+    """
+    from sqlalchemy import delete as sa_delete, update as sa_update
+    if profile_id == DEFAULT_PROFILE_ID:
+        raise ValueError("the default profile cannot be deleted")
+    if reassign_to == profile_id:
+        raise ValueError("members cannot be reassigned to the profile being deleted")
+    moved = list((await db.execute(
+        select(User.id).where(_profile_id_expr() == profile_id)
+    )).scalars().all())
+    if moved:
+        await db.execute(sa_update(User).where(_profile_id_expr() == profile_id).values(profile_id=reassign_to))
+    for model in (ProfileModelGroupLimit, ProfileInstanceGroupLimit, ProfileModelAccessException, ModelAlias):
+        await db.execute(sa_delete(model).where(model.profile_id == profile_id))
+    await db.execute(sa_delete(UserProfile).where(UserProfile.id == profile_id))
     await db.commit()
-    return True
+    return moved
+
+
+async def assign_users_profile(db: AsyncSession, user_ids: List[int], profile_id: int) -> List[int]:
+    """Put these users in *profile_id*; returns the ids that exist (and were moved)."""
+    from sqlalchemy import update as sa_update
+    found = list((await db.execute(select(User.id).where(User.id.in_(user_ids)))).scalars().all())
+    if found:
+        await db.execute(sa_update(User).where(User.id.in_(found)).values(profile_id=profile_id))
+    await db.commit()
+    return found
+
+
+async def list_profile_member_ids(db: AsyncSession, profile_ids: List[int]) -> List[int]:
+    result = await db.execute(select(User.id).where(_profile_id_expr().in_(profile_ids)))
+    return list(result.scalars().all())
+
+
+async def list_profile_members(db: AsyncSession, profile_id: int) -> List[User]:
+    result = await db.execute(
+        select(User).where(_profile_id_expr() == profile_id).order_by(User.username)
+    )
+    return list(result.scalars().all())
+
+
+async def upsert_profile_limits(
+    db: AsyncSession, profile_id: int, rpm: Optional[int], rpd: Optional[int],
+    admin_username: str, fields_set: set,
+) -> Optional[UserProfile]:
+    """Set a profile's overall limits; only fields in fields_set change."""
+    fields = {}
+    if "rpm_limit" in fields_set:
+        fields["rpm_limit"] = rpm
+    if "rpd_limit" in fields_set:
+        fields["rpd_limit"] = rpd
+    return await update_profile(db, profile_id, fields, admin_username)
+
+
+async def _upsert_profile_group_row(
+    db: AsyncSession, model, profile_id: int, group_id: int,
+    rpm: Optional[int], rpd: Optional[int], admin_username: str, fields_set: set,
+) -> None:
+    row = (await db.execute(select(model).where(
+        model.profile_id == profile_id, model.group_id == group_id,
+    ))).scalar_one_or_none()
+    if row is None:
+        row = model(profile_id=profile_id, group_id=group_id)
+        db.add(row)
+    if "rpm_limit" in fields_set:
+        row.rpm_limit = rpm
+    if "rpd_limit" in fields_set:
+        row.rpd_limit = rpd
+    if row.rpm_limit is None and row.rpd_limit is None:
+        # Both unlimited is what a missing row already means.
+        if row in db.new:
+            db.expunge(row)
+        else:
+            await db.delete(row)
+        return
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+
+
+async def upsert_profile_group_limit(
+    db: AsyncSession, profile_id: int, group_id: int, rpm: Optional[int], rpd: Optional[int],
+    admin_username: str, fields_set: set, instance: bool = False,
+) -> None:
+    """Set one profile's limits for a model group (or, with instance=True, an instance group)."""
+    model = ProfileInstanceGroupLimit if instance else ProfileModelGroupLimit
+    await _upsert_profile_group_row(db, model, profile_id, group_id, rpm, rpd, admin_username, fields_set)
+    await db.commit()
+
+
+async def set_group_limit_for_all_profiles(
+    db: AsyncSession, group_id: int, rpm: Optional[int], rpd: Optional[int],
+    admin_username: str, instance: bool = False,
+    fields_set: set = frozenset({"rpm_limit", "rpd_limit"}),
+) -> None:
+    """Give every profile the same limits for one group (the group modal's shortcut).
+
+    Only fields in fields_set change, so a limit the admin left blank keeps each
+    profile's own value.
+    """
+    model = ProfileInstanceGroupLimit if instance else ProfileModelGroupLimit
+    for pid in (await db.execute(select(UserProfile.id))).scalars().all():
+        await _upsert_profile_group_row(
+            db, model, pid, group_id, rpm, rpd, admin_username, fields_set,
+        )
+    await db.commit()
+
+
+async def get_profile_limits(db: AsyncSession, profile_id: int) -> dict:
+    """The profile's limits for every model group and instance group, set or not."""
+    out = {}
+    for key, group_model, member_attr, limit_model in (
+        ("model_groups", ModelGroup, ModelGroup.members, ProfileModelGroupLimit),
+        ("instance_groups", InstanceGroup, InstanceGroup.members, ProfileInstanceGroupLimit),
+    ):
+        groups = (await db.execute(
+            select(group_model).options(selectinload(member_attr)).order_by(group_model.name)
+        )).scalars().all()
+        limits = {
+            row.group_id: row for row in (await db.execute(
+                select(limit_model).where(limit_model.profile_id == profile_id)
+            )).scalars()
+        }
+        out[key] = [
+            {
+                "group_id": g.id, "name": g.name, "member_count": len(g.members),
+                "rpm_limit": limits[g.id].rpm_limit if g.id in limits else None,
+                "rpd_limit": limits[g.id].rpd_limit if g.id in limits else None,
+            }
+            for g in groups
+        ]
+    return out
+
+
+async def set_profile_model_mode(
+    db: AsyncSession, profile_id: int, mode: str, admin_username: str,
+) -> Optional[UserProfile]:
+    return await update_profile(db, profile_id, {"model_access_mode": mode}, admin_username)
+
+
+async def list_profile_model_exceptions(db: AsyncSession, profile_id: int) -> Dict[str, bool]:
+    result = await db.execute(
+        select(ProfileModelAccessException).where(ProfileModelAccessException.profile_id == profile_id)
+    )
+    return {row.model_id: row.is_allowed for row in result.scalars()}
+
+
+async def upsert_profile_model_exception(
+    db: AsyncSession, profile_id: int, model_id: str, is_allowed: bool, admin_username: str,
+) -> None:
+    row = (await db.execute(select(ProfileModelAccessException).where(
+        ProfileModelAccessException.profile_id == profile_id,
+        ProfileModelAccessException.model_id == model_id,
+    ))).scalar_one_or_none()
+    if row is None:
+        row = ProfileModelAccessException(profile_id=profile_id, model_id=model_id)
+        db.add(row)
+    row.is_allowed = is_allowed
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+
+
+async def delete_profile_model_exception(db: AsyncSession, profile_id: int, model_id: str) -> bool:
+    from sqlalchemy import delete as sa_delete
+    result = await db.execute(sa_delete(ProfileModelAccessException).where(
+        ProfileModelAccessException.profile_id == profile_id,
+        ProfileModelAccessException.model_id == model_id,
+    ))
+    await db.commit()
+    return bool(result.rowcount)
+
+
+async def set_profile_model_exceptions_bulk(
+    db: AsyncSession, profile_id: int, overrides: Dict[str, bool], admin_username: str,
+) -> None:
+    """Replace every exception of a profile in one transaction (seeding a custom baseline)."""
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(ProfileModelAccessException).where(
+        ProfileModelAccessException.profile_id == profile_id
+    ))
+    now = datetime.utcnow()
+    for model_id, is_allowed in overrides.items():
+        db.add(ProfileModelAccessException(
+            profile_id=profile_id, model_id=model_id, is_allowed=is_allowed,
+            updated_by=admin_username, updated_at=now,
+        ))
+    await db.commit()

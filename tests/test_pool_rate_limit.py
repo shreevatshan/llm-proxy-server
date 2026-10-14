@@ -112,11 +112,9 @@ class PooledLimitTests(PoolTestCase):
         # minute's, or one member's burst would block everyone else's next request.
         alice = await self.make_user("alice")
         bob = await self.make_user("bob")
-        self.db.add_all([
-            UserRateLimit(user_id=alice.id, rpm_limit=2, rpd_limit=5),
-            UserRateLimit(user_id=bob.id, rpm_limit=2, rpd_limit=5),
-        ])
-        await self.db.commit()
+        profile = await self.make_profile("rpm-2", rpm_limit=2, rpd_limit=5)
+        await self.set_profile(alice, profile.id)
+        await self.set_profile(bob, profile.id)
         await self.make_pool("team", alice, [bob])
 
         self.assertEqual(

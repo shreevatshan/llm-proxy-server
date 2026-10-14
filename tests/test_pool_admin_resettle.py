@@ -15,7 +15,7 @@ partition: regrouping a model moves rows between scopes, which is a real delta o
 """
 
 from app.auth.admin import AdminUser
-from app.auth.models import UserRateLimitUpdate
+from app.auth.models import ProfileLimitsUpdate, UserProfileAssign
 from app.routes import admin as admin_routes
 from app.routes.pools import resettle_pools
 from tests.pool_test_base import PoolTestCase
@@ -26,13 +26,39 @@ ADMIN = AdminUser(username="root", email="root@example.test")
 
 class AdminResettleTests(PoolTestCase):
 
+    async def _move_to_rpd(self, user, rpd_limit):
+        """The admin edit under test: move `user` to a profile with this daily limit.
+
+        The profile is created without refreshing the tracker, so whatever the
+        limiter sees afterwards is the endpoint's own doing.
+        """
+        profile_id = await self.profile_with_rpd(rpd_limit)
+        await admin_routes.set_user_profile_endpoint(
+            UserProfileAssign(profile_id=profile_id), user.id, ADMIN, self.db,
+        )
+
+    async def test_editing_a_profile_limit_reaches_its_members_pools(self):
+        alice = await self.make_user("alice")
+        bob = await self.make_user("bob", rpd_limit=10)
+        own = await self.make_profile("alice-only", rpd_limit=10)
+        await self.set_profile(alice, own.id)
+        await self.make_pool("team", alice, [bob])
+        await self.seed_usage("alice", 8)
+        await self.tracker.get_user_status(alice.id, "alice")   # warm the RPD cache
+
+        await admin_routes.update_profile_limits_endpoint(
+            ProfileLimitsUpdate(rpd_limit=30), own.id, ADMIN, self.db,
+        )
+
+        status = await self.tracker.get_user_status(bob.id, "bob")
+        self.assertEqual(status.rpd_limit, 40, "bob's pool sees alice's profile edit at once")
+        self.assertEqual(status.rpd_count, 8)
+
     async def test_an_unpooled_user_is_not_settled_at_all(self):
         alice = await self.make_user("alice", rpd_limit=10)
         await self.seed_usage("alice", 3)
 
-        await admin_routes.update_user_rate_limit(
-            UserRateLimitUpdate(rpd_limit=30), alice.id, ADMIN, self.db,
-        )
+        await self._move_to_rpd(alice, 30)
 
         self.assertEqual(await self.carry(alice.id), 0,
                          "an ordinary limit edit must not pay for a settlement pass")
@@ -47,9 +73,7 @@ class AdminResettleTests(PoolTestCase):
         await resettle_pools(self.db, user_ids=[alice.id])
         self.assertEqual(await self.charged(pool.id, alice.id), 4)   # split 10:10
 
-        await admin_routes.update_user_rate_limit(
-            UserRateLimitUpdate(rpd_limit=30), alice.id, ADMIN, self.db,
-        )
+        await self._move_to_rpd(alice, 30)
 
         self.assertEqual(await self.charged(pool.id, alice.id), 4,
                          "those eight were consumed under the old weights and stay split "
@@ -67,9 +91,7 @@ class AdminResettleTests(PoolTestCase):
         await self.seed_usage("alice", 8)
         await resettle_pools(self.db, user_ids=[alice.id])
 
-        await admin_routes.update_user_rate_limit(
-            UserRateLimitUpdate(rpd_limit=30), alice.id, ADMIN, self.db,
-        )
+        await self._move_to_rpd(alice, 30)
         await self.seed_usage("bob", 4)
         await resettle_pools(self.db, user_ids=[alice.id])
 
@@ -84,9 +106,7 @@ class AdminResettleTests(PoolTestCase):
         await self.seed_usage("alice", 8)
         await self.tracker.get_user_status(alice.id, "alice")   # warm the RPD cache
 
-        await admin_routes.update_user_rate_limit(
-            UserRateLimitUpdate(rpd_limit=30), alice.id, ADMIN, self.db,
-        )
+        await self._move_to_rpd(alice, 30)
 
         # No refresh() here on purpose: the helper's own trailing reload is what has to
         # have landed, or the cache serves the pre-edit numbers for _RPD_TTL.

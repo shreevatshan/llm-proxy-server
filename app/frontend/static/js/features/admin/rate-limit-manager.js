@@ -1,13 +1,56 @@
+/**
+ * Rate Limits tab. Every limit belongs to a user profile: the profile bar at the top
+ * picks which one the Overall, Model and Instance panes edit.
+ */
 class RateLimitManager {
     constructor() {
         this._refreshTimer = null;
         this._REFRESH_INTERVAL = 10000;
-        this._allUsers = [];
+        this._members = [];
+        this._profileId = null;
+        document.addEventListener('profiles:changed', () => this._onProfilesChanged());
+    }
+
+    async _onProfilesChanged() {
+        const before = this._profileId;
+        await this._fillProfileSelect();
+        // The shown profile was deleted and the picker fell back to another: reload the
+        // panes, or the next Save would write the old profile's values into this one.
+        if (before !== null && this._profileId !== before) await this._loadProfile();
     }
 
     async load() {
-        await Promise.all([this._loadDefaults(), this._loadUsers()]);
+        await this._fillProfileSelect();
+        await this._loadProfile();
         this._startAutoRefresh();
+    }
+
+    async _fillProfileSelect() {
+        const sel = document.getElementById('rl-profile-select');
+        if (!sel) return;
+        const want = window.ProfileStore.selected('rate-limits', window.ProfileStore.DEFAULT_ID);
+        await window.ProfileStore.fillSelect(sel, { selectedId: want });
+        this._profileId = sel.value ? parseInt(sel.value, 10) : null;
+        if (!window.ProfileStore.byId(this._profileId)) this._profileId = window.ProfileStore.DEFAULT_ID;
+    }
+
+    async onProfileChange(value) {
+        this._profileId = value ? parseInt(value, 10) : null;
+        window.ProfileStore.select('rate-limits', this._profileId);
+        await this._loadProfile();
+    }
+
+    async _loadProfile() {
+        const members = this._loadMembers();
+        // One GET serves all three panes (overall, model groups, instance groups).
+        // On failure the group panes fall back to fetching for themselves.
+        const limits = await this._fetchLimits();
+        this._renderOverall(limits);
+        await Promise.all([
+            members,
+            window.ModelGroupManager?.setProfile(this._profileId, limits),
+            window.InstanceGroupManager?.setProfile(this._profileId, limits),
+        ]);
     }
 
     stopAutoRefresh() {
@@ -20,48 +63,50 @@ class RateLimitManager {
     _startAutoRefresh() {
         this.stopAutoRefresh();
         this._refreshTimer = setInterval(() => {
-            // Don't re-render while the admin is typing in the search box or editing a limit,
+            // Don't re-render while the admin is typing in the search box,
             // otherwise their input/focus would be wiped every tick.
-            const active = document.activeElement;
-            if (active && (active.id === 'rl-user-search'
-                || active.classList?.contains('rl-rpm-input')
-                || active.classList?.contains('rl-rpd-input'))) {
-                return;
-            }
-            this._loadUsers();
+            if (document.activeElement?.id === 'rl-user-search') return;
+            this._loadMembers();
         }, this._REFRESH_INTERVAL);
     }
 
-    async _loadDefaults() {
+    async _fetchLimits() {
+        if (!this._profileId) return null;
         try {
-            const resp = await fetch('/admin/rate-limits/defaults', { credentials: 'include' });
-            if (!resp.ok) return;
-            const data = await resp.json();
-            const rpmInput = document.getElementById('rl-default-rpm');
-            const rpdInput = document.getElementById('rl-default-rpd');
-            if (rpmInput) rpmInput.value = data.rpm_default !== null && data.rpm_default !== undefined ? data.rpm_default : '';
-            if (rpdInput) rpdInput.value = data.rpd_default !== null && data.rpd_default !== undefined ? data.rpd_default : '';
+            const resp = await fetch(`/admin/profiles/limits?profile_id=${this._profileId}`, { credentials: 'include' });
+            return resp.ok ? await resp.json() : null;
         } catch (e) {
-            console.error('RateLimitManager: failed to load defaults', e);
+            console.error('RateLimitManager: failed to load profile limits', e);
+            return null;
         }
     }
 
-    async _loadUsers() {
+    _renderOverall(limits) {
+        const profile = limits?.profile;
+        if (!profile) return;
+        document.getElementById('rl-profile-rpm').value = profile.rpm_limit ?? '';
+        document.getElementById('rl-profile-rpd').value = profile.rpd_limit ?? '';
+        document.getElementById('rl-profile-title').textContent = profile.name;
+        document.getElementById('rl-profile-members').textContent =
+            `${profile.member_count} member${profile.member_count === 1 ? '' : 's'}`;
+    }
+
+    async _loadMembers() {
         const tbody = document.getElementById('rate-limits-tbody');
-        if (!tbody) return;
+        if (!tbody || !this._profileId) return;
         try {
-            const resp = await fetch('/admin/rate-limits/users', { credentials: 'include' });
+            const resp = await fetch(`/admin/profiles/members?profile_id=${this._profileId}`, { credentials: 'include' });
             if (!resp.ok) {
-                this._allUsers = [];
-                tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger py-4">Failed to load rate limit data.</td></tr>';
+                this._members = [];
+                tbody.innerHTML = '<tr><td colspan="3" class="text-center text-danger py-4">Failed to load members.</td></tr>';
                 return;
             }
-            this._allUsers = await resp.json();
+            this._members = await resp.json();
             this._applyFilter();
         } catch (e) {
-            console.error('RateLimitManager: failed to load users', e);
-            this._allUsers = [];
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-danger py-4">Error loading data.</td></tr>';
+            console.error('RateLimitManager: failed to load members', e);
+            this._members = [];
+            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-danger py-4">Error loading data.</td></tr>';
         }
     }
 
@@ -72,130 +117,57 @@ class RateLimitManager {
     _applyFilter() {
         const tbody = document.getElementById('rate-limits-tbody');
         if (!tbody) return;
-        if (!this._allUsers.length) {
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users found.</td></tr>';
+        if (!this._members.length) {
+            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted py-4">No users in this profile.</td></tr>';
             return;
         }
         const q = (document.getElementById('rl-user-search')?.value || '').trim().toLowerCase();
         const filtered = q
-            ? this._allUsers.filter(u =>
+            ? this._members.filter(u =>
                 (u.username || '').toLowerCase().includes(q)
                 || (u.email || '').toLowerCase().includes(q))
-            : this._allUsers;
+            : this._members;
         if (!filtered.length) {
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">No users match your search.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted py-4">No users match your search.</td></tr>';
             return;
         }
-        tbody.innerHTML = filtered.map(u => this._renderRow(u)).join('');
+        const esc = window.UIUtils.escapeHtml;
+        tbody.innerHTML = filtered.map(u => `
+            <tr>
+                <td>
+                    <div class="fw-semibold">${esc(u.username)}${u.is_active ? '' : ' <span class="status-badge status-inactive ms-1">Inactive</span>'}</div>
+                    <div class="text-muted small">${esc(u.email)}</div>
+                </td>
+                <td>${u.current_rpm_count}</td>
+                <td>${u.current_rpd_count}</td>
+            </tr>`).join('');
     }
 
-    _renderRow(u) {
-        const rpmVal = u.rpm_limit !== null && u.rpm_limit !== undefined ? u.rpm_limit : '';
-        const rpdVal = u.rpd_limit !== null && u.rpd_limit !== undefined ? u.rpd_limit : '';
-        const safeUsername = window.UIUtils.escapeHtml(u.username);
-        const safeEmail = window.UIUtils.escapeHtml(u.email);
-        return `
-        <tr data-user-id="${u.user_id}" data-username="${safeUsername}">
-            <td>
-                <div class="fw-semibold">${safeUsername}</div>
-                <div class="text-muted small">${safeEmail}</div>
-            </td>
-            <td>
-                <input type="number" min="0" class="form-control form-control-sm rl-rpm-input"
-                    data-user-id="${u.user_id}" placeholder="Default" value="${rpmVal}" style="width:120px;">
-            </td>
-            <td>
-                <input type="number" min="0" class="form-control form-control-sm rl-rpd-input"
-                    data-user-id="${u.user_id}" placeholder="Default" value="${rpdVal}" style="width:120px;">
-            </td>
-            <td>
-                <button class="btn btn-primary btn-sm me-1" onclick="window.RateLimitManager.saveUserLimits(${u.user_id})">
-                    <i class="fas fa-save me-1"></i>Save
-                </button>
-                <button class="btn btn-outline-danger btn-sm" onclick="window.RateLimitManager.clearUserOverride(${u.user_id})">
-                    <i class="fas fa-times me-1"></i>Clear
-                </button>
-            </td>
-        </tr>`;
-    }
-
-    async saveDefaults() {
-        const rpmRaw = document.getElementById('rl-default-rpm')?.value.trim();
-        const rpdRaw = document.getElementById('rl-default-rpd')?.value.trim();
-        const body = {
-            rpm_default: rpmRaw !== '' ? parseInt(rpmRaw, 10) : null,
-            rpd_default: rpdRaw !== '' ? parseInt(rpdRaw, 10) : null,
-        };
-        try {
-            const resp = await fetch('/admin/rate-limits/defaults', {
-                method: 'PUT',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
-            if (resp.ok) {
-                window.UIUtils?.showToast('Global defaults saved.', 'success');
-                await this._loadUsers();
-            } else {
-                const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(err.detail || 'Failed to save defaults.', 'error');
-            }
-        } catch (e) {
-            window.UIUtils?.showToast('Network error saving defaults.', 'error');
-        }
-    }
-
-    async saveUserLimits(userId) {
-        const rpmInput = document.querySelector(`.rl-rpm-input[data-user-id="${userId}"]`);
-        const rpdInput = document.querySelector(`.rl-rpd-input[data-user-id="${userId}"]`);
-        const rpmRaw = rpmInput?.value.trim();
-        const rpdRaw = rpdInput?.value.trim();
+    async saveProfileLimits() {
+        if (!this._profileId) return;
+        const rpmRaw = document.getElementById('rl-profile-rpm')?.value.trim();
+        const rpdRaw = document.getElementById('rl-profile-rpd')?.value.trim();
         const body = {
             rpm_limit: rpmRaw !== '' ? parseInt(rpmRaw, 10) : null,
             rpd_limit: rpdRaw !== '' ? parseInt(rpdRaw, 10) : null,
         };
         try {
-            const resp = await fetch(`/admin/rate-limits/users?user_id=${userId}`, {
+            const resp = await fetch(`/admin/profiles/limits?profile_id=${this._profileId}`, {
                 method: 'PUT',
                 credentials: 'include',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(body),
             });
             if (resp.ok) {
-                window.UIUtils?.showToast('Rate limit saved.', 'success');
-                await this._loadUsers();
+                window.UIUtils?.showToast('Profile limits saved.', 'success');
+                await window.ProfileStore.notifyChanged();
+                await this._loadMembers();
             } else {
                 const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(err.detail || 'Failed to save rate limit.', 'error');
+                window.UIUtils?.showToast(err.detail || 'Failed to save limits.', 'error');
             }
         } catch (e) {
-            window.UIUtils?.showToast('Network error saving rate limit.', 'error');
-        }
-    }
-
-    async clearUserOverride(userId) {
-        const row = document.querySelector(`tr[data-user-id="${userId}"]`);
-        const username = row?.dataset.username || `user ${userId}`;
-        const confirmed = await window.UIUtils?.showConfirmModal(
-            'Clear Override',
-            `Remove rate limit override for ${username}? They will fall back to global defaults.`,
-            'warning',
-        );
-        if (!confirmed) return;
-        try {
-            const resp = await fetch(`/admin/rate-limits/users?user_id=${userId}`, {
-                method: 'DELETE',
-                credentials: 'include',
-            });
-            if (resp.ok) {
-                window.UIUtils?.showToast(`Override removed for ${username}.`, 'success');
-                await this._loadUsers();
-            } else {
-                const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(err.detail || 'Failed to remove override.', 'error');
-            }
-        } catch (e) {
-            window.UIUtils?.showToast('Network error removing override.', 'error');
+            window.UIUtils?.showToast('Network error saving limits.', 'error');
         }
     }
 }

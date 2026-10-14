@@ -31,6 +31,15 @@ def _model(model_id: str) -> ModelInfo:
     return ModelInfo(id=model_id, created=0, owned_by="test", provider="test")
 
 
+
+def _grant(test, user_id, mode, exceptions=None):
+    """Put `user_id` in a profile with this model-access mode, for one test."""
+    from app.profiles import ProfileSnapshot, profile_registry
+    profile_registry.install(
+        {user_id: 9}, [ProfileSnapshot(9, "test", access_mode=mode, access_exceptions=exceptions or {})]
+    )
+    test.addCleanup(profile_registry.reset)
+
 class _StubProvider:
     """Minimal provider double: only the surface _filter_pool touches."""
 
@@ -317,15 +326,14 @@ class PoolFilterTests(unittest.TestCase):
 class CallerFilterTests(unittest.TestCase):
     def test_denied_provider_is_dropped_for_that_user(self):
         with _Env(["azure:foundry/gpt-5.4", "openai:main/gpt-5.4"]) as env:
-            env.cache._user_model_policies = {7: "custom"}
-            env.cache._user_model_exceptions = {7: {"azure:foundry/gpt-5.4": False}}
+            _grant(self, 7, "custom", {"azure:foundry/gpt-5.4": False})
             self.assertEqual(_resolve(_request(), _User(7), "gpt-5.4"),
                              "openai:main/gpt-5.4")
 
     def test_admin_bypasses_the_per_user_filter(self):
         admin = AdminUser("root", "root@example.com")
         with _Env(["azure:foundry/gpt-5.4"]) as env:
-            env.cache._user_model_policies = {None: "deny"}
+            _grant(self, 0, "deny")
             self.assertEqual(_resolve(_request(), admin, "gpt-5.4"),
                              "azure:foundry/gpt-5.4")
 
@@ -340,7 +348,7 @@ class CallerFilterTests(unittest.TestCase):
         disabled model by explicit canonical id, but never by bare name."""
         with _Env(["azure:foundry/gpt-5.4"],
                   disabled_models=["azure:foundry/gpt-5.4"]) as env:
-            env.cache._user_model_policies = {7: "allow"}
+            _grant(self, 7, "allow")
             with self.assertRaises(ModelUnavailable):
                 _resolve(_request(), _User(7), "gpt-5.4")
 
@@ -408,7 +416,7 @@ class FailureStatusTests(unittest.TestCase):
         "not enabled for your account" for the canonical id -- same cause,
         contradictory answers."""
         with _Env(["azure:foundry/gpt-5.4"]) as env:
-            env.cache._user_model_policies = {7: "deny"}
+            _grant(self, 7, "deny")
             with self.assertRaises(ModelAccessDenied) as ctx:
                 _resolve(_request(), _User(7), "gpt-5.4")
         self.assertEqual(ctx.exception.status_code, 403)
@@ -437,7 +445,7 @@ class FailureStatusTests(unittest.TestCase):
 
     def test_denial_envelope_follows_the_surface_too(self):
         with _Env(["azure:foundry/gpt-5.4"]) as env:
-            env.cache._user_model_policies = {7: "deny"}
+            _grant(self, 7, "deny")
             with self.assertRaises(ModelAccessDenied) as ctx:
                 _resolve(_request("/v1/messages"), _User(7), "gpt-5.4")
         self.assertEqual(ctx.exception.body["error"]["type"], "permission_error")

@@ -1,6 +1,7 @@
 /**
  * User Management Module
- * Handles user-related operations like activate, deactivate, and remove
+ * Handles user-related operations like activate, deactivate, remove and create.
+ * Profile membership is managed on the Profiles tab (profile-manager.js).
  */
 
 class UserManager {
@@ -8,6 +9,59 @@ class UserManager {
         // Selection is held here rather than read off the DOM so that selections
         // survive the search filter hiding and re-showing rows.
         this._selectedIds = new Set();
+    }
+
+    openCreateUser() {
+        ['createUsernameInput', 'createEmailInput', 'createPasswordInput', 'createConfirmPasswordInput']
+            .forEach(id => { document.getElementById(id).value = ''; });
+        document.getElementById('createUserError').classList.add('d-none');
+        const modal = document.getElementById('createUserModal');
+        modal.addEventListener('shown.bs.modal', () => {
+            document.getElementById('createUsernameInput').focus();
+        }, { once: true });
+        bootstrap.Modal.getOrCreateInstance(modal).show();
+    }
+
+    async submitCreateUser(event) {
+        if (event) event.preventDefault();
+        const errorDiv = document.getElementById('createUserError');
+        const showError = (msg) => { errorDiv.textContent = msg; errorDiv.classList.remove('d-none'); };
+        errorDiv.classList.add('d-none');
+
+        const username = document.getElementById('createUsernameInput').value.trim();
+        const email = document.getElementById('createEmailInput').value.trim();
+        const password = document.getElementById('createPasswordInput').value;
+        const confirm = document.getElementById('createConfirmPasswordInput').value;
+
+        if (username.length < 3) return showError('Username must be at least 3 characters long');
+        if (!email) return showError('Email is required');
+        if (password.length < 6) return showError('Password must be at least 6 characters long');
+        if (password !== confirm) return showError('Passwords do not match');
+
+        const btn = document.getElementById('createUserConfirmBtn');
+        btn.disabled = true;
+        try {
+            const response = await fetch('/admin/users', {
+                method: 'POST',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, email, password }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                const detail = Array.isArray(result.detail)
+                    ? result.detail.map(d => d.msg).join('; ')
+                    : result.detail;
+                return showError(detail || 'Failed to create user');
+            }
+            bootstrap.Modal.getInstance(document.getElementById('createUserModal'))?.hide();
+            window.UIUtils.showToast(`User "${result.username}" created.`, 'success');
+            setTimeout(() => location.reload(), 1000);
+        } catch (error) {
+            showError('Error creating user: ' + error.message);
+        } finally {
+            btn.disabled = false;
+        }
     }
 
     filterUsers(query) {
@@ -153,7 +207,10 @@ class UserManager {
 
         const confirmed = await window.UIUtils.showConfirmModal(title, message, type);
         if (!confirmed) return;
+        await this._sendBulk(action);
+    }
 
+    async _sendBulk(action) {
         const userIds = [...this._selectedIds].map(id => parseInt(id, 10));
 
         try {

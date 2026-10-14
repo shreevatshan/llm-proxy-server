@@ -26,6 +26,15 @@ from app.openai_models import (
 from app.providers.provider_manager import provider_manager
 
 
+
+def _grant(test, user_id, mode, exceptions=None):
+    """Put `user_id` in a profile with this model-access mode, for one test."""
+    from app.profiles import ProfileSnapshot, profile_registry
+    profile_registry.install(
+        {user_id: 9}, [ProfileSnapshot(9, "test", access_mode=mode, access_exceptions=exceptions or {})]
+    )
+    test.addCleanup(profile_registry.reset)
+
 class _Caller:
     """A non-admin principal with no per-user restrictions."""
 
@@ -176,8 +185,7 @@ class RoundRobinAttributionTests(unittest.TestCase):
              patch("app.request_tracker.request_tracker.end_request", new_callable=AsyncMock), \
              patch.object(provider_manager, "chat_completion", _fake_chat_completion), \
              patch.object(provider_manager, "get_provider_for_model", lambda m: _StubProvider()):
-            inv.cache._user_model_policies = {1: "custom"}
-            inv.cache._user_model_exceptions = {1: {"azure:foundry/gpt-5.4": False}}
+            _grant(self, 1, "custom", {"azure:foundry/gpt-5.4": False})
             client = TestClient(self.app)
             body = {"model": "gpt-5.4", "stream": False,
                     "messages": [{"role": "user", "content": "hi"}]}
@@ -189,7 +197,7 @@ class RoundRobinAttributionTests(unittest.TestCase):
         with _Inventory(pool, ["azure:foundry", "openai:main"]) as inv, \
              patch("app.request_tracker.request_tracker.start_request", new_callable=AsyncMock), \
              patch("app.request_tracker.request_tracker.end_request", new_callable=AsyncMock):
-            inv.cache._user_model_policies = {1: "deny"}
+            _grant(self, 1, "deny")
             client = TestClient(self.app)
             response = client.post("/v1/chat/completions", json={
                 "model": "gpt-5.4", "stream": False,

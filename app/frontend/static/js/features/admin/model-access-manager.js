@@ -2,30 +2,29 @@
  * Unified Models manager.
  *
  * One view, two scopes selected from the left column:
- *   - "Global"  → enable/disable each model for everyone (global availability).
- *   - a user    → set that user's default policy (Allow all / Deny all) plus
- *                 per-model allow/deny exceptions. Globally disabled models stay
- *                 locked off regardless of the per-user setting.
+ *   - "Global"   → enable/disable each model for everyone (global availability).
+ *   - a profile  → set that profile's access mode (Default / Allow all / Deny all /
+ *                  Custom) plus per-model allow/deny exceptions. Every member of the
+ *                  profile gets exactly this access.
  *
- * The right pane swaps between the global panel (#ma-global) and the per-user
+ * The right pane swaps between the global panel (#ma-global) and the profile
  * panel (#ma-detail); #ma-empty is the pre-selection placeholder.
  */
 class ModelsManager {
     constructor() {
-        this._scope = 'global';        // 'global' or 'user'
-        this._users = [];
-        this._selectedUserId = null;
-        this._detail = null;           // UserModelAccessResponse for the selected user
-        this._exceptionCounts = {};    // user_id -> number of exceptions (for badges)
+        this._scope = 'global';        // 'global' or 'profile'
+        this._selectedProfileId = null;
+        this._detail = null;           // ProfileModelAccessResponse for the selected profile
         this._globalModels = [];       // [{model_id, model_name, provider_key, is_enabled}]
+        document.addEventListener('profiles:changed', () => this._renderProfiles());
     }
 
     async load() {
-        await this._loadUsers();
-        // Re-apply the current scope so the tab remembers what you were editing.
-        if (this._scope === 'user' && this._selectedUserId != null) {
-            this._updateScopeHighlight();
-            await this._loadDetail(this._selectedUserId);
+        await window.ProfileStore.list({ force: true });
+        // A quick link from the Profiles tab (or the last visit) picks the scope.
+        const wanted = window.ProfileStore.selected('model-access', null);
+        if (wanted != null && window.ProfileStore.byId(wanted)) {
+            await this.selectProfile(wanted);
         } else {
             await this.selectScope('global');
         }
@@ -33,57 +32,34 @@ class ModelsManager {
 
     // ── Left column: scope list ──────────────────────────────────────────────
 
-    async _loadUsers() {
-        const list = document.getElementById('ma-user-list');
-        if (!list) return;
-        try {
-            const resp = await fetch('/admin/users', { credentials: 'include' });
-            if (!resp.ok) {
-                list.innerHTML = '<div class="text-danger small py-3 text-center">Couldn\'t load users. Retry.</div>';
-                return;
-            }
-            this._users = await resp.json();
-            this._renderUsers();
-        } catch (e) {
-            console.error('ModelsManager: failed to load users', e);
-            list.innerHTML = '<div class="text-danger small py-3 text-center">Error loading users.</div>';
-        }
+    filterProfiles() {
+        this._renderProfiles();
     }
 
-    filterUsers() {
-        this._renderUsers();
-    }
-
-    _renderUsers() {
-        const list = document.getElementById('ma-user-list');
+    _renderProfiles() {
+        const list = document.getElementById('ma-profile-list');
         if (!list) return;
-        if (!this._users.length) {
-            list.innerHTML = '<div class="text-muted small py-3 text-center">No users found.</div>';
-            return;
-        }
-        const q = (document.getElementById('ma-user-search')?.value || '').trim().toLowerCase();
-        const filtered = q
-            ? this._users.filter(u =>
-                (u.username || '').toLowerCase().includes(q)
-                || (u.email || '').toLowerCase().includes(q))
-            : this._users;
+        const profiles = window.ProfileStore._profiles || [];
+        const q = (document.getElementById('ma-profile-search')?.value || '').trim().toLowerCase();
+        const filtered = q ? profiles.filter(p => (p.name || '').toLowerCase().includes(q)) : profiles;
         if (!filtered.length) {
-            list.innerHTML = '<div class="text-muted small py-3 text-center">No users match your search.</div>';
+            list.innerHTML = `<div class="text-muted small py-3 text-center">${profiles.length ? 'No profiles match your search.' : 'No profiles found.'}</div>`;
             return;
         }
-        list.innerHTML = filtered.map(u => this._renderUserRow(u)).join('');
+        list.innerHTML = filtered.map(p => this._renderProfileRow(p)).join('');
     }
 
-    _renderUserRow(u) {
-        const safeUsername = window.UIUtils.escapeHtml(u.username);
-        const safeEmail = window.UIUtils.escapeHtml(u.email || '');
-        const active = (this._scope === 'user' && u.id === this._selectedUserId) ? ' active' : '';
+    _renderProfileRow(p) {
+        const esc = window.UIUtils.escapeHtml;
+        const active = (this._scope === 'profile' && p.id === this._selectedProfileId) ? ' active' : '';
+        const exceptions = p.model_access_mode === 'custom' && p.exception_count
+            ? ` · ${p.exception_count} exception${p.exception_count === 1 ? '' : 's'}` : '';
         return `
-        <button type="button" class="ma-user-item${active}" data-user-id="${u.id}"
-            onclick="window.ModelsManager.selectUser(${u.id})">
+        <button type="button" class="ma-user-item${active}" data-profile-id="${p.id}"
+            onclick="window.ModelsManager.selectProfile(${p.id})">
             <span class="ma-user-text">
-                <span class="ma-user-name">${safeUsername}</span>
-                <span class="ma-user-email">${safeEmail}</span>
+                <span class="ma-user-name">${esc(p.name)}</span>
+                <span class="ma-user-email">${p.member_count} member${p.member_count === 1 ? '' : 's'} · ${esc(p.model_access_mode)}${exceptions}</span>
             </span>
             <span class="ma-user-trailing">
                 <span class="ma-editing-flag"><i class="fas fa-pen me-1"></i>Editing</span>
@@ -94,7 +70,7 @@ class ModelsManager {
     _updateScopeHighlight() {
         const globalBtn = document.getElementById('ma-scope-global');
         if (globalBtn) globalBtn.classList.toggle('active', this._scope === 'global');
-        this._renderUsers();  // refresh the per-user active highlight
+        this._renderProfiles();  // refresh the per-profile active highlight
     }
 
     _showPanel(which) {
@@ -104,20 +80,15 @@ class ModelsManager {
             if (el) el.style.display = key === which ? '' : 'none';
         });
     }
-    
-    _setScopeBanner(kind, name) {
-        const el = document.getElementById('ma-scope-banner');
-        if (!el) return;
-    }
 
     // ── Global scope ─────────────────────────────────────────────────────────
 
     async selectScope(scope) {
         if (scope !== 'global') return;
         this._scope = 'global';
-        this._selectedUserId = null;
+        this._selectedProfileId = null;
+        window.ProfileStore.select('model-access', null);
         this._updateScopeHighlight();
-        this._setScopeBanner('global');
         await this._loadGlobal();
     }
 
@@ -268,44 +239,57 @@ class ModelsManager {
         }
     }
 
-    // ── Per-user scope ───────────────────────────────────────────────────────
+    // ── Profile scope ────────────────────────────────────────────────────────
 
-    async selectUser(userId) {
-        this._scope = 'user';
-        this._selectedUserId = userId;
+    async selectProfile(profileId) {
+        this._scope = 'profile';
+        this._selectedProfileId = profileId;
+        window.ProfileStore.select('model-access', profileId);
         this._updateScopeHighlight();
-        await this._loadDetail(userId);
+        await this._loadDetail(profileId);
     }
 
-    async _loadDetail(userId) {
+    _url(path, modelId) {
+        let url = `/admin/profiles/model-access${path}?profile_id=${this._selectedProfileId}`;
+        if (modelId) url += `&model_id=${encodeURIComponent(modelId)}`;
+        return url;
+    }
+
+    async _loadDetail(profileId) {
         try {
-            const resp = await fetch(`/admin/users/model-access?user_id=${userId}`, { credentials: 'include' });
+            const resp = await fetch(`/admin/profiles/model-access?profile_id=${profileId}`, { credentials: 'include' });
             if (!resp.ok) {
                 this._showPanel('empty');
-                this._setScopeBanner(null);
                 const empty = document.getElementById('ma-empty');
                 if (empty) empty.querySelector('p').textContent = "Couldn't load model access. Retry.";
                 return;
             }
             this._detail = await resp.json();
-            this._exceptionCounts[userId] = this._detail.models.filter(m => m.is_exception).length;
             this._showPanel('detail');
-            this._setScopeBanner('user', this._detail.username);
             this._renderDetail();
-            this._renderUsers();  // update badge count
         } catch (e) {
             console.error('ModelsManager: failed to load detail', e);
             this._showPanel('empty');
-            this._setScopeBanner(null);
             const empty = document.getElementById('ma-empty');
             if (empty) empty.querySelector('p').textContent = "Couldn't load model access. Retry.";
         }
     }
 
+    /** The server's view changed (mode, exceptions): refresh the left-column counts too. */
+    async _afterChange() {
+        this._renderDetail();
+        await window.ProfileStore.notifyChanged();
+    }
+
     _renderDetail() {
         if (!this._detail) return;
-        const usernameEl = document.getElementById('ma-selected-username');
-        if (usernameEl) usernameEl.textContent = this._detail.username;
+        const nameEl = document.getElementById('ma-selected-username');
+        if (nameEl) nameEl.textContent = this._detail.name;
+        const membersEl = document.getElementById('ma-selected-members');
+        if (membersEl) {
+            const n = this._detail.member_count;
+            membersEl.textContent = `Applies to ${n} member${n === 1 ? '' : 's'}`;
+        }
 
         // Reflect the mode in the 4-option segmented control.
         const mode = this._detail.mode || 'default';
@@ -329,13 +313,13 @@ class ModelsManager {
     _modeHint(mode) {
         switch (mode) {
             case 'allow':
-                return 'Every model is enabled for this user, overriding the global config (including future models).';
+                return 'Every model is enabled for every member of this profile, overriding the global config (including future models).';
             case 'deny':
-                return 'Every model is disabled for this user, overriding the global config (including future models).';
+                return 'Every model is disabled for every member of this profile, overriding the global config (including future models).';
             case 'custom':
                 return 'Per-model overrides win. New models follow the global config; overrides can enable a globally-disabled model.';
             default:
-                return 'Follows the global model config. Toggle any model to switch to Custom for this user.';
+                return 'Follows the global model config. Toggle any model to switch this profile to Custom.';
         }
     }
 
@@ -375,7 +359,7 @@ class ModelsManager {
         if (disabledGlobally) rowCls.push('is-global-off');
 
         // Toggle reflects effective state. Toggles stay active in every mode so an
-        // admin can enable a globally-disabled model for a single user (switches to custom).
+        // admin can enable a globally-disabled model for one profile (switches to custom).
         const checked = m.effective_allowed ? ' checked' : '';
 
         const tag = disabledGlobally
@@ -398,10 +382,10 @@ class ModelsManager {
     }
 
     async setMode(mode) {
-        if (this._selectedUserId == null) return;
+        if (this._selectedProfileId == null) return;
         const labels = { default: 'Default', allow: 'Allow all', deny: 'Deny all', custom: 'Custom' };
         try {
-            const resp = await fetch(`/admin/users/model-access/policy?user_id=${this._selectedUserId}`, {
+            const resp = await fetch(this._url('/policy'), {
                 method: 'PUT',
                 credentials: 'include',
                 headers: { 'Content-Type': 'application/json' },
@@ -409,10 +393,8 @@ class ModelsManager {
             });
             if (resp.ok) {
                 this._detail = await resp.json();
-                this._exceptionCounts[this._selectedUserId] = this._detail.models.filter(m => m.is_exception).length;
                 window.UIUtils?.showToast(`Mode set to ${labels[mode] || mode}.`, 'success');
-                this._renderDetail();
-                this._renderUsers();
+                await this._afterChange();
             } else {
                 const err = await resp.json().catch(() => ({}));
                 window.UIUtils?.showToast(err.detail || 'Failed to update mode.', 'error');
@@ -423,47 +405,44 @@ class ModelsManager {
     }
 
     async toggleModel(encodedModelId, isAllowed) {
-        if (this._selectedUserId == null) return;
+        if (this._selectedProfileId == null) return;
         const modelId = decodeURIComponent(encodedModelId);
         try {
-            const resp = await fetch(
-                `/admin/users/model-access?user_id=${this._selectedUserId}&model_id=${encodeURIComponent(modelId)}`, {
+            const resp = await fetch(this._url('', modelId), {
                 method: 'PUT',
                 credentials: 'include',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ is_allowed: isAllowed }),
             });
             if (resp.ok) {
-                // Response is the full view; toggling may have flipped the user to
+                // Response is the full view; toggling may have flipped the profile to
                 // custom mode, so re-render the mode control and list from server truth.
                 this._detail = await resp.json();
-                this._exceptionCounts[this._selectedUserId] = this._detail.models.filter(m => m.is_exception).length;
-                this._renderDetail();
-                this._renderUsers();
+                await this._afterChange();
             } else {
                 const err = await resp.json().catch(() => ({}));
                 window.UIUtils?.showToast(err.detail || 'Failed to update access.', 'error');
                 // Reconcile with server truth.
-                await this._loadDetail(this._selectedUserId);
+                await this._loadDetail(this._selectedProfileId);
             }
         } catch (e) {
             window.UIUtils?.showToast('Network error updating access.', 'error');
-            await this._loadDetail(this._selectedUserId);
+            await this._loadDetail(this._selectedProfileId);
         }
     }
 
     async resetModel(encodedModelId) {
-        if (this._selectedUserId == null) return;
+        if (this._selectedProfileId == null) return;
         const modelId = decodeURIComponent(encodedModelId);
         try {
-            const resp = await fetch(
-                `/admin/users/model-access?user_id=${this._selectedUserId}&model_id=${encodeURIComponent(modelId)}`, {
+            const resp = await fetch(this._url('', modelId), {
                 method: 'DELETE',
                 credentials: 'include',
             });
             if (resp.ok) {
                 window.UIUtils?.showToast('Reset to global default.', 'success');
-                await this._loadDetail(this._selectedUserId);
+                await this._loadDetail(this._selectedProfileId);
+                await window.ProfileStore.notifyChanged();
             } else {
                 const err = await resp.json().catch(() => ({}));
                 window.UIUtils?.showToast(err.detail || 'Failed to reset.', 'error');

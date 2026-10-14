@@ -81,6 +81,13 @@ async def shared_startup():
                     "auth_cache.user_ttl": auth_cache.USER_TTL
                 })
 
+            # Model access reads profiles, so they must be loaded before the model
+            # cache serves anything; the rate limiter keeps them fresh afterwards.
+            with create_span("app.startup.init_profiles"):
+                from app.profiles import profile_registry
+                async with AsyncSessionLocal() as db:
+                    await profile_registry.load(db)
+
             with create_span("app.startup.init_transformation_manager"):
                 from app.transformation import initialize_transformation_manager
                 initialize_transformation_manager(config.transformation)
@@ -333,9 +340,9 @@ def _add_request_tracking(app: FastAPI, server_name: str):
         # Tag the API surface first, before the _TRACKED_PREFIXES gate: paths
         # outside it (e.g. /openai/v1/audio/*, /openai/v1/images/*) skip the
         # alias block below but still call apply_alias() inside their handlers.
-        from app.model_alias import current_api_surface, alias_resolved_name
+        from app.model_alias import current_api_surface, reset_alias_context
         current_api_surface.set(server_name)
-        alias_resolved_name.set(None)
+        reset_alias_context()
 
         # Open the request's identity holder here, in the *outer* middleware task,
         # before the _TRACKED_PREFIXES gate below and long before auth has run.

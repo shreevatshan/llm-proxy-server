@@ -1160,7 +1160,9 @@ input:checked + .model-toggle-slider:before {
 
 .ma-api-checks .form-check-input,
 #users-mgmt-tbody .form-check-input,
-#user-mgmt-select-all {
+#user-mgmt-select-all,
+#profile-members-tbody .form-check-input,
+#profile-members-select-all {
     appearance: none;
     -webkit-appearance: none;
     float: none;
@@ -1176,13 +1178,17 @@ input:checked + .model-toggle-slider:before {
 
 .ma-api-checks .form-check-input:hover,
 #users-mgmt-tbody .form-check-input:hover,
-#user-mgmt-select-all:hover {
+#user-mgmt-select-all:hover,
+#profile-members-tbody .form-check-input:hover,
+#profile-members-select-all:hover {
     border-color: var(--mono-text-primary);
 }
 
 .ma-api-checks .form-check-input:focus-visible,
 #users-mgmt-tbody .form-check-input:focus-visible,
-#user-mgmt-select-all:focus-visible {
+#user-mgmt-select-all:focus-visible,
+#profile-members-tbody .form-check-input:focus-visible,
+#profile-members-select-all:focus-visible {
     outline: none;
     border-color: var(--accent-500);
     box-shadow: 0 0 0 2px var(--accent-500-alpha);
@@ -1190,7 +1196,9 @@ input:checked + .model-toggle-slider:before {
 
 .ma-api-checks .form-check-input:checked,
 #users-mgmt-tbody .form-check-input:checked,
-#user-mgmt-select-all:checked {
+#user-mgmt-select-all:checked,
+#profile-members-tbody .form-check-input:checked,
+#profile-members-select-all:checked {
     background-color: var(--mono-text-primary);
     border-color: var(--mono-text-primary);
     /* Dark checkmark on the white fill. */
@@ -1482,7 +1490,8 @@ input:checked + .model-toggle-slider:before {
 
 /* Partial selection: a dash rather than a tick, on the same white fill as
    :checked so the header box stays inside the monochrome system. */
-#user-mgmt-select-all:indeterminate {
+#user-mgmt-select-all:indeterminate,
+#profile-members-select-all:indeterminate {
     background-color: var(--mono-text-primary);
     border-color: var(--mono-text-primary);
     background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%230d0d0d' stroke-width='2.5' stroke-linecap='round' d='M4 8h8'/%3e%3c/svg%3e");
@@ -1502,15 +1511,18 @@ input:checked + .model-toggle-slider:before {
 
 /* tbody tr:hover already owns --dark-bg-secondary, so selection is marked with
    an inset edge instead of a background it would fight with. */
-.user-mgmt-row.selected td:first-child {
+.user-mgmt-row.selected td:first-child,
+.profile-member-row.selected td:first-child {
     box-shadow: inset 2px 0 0 var(--mono-text-primary);
 }
 
 /* Five actions plus the status line can outrun a narrow window before the
    mobile breakpoint, so the group wraps rather than pushing past the header. */
-#user-bulk-actions {
+#user-bulk-actions,
+#profile-members-bulk {
     flex-wrap: wrap;
     justify-content: flex-end;
+    align-items: center;
 }
 
 .bulk-selection-status {
@@ -1738,3 +1750,62 @@ input:checked + .model-toggle-slider:before {
         flex: 1 1 auto;
     }
 }
+
+/* ===== User profiles ===== */
+
+/* Profile picker shown above per-profile tabs (Rate Limits, Model Mapping). */
+.profile-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border-color);
+    border-left: 4px solid var(--accent-500);
+    border-radius: 0.5rem;
+}
+
+.profile-bar .form-select {
+    width: auto;
+    min-width: 200px;
+}
+
+/* accent-500 is white in the monochrome palette, so the text must be dark */
+.profile-badge-default {
+    background: var(--accent-500);
+    color: var(--mono-text-inverse) !important;
+    font-weight: 500;
+}
+
+/* Sized to its options, not the column: form-select is width: 100% by default. */
+.user-profile-select {
+    width: auto;
+    min-width: 160px;
+}
+
+/* forms.css pads every .form-control to ~50px tall, -sm included; pin the Members
+   toolbar's search box and selects to one height so they line up. */
+#profile-members-search,
+.profile-members-filter {
+    height: 2.375rem;
+    padding-top: 0.375rem;
+    padding-bottom: 0.375rem;
+}
+
+.profile-members-filter {
+    width: auto;
+    min-width: 180px;
+}
+
+/* Member count in the profiles table: clicking it filters the Members table. */
+.profile-count-link {
+    cursor: pointer;
+    transition: border-color 0.15s ease;
+}
+
+.profile-count-link:hover,
+.profile-count-link:focus-visible {
+    border-color: var(--mono-text-primary) !important;
+    outline: none;
+}
+

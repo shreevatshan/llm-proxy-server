@@ -4,7 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from app.model_alias import (
+    alias_input_name,
     alias_resolved_name,
+    alias_resolved_scope,
+    alias_seen_names,
+    current_profile_id,
     apply_alias,
     build_rule,
     current_api_surface,
@@ -20,16 +24,20 @@ from app.model_alias import (
 @pytest.fixture(autouse=True)
 def _isolated_resolver():
     """Restore the live snapshot and per-request context after every test."""
-    previous = model_alias_resolver._snapshot
+    previous = (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots)
     tokens = [
         (original_model_name, original_model_name.set(None)),
         (current_api_surface, current_api_surface.set(None)),
         (alias_resolved_name, alias_resolved_name.set(None)),
+        (alias_input_name, alias_input_name.set(None)),
+        (alias_resolved_scope, alias_resolved_scope.set(None)),
+        (alias_seen_names, alias_seen_names.set(frozenset())),
+        (current_profile_id, current_profile_id.set(None)),
     ]
     try:
         yield
     finally:
-        model_alias_resolver._snapshot = previous
+        (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots) = previous
         for var, token in reversed(tokens):
             var.reset(token)
 
@@ -231,7 +239,7 @@ def test_overlapping_reloads_install_the_latest_rows(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-    async def _fake_get_all(db):
+    async def _fake_get_all(db, **_scope):
         snapshot = list(db_rows)
         if not first_select_started.is_set():
             first_select_started.set()
@@ -270,6 +278,18 @@ def test_apply_alias_does_not_chain():
     assert apply_alias("gpt-4o-mini") == "p/gpt-4o"
 
 
+def test_a_second_mapping_does_not_capture_earlier_targets():
+    model_alias_resolver.set_rules([
+        build_rule("a", "p/x", rule_id=1),
+        build_rule("b", "p/y", rule_id=2),
+    ])
+    assert apply_alias("a") == "p/x"
+    assert apply_alias("b") == "p/y"
+    # p/x was produced for an earlier input; it must not come back as b's target.
+    assert apply_alias("p/x") == "p/x"
+    assert apply_alias("p/y") == "p/y"
+
+
 def test_load_from_database_skips_disabled_and_invalid_rows(monkeypatch):
     import app.model_alias as model_alias_module
 
@@ -287,7 +307,7 @@ def test_load_from_database_skips_disabled_and_invalid_rows(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-    async def _fake_get_all(db):
+    async def _fake_get_all(db, **_scope):
         return rows
 
     monkeypatch.setattr(model_alias_module, "AsyncSessionLocal", lambda: _Session())

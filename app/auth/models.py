@@ -1,6 +1,6 @@
 """Database models for authentication."""
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint, Index, func, text
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, Date, UniqueConstraint, Index, func, text, event, DDL
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime, date
@@ -25,6 +25,48 @@ USERNAME_MIN_LENGTH = 3
 
 Base = declarative_base()
 
+# The built-in profile every user starts in. Like global_rate_limits' id=1 singleton,
+# being the default is a property of the id, not a stored flag: it cannot be deleted,
+# and every NULL or dangling users.profile_id reads as this one.
+DEFAULT_PROFILE_ID = 1
+
+MODEL_ACCESS_MODES = ("default", "allow", "deny", "custom")
+
+
+class UserProfile(Base):
+    """A named bundle of rate limits, model access and model mappings.
+
+    Every user belongs to exactly one profile; the limits and access rules a user is
+    held to are their profile's. NULL limits mean unlimited.
+    """
+    __tablename__ = "user_profiles"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), nullable=False)
+    description = Column(String(256), nullable=True)
+    rpm_limit = Column(Integer, nullable=True)  # null = unlimited
+    rpd_limit = Column(Integer, nullable=True)  # null = unlimited
+    # One of MODEL_ACCESS_MODES; same semantics as the per-user policy it replaced.
+    model_access_mode = Column(String(16), nullable=False, default="default", server_default="default")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    __table_args__ = (
+        # Case-insensitive, as for request pools: "Team" and "team" are one name.
+        Index("uq_user_profiles_name_lower", func.lower(name), unique=True),
+    )
+
+
+# Seed the Default profile whenever the table is created, so databases built by
+# create_all alone (fresh installs, tests) satisfy users.profile_id's foreign key.
+# Existing databases get the same row from _run_auto_migrations.
+event.listen(UserProfile.__table__, "after_create", DDL(
+    "INSERT INTO user_profiles (id, name, description, model_access_mode, created_at, updated_at) "
+    "VALUES (1, 'Default', 'Built-in profile for new users', 'default', "
+    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+))
+
 
 class User(Base):
     """User model for authentication."""
@@ -37,6 +79,11 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     is_active = Column(Boolean, default=True)
     is_pending_approval = Column(Boolean, default=False)
+    # Nullable only because SQLite cannot ADD a REFERENCES column with a non-NULL
+    # default; NULL reads as DEFAULT_PROFILE_ID everywhere. No ON DELETE: a profile
+    # with members cannot be deleted until they are reassigned.
+    profile_id = Column(Integer, ForeignKey("user_profiles.id"), nullable=True,
+                        default=DEFAULT_PROFILE_ID, index=True)
 
     # OAuth fields
     oauth_provider = Column(String(50), nullable=True)  # e.g., "zoho", "google"
@@ -226,7 +273,11 @@ class ModelAlias(Base):
     __tablename__ = "model_aliases"
 
     id = Column(Integer, primary_key=True, index=True)
-    alias = Column(String(200), unique=True, index=True, nullable=False)
+    alias = Column(String(200), index=True, nullable=False)
+    # The profile whose members this mapping applies to. Each profile has its own
+    # list; there is no list shared across profiles.
+    profile_id = Column(Integer, ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False,
+                        default=DEFAULT_PROFILE_ID)
     target_model_id = Column(String(200), nullable=False)
     enabled = Column(Boolean, default=True, nullable=False)
     # JSON array of API surfaces this alias applies to. NULL (legacy rows) means
@@ -239,6 +290,11 @@ class ModelAlias(Base):
     priority = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        # One alias text per profile.
+        Index("uq_model_aliases_scope_alias", profile_id, alias, unique=True),
+    )
 
 
 class ResponseProviderMapping(Base):
@@ -459,6 +515,7 @@ class ModelGroup(Base):
 
     members = relationship("ModelGroupMember", back_populates="group", cascade="all, delete-orphan")
     user_limits = relationship("UserModelGroupRateLimit", back_populates="group", cascade="all, delete-orphan")
+    profile_limits = relationship("ProfileModelGroupLimit", back_populates="group", cascade="all, delete-orphan")
 
 
 class ModelGroupMember(Base):
@@ -511,6 +568,7 @@ class InstanceGroup(Base):
 
     members = relationship("InstanceGroupMember", back_populates="group", cascade="all, delete-orphan")
     user_limits = relationship("UserInstanceGroupRateLimit", back_populates="group", cascade="all, delete-orphan")
+    profile_limits = relationship("ProfileInstanceGroupLimit", back_populates="group", cascade="all, delete-orphan")
 
 
 class InstanceGroupMember(Base):
@@ -582,6 +640,61 @@ class UserModelAccessException(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "model_id", name="uq_user_model_access_exception"),
         Index("ix_user_model_access_exceptions_user_id", "user_id"),
+    )
+
+
+class ProfileModelGroupLimit(Base):
+    """A profile's RPM/RPD for one model group. Absent row or NULL = unlimited."""
+    __tablename__ = "profile_model_group_limits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    profile_id = Column(Integer, ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False)
+    group_id = Column(Integer, ForeignKey("model_groups.id", ondelete="CASCADE"), nullable=False)
+    rpm_limit = Column(Integer, nullable=True)
+    rpd_limit = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    group = relationship("ModelGroup", back_populates="profile_limits")
+
+    __table_args__ = (
+        UniqueConstraint("profile_id", "group_id", name="uq_profile_model_group_limit"),
+    )
+
+
+class ProfileInstanceGroupLimit(Base):
+    """A profile's RPM/RPD for one instance group. Absent row or NULL = unlimited."""
+    __tablename__ = "profile_instance_group_limits"
+
+    id = Column(Integer, primary_key=True, index=True)
+    profile_id = Column(Integer, ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False)
+    group_id = Column(Integer, ForeignKey("instance_groups.id", ondelete="CASCADE"), nullable=False)
+    rpm_limit = Column(Integer, nullable=True)
+    rpd_limit = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    group = relationship("InstanceGroup", back_populates="profile_limits")
+
+    __table_args__ = (
+        UniqueConstraint("profile_id", "group_id", name="uq_profile_instance_group_limit"),
+    )
+
+
+class ProfileModelAccessException(Base):
+    """Explicit per-(profile, model) override, honoured when the profile's mode is custom."""
+    __tablename__ = "profile_model_access_exceptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    profile_id = Column(Integer, ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False)
+    model_id = Column(String(200), nullable=False)
+    is_allowed = Column(Boolean, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("profile_id", "model_id", name="uq_profile_model_access_exception"),
+        Index("ix_profile_model_access_exceptions_profile_id", "profile_id"),
     )
 
 
@@ -827,9 +940,16 @@ class UserResponse(BaseModel):
     created_at: datetime
     is_active: bool
     is_pending_approval: bool = False
+    profile_id: Optional[int] = None
 
     class Config:
         from_attributes = True
+
+
+class AdminUserCreate(UserCreate):
+    """Admin-created account. A separate model so public signup, which shares
+    UserCreate, can never choose its own profile."""
+    profile_id: Optional[int] = None
 
 
 class APIKeyCreate(BaseModel):
@@ -890,14 +1010,99 @@ class AdminUserModify(BaseModel):
     new_password: Optional[str] = None
 
 
-class GlobalRateLimitResponse(BaseModel):
-    rpm_default: Optional[int] = None
-    rpd_default: Optional[int] = None
+def _clean_name(name: str) -> str:
+    """Validate a profile, model group or instance group name."""
+    name = name.strip()
+    if not name or len(name) > 64:
+        raise ValueError("name must be 1–64 characters")
+    if not re.match(r'^[A-Za-z0-9_\- ]+$', name):
+        raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+    return name
+
+
+class ProfileCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    # Copy limits, model access and mappings from this profile. None starts empty
+    # (everything unlimited, no mappings, access follows the global switches).
+    clone_from_id: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        self.name = _clean_name(self.name)
+        if self.description is not None:
+            self.description = self.description.strip()[:256]
+        return self
+
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        if self.name is not None:
+            self.name = _clean_name(self.name)
+        if self.description is not None:
+            self.description = self.description.strip()[:256]
+        return self
+
+
+class ProfileLimitsUpdate(BaseModel):
+    """RPM/RPD for a profile (overall, or one group). null = unlimited; an omitted
+    field is left unchanged."""
+    rpm_limit: Optional[int] = None
+    rpd_limit: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_non_negative(self):
+        if self.rpm_limit is not None and self.rpm_limit < 0:
+            raise ValueError("rpm_limit must be >= 0")
+        if self.rpd_limit is not None and self.rpd_limit < 0:
+            raise ValueError("rpd_limit must be >= 0")
+        return self
+
+
+class ProfileResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    is_default: bool = False
+    member_count: int = 0
+    rpm_limit: Optional[int] = None
+    rpd_limit: Optional[int] = None
+    model_access_mode: str = "default"
+    exception_count: int = 0
+    alias_count: int = 0
     updated_at: Optional[datetime] = None
     updated_by: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+
+class ProfileGroupLimitResponse(BaseModel):
+    group_id: int
+    name: str
+    member_count: int = 0          # models (or instances) in the group
+    rpm_limit: Optional[int] = None
+    rpd_limit: Optional[int] = None
+
+
+class ProfileLimitsResponse(BaseModel):
+    profile: ProfileResponse
+    model_groups: List[ProfileGroupLimitResponse] = []
+    instance_groups: List[ProfileGroupLimitResponse] = []
+
+
+class ProfileMemberResponse(BaseModel):
+    user_id: int
+    username: str
+    email: str
+    is_active: bool = True
+    current_rpm_count: int = 0
+    current_rpd_count: int = 0
+
+
+class UserProfileAssign(BaseModel):
+    profile_id: int
 
 
 class UserManagementSettingsResponse(BaseModel):
@@ -1124,34 +1329,6 @@ class WebSearchTestRequest(BaseModel):
     settings: Optional[WebSearchSettingsUpdate] = None
 
 
-class UserRateLimitResponse(BaseModel):
-    user_id: int
-    username: str
-    email: str
-    rpm_limit: Optional[int] = None
-    rpd_limit: Optional[int] = None
-    effective_rpm: Optional[int] = None
-    effective_rpd: Optional[int] = None
-    current_rpm_count: int = 0
-    current_rpd_count: int = 0
-
-    class Config:
-        from_attributes = True
-
-
-class UserRateLimitUpdate(BaseModel):
-    rpm_limit: Optional[int] = None
-    rpd_limit: Optional[int] = None
-
-    @model_validator(mode="after")
-    def validate_non_negative(self):
-        if self.rpm_limit is not None and self.rpm_limit < 0:
-            raise ValueError("rpm_limit must be >= 0")
-        if self.rpd_limit is not None and self.rpd_limit < 0:
-            raise ValueError("rpd_limit must be >= 0")
-        return self
-
-
 class AccountDelete(BaseModel):
     confirmation: str
 
@@ -1168,12 +1345,7 @@ class ModelGroupCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_fields(self):
-        import re
-        self.name = self.name.strip()
-        if not self.name or len(self.name) > 64:
-            raise ValueError("name must be 1–64 characters")
-        if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
-            raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+        self.name = _clean_name(self.name)
         if self.description is not None:
             self.description = self.description.strip()[:256]
         if self.rpm_default is not None and self.rpm_default < 0:
@@ -1189,13 +1361,8 @@ class ModelGroupUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_fields(self):
-        import re
         if self.name is not None:
-            self.name = self.name.strip()
-            if not self.name or len(self.name) > 64:
-                raise ValueError("name must be 1–64 characters")
-            if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
-                raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+            self.name = _clean_name(self.name)
         if self.description is not None:
             self.description = self.description.strip()[:256]
         return self
@@ -1241,29 +1408,14 @@ class ModelGroupMemberResponse(BaseModel):
 
 
 class ModelGroupResponse(BaseModel):
+    # Limits live on profiles: see ProfileGroupLimitResponse.
     id: int
     name: str
     description: Optional[str] = None
-    rpm_default: Optional[int] = None
-    rpd_default: Optional[int] = None
     member_count: int = 0
     members: List[str] = []
     updated_at: Optional[datetime] = None
     updated_by: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
-class UserModelGroupRateLimitResponse(BaseModel):
-    user_id: int
-    username: str
-    email: str
-    group_id: int
-    rpm_limit: Optional[int] = None
-    rpd_limit: Optional[int] = None
-    effective_rpm: Optional[int] = None
-    effective_rpd: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -1428,19 +1580,7 @@ class MyQuotasResponse(BaseModel):
     is_admin: bool = False                     # true ⇒ exempt from all limits
     sections: List[QuotaSectionResponse] = []  # unified list; empty when is_admin
     pool: Optional[PoolSummary] = None         # null when the user is not in a pool
-
-
-class UserModelGroupRateLimitUpdate(BaseModel):
-    rpm_limit: Optional[int] = None
-    rpd_limit: Optional[int] = None
-
-    @model_validator(mode="after")
-    def validate_non_negative(self):
-        if self.rpm_limit is not None and self.rpm_limit < 0:
-            raise ValueError("rpm_limit must be >= 0")
-        if self.rpd_limit is not None and self.rpd_limit < 0:
-            raise ValueError("rpd_limit must be >= 0")
-        return self
+    profile_name: Optional[str] = None         # the profile the limits come from
 
 
 # ---------------------------------------------------------------------------
@@ -1455,12 +1595,7 @@ class InstanceGroupCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_fields(self):
-        import re
-        self.name = self.name.strip()
-        if not self.name or len(self.name) > 64:
-            raise ValueError("name must be 1–64 characters")
-        if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
-            raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+        self.name = _clean_name(self.name)
         if self.description is not None:
             self.description = self.description.strip()[:256]
         if self.rpm_default is not None and self.rpm_default < 0:
@@ -1476,13 +1611,8 @@ class InstanceGroupUpdate(BaseModel):
 
     @model_validator(mode="after")
     def validate_fields(self):
-        import re
         if self.name is not None:
-            self.name = self.name.strip()
-            if not self.name or len(self.name) > 64:
-                raise ValueError("name must be 1–64 characters")
-            if not re.match(r'^[A-Za-z0-9_\- ]+$', self.name):
-                raise ValueError("name may only contain letters, digits, spaces, hyphens, and underscores")
+            self.name = _clean_name(self.name)
         if self.description is not None:
             self.description = self.description.strip()[:256]
         return self
@@ -1520,11 +1650,10 @@ class InstanceGroupMembersUpdate(BaseModel):
 
 
 class InstanceGroupResponse(BaseModel):
+    # Limits live on profiles: see ProfileGroupLimitResponse.
     id: int
     name: str
     description: Optional[str] = None
-    rpm_default: Optional[int] = None
-    rpd_default: Optional[int] = None
     member_count: int = 0
     members: List[str] = []               # member provider_keys
     updated_at: Optional[datetime] = None
@@ -1532,33 +1661,6 @@ class InstanceGroupResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-
-class UserInstanceGroupRateLimitResponse(BaseModel):
-    user_id: int
-    username: str
-    email: str
-    group_id: int
-    rpm_limit: Optional[int] = None
-    rpd_limit: Optional[int] = None
-    effective_rpm: Optional[int] = None
-    effective_rpd: Optional[int] = None
-
-    class Config:
-        from_attributes = True
-
-
-class UserInstanceGroupRateLimitUpdate(BaseModel):
-    rpm_limit: Optional[int] = None
-    rpd_limit: Optional[int] = None
-
-    @model_validator(mode="after")
-    def validate_non_negative(self):
-        if self.rpm_limit is not None and self.rpm_limit < 0:
-            raise ValueError("rpm_limit must be >= 0")
-        if self.rpd_limit is not None and self.rpd_limit < 0:
-            raise ValueError("rpd_limit must be >= 0")
-        return self
 
 
 class ModelAliasUpsert(BaseModel):
@@ -1571,6 +1673,8 @@ class ModelAliasUpsert(BaseModel):
     # None keeps an existing row's type ("exact" for a new row). The endpoint
     # re-validates against that effective type, since it is unknown here.
     match_type: Optional[Literal[MODEL_ALIAS_MATCH_TYPES]] = None
+    # The profile this mapping belongs to.
+    profile_id: int = DEFAULT_PROFILE_ID
 
     @model_validator(mode="after")
     def validate_fields(self):
@@ -1601,6 +1705,7 @@ class ModelAliasResponse(BaseModel):
     apis: List[str]
     match_type: str
     priority: int
+    profile_id: int = DEFAULT_PROFILE_ID
     created_at: datetime
     updated_at: datetime
 
@@ -1626,8 +1731,9 @@ class ModelAliasResponse(BaseModel):
 
 
 class ModelAliasReorder(BaseModel):
-    """Every alias id, in the desired evaluation order (highest priority first)."""
+    """Every alias id of one profile, in the desired evaluation order (highest priority first)."""
     ids: List[int]
+    profile_id: int = DEFAULT_PROFILE_ID
 
     @model_validator(mode="after")
     def validate_ids(self):
@@ -1698,7 +1804,8 @@ class BulkToggleRequest(BaseModel):
 
 class BulkUserActionRequest(BaseModel):
     user_ids: List[int]
-    action: str  # "approve", "deactivate", "activate" or "delete"
+    action: str  # "approve", "deactivate", "activate", "delete" or "assign_profile"
+    profile_id: Optional[int] = None  # required for "assign_profile"
 
 
 class ModelSearchResponse(BaseModel):

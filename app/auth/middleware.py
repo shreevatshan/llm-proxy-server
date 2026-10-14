@@ -1,5 +1,7 @@
 """Authentication middleware for API key validation."""
 
+import logging
+
 from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError
@@ -17,6 +19,8 @@ from app.tracing import (
     AuthAttributes, set_trace_user
 )
 from opentelemetry import trace
+
+logger = logging.getLogger(__name__)
 
 security = HTTPBearer(auto_error=False)
 
@@ -144,13 +148,51 @@ def _resolve_identity(auth_result) -> tuple[Optional[str], Optional[str], Option
     return None, None, None
 
 
+async def _bind_profile_context(request: Request, auth_result) -> None:
+    """Bind the caller's profile for alias resolution, and re-map the request's model.
+
+    The tracking middleware applied Default's mappings before auth (the profile was
+    not known yet) and recorded the result in request.state.model. For a caller in any
+    other profile the model is re-resolved here against that profile's own list --
+    before _enforce_rate_limit reads it to decide whether the overall limit applies --
+    and the in-flight usage entry is retagged so usage is recorded under the model
+    actually served.
+    """
+    from app.model_alias import apply_alias, current_profile_id
+    from app.profiles import DEFAULT_PROFILE_ID, profile_id_for_auth
+
+    profile_id = profile_id_for_auth(auth_result)
+    current_profile_id.set(profile_id)
+    if profile_id is None or profile_id == DEFAULT_PROFILE_ID:
+        return
+    state = getattr(request, "state", None)
+    model = getattr(state, "model", None) if state is not None else None
+    if not isinstance(model, str) or not model:
+        return
+    remapped = apply_alias(model)
+    if remapped == model:
+        return
+    state.model = remapped
+    request_id = getattr(state, "tracking_request_id", None)
+    if request_id:
+        from app.request_tracker import request_tracker
+        await request_tracker.update_model(request_id, remapped)
+
+
 async def _update_tracking_identity(request: Request, auth_result) -> None:
     """Update the request tracker with the authenticated user's identity.
 
     Doubles as the single choke point that publishes the username to the tracing
     layer: every successful auth path in this module, plus _authenticate_azure,
-    calls this, so the OTel spans and the usage rows can never disagree.
+    calls this, so the OTel spans and the usage rows can never disagree. For the
+    same reason it is where the caller's profile is bound (_bind_profile_context).
     """
+    try:
+        await _bind_profile_context(request, auth_result)
+    except Exception:
+        # Default's mappings already apply; failing to bind must never turn a
+        # successful auth into a 500.
+        logger.warning("Unable to bind profile context", exc_info=True)
     try:
         identity, kind, user_id = _resolve_identity(auth_result)
     except Exception:
