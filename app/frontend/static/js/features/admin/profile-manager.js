@@ -81,6 +81,80 @@ class ProfileStore {
 }
 
 
+/**
+ * The profile heading of a per-profile tab (Rate Limits, Model Mapping): the selected
+ * profile's name is the title, and clicking it opens the list of profiles.
+ * `stats(profile)` returns [count, singular noun] pairs shown beside the title.
+ */
+class ProfileSwitcher {
+    constructor(root, { label, hint, stats = () => [], onSelect }) {
+        this._root = root;
+        this._label = label;
+        this._hint = hint;
+        this._stats = stats;
+        this._onSelect = onSelect;
+        this.value = null;
+        root?.addEventListener('click', e => {
+            const opt = e.target.closest('[data-profile-id]');
+            if (!opt) return;
+            const id = parseInt(opt.dataset.profileId, 10);
+            if (id === this.value) return;
+            this.value = id;
+            this.refresh();
+            this._onSelect(id);
+        });
+    }
+
+    /** Rebuild from the profile list, keeping `selectedId` when it still exists. */
+    async render(selectedId) {
+        const store = window.ProfileStore;
+        await store.list();
+        this.value = store.byId(selectedId) ? Number(selectedId) : store.DEFAULT_ID;
+        this.refresh();
+        return this.value;
+    }
+
+    refresh() {
+        if (!this._root) return;
+        const esc = window.UIUtils?.escapeHtml || (s => s);
+        const profiles = window.ProfileStore._profiles || [];
+        const current = window.ProfileStore.byId(this.value);
+        const plural = (n, noun) => `<span><strong>${n}</strong>${noun}${n === 1 ? '' : 's'}</span>`;
+        const options = profiles.map(p => {
+            const on = p.id === this.value;
+            return `
+            <li><button type="button" class="dropdown-item profile-switcher-option${on ? ' is-current' : ''}"
+                data-profile-id="${p.id}"${on ? ' aria-current="true"' : ''}>
+                <i class="fas fa-check"></i>
+                <span class="profile-switcher-option-name">${esc(p.name)}</span>
+                <span class="profile-switcher-option-count">${p.member_count} member${p.member_count === 1 ? '' : 's'}</span>
+                ${p.description ? `<span class="profile-switcher-option-desc">${esc(p.description)}</span>` : ''}
+            </button></li>`;
+        }).join('');
+        const stats = current ? this._stats(current).map(([n, noun]) => plural(n, noun)).join('') : '';
+        this._root.innerHTML = `
+                <span class="profile-switcher-label">${esc(this._label)}</span>
+                <div class="dropdown">
+                    <button type="button" class="profile-switcher-toggle" data-bs-toggle="dropdown"
+                        aria-expanded="false" aria-label="${esc(this._label)}: ${esc(current?.name || '')}. Change profile">
+                        <span class="profile-switcher-name">${esc(current?.name || '—')}</span>
+                        <i class="fas fa-chevron-down"></i>
+                    </button>
+                    <ul class="dropdown-menu profile-switcher-menu">
+                        ${options}
+                        <li><hr class="dropdown-divider"></li>
+                        <li><button type="button" class="dropdown-item profile-switcher-manage" onclick="showTab('profiles')">
+                            <i class="fas fa-id-badge"></i>Manage profiles</button></li>
+                    </ul>
+                </div>
+                <div class="profile-switcher-meta">
+                    <p class="profile-switcher-hint">${esc(this._hint)}</p>
+                    ${stats ? `<div class="profile-switcher-stats">${stats}</div>` : ''}
+                </div>`;
+    }
+}
+
+
 class ProfileManager {
     constructor() {
         this._modal = null;
@@ -437,4 +511,5 @@ class ProfileManager {
 }
 
 window.ProfileStore = new ProfileStore();
+window.ProfileSwitcher = ProfileSwitcher;
 window.ProfileManager = new ProfileManager();

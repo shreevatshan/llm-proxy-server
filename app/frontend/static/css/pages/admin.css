@@ -1753,21 +1753,180 @@ input:checked + .model-toggle-slider:before {
 
 /* ===== User profiles ===== */
 
-/* Profile picker shown above per-profile tabs (Rate Limits, Model Mapping). */
-.profile-bar {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    padding: 0.75rem 1rem;
-    border: 1px solid var(--border-color);
-    border-left: 4px solid var(--accent-500);
-    border-radius: 0.5rem;
+/* Profile switcher heading the per-profile tabs (Rate Limits, Model Mapping). The
+   profile's name is the tab's title, set in the name hue so it reads as the scope
+   everything below it belongs to; the hairline separates it from what it governs. */
+.profile-switcher {
+    padding-bottom: 1.25rem;
+    margin-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border-color);
 }
 
-.profile-bar .form-select {
-    width: auto;
-    min-width: 200px;
+.profile-switcher-label {
+    display: block;
+    margin-bottom: 0.25rem;
+    font-size: var(--text-sm);
+    color: var(--mono-text-secondary);
+}
+
+/* Pulled left by its padding so the name lines up with the label above it. */
+.profile-switcher-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.75rem;
+    max-width: 100%;
+    margin-left: -0.5rem;
+    padding: 0.125rem 0.5rem;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: var(--radius-md);
+    color: var(--mono-text-name);
+    font-family: var(--font-family-display);
+    font-size: 1.5rem;
+    font-weight: 600;
+    line-height: 1.2;
+    letter-spacing: -0.015em;
+    cursor: pointer;
+}
+
+.profile-switcher-toggle:hover,
+.profile-switcher-toggle[aria-expanded="true"] {
+    background: var(--mono-2);
+    border-color: var(--mono-5);
+}
+
+.profile-switcher-toggle:focus-visible {
+    outline: 2px solid var(--accent-500);
+    outline-offset: 2px;
+}
+
+.profile-switcher-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.profile-switcher-toggle .fa-chevron-down {
+    flex: 0 0 auto;
+    font-size: 0.875rem;
+    color: var(--mono-text-secondary);
+    transition: transform 0.15s ease;
+}
+
+.profile-switcher-toggle[aria-expanded="true"] .fa-chevron-down {
+    transform: rotate(180deg);
+}
+
+/* Hint, then the profile's counts after a divider, on one line under the name. */
+.profile-switcher-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.25rem 1rem;
+    margin-top: 0.375rem;
+    font-size: var(--text-sm);
+    color: var(--mono-text-secondary);
+}
+
+.profile-switcher-hint {
+    margin: 0;
+}
+
+.profile-switcher-stats {
+    display: flex;
+    gap: 1rem;
+    padding-left: 1rem;
+    border-left: 1px solid var(--mono-5);
+}
+
+.profile-switcher-stats strong {
+    margin-right: 0.375rem;
+    font-weight: 600;
+}
+
+/* The counts wrap under the hint here, so the divider would lead nothing. */
+@media (max-width: 768px) {
+    .profile-switcher-stats {
+        padding-left: 0;
+        border-left: none;
+    }
+}
+
+.profile-switcher-menu {
+    min-width: 20rem;
+    max-width: min(28rem, calc(100vw - 2rem));
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 0.375rem;
+}
+
+/* check | name | member count, with the description under the name */
+.profile-switcher-option {
+    display: grid;
+    grid-template-columns: 1rem minmax(0, 1fr) auto;
+    column-gap: 0.625rem;
+    align-items: baseline;
+    padding: 0.5rem 0.625rem;
+    border-radius: var(--radius-md);
+    white-space: normal;
+}
+
+.profile-switcher-option .fa-check {
+    visibility: hidden;
+    font-size: 0.75rem;
+}
+
+.profile-switcher-option.is-current .fa-check {
+    visibility: visible;
+    color: var(--mono-text-name);
+}
+
+.profile-switcher-option-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+    color: var(--mono-text-primary);
+}
+
+.profile-switcher-option.is-current .profile-switcher-option-name {
+    color: var(--mono-text-name);
+}
+
+.profile-switcher-option-count {
+    font-size: 0.75rem;
+    color: var(--mono-text-secondary);
+}
+
+/* width: 0 keeps a long description from widening the count column it spans;
+   min-width then stretches it back across both columns. */
+.profile-switcher-option-desc {
+    grid-column: 2 / 4;
+    width: 0;
+    min-width: 100%;
+    font-size: 0.75rem;
+    color: var(--mono-text-secondary);
+}
+
+.profile-switcher-manage {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    padding: 0.5rem 0.625rem;
+    border-radius: var(--radius-md);
+    font-size: var(--text-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .profile-switcher-toggle .fa-chevron-down {
+        transition: none;
+    }
+}
+
+@media (max-width: 576px) {
+    .profile-switcher-toggle {
+        font-size: 1.25rem;
+    }
 }
 
 /* accent-500 is white in the monochrome palette, so the text must be dark */

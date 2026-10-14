@@ -26,13 +26,24 @@ class ModelAliasManager {
         // The profile whose mappings are shown. Each profile has its own list; its
         // members are mapped with that list alone.
         this._profileId = window.ProfileStore.DEFAULT_ID;
+        this._switcher = new window.ProfileSwitcher(document.getElementById('model-alias-switcher'), {
+            label: 'Model mappings for',
+            hint: 'Mappings for members of this profile only. Other profiles have their own lists.',
+            // The list shown is fresher than the profile's alias_count once a mapping is saved.
+            stats: p => [
+                [p.member_count, 'member'],
+                [p.id === this._aliasesFor ? this.aliases.length : p.alias_count, 'mapping'],
+            ],
+            onSelect: id => this.setScope(id),
+        });
+        this._aliasesFor = null;
         document.addEventListener('profiles:changed', () => this._onProfilesChanged());
     }
 
     async _onProfilesChanged() {
         const before = this._profileId;
         await this._fillScope();
-        // The shown profile was deleted and the picker fell back to Default: show
+        // The shown profile was deleted and the switcher fell back to Default: show
         // Default's mappings, not the deleted profile's.
         if (this._profileId !== before) await this.setScope(this._profileId);
     }
@@ -48,25 +59,13 @@ class ModelAliasManager {
     }
 
     async _fillScope() {
-        const sel = document.getElementById('model-alias-scope');
-        await window.ProfileStore.fillSelect(sel, { selectedId: this._profileId, showCounts: false });
-        if (sel && sel.value) this._profileId = parseInt(sel.value, 10);
-        if (!window.ProfileStore.byId(this._profileId)) this._profileId = window.ProfileStore.DEFAULT_ID;
-        this._syncScopeHint();
-    }
-
-    _syncScopeHint() {
-        const hint = document.getElementById('model-alias-scope-hint');
-        if (!hint) return;
-        const p = window.ProfileStore.byId(this._profileId);
-        const esc = window.UIUtils?.escapeHtml || (v => v);
-        hint.innerHTML = p
-            ? `Mappings for members of <strong>${esc(p.name)}</strong> only. Other profiles have their own lists.`
-            : '';
+        this._profileId = await this._switcher.render(this._profileId);
     }
 
     async setScope(value) {
         this._profileId = value ? parseInt(value, 10) : window.ProfileStore.DEFAULT_ID;
+        this._switcher.value = this._profileId;
+        this._switcher.refresh();
         window.ProfileStore.select('model-mapping', this._profileId);
         this._resetForm();
         this._search = '';
@@ -74,7 +73,6 @@ class ModelAliasManager {
         if (search) search.value = '';
         const out = document.getElementById('model-alias-test-result');
         if (out) out.innerHTML = '';
-        this._syncScopeHint();
         await this._loadAliases();
     }
 
@@ -86,10 +84,13 @@ class ModelAliasManager {
     async _loadAliases() {
         const tbody = document.getElementById('model-aliases-tbody');
         if (!tbody) return;
+        const profileId = this._profileId;
         try {
             const response = await fetch(`/admin/model-aliases${this._scopeQuery()}`, { credentials: 'include' });
             if (!response.ok) throw new Error('load failed');
             this.aliases = await response.json();
+            this._aliasesFor = profileId;
+            this._switcher.refresh();
             this._render();
         } catch (_) {
             tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Failed to load mappings.</td></tr>';

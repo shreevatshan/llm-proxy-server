@@ -149,11 +149,9 @@ function showTab(tabName) {
         window.UsageManager?.stopAutoRefresh();
     }
 
-    // Load rate limits when switching to rate-limits tab; stop polling when leaving
+    // Load rate limits when switching to rate-limits tab
     if (tabName === 'rate-limits') {
         window.RateLimitManager?.load();
-    } else {
-        window.RateLimitManager?.stopAutoRefresh();
     }
 
     if (tabName === 'model-mapping') {

@@ -26,26 +26,26 @@
     <button class="tab-button" onclick="showTab('profiles')">
         <i class="fas fa-id-badge"></i> Profiles
     </button>
-    <button class="tab-button" onclick="showTab('providers')">
-        <i class="fas fa-server"></i> Providers
-    </button>
-    <button class="tab-button" onclick="showTab('models')">
-        <i class="fas fa-cubes"></i> Models
-    </button>
-    <button class="tab-button" onclick="showTab('requests')">
-        <i class="fas fa-satellite-dish"></i> Active Requests
-    </button>
-    <button class="tab-button" onclick="showTab('usage')">
-        <i class="fas fa-chart-bar"></i> Usage
-    </button>
     <button class="tab-button" onclick="showTab('rate-limits')">
         <i class="fas fa-tachometer-alt"></i> Rate Limits
     </button>
     <button class="tab-button" onclick="showTab('model-mapping')">
         <i class="fas fa-map-signs"></i> Model Mapping
     </button>
+    <button class="tab-button" onclick="showTab('providers')">
+        <i class="fas fa-server"></i> Providers
+    </button>
+    <button class="tab-button" onclick="showTab('models')">
+        <i class="fas fa-cubes"></i> Models
+    </button>
     <button class="tab-button" onclick="showTab('websearch')">
         <i class="fas fa-magnifying-glass"></i> Web Search
+    </button>
+    <button class="tab-button" onclick="showTab('requests')">
+        <i class="fas fa-satellite-dish"></i> Active Requests
+    </button>
+    <button class="tab-button" onclick="showTab('usage')">
+        <i class="fas fa-chart-bar"></i> Usage
     </button>
 </div>
 
@@ -540,13 +540,8 @@
 
 <!-- Rate Limits Section -->
 <div class="section tab-content" id="rate-limits-tab" style="display: none;">
-    <!-- Profile picker: every pane below edits this profile's limits -->
-    <div class="profile-bar mb-3">
-        <label for="rl-profile-select" class="form-label mb-0 fw-semibold"><i class="fas fa-id-badge me-1"></i>Profile</label>
-        <select id="rl-profile-select" class="form-select form-select-sm"
-            onchange="window.RateLimitManager?.onProfileChange(this.value)"></select>
-        <span class="text-muted small">Limits apply to every member of the selected profile. Empty means unlimited.</span>
-    </div>
+    <!-- Profile switcher: every pane below edits this profile's limits -->
+    <div class="profile-switcher" id="rl-profile-switcher"></div>
 
     <!-- Sub-tab nav -->
     <div class="subtab-navigation mb-4" id="rateLimitSubTabs" role="tablist">
@@ -566,8 +561,7 @@
         <!-- Profile overall limits -->
         <div class="card mb-4">
             <div class="card-header d-flex align-items-center justify-content-between">
-                <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Overall limits — <span id="rl-profile-title"></span>
-                    <span class="text-muted small fw-normal ms-2" id="rl-profile-members"></span></h5>
+                <h5 class="mb-0"><i class="fas fa-gauge-high me-2"></i>Overall limits</h5>
                 <button class="btn btn-primary btn-sm" onclick="window.RateLimitManager?.saveProfileLimits()">
                     <i class="fas fa-save me-1"></i>Save
                 </button>
@@ -587,39 +581,6 @@
             </div>
         </div>
 
-        <!-- Members and live usage -->
-        <div class="card">
-            <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                <div class="d-flex align-items-center gap-2">
-                    <h5 class="mb-0 me-4"><i class="fas fa-users me-2"></i>Members</h5>
-                    <div class="position-relative flex-shrink-0" style="width: 240px;">
-                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
-                        <input type="text" id="rl-user-search" class="form-control form-control-sm ps-5"
-                            placeholder="Search users"
-                            oninput="window.RateLimitManager?.filterUsers(this.value)">
-                    </div>
-                </div>
-                <button class="btn btn-outline-secondary btn-sm" onclick="window.RateLimitManager?.load()">
-                    <i class="fas fa-sync-alt me-1"></i>Refresh
-                </button>
-            </div>
-            <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead>
-                            <tr>
-                                <th>User</th>
-                                <th>Requests this minute</th>
-                                <th>Requests today</th>
-                            </tr>
-                        </thead>
-                        <tbody id="rate-limits-tbody">
-                            <tr><td colspan="3" class="text-center text-muted py-4">Loading…</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
     </div>
 
     <!-- Sub-pane: Model Groups -->
@@ -985,12 +946,8 @@
 
 <!-- Model Mapping Section -->
 <div class="section tab-content" id="model-mapping-tab" style="display: none;">
-    <div class="profile-bar mb-3">
-        <label for="model-alias-scope" class="form-label mb-0 fw-semibold"><i class="fas fa-id-badge me-1"></i>Mappings for</label>
-        <select id="model-alias-scope" class="form-select form-select-sm"
-            onchange="window.ModelAliasManager?.setScope(this.value)"></select>
-        <span id="model-alias-scope-hint" class="text-muted small"></span>
-    </div>
+    <!-- Profile switcher: each profile has its own mapping list -->
+    <div class="profile-switcher" id="model-alias-switcher"></div>
     <div class="card mb-4">
         <div class="card-header"><h5 class="mb-0" id="model-alias-form-title"><i class="fas fa-plus me-2"></i>Add or Update Mapping</h5></div>
         <div class="card-body">
