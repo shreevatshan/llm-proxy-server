@@ -29,11 +29,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.admin import AdminUser
-from app.auth.database import allocate_pool_id, get_db, get_user_by_username
+from app.auth.database import allocate_pool_id, get_db, get_user_by_username, load_pool_settings
 from app.auth.middleware import get_current_active_user
 from app.auth.models import (
-    MAX_POOL_MEMBERS,
-    AdminPoolResponse, MyPoolResponse, PoolCreate, PoolInvitationResponse,
+    AdminPoolResponse, PoolSettingsResponse, MyPoolResponse, PoolCreate, PoolInvitationResponse,
     PoolInviteCreate, PoolLeavePreview, PoolMemberResponse, PoolMemberScope,
     PoolMembershipInterval, PoolScopeResponse, PoolSummary, PoolUpdate,
     RequestPool, RequestPoolInvitation, RequestPoolLedger, RequestPoolMember,
@@ -53,6 +52,37 @@ POOL_DESCRIPTION_MAX_LENGTH = 256
 # --------------------------------------------------------------------------- #
 # Shared helpers
 # --------------------------------------------------------------------------- #
+
+
+def effective_pool_limits(
+    max_members_override: Optional[int], share_pct_override: Optional[int],
+    settings: PoolSettingsResponse,
+) -> Tuple[int, Optional[int]]:
+    """(max_members, max_member_share_pct) in force for one pool.
+
+    A pool's own override wins; NULL inherits the admin's global PoolSettings. Pure, so
+    a caller rendering many pools loads the settings once and passes them in.
+    """
+    max_members = max_members_override if max_members_override is not None else settings.max_members
+    share_pct = share_pct_override if share_pct_override is not None else settings.max_member_share_pct
+    return max_members, share_pct
+
+
+async def _pool_limits(db: AsyncSession, pool_id: int) -> Tuple[int, Optional[int]]:
+    """effective_pool_limits for one pool, read fresh from the database.
+
+    Selects the override columns rather than reading them off a loaded RequestPool: the
+    session does not expire on commit, so an object loaded before an admin's edit would
+    keep serving the old override.
+    """
+    row = (await db.execute(
+        select(RequestPool.max_members, RequestPool.max_member_share_pct)
+        .where(RequestPool.id == pool_id)
+    )).one_or_none()
+    settings = await load_pool_settings(db)
+    if row is None:
+        return effective_pool_limits(None, None, settings)
+    return effective_pool_limits(row[0], row[1], settings)
 
 
 # --------------------------------------------------------------------------- #
@@ -332,9 +362,12 @@ def _active_scopes(detail: dict, members: List[tuple]) -> List[tuple]:
 
 def _build_scope_rows(
     detail: dict, members: List[tuple], scopes: List[tuple],
-    inactive: Optional[Set[int]] = None,
+    inactive: Optional[Set[int]] = None, pool_id: Optional[int] = None,
 ):
     """Return (pool-level scope rows, per-member scope rows keyed by user_id).
+
+    With `pool_id`, each member row also carries their share cap on that tier, from the
+    same rate_limit_tracker.member_share_cap the limiter enforces.
 
     `inactive` are members whose account is deactivated. Their limit is left out of the
     pool total, because enforcement leaves it out too -- a disabled account cannot send,
@@ -342,6 +375,8 @@ def _build_scope_rows(
     traffic was real. Their own per-member row still shows their own limit, so the tab
     explains where the missing headroom went rather than silently dropping it.
     """
+    from app.rate_limit import rate_limit_tracker
+
     inactive = inactive or set()
     pool_scopes: List[PoolScopeResponse] = []
     per_member: dict = {uid: [] for uid, _ in members}
@@ -375,6 +410,8 @@ def _build_scope_rows(
                 scope_kind=scope_kind, scope_id=scope_id, name=name,
                 limit=limit, sent=sent, charged=charged, carry=carry,
                 net_contribution=0 if limit is None else limit - charged,
+                share_cap=rate_limit_tracker.member_share_cap(pool_id, limit, pool_limit),
+                share_used=max(0, sent + carry),
             ))
 
     return pool_scopes, per_member
@@ -397,7 +434,7 @@ async def _render_pool(db: AsyncSession, pool: RequestPool) -> tuple:
     scopes = _relevant_scopes()
     inactive = {r.user_id for r in rows
                 if r.user_id in users and not users[r.user_id].is_active}
-    pool_scopes, per_member = _build_scope_rows(detail, members, scopes, inactive)
+    pool_scopes, per_member = _build_scope_rows(detail, members, scopes, inactive, pool.id)
 
     member_responses = [
         PoolMemberResponse(
@@ -684,10 +721,11 @@ async def create_invite(
         )
 
     current_members = await _member_rows(db, pool.id)
-    if len(current_members) >= MAX_POOL_MEMBERS:
+    max_members, _pct = await _pool_limits(db, pool.id)
+    if len(current_members) >= max_members:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"This pool is full ({MAX_POOL_MEMBERS} members).",
+            detail=f"This pool is full ({max_members} members).",
         )
 
     existing = (await db.execute(
@@ -939,15 +977,17 @@ async def accept_invite(
     pool = await _get_pool(db, invite.pool_id)
 
     # Everything from the member count to the commit runs under the pool lock. The count
-    # is the only thing standing between MAX_POOL_MEMBERS and two pending invites to a
-    # full-but-one pool both accepting -- there is no DB constraint behind it -- so
-    # reading it outside the lock would leave the check advisory.
+    # is the only thing standing between the pool's max_members and two pending invites
+    # to a full-but-one pool both accepting -- there is no DB constraint behind it -- so
+    # reading it outside the lock would leave the check advisory. The cap itself is read
+    # here too, so an admin's override committed under the same lock is never missed.
     async with pool_guard(pool.id):
         existing = await _member_rows(db, pool.id)
-        if len(existing) >= MAX_POOL_MEMBERS:
+        max_members, _pct = await _pool_limits(db, pool.id)
+        if len(existing) >= max_members:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"This pool is full ({MAX_POOL_MEMBERS} members).",
+                detail=f"This pool is full ({max_members} members).",
             )
 
         users = await _users_by_id(db, [r.user_id for r in existing])
@@ -1281,6 +1321,7 @@ async def get_my_pool(
     )).scalars().all())
 
     owner_name = next((m.username for m in member_responses if m.is_owner), None)
+    max_members, share_pct = await _pool_limits(db, pool.id)
 
     return MyPoolResponse(
         pool=PoolSummary(id=pool.id, name=pool.name, member_count=len(member_responses)),
@@ -1292,6 +1333,8 @@ async def get_my_pool(
         if_i_leave_now=await _leave_preview(db, pool, user.id),
         incoming_invites=await _hydrate_invites(db, incoming),
         outgoing_invites=await _hydrate_invites(db, outgoing),
+        max_members=max_members,
+        max_member_share_pct=share_pct,
     )
 
 
@@ -1724,17 +1767,53 @@ async def admin_list_pools(db: AsyncSession) -> List[AdminPoolResponse]:
     pools = list((await db.execute(
         select(RequestPool).order_by(RequestPool.name)
     )).scalars().all())
+    settings = await load_pool_settings(db)
 
     out = []
     for pool in pools:
         members, scopes, _detail, _users = await _render_pool(db, pool)
+        max_members, share_pct = effective_pool_limits(
+            pool.max_members, pool.max_member_share_pct, settings,
+        )
         out.append(AdminPoolResponse(
             id=pool.id, name=pool.name, description=pool.description,
             owner_username=next((m.username for m in members if m.is_owner), None),
             created_at=pool.created_at,
             members=members, scopes=scopes,
+            member_count=len(members),
+            max_members_override=pool.max_members,
+            max_member_share_pct_override=pool.max_member_share_pct,
+            effective_max_members=max_members,
+            effective_max_member_share_pct=share_pct,
         ))
     return out
+
+
+async def admin_set_pool_limits(
+    db: AsyncSession, pool_id: int, max_members: Optional[int], share_pct: Optional[int],
+    fields: Set[str],
+) -> RequestPool:
+    """Write a pool's overrides. Only fields named in `fields` change; None clears one.
+
+    Committed under the pool lock, the same lock the accept path reads max_members
+    under, so a join can never count against a cap that changes beneath it. Nobody is
+    removed when max_members drops below the current size: the pool just stays closed
+    to new members until it is back under.
+    """
+    pool = await _get_pool(db, pool_id)
+    async with pool_guard(pool_id):
+        try:
+            if "max_members" in fields:
+                pool.max_members = max_members
+            if "max_member_share_pct" in fields:
+                pool.max_member_share_pct = share_pct
+            pool.updated_at = datetime.utcnow()
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    await db.refresh(pool)
+    return pool
 
 
 async def admin_delete_pool(db: AsyncSession, pool_id: int) -> str:

@@ -14,7 +14,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileInstanceGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileInstanceGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -651,6 +651,37 @@ async def load_user_management_settings(db: AsyncSession) -> UserManagementSetti
 async def is_self_delete_allowed(db: AsyncSession) -> bool:
     """Whether regular users may delete their own account (allowed until an admin says otherwise)."""
     return (await load_user_management_settings(db)).allow_self_delete
+
+
+async def get_pool_settings(db: AsyncSession) -> Optional[PoolSettings]:
+    """Return the singleton pool settings row (id=1), or None if never saved."""
+    result = await db.execute(select(PoolSettings).where(PoolSettings.id == 1))
+    return result.scalar_one_or_none()
+
+
+async def upsert_pool_settings(
+    db: AsyncSession, max_members: int, max_member_share_pct: Optional[int], admin_username: str
+) -> PoolSettings:
+    """Create or update the pool settings singleton."""
+    row = await get_pool_settings(db)
+    if row is None:
+        row = PoolSettings(id=1)
+        db.add(row)
+    row.max_members = max_members
+    row.max_member_share_pct = max_member_share_pct
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def load_pool_settings(db: AsyncSession) -> PoolSettingsResponse:
+    """Effective pool settings: the saved row, or the model defaults if never saved."""
+    row = await get_pool_settings(db)
+    if row is None:
+        return PoolSettingsResponse()
+    return PoolSettingsResponse.model_validate(row)
 
 
 async def get_websearch_settings(db: AsyncSession) -> Optional[WebSearchSettings]:
@@ -2991,6 +3022,22 @@ async def _run_auto_migrations():
                         await conn.execute(text(ddl))
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add websearch backend columns: {e}")
+
+        # Per-pool admin overrides of PoolSettings. NULL inherits the global value, so
+        # existing pools keep today's behaviour.
+        try:
+            result = await conn.execute(text("PRAGMA table_info(request_pools)"))
+            columns = [row[1] for row in result.fetchall()]
+            if columns:
+                for name, ddl in (
+                    ('max_members', "ALTER TABLE request_pools ADD COLUMN max_members INTEGER"),
+                    ('max_member_share_pct', "ALTER TABLE request_pools ADD COLUMN max_member_share_pct INTEGER"),
+                ):
+                    if name not in columns:
+                        logger.info(f"Auto-migration: Adding '{name}' column to request_pools")
+                        await conn.execute(text(ddl))
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not add request_pools override columns: {e}")
 
         # Migrate api_version → discovery_api_version and drop legacy Azure AD columns.
         try:

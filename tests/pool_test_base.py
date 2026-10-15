@@ -92,6 +92,8 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         self.tracker._pool_locks = {}
         self.tracker._carries = {}
         self.tracker._carries_date = None
+        self.tracker._pool_share_default = None
+        self.tracker._pool_share_override = {}
         from app.profiles import profile_registry
         profile_registry.reset()
         # User ids repeat across tests, so per-minute counts must not carry over.

@@ -1968,3 +1968,42 @@ input:checked + .model-toggle-slider:before {
     outline: none;
 }
 
+
+/* ── Pools tab: settings form ──────────────────────────────────────────── */
+/* Labels, controls and hints on separate grid rows, so the Save button sits in the
+   controls' row and stretches to their height regardless of how the hints wrap. */
+.pool-settings-form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    grid-template-areas:
+        "members-label share-label ."
+        "members-input share-input save"
+        "members-hint  share-hint  .";
+    column-gap: 1rem;
+    max-width: 1260px;
+}
+.pool-settings-form .form-label { margin-bottom: 0.5rem; }
+.pool-settings-form .form-text { margin-top: 0.4rem; }
+.pool-settings-form .ps-members-label { grid-area: members-label; }
+.pool-settings-form .ps-members-input { grid-area: members-input; }
+.pool-settings-form .ps-members-hint  { grid-area: members-hint; }
+.pool-settings-form .ps-share-label   { grid-area: share-label; }
+.pool-settings-form .ps-share-input   { grid-area: share-input; }
+.pool-settings-form .ps-share-hint    { grid-area: share-hint; }
+.pool-settings-form .ps-save {
+    grid-area: save; align-self: stretch;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding-inline: 1.5rem;
+}
+
+@media (max-width: 768px) {
+    .pool-settings-form {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas:
+            "members-label" "members-input" "members-hint"
+            "share-label" "share-input" "share-hint"
+            "save";
+    }
+    .pool-settings-form .ps-share-label { margin-top: 1rem; }
+    .pool-settings-form .ps-save { justify-self: start; margin-top: 1rem; }
+}

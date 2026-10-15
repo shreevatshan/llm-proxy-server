@@ -256,11 +256,20 @@ class QuotasManager {
         if (s.rpd_limit === null || s.rpd_limit === undefined) return '';
         if (s.rpd_remaining === null || s.rpd_remaining === undefined) return '';
         // Flag near-exhaustion by weight + a glyph (no color — the palette is monochrome).
-        const critical = s.rpd_limit > 0 && (s.rpd_count / s.rpd_limit) >= 0.9;
+        // With a per-member share cap, rpd_remaining is already the smaller of what the
+        // pool and the user's share allow, so "critical" follows whichever binds.
+        const capped = s.share_cap !== null && s.share_cap !== undefined;
+        const critical = capped
+            ? s.share_cap > 0 && (Number(s.share_used || 0) / s.share_cap) >= 0.9
+            : s.rpd_limit > 0 && (s.rpd_count / s.rpd_limit) >= 0.9;
         const icon = critical ? '<i class="fas fa-triangle-exclamation"></i>' : '';
+        const share = capped
+            ? ` · your share ${Number(s.share_used || 0).toLocaleString()} / ${this._fmt(s.share_cap)}`
+            : '';
         return `
-            <div class="quota-left${critical ? ' is-critical' : ''}">
-                ${icon}${Number(s.rpd_remaining).toLocaleString()} left today
+            <div class="quota-left${critical ? ' is-critical' : ''}"${capped
+                ? ' title="Pool members may each use only part of the pool\'s daily quota"' : ''}>
+                ${icon}${Number(s.rpd_remaining).toLocaleString()} left today${share}
             </div>
         `;
     }

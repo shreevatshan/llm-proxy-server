@@ -262,11 +262,14 @@ class PoolManager {
     // card — and the active button paints its own background because the indicator
     // is positioned in pixels and measures 0 until the Pool tab is visible.
     //
-    // "N of 25" replaces the old "this pool is full" footer: the same fact, carried
-    // continuously instead of appearing only at the boundary.
+    // "N of max" replaces the old "this pool is full" footer: the same fact, carried
+    // continuously instead of appearing only at the boundary. The max is the admin's
+    // setting for this pool, which the server always sends. A per-member share cap, when
+    // the admin has set one, rides alongside it.
     _panelBarHtml(data) {
         const count = (data.members || []).length;
-        const max = data.max_members || 25;
+        const max = data.max_members;
+        const share = data.max_member_share_pct;
         const tab = (key, label) => `
             <button type="button" class="pool-view-btn${this._poolTab === key ? ' is-active' : ''}"
                     data-act="pooltab" data-pooltab="${key}"
@@ -279,7 +282,8 @@ class PoolManager {
                     ${tab('members', 'Members')}
                     ${tab('invite', 'Invite')}
                 </div>
-                <span class="pool-eyebrow">${count} of ${max}</span>
+                <span class="pool-eyebrow">${count} of ${max}${share !== null && share !== undefined && share < 100
+                    ? ` · up to ${share}% each` : ''}</span>
             </div>
         `;
     }
@@ -384,7 +388,7 @@ class PoolManager {
     // they type, so a running total is a label for something already on screen. Someone
     // filtering by ear cannot, which is why the live region stays.
     _directoryHtml(data) {
-        const full = (data.members || []).length >= (data.max_members || 25);
+        const full = (data.members || []).length >= data.max_members;
         return `
             <div class="pool-invite-pane">
                 <div class="pool-search">
@@ -504,7 +508,7 @@ class PoolManager {
     _poolIsFull() {
         const data = this._cache;
         if (!data) return false;
-        return (data.members || []).length >= (data.max_members || 25);
+        return (data.members || []).length >= data.max_members;
     }
 
     async _loadDirectory() {
@@ -766,7 +770,7 @@ class PoolManager {
             row.can_cancel = true;
         }
         // Nothing outside this pane depends on a pending invite — the roster and the
-        // "N of 25" count only move when someone actually joins — so the row is the
+        // "N of max" count only move when someone actually joins — so the row is the
         // whole update. Re-rendering the card here would cost a DOM replacement to
         // show the reader the same thing back.
         this._renderDirectory();

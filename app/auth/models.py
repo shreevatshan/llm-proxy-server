@@ -346,6 +346,23 @@ class UserManagementSettings(Base):
     updated_by = Column(String(50), nullable=True)
 
 
+class PoolSettings(Base):
+    """Admin-managed request-pool policy. Single row (id=1); absent row = defaults.
+
+    Both values are defaults every pool inherits; RequestPool carries a nullable
+    override of each.
+    """
+    __tablename__ = "pool_settings"
+
+    id = Column(Integer, primary_key=True)  # always 1
+    max_members = Column(Integer, default=25, nullable=False)  # MAX_POOL_MEMBERS, defined below
+    # Most of a pool's daily limit, in percent, one member may consume on any scope.
+    # NULL means no per-member cap -- any member may spend the whole pool.
+    max_member_share_pct = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+
 class WebSearchSettings(Base):
     """Web search interception settings. Single row (id=1).
 
@@ -744,10 +761,13 @@ class ProviderCredentials(Base):
 # Request pooling: a group of users sharing one daily request quota (RPD only)
 # ---------------------------------------------------------------------------
 
-# Cap on pool size. Mirrors the MAX_BULK_USER_IDS precedent in app/routes/admin.py:
-# a bound that keeps a single settlement's apportionment loop (O(members^2) in the
-# worst case, when every member caps out) trivially cheap.
+# Default cap on pool size, used until an admin saves PoolSettings. The admin can
+# move it (globally or per pool) up to POOL_MEMBERS_HARD_CAP, the bound that keeps a
+# single settlement's apportionment loop (O(members^2) in the worst case, when every
+# member caps out) cheap -- the MAX_BULK_USER_IDS precedent in app/routes/admin.py.
 MAX_POOL_MEMBERS = 25
+POOL_MEMBERS_HARD_CAP = 100
+POOL_MEMBERS_MIN = 2
 
 # Invitation states. 'superseded' is written when the invitee joins some other pool,
 # so a stale invite can never later move them silently.
@@ -773,6 +793,9 @@ class RequestPool(Base):
     name = Column(String(64), unique=True, nullable=False)
     description = Column(String(256), nullable=True)
     owner_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # Admin overrides of PoolSettings for this pool alone; NULL inherits the global value.
+    max_members = Column(Integer, nullable=True)
+    max_member_share_pct = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1448,6 +1471,10 @@ class QuotaSectionResponse(BaseModel):
     pooled_from_members: int = 0         # how many members contribute; 0 when unpooled
     carry_adjustment: int = 0            # this user's settlement adjustment inside rpd_count;
                                          # explains a count that doesn't match their own history
+    # Per-member share cap inside a pool: the most of the pooled daily limit this user
+    # may consume. null when unpooled or uncapped. rpd_remaining already accounts for it.
+    share_cap: Optional[int] = None
+    share_used: Optional[int] = None
 
 
 class PoolSummary(BaseModel):
@@ -1491,6 +1518,11 @@ class PoolMemberScope(BaseModel):
     charged: int = 0                      # settled share of the pool's consumption
     carry: int = 0                        # charged - sent; the adjustment the limiter applies
     net_contribution: int = 0             # limit - charged; headroom this member still brings
+    # The per-member share cap: the most of the pool this member may consume on this
+    # tier today. null means uncapped. share_used is max(0, sent + carry) -- the number
+    # the cap is enforced against.
+    share_cap: Optional[int] = None
+    share_used: int = 0
 
 
 class PoolMemberResponse(BaseModel):
@@ -1560,7 +1592,8 @@ class MyPoolResponse(BaseModel):
     if_i_leave_now: List[PoolLeavePreview] = []
     incoming_invites: List[PoolInvitationResponse] = []
     outgoing_invites: List[PoolInvitationResponse] = []
-    max_members: int = MAX_POOL_MEMBERS
+    max_members: int = MAX_POOL_MEMBERS          # effective for this pool
+    max_member_share_pct: Optional[int] = None   # effective for this pool; null = uncapped
 
 
 class AdminPoolResponse(BaseModel):
@@ -1571,9 +1604,73 @@ class AdminPoolResponse(BaseModel):
     created_at: Optional[datetime] = None
     members: List[PoolMemberResponse] = []
     scopes: List[PoolScopeResponse] = []
+    member_count: int = 0
+    # The pool's own overrides (null = inherits) and what actually applies.
+    max_members_override: Optional[int] = None
+    max_member_share_pct_override: Optional[int] = None
+    effective_max_members: int = MAX_POOL_MEMBERS
+    effective_max_member_share_pct: Optional[int] = None
 
     class Config:
         from_attributes = True
+
+
+def _check_pool_max_members(value: Optional[int]) -> Optional[int]:
+    if value is not None and not (POOL_MEMBERS_MIN <= value <= POOL_MEMBERS_HARD_CAP):
+        raise ValueError(
+            f"max_members must be between {POOL_MEMBERS_MIN} and {POOL_MEMBERS_HARD_CAP}"
+        )
+    return value
+
+
+def _check_pool_share_pct(value: Optional[int]) -> Optional[int]:
+    if value is not None and not (0 <= value <= 100):
+        raise ValueError("max_member_share_pct must be between 0 and 100")
+    return value
+
+
+class PoolSettingsResponse(BaseModel):
+    max_members: int = MAX_POOL_MEMBERS
+    max_member_share_pct: Optional[int] = None
+    hard_cap: int = POOL_MEMBERS_HARD_CAP
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PoolSettingsUpdate(BaseModel):
+    """Global pool policy. max_member_share_pct null removes the per-member cap."""
+    max_members: int
+    max_member_share_pct: Optional[int] = None
+
+    @field_validator("max_members")
+    @classmethod
+    def _validate_max_members(cls, v):
+        return _check_pool_max_members(v)
+
+    @field_validator("max_member_share_pct")
+    @classmethod
+    def _validate_share_pct(cls, v):
+        return _check_pool_share_pct(v)
+
+
+class AdminPoolLimitsUpdate(BaseModel):
+    """Per-pool overrides. An omitted field is left alone; an explicit null clears the
+    override so the pool inherits the global value again (see model_fields_set)."""
+    max_members: Optional[int] = None
+    max_member_share_pct: Optional[int] = None
+
+    @field_validator("max_members")
+    @classmethod
+    def _validate_max_members(cls, v):
+        return _check_pool_max_members(v)
+
+    @field_validator("max_member_share_pct")
+    @classmethod
+    def _validate_share_pct(cls, v):
+        return _check_pool_share_pct(v)
 
 
 class MyQuotasResponse(BaseModel):

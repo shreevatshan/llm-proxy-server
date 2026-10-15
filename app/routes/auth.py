@@ -623,6 +623,24 @@ async def get_my_quotas(
             current_user.id, group_id, instance=instance
         )
 
+    async def _share(scope_kind, scope_id, pool_rpd, rpd_remaining):
+        """(share_cap, share_used, rpd_remaining) once the pool's per-member cap applies.
+
+        A member can be stopped by their share before the pool runs dry, so "left today"
+        is whichever of the two runs out first -- what the limiter will actually allow.
+        """
+        if not is_pooled:
+            return None, None, rpd_remaining
+        cap, used = await rate_limit_tracker.member_share_status(
+            current_user.id, current_user.username, scope_kind, scope_id, pool_rpd,
+        )
+        if cap is None:
+            return None, None, rpd_remaining
+        own_left = max(0, cap - used)
+        if rpd_remaining is not None:
+            own_left = min(own_left, rpd_remaining)
+        return cap, used, own_left
+
     # --- Instance-group sections (highest precedence) ---
     instance_group_rows = await list_instance_groups(db)  # eager-loads .members
     for group in instance_group_rows:
@@ -640,6 +658,9 @@ async def get_my_quotas(
         )
         eff_rpd = _pooled_rpd(eff_rpd, group.id, instance=True)
         rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
+        share_cap, share_used, rpd_remaining = await _share(
+            "instance_group", group.id, eff_rpd, rpd_remaining,
+        )
         named_sections.append(QuotaSectionResponse(
             name=group.name, description=group.description,
             rpm_limit=eff_rpm, rpd_limit=eff_rpd,
@@ -650,6 +671,7 @@ async def get_my_quotas(
             carry_adjustment=rate_limit_tracker.carry_for(
                 current_user.id, "instance_group", group.id
             ),
+            share_cap=share_cap, share_used=share_used,
         ))
 
     # --- Model-group sections (exclude models already claimed by an instance group) ---
@@ -668,6 +690,9 @@ async def get_my_quotas(
         )
         eff_rpd = _pooled_rpd(eff_rpd, group.id, instance=False)
         rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
+        share_cap, share_used, rpd_remaining = await _share(
+            "model_group", group.id, eff_rpd, rpd_remaining,
+        )
         named_sections.append(QuotaSectionResponse(
             name=group.name, description=group.description,
             rpm_limit=eff_rpm, rpd_limit=eff_rpd,
@@ -678,6 +703,7 @@ async def get_my_quotas(
             carry_adjustment=rate_limit_tracker.carry_for(
                 current_user.id, "model_group", group.id
             ),
+            share_cap=share_cap, share_used=share_used,
         ))
 
     # Named groups share one visual treatment; order alphabetically.
@@ -688,18 +714,22 @@ async def get_my_quotas(
     other_models = [mid for mid in accessible_ids if mid not in claimed]
     if other_models:
         status_obj = await rate_limit_tracker.get_user_status(current_user.id, current_user.username)
+        share_cap, share_used, rpd_remaining = await _share(
+            "overall", 0, status_obj.rpd_limit, status_obj.rpd_remaining,
+        )
         sections.append(QuotaSectionResponse(
             name="Other Models",
             description="Models not assigned to any group",
             rpm_limit=status_obj.rpm_limit,
             rpd_limit=status_obj.rpd_limit,
             rpd_count=status_obj.rpd_count,
-            rpd_remaining=status_obj.rpd_remaining,
+            rpd_remaining=rpd_remaining,
             models=other_models,
             is_other=True,
             is_pooled=is_pooled,
             pooled_from_members=member_count if is_pooled else 0,
             carry_adjustment=rate_limit_tracker.carry_for(current_user.id, "overall", 0),
+            share_cap=share_cap, share_used=share_used,
         ))
 
     # The pool summary is a header chip, so only the name is needed beyond what the

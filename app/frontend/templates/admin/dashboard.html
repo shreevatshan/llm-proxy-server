@@ -26,6 +26,9 @@
     <button class="tab-button" onclick="showTab('profiles')">
         <i class="fas fa-id-badge"></i> Profiles
     </button>
+    <button class="tab-button" onclick="showTab('pools')">
+        <i class="fas fa-users-rectangle"></i> Pools
+    </button>
     <button class="tab-button" onclick="showTab('rate-limits')">
         <i class="fas fa-tachometer-alt"></i> Rate Limits
     </button>
@@ -249,6 +252,53 @@
                 <tr><td colspan="5" class="text-center text-muted py-4">Loading…</td></tr>
             </tbody>
         </table>
+    </div>
+</div>
+
+<!-- Request Pools Section -->
+<div class="section tab-content" id="pools-tab" style="display: none;">
+    <div class="section-header">
+        <div>
+            <h2 class="section-title">Pool settings</h2>
+            <p class="text-muted small mb-0">Defaults for every pool. A pool can override either value from its
+                <strong>Limits</strong> button below.</p>
+        </div>
+    </div>
+    <!-- A grid rather than a Bootstrap row: labels, controls and hints each get their
+         own track, so Save shares the inputs' row and height whatever the hints wrap to. -->
+    <form class="pool-settings-form" onsubmit="window.PoolAdminManager?.saveSettings(); return false;">
+        <label class="form-label ps-members-label" for="pool-settings-max-members">Max members per pool</label>
+        <input type="number" id="pool-settings-max-members" class="form-control ps-members-input" min="2" max="100" step="1" required>
+        <div class="form-text ps-members-hint" id="pool-settings-max-members-hint">Between 2 and 100.</div>
+
+        <label class="form-label ps-share-label" for="pool-settings-share">Max share per member (%)</label>
+        <input type="number" id="pool-settings-share" class="form-control ps-share-input" min="0" max="100" step="1" placeholder="No cap">
+        <div class="form-text ps-share-hint">Of the pool's daily limit, on each quota (overall and every group). A member
+            always keeps at least their own limit. Blank = no cap.</div>
+
+        <button type="submit" class="btn btn-primary ps-save" id="pool-settings-save">
+            <i class="fas fa-save me-1"></i>Save
+        </button>
+    </form>
+
+    <div class="section-header mt-5">
+        <div>
+            <h2 class="section-title">Pools</h2>
+            <p class="text-muted small mb-0">Click a pool to see its members. Pool usage is under
+                <a href="#" onclick="showTab('usage'); window.UsageManager?.setView('pool'); return false;">Usage › By Pool</a>.</p>
+        </div>
+        <div class="d-flex gap-2 ms-auto">
+            <button type="button" class="btn btn-outline-secondary btn-sm" id="pools-back" style="display:none;"
+                onclick="window.PoolAdminManager?.back()">
+                <i class="fas fa-arrow-left"></i> Back
+            </button>
+            <button class="btn btn-outline-secondary btn-sm" onclick="window.PoolAdminManager?.load()">
+                <i class="fas fa-sync-alt me-1"></i>Refresh
+            </button>
+        </div>
+    </div>
+    <div id="pools-table-container">
+        <p class="text-center text-muted py-4">Loading…</p>
     </div>
 </div>
 
@@ -1184,6 +1234,38 @@
     </div>
 </div>
 
+<!-- Pool Limits (per-pool override) Modal -->
+<div class="modal fade" id="poolLimitsModal" tabindex="-1" aria-labelledby="poolLimitsModalTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <form onsubmit="window.PoolAdminManager?.saveLimits(); return false;">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="poolLimitsModalTitle">Pool limits</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <input type="hidden" id="pool-limits-id">
+                    <p class="text-muted small">Leave a field blank to use the global setting.</p>
+                    <div class="mb-3">
+                        <label class="form-label" for="pool-limits-max-members">Max members</label>
+                        <input type="number" id="pool-limits-max-members" class="form-control" min="2" max="100" step="1">
+                        <div class="form-text" id="pool-limits-members-hint"></div>
+                    </div>
+                    <div class="mb-1">
+                        <label class="form-label" for="pool-limits-share">Max share per member (%)</label>
+                        <input type="number" id="pool-limits-share" class="form-control" min="0" max="100" step="1">
+                        <div class="form-text">Use 100 for no cap on this pool even when the global setting has one.</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary"><i class="fas fa-save me-1"></i>Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <!-- Delete Profile Modal -->
 <div class="modal fade" id="deleteProfileModal" tabindex="-1" aria-labelledby="deleteProfileModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
@@ -1512,6 +1594,7 @@
 <!-- Modular JavaScript files -->
 <script src="/static/js/core/ui-utils.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/profile-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/pool-admin-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/provider-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/provider-forms.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/model-manager.js?v={{ cache_version }}"></script>

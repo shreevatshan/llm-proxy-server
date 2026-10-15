@@ -257,9 +257,10 @@ def _instrument_app(app: FastAPI, name: str, *, excluded_prefixes=()):
 _TRACKED_PREFIXES = ("/v1/", "/openai/deployments/")
 _EXCLUDED_PATHS = ("/v1/messages/count_tokens",)
 
-# Max body size the tracking middleware will buffer purely to sniff the "model"
-# field. Above this, we skip the sniff (audio/image uploads shouldn't be pulled
-# fully into memory here) and rely on the path-based fallback where available.
+# Max non-JSON body size the tracking middleware will buffer purely to sniff the
+# "model" field. Above this, we skip the sniff (audio/image uploads shouldn't be
+# pulled fully into memory here) and rely on the path-based fallback where
+# available. JSON bodies are exempt: the route reads them whole anyway.
 _MAX_SNIFF_BODY_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 
@@ -373,13 +374,19 @@ def _add_request_tracking(app: FastAPI, server_name: str):
 
             # Skip buffering/sniffing very large bodies (e.g. audio/image uploads)
             # to avoid pulling the whole upload into memory just to read one field.
+            # JSON bodies are always sniffed: FastAPI reads and parses them in full
+            # before it runs the auth dependency, so the cap saves no memory there,
+            # and skipping it leaves a large chat request (e.g. one carrying base64
+            # images) on the dashboard with no model and the wrong stream mode
+            # until auth finishes.
             content_length = request.headers.get("content-length")
+            content_type = request.headers.get("content-type", "")
             too_large = (
-                content_length is not None
+                "application/json" not in content_type.lower()
+                and content_length is not None
                 and content_length.isdigit()
                 and int(content_length) > _MAX_SNIFF_BODY_BYTES
             )
-            content_type = request.headers.get("content-type", "")
 
             if not too_large:
                 body_bytes = await request.body()

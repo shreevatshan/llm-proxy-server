@@ -181,7 +181,7 @@
 /* Members and Invite are two lists of people, not two lenses on one list, so they
    get real panes. The track is the usage panel's .pool-view-switch unchanged — one
    control language per card — and the capacity readout sits opposite it, carrying
-   "N of 25" continuously where the old footer only spoke at the limit. */
+   "N of max" continuously where the old footer only spoke at the limit. */
 .pool-panelbar {
     display: flex; align-items: center; justify-content: space-between;
     gap: 9px 18px; flex-wrap: wrap;

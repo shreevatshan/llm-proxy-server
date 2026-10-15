@@ -26,6 +26,7 @@ from app.auth.database import (
     count_usage_requests,
     usage_user_ids_for_pool,
     load_user_management_settings, upsert_user_management_settings,
+    load_pool_settings, upsert_pool_settings,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
     set_group_members, get_model_group_limits,
     list_instance_groups, create_instance_group, update_instance_group, delete_instance_group,
@@ -51,7 +52,7 @@ from app.auth.models import (
     InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupMembersUpdate, InstanceGroupResponse,
     ModelAliasUpsert, ModelAliasResponse, ModelAliasReorder, ModelAliasTestMatch,
     MODEL_ALIAS_API_SURFACES, validate_alias_pattern,
-    AdminPoolResponse,
+    AdminPoolResponse, AdminPoolLimitsUpdate, PoolSettingsResponse, PoolSettingsUpdate,
     WebSearchSettingsResponse, WebSearchSettingsUpdate, WebSearchTestRequest, WebSearchEnginesRequest,
     FOURGET_WEB_SCRAPERS, WEBSEARCH_PROVIDER_LABELS,
 )
@@ -3341,7 +3342,7 @@ async def get_usage(
                     "name": pool["name"],
                     "member_count": len(pool["members"]),
                     # Carried so the delete confirm can name the members. Bounded by
-                    # MAX_POOL_MEMBERS (25), so this is a handful of strings.
+                    # POOL_MEMBERS_HARD_CAP, so this is a handful of strings.
                     "members": pool["members"],
                     "request_count": counts.get(pool_id, 0),
                 }
@@ -3531,6 +3532,66 @@ async def admin_get_pools(
     except Exception as e:
         logger.error(f"Admin pool listing failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to load pools")
+
+
+@router.get("/pools/settings", response_model=PoolSettingsResponse)
+async def admin_get_pool_settings(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Global pool policy: max members per pool and the per-member share cap."""
+    return await load_pool_settings(db)
+
+
+@router.put("/pools/settings", response_model=PoolSettingsResponse)
+async def admin_update_pool_settings(
+    body: PoolSettingsUpdate,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Update the global pool policy every pool without its own override inherits."""
+    from app.rate_limit import rate_limit_tracker
+    row = await upsert_pool_settings(
+        db, body.max_members, body.max_member_share_pct, current_admin.username,
+    )
+    # Only the caps moved, not any count, so the cached RPD counts stay valid.
+    await rate_limit_tracker.reload_config()
+    logger.info(
+        f"Admin '{current_admin.username}' set pool settings: max_members={row.max_members}, "
+        f"max_member_share_pct={row.max_member_share_pct}"
+    )
+    return PoolSettingsResponse.model_validate(row)
+
+
+@router.put("/pools/limits")
+async def admin_update_pool_limits(
+    body: AdminPoolLimitsUpdate,
+    pool_id: int = Query(..., description="Pool ID"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Override max members and/or the share cap for one pool. null inherits the global value."""
+    from app.routes.pools import admin_set_pool_limits
+    from app.rate_limit import rate_limit_tracker
+    try:
+        pool = await admin_set_pool_limits(
+            db, pool_id, body.max_members, body.max_member_share_pct, body.model_fields_set,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Admin pool limits update failed for pool {pool_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to update pool limits")
+    await rate_limit_tracker.reload_config()
+    logger.info(
+        f"Admin '{current_admin.username}' set pool '{pool.name}' overrides: "
+        f"max_members={pool.max_members}, max_member_share_pct={pool.max_member_share_pct}"
+    )
+    return {
+        "message": f"Updated {pool.name}",
+        "max_members": pool.max_members,
+        "max_member_share_pct": pool.max_member_share_pct,
+    }
 
 
 @router.get("/pools/usage")

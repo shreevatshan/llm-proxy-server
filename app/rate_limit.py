@@ -80,6 +80,10 @@ class RateLimitDecision:
     # Only set on RPD denials, where it suppresses the "join a pool" hint that
     # would otherwise be advice the user has already taken.
     pooled: bool = False
+    # Set when the denial is this member's share cap inside a pool rather than the
+    # pool's own total: the cap that was hit and the percent it came from.
+    pool_share_cap: Optional[int] = None
+    pool_share_pct: Optional[int] = None
 
 
 @dataclass
@@ -200,7 +204,24 @@ def _pooling_hint(d: RateLimitDecision) -> str:
     )
 
 
+def _share_message(d: RateLimitDecision, scope: str, pool_limit: Optional[int]) -> str:
+    """Denial text for a member who used their share of the pool rather than the pool."""
+    return (
+        f"Rate limit exceeded: you have used your share of your pool's daily quota{scope} — "
+        f"{d.pool_share_cap} of the pool's {pool_limit} requests per day "
+        f"(members may use up to {d.pool_share_pct}% each, and never less than their own limit). "
+        f"Retry after {_human_duration(d.retry_after_seconds)}. "
+        f"View your allowed quota in the console."
+    )
+
+
 def _limit_message(d: RateLimitDecision) -> str:
+    if d.pool_share_cap is not None:
+        if d.limited_by == "instance_group_rpd":
+            return _share_message(d, f" for instance group '{d.group_name}'", d.group_rpd_limit)
+        if d.limited_by == "group_rpd":
+            return _share_message(d, f" for model group '{d.group_name}'", d.group_rpd_limit)
+        return _share_message(d, "", d.rpd_limit)
     if d.limited_by == "instance_group_rpm":
         return (
             f"Rate limit exceeded for instance group '{d.group_name}': {d.group_rpm_limit} requests per minute. "
@@ -241,7 +262,10 @@ def _limit_message(d: RateLimitDecision) -> str:
 
 
 def _rl_headers(d: RateLimitDecision) -> dict:
-    if d.limited_by in ("group_rpm", "group_rpd", "instance_group_rpm", "instance_group_rpd"):
+    if d.pool_share_cap is not None:
+        # The member's own ceiling is the limit they actually ran into.
+        limit = d.pool_share_cap
+    elif d.limited_by in ("group_rpm", "group_rpd", "instance_group_rpm", "instance_group_rpd"):
         limit = d.group_rpm_limit if d.limited_by in ("group_rpm", "instance_group_rpm") else d.group_rpd_limit
     else:
         limit = d.rpm_limit if d.limited_by == "rpm" else d.rpd_limit
@@ -311,6 +335,11 @@ class RateLimitTracker:
         self._inactive_members: Set[int] = set()
         self._carries: Dict[Tuple[int, str, int], int] = {}        # (user_id, scope_kind, scope_id) → carry
         self._carries_date = None                                  # local day the carries were loaded for
+        # Per-member share cap (percent of the pool's limit on any scope). The global
+        # default and the per-pool overrides are kept apart so a pool missing from the
+        # snapshot still falls back to the default. None = uncapped.
+        self._pool_share_default: Optional[int] = None
+        self._pool_share_override: Dict[int, int] = {}             # pool_id → pct
 
     def set_db_session_factory(self, factory: Callable) -> None:
         self._db_session_factory = factory
@@ -425,6 +454,8 @@ class RateLimitTracker:
                 )
                 carry_rows = result.scalars().all()
 
+                share_default, share_override = await self._load_pool_share(db)
+
             lock = await self._get_lock()
             async with lock:
                 self._groups = {
@@ -472,8 +503,34 @@ class RateLimitTracker:
                     for row in carry_rows
                 }
                 self._carries_date = carry_day
+                self._pool_share_default = share_default
+                self._pool_share_override = share_override
         except Exception as e:
             logger.warning(f"RateLimitTracker: config reload failed: {e}")
+
+    async def _load_pool_share(self, db) -> Tuple[Optional[int], Dict[int, int]]:
+        """Read the share-cap policy: (global pct, {pool_id: override pct}).
+
+        Isolated from the rest of the reload: if these reads fail (say the override
+        columns were never migrated) the cap falls back to "none" instead of taking
+        groups, membership and carries down with it.
+        """
+        try:
+            from app.auth.models import PoolSettings, RequestPool
+            from sqlalchemy.future import select
+
+            result = await db.execute(
+                select(PoolSettings.max_member_share_pct).where(PoolSettings.id == 1)
+            )
+            default = result.scalar_one_or_none()
+            result = await db.execute(
+                select(RequestPool.id, RequestPool.max_member_share_pct)
+                .where(RequestPool.max_member_share_pct.is_not(None))
+            )
+            return default, {pid: pct for pid, pct in result.all()}
+        except Exception as e:
+            logger.warning(f"RateLimitTracker: pool share settings read failed: {e}")
+            return None, {}
 
     def _evict_stale_buckets(self) -> None:
         now = time.time()
@@ -687,6 +744,30 @@ class RateLimitTracker:
             return 0
         return sum(self._carries.get((uid, scope_kind, scope_id), 0) for uid in member_ids)
 
+    def share_pct_for(self, pool_id: Optional[int]) -> Optional[int]:
+        """The per-member share percent in force for a pool; None when uncapped."""
+        if pool_id is None:
+            return None
+        return self._pool_share_override.get(pool_id, self._pool_share_default)
+
+    def member_share_cap(
+        self, pool_id: Optional[int], own_limit: Optional[int], pool_limit: Optional[int]
+    ) -> Optional[int]:
+        """The most of a pool's daily limit one member may consume on one scope.
+
+            cap = max(own_limit, floor(pool_limit * pct / 100))
+
+        The floor at own_limit means pooling never leaves a member worse off than going
+        solo; the pool-total check still runs first, so the pool itself is never
+        exceeded. None (uncapped) when no percent applies, at 100%, or when either limit
+        is unlimited -- a percentage of "unlimited" bounds nothing, and an unlimited
+        member's own floor is unlimited too.
+        """
+        pct = self.share_pct_for(pool_id)
+        if pct is None or pct >= 100 or own_limit is None or pool_limit is None:
+            return None
+        return max(own_limit, pool_limit * pct // 100)
+
     def invalidate_pool(self, pool_id: int) -> None:
         """Drop every cached RPD count for a pool, across all three tiers.
 
@@ -750,12 +831,15 @@ class RateLimitTracker:
 
             # RPD may be pooled across the members' group limits; RPM stays per-user.
             scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
+            share_cap = None
             if pool_id is None:
                 g_rpd = _own_rpd
             else:
                 g_rpd = self._pooled_rpd_limit(
                     member_ids, lambda uid: self._resolve_group_limits(uid, group)[1]
                 )
+                share_cap = self.member_share_cap(pool_id, _own_rpd, g_rpd)
+            share_pct = self.share_pct_for(pool_id)
 
         if g_rpm is None and g_rpd is None:
             return None
@@ -806,6 +890,27 @@ class RateLimitTracker:
                         group_rpd_remaining=0,
                         pooled=pool_id is not None,
                     )
+                # The pool has room, but this member may have used their share of it.
+                if share_cap is not None:
+                    own_count = await self._get_today_group_count(
+                        _user_scope_key(username), [user_id], group.model_ids, group.group_id
+                    )
+                    if own_count >= share_cap:
+                        return RateLimitDecision(
+                            allowed=False,
+                            rpm_limit=None, rpm_remaining=None,
+                            rpd_limit=None, rpd_remaining=None,
+                            retry_after_seconds=_seconds_until_local_midnight(),
+                            limited_by="group_rpd",
+                            group_id=group.group_id,
+                            group_name=group.name,
+                            group_rpm_limit=g_rpm,
+                            group_rpd_limit=g_rpd,
+                            group_rpd_remaining=0,
+                            pooled=True,
+                            pool_share_cap=share_cap,
+                            pool_share_pct=share_pct,
+                        )
 
             # Passed — increment group RPM bucket
             group_bucket.count += 1
@@ -832,12 +937,15 @@ class RateLimitTracker:
 
             # RPD may be pooled across the members' group limits; RPM stays per-user.
             scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
+            share_cap = None
             if pool_id is None:
                 g_rpd = _own_rpd
             else:
                 g_rpd = self._pooled_rpd_limit(
                     member_ids, lambda uid: self._resolve_instance_group_limits(uid, group)[1]
                 )
+                share_cap = self.member_share_cap(pool_id, _own_rpd, g_rpd)
+            share_pct = self.share_pct_for(pool_id)
 
         if g_rpm is None and g_rpd is None:
             return None
@@ -888,6 +996,27 @@ class RateLimitTracker:
                         group_rpd_remaining=0,
                         pooled=pool_id is not None,
                     )
+                # The pool has room, but this member may have used their share of it.
+                if share_cap is not None:
+                    own_count = await self._get_today_instance_group_count(
+                        _user_scope_key(username), [user_id], group.provider_keys, group.group_id
+                    )
+                    if own_count >= share_cap:
+                        return RateLimitDecision(
+                            allowed=False,
+                            rpm_limit=None, rpm_remaining=None,
+                            rpd_limit=None, rpd_remaining=None,
+                            retry_after_seconds=_seconds_until_local_midnight(),
+                            limited_by="instance_group_rpd",
+                            group_id=group.group_id,
+                            group_name=group.name,
+                            group_rpm_limit=g_rpm,
+                            group_rpd_limit=g_rpd,
+                            group_rpd_remaining=0,
+                            pooled=True,
+                            pool_share_cap=share_cap,
+                            pool_share_pct=share_pct,
+                        )
 
             # Passed — increment instance-group RPM bucket
             group_bucket.count += 1
@@ -943,10 +1072,13 @@ class RateLimitTracker:
 
             # RPD may be pooled; RPM above is always this user's own.
             scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
+            share_cap = None
             if pool_id is None:
                 rpd = self._own_rpd_limit(user_id)
             else:
                 rpd = self._pooled_rpd_limit(member_ids, self._own_rpd_limit)
+                share_cap = self.member_share_cap(pool_id, self._own_rpd_limit(user_id), rpd)
+            share_pct = self.share_pct_for(pool_id)
 
         # Per-user lock serializes the RPM check + RPD check + increment for this user,
         # eliminating the TOCTOU race where two concurrent requests both pass RPD.
@@ -985,6 +1117,20 @@ class RateLimitTracker:
                         limited_by="rpd",
                         pooled=pool_id is not None,
                     )
+                # The pool has room, but this member may have used their share of it.
+                if share_cap is not None:
+                    own_count = await self._get_today_count(_user_scope_key(username), [user_id])
+                    if own_count >= share_cap:
+                        return RateLimitDecision(
+                            allowed=False,
+                            rpm_limit=rpm, rpm_remaining=None,
+                            rpd_limit=rpd, rpd_remaining=0,
+                            retry_after_seconds=_seconds_until_local_midnight(),
+                            limited_by="rpd",
+                            pooled=True,
+                            pool_share_cap=share_cap,
+                            pool_share_pct=share_pct,
+                        )
 
             # All checks passed — increment the RPM bucket
             bucket.count += 1
@@ -1113,6 +1259,41 @@ class RateLimitTracker:
             group = self._instance_groups.get(scope_id)
             return None if group is None else self._resolve_instance_group_limits(user_id, group)[1]
         return None
+
+    async def member_share_status(
+        self, user_id: int, username: str, scope_kind: str, scope_id: int,
+        pool_limit: Optional[int],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        """(share_cap, share_used) for a pooled user on one scope, for display.
+
+        Both None when unpooled or uncapped. share_used is the member's own effective
+        count -- rows plus their carry -- read through the same cached reader the
+        enforcement path uses, so the quota page and the 429 agree.
+        """
+        pool_id = self._user_to_pool.get(user_id)
+        if pool_id is None:
+            return None, None
+        cap = self.member_share_cap(
+            pool_id, self.member_limit_for_scope(user_id, scope_kind, scope_id), pool_limit,
+        )
+        if cap is None:
+            return None, None
+        own_key = _user_scope_key(username)
+        if scope_kind == "model_group":
+            group = self._groups.get(scope_id)
+            if group is None:
+                return None, None
+            used = await self._get_today_group_count(own_key, [user_id], group.model_ids, scope_id)
+        elif scope_kind == "instance_group":
+            group = self._instance_groups.get(scope_id)
+            if group is None:
+                return None, None
+            used = await self._get_today_instance_group_count(
+                own_key, [user_id], group.provider_keys, scope_id
+            )
+        else:
+            used = await self._get_today_count(own_key, [user_id])
+        return cap, used
 
     def carry_for(self, user_id: int, scope_kind: str, scope_id: int = 0) -> int:
         """One user's own day-scoped carry on a scope — for explaining a count in the UI."""

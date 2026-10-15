@@ -162,6 +162,10 @@ function showTab(tabName) {
         window.ProfileManager?.load();
     }
 
+    if (tabName === 'pools') {
+        window.PoolAdminManager?.load();
+    }
+
     if (tabName === 'websearch') {
         window.WebSearchManager?.load();
     }
