@@ -189,9 +189,6 @@ class SearchManager {
     // Bind handlers via data-* attributes rather than interpolating provider/
     // model ids into inline on* handlers (XSS/quote-injection risk).
     _bindResultHandlers(container) {
-        container.querySelectorAll('[data-action="toggle-provider-models"]').forEach(el => {
-            el.addEventListener('click', () => window.ModelManager.toggleProviderModels(el.dataset.providerKey));
-        });
         container.querySelectorAll('[data-action="toggle-provider"]').forEach(el => {
             el.addEventListener('change', () => window.ProviderManager.toggleProviderEnabled(el.dataset.providerKey, el.checked));
         });
@@ -232,9 +229,6 @@ class SearchManager {
                         </div>
                     </div>
                     <div class="provider-actions">
-                        <button class="btn btn-sm btn-outline-info" data-action="toggle-provider-models" data-provider-key="${pk}" title="Show/Hide Models" id="models-btn-${pk}">
-                            <i class="fas fa-list"></i> Models (${provider.model_count || 0})
-                        </button>
                         <label class="toggle-switch">
                             <input type="checkbox" ${provider.enabled ? 'checked' : ''}
                                    data-action="toggle-provider" data-provider-key="${pk}">

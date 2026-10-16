@@ -428,13 +428,13 @@ class RateLimitInvalidateIdentityTests(unittest.IsolatedAsyncioTestCase):
         tracker._rpd_cache[bystander] = entry
         tracker._group_rpd_cache[(old, 1)] = entry
         tracker._group_rpd_cache[(bystander, 1)] = entry
-        tracker._instance_group_rpd_cache[(old, 2)] = entry
+        tracker._group_rpd_cache[(old, 2)] = entry
 
         tracker.invalidate_identity("old.name")
 
         self.assertNotIn(old, tracker._rpd_cache)
         self.assertNotIn((old, 1), tracker._group_rpd_cache)
-        self.assertNotIn((old, 2), tracker._instance_group_rpd_cache)
+        self.assertNotIn((old, 2), tracker._group_rpd_cache)
         self.assertIn(bystander, tracker._rpd_cache)
         self.assertIn((bystander, 1), tracker._group_rpd_cache)
 

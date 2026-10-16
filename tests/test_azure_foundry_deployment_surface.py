@@ -333,5 +333,33 @@ class DeploymentRouteGuardTests(unittest.TestCase):
         self.assertIn("/v1/messages", response.json()["error"]["message"])
 
 
+class FamilyPrefixTests(unittest.TestCase):
+    """A URL naming the provider family ('azure') with one instance is that
+    instance's model, so the group limit, the enable flags and the group switch all
+    see the id they know -- as /v1 requests already do."""
+
+    def test_the_access_check_sees_the_instance_id(self):
+        app = create_azure_openai_app()
+        app.dependency_overrides[azure_openai._authenticate_azure] = \
+            lambda: AdminUser(username="admin", email="admin@example.com")
+        foundry = _provider("foundry")
+        foundry.chat_completion = _fake_chat_completion
+        enforce = AsyncMock(return_value=None)
+        saved = provider_manager.providers
+        provider_manager.providers = {FOUNDRY_KEY: foundry}
+        try:
+            with patch.object(azure_openai, "enforce_access_and_limits", enforce), \
+                 patch("app.request_tracker.request_tracker.start_request", new_callable=AsyncMock), \
+                 patch("app.request_tracker.request_tracker.end_request", new_callable=AsyncMock):
+                response = TestClient(app).post(
+                    f"/openai/deployments/azure/{OPENAI_DEPLOYMENT}/chat/completions",
+                    json={"model": "ignored", "messages": [{"role": "user", "content": "hi"}]},
+                )
+        finally:
+            provider_manager.providers = saved
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(enforce.await_args.args[2], f"{FOUNDRY_KEY}/{OPENAI_DEPLOYMENT}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -208,49 +208,12 @@ class ModelManager {
         }
     }
 
-    async bulkToggleProviderModels(providerKey, enable) {
-        console.log('Bulk toggling provider models:', { providerKey, enable });
-        
-        try {
-            const response = await fetch(`/admin/models/provider/toggle?provider_key=${encodeURIComponent(providerKey)}`, {
-                method: 'PUT',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest'
-                },
-                credentials: 'include',
-                body: JSON.stringify({
-                    enabled: enable
-                })
-            });
-
-            if (response.ok) {
-                const result = await response.json();
-                console.log('✅ Bulk toggle successful:', result);
-                window.UIUtils.showToast(result.message, 'success');
-                
-                // Clear search manager's cached models data
-                if (window.SearchManager) {
-                    window.SearchManager.clearModelsCache();
-                }
-                
-                // Update the UI for this provider
-                await this.updateProviderModelCounts(providerKey);
-            } else {
-                const error = await response.json();
-                console.error('❌ Bulk toggle failed:', error);
-                window.UIUtils.showToast(`Failed to toggle provider models: ${error.detail}`, 'error');
-            }
-        } catch (error) {
-            console.error('❌ Error in bulk toggle:', error);
-            window.UIUtils.showToast(`Error: ${error.message}`, 'error');
-        }
-    }
-
     async updateProviderModelCounts(providerKey) {
         try {
-            // Reload the provider data to get updated counts
-            await window.ProviderManager.loadUnifiedProviderData();
+            // Searches cache each provider's models; drop them so the next one sees this change.
+            window.SearchManager?.clearModelsCache();
+            // Counts only: a full reload would close the open model lists.
+            await window.ProviderManager.refreshProviderCounts();
         } catch (error) {
             console.warn('Failed to update provider model counts:', error);
         }
@@ -554,7 +517,6 @@ window.ModelManager = new ModelManager();
 window.toggleProviderModels = (key) => window.ModelManager.toggleProviderModels(key);
 window.loadProviderModels = (key) => window.ModelManager.loadProviderModels(key);
 window.toggleIndividualModel = (id, enabled, provider) => window.ModelManager.toggleIndividualModel(id, enabled, provider);
-window.bulkToggleProviderModels = (key, enabled) => window.ModelManager.bulkToggleProviderModels(key, enabled);
 window.syncModels = () => window.ModelManager.syncModels();
 window.bulkToggle = (action) => window.ModelManager.bulkToggle(action);
 window.reinitSystem = () => window.ModelManager.reinitSystem();

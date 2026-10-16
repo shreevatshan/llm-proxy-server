@@ -242,9 +242,8 @@ class PrefixlessAnthropicEndToEndTests(unittest.TestCase):
 
 
 class AzureV1SurfaceTests(unittest.TestCase):
-    """/openai/v1/* is not covered by the tracking middleware (its paths do not
-    match _TRACKED_PREFIXES), so route-level resolution is the only mechanism
-    that reaches it -- and it does, because it lives in the handler."""
+    """/openai/v1/* re-mounts the OpenAI routers on the Azure app; bare-name
+    resolution lives in the handler, so it reaches this surface too."""
 
     def setUp(self):
         self.app = create_azure_openai_app()

@@ -424,6 +424,23 @@ Receive notifications when new users sign up through any method:
 
 The text format is compatible with Slack, Discord, Microsoft Teams, and other messaging webhooks.
 
+#### Daily Usage Report
+
+When `NOTIFICATION_WEBHOOK_URL` is set, a usage summary is posted every day at **08:00 in the configured `TIMEZONE`**. It contains:
+- Total request count for yesterday and for the last 30 days
+- Top 5 users by request count, for yesterday and for the last 30 days
+- Top 5 models by request count, for yesterday and for the last 30 days
+
+"Last 30 days" means the 30 complete days ending yesterday, so every figure is final. It does not include today's partial counts, unlike the dashboard's 30-day view. If the server is down at 08:00, that day's report is skipped and not sent later.
+
+**Payload Format** (same text format as the signup notification):
+
+```json
+{
+  "text": "📊 Daily Usage Report — 2026-10-15\n🌐 Domain: llm.example.com\n\n📈 Total Requests\n• Yesterday (2026-10-15): 1,234\n• Last 30 days (2026-09-16 → 2026-10-15): 45,678\n\n👤 Top 5 Users — Yesterday\n1. alice — 400\n...\n\n🤖 Top 5 Models — Last 30 Days\n1. openai/gpt-4o — 12,345\n..."
+}
+```
+
 ### Integration Examples
 
 **Slack Incoming Webhook:**

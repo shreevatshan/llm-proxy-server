@@ -34,8 +34,8 @@ from app.auth.middleware import (
 )
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
-from app.rate_limit_dep import enforce_group_rate_limit
-from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
+from app.model_access_dep import ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.websearch import (
@@ -69,6 +69,7 @@ router = APIRouter()
 # NOTE: This must be registered BEFORE the {response_id} catch-all routes
 
 @router.post("/v1/responses/input_tokens", tags=["responses"])
+@enforces_limits
 async def responses_input_tokens(
     request_obj: Request,
     request: ResponsesInputTokensRequest,
@@ -78,9 +79,8 @@ async def responses_input_tokens(
     with create_span("responses_input_tokens", kind=trace.SpanKind.INTERNAL) as span:
         try:
             request.model = await resolve_model_for_request(request_obj, auth, request.model)
-            # Group rate limit + per-user model access enforcement.
-            await enforce_group_rate_limit(request_obj, auth, request.model)
-            await enforce_model_access(request_obj, auth, request.model)
+            # Per-user model access, then the model's group rate limit.
+            await enforce_access_and_limits(request_obj, auth, request.model)
 
             response = await provider_manager.responses_input_tokens(request)
             return response
@@ -104,6 +104,7 @@ async def responses_input_tokens(
 # ==================== POST /v1/responses/compact ====================
 
 @router.post("/v1/responses/compact", tags=["responses"])
+@enforces_limits
 async def responses_compact(
     request_obj: Request,
     request: ResponsesCompactRequest,
@@ -113,10 +114,9 @@ async def responses_compact(
     with create_span("responses_compact", kind=trace.SpanKind.INTERNAL) as span:
         try:
             request.model = await resolve_model_for_request(request_obj, auth, request.model)
-            # Group rate limit + per-user model access enforcement. compact
+            # Per-user model access, then the model's group rate limit. compact
             # invokes the upstream model, so it must be gated like inference.
-            await enforce_group_rate_limit(request_obj, auth, request.model)
-            await enforce_model_access(request_obj, auth, request.model)
+            await enforce_access_and_limits(request_obj, auth, request.model)
 
             response = await provider_manager.responses_compact(request)
             return response
@@ -140,6 +140,7 @@ async def responses_compact(
 # ==================== POST /v1/responses ====================
 
 @router.post("/v1/responses", tags=["responses"])
+@enforces_limits
 async def responses_create(
     request_obj: Request,  # FastAPI request for disconnect detection
     request: ResponsesCreateRequest,
@@ -150,9 +151,8 @@ async def responses_create(
     with create_span("responses_create", kind=trace.SpanKind.INTERNAL) as span:
         try:
             request.model = await resolve_model_for_request(request_obj, auth, request.model)
-            # Group rate limit check (request-level limits already handled in middleware)
-            await enforce_group_rate_limit(request_obj, auth, request.model)
-            await enforce_model_access(request_obj, auth, request.model)
+            # Access first, so a 403 spends no quota; then the model's group limit.
+            await enforce_access_and_limits(request_obj, auth, request.model)
 
             owner_id = get_owner_user_id(auth)
             request = settle_pending_responses_calls(request)

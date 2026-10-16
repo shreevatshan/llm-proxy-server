@@ -58,9 +58,9 @@ from app.routes.stream_utils import (
     stream_with_context_and_timeout,
     STREAM_TIMEOUT_SECONDS,
 )
-from app.rate_limit_dep import enforce_group_rate_limit
-from app.model_access_dep import enforce_model_access
+from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
 from app.model_alias import apply_alias
+from app.model_resolution import canonicalize_provider_prefix
 from fastapi.encoders import jsonable_encoder
 from app.websearch import (
     HEADER_NAME as WEBSEARCH_HEADER,
@@ -145,7 +145,7 @@ async def _authenticate_azure(
         from app.auth.middleware import _update_tracking_identity, _enforce_rate_limit
         await _update_tracking_identity(request, cached_key)
         await _enforce_rate_limit(request, cached_key, envelope_override="azure")
-        # Return the *cached* object, not the ORM row: enforce_group_rate_limit
+        # Return the *cached* object, not the ORM row: enforce_access_and_limits
         # derives its own identity from what we return here, and APIKey has no
         # username column, so returning api_key_obj would make the group limiter
         # query "key:<id>" while the rest of the request uses the username.
@@ -276,6 +276,7 @@ async def list_deployments(
     "/openai/deployments/{provider_name}/{deployment}/chat/completions",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_chat_completions(
     request_obj: Request,
     provider_name: str,
@@ -292,7 +293,8 @@ async def azure_chat_completions(
     # forward the inbound api-version.  Pre-validate so streaming responses get
     # a clean 400 before the StreamingResponse wrapper is returned.  (Foundry
     # ignores both ContextVars; see _deployment_call_guard.)
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    model_name = await canonicalize_provider_prefix(
+        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -302,8 +304,7 @@ async def azure_chat_completions(
     azure_api_version.set(api_version)
 
     request.model = model_name
-    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_chat_completion", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -373,6 +374,7 @@ async def azure_chat_completions(
     "/openai/deployments/{provider_name}/{deployment}/completions",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_completions(
     request_obj: Request,
     provider_name: str,
@@ -385,7 +387,8 @@ async def azure_completions(
     request_started_at = time.monotonic()
     provider = _get_azure_provider(provider_name)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    model_name = await canonicalize_provider_prefix(
+        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -395,8 +398,7 @@ async def azure_completions(
     azure_api_version.set(api_version)
 
     request.model = model_name
-    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_completion", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -449,6 +451,7 @@ async def azure_completions(
     "/openai/deployments/{provider_name}/{deployment}/embeddings",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_embeddings(
     request_obj: Request,
     provider_name: str,
@@ -460,7 +463,8 @@ async def azure_embeddings(
     """Azure OpenAI embeddings endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    model_name = await canonicalize_provider_prefix(
+        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -470,8 +474,7 @@ async def azure_embeddings(
     azure_api_version.set(api_version)
 
     request.model = model_name
-    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_embeddings", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -499,6 +502,7 @@ async def azure_embeddings(
     "/openai/deployments/{provider_name}/{deployment}/images/generations",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_image_generation(
     request_obj: Request,
     provider_name: str,
@@ -510,7 +514,8 @@ async def azure_image_generation(
     """Azure OpenAI image generation endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    model_name = await canonicalize_provider_prefix(
+        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -520,8 +525,7 @@ async def azure_image_generation(
     azure_api_version.set(api_version)
 
     request.model = model_name
-    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_image_generation", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -549,6 +553,7 @@ async def azure_image_generation(
     "/openai/deployments/{provider_name}/{deployment}/audio/speech",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_audio_speech(
     request_obj: Request,
     provider_name: str,
@@ -560,7 +565,8 @@ async def azure_audio_speech(
     """Azure OpenAI text-to-speech endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    model_name = await canonicalize_provider_prefix(
+        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -570,8 +576,7 @@ async def azure_audio_speech(
     azure_api_version.set(api_version)
 
     request.model = model_name
-    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="azure")
 
     # Validate response_format before interpolating it into Content-Disposition
     # (guards against header injection); reuse the same content-type map.
@@ -620,6 +625,7 @@ async def azure_audio_speech(
     "/openai/deployments/{provider_name}/{deployment}/audio/transcriptions",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_audio_transcription(
     request_obj: Request,
     provider_name: str,
@@ -636,7 +642,8 @@ async def azure_audio_transcription(
     """Azure OpenAI audio transcription endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    model_name = await canonicalize_provider_prefix(
+        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -645,8 +652,7 @@ async def azure_audio_transcription(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_audio_transcription", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -691,6 +697,7 @@ async def azure_audio_transcription(
     "/openai/deployments/{provider_name}/{deployment}/audio/translations",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_audio_translation(
     request_obj: Request,
     provider_name: str,
@@ -705,7 +712,8 @@ async def azure_audio_translation(
     """Azure OpenAI audio translation endpoint."""
     provider = _get_azure_provider(provider_name)
 
-    model_name = apply_alias(_build_model_name(provider_name, deployment))
+    model_name = await canonicalize_provider_prefix(
+        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -714,8 +722,7 @@ async def azure_audio_translation(
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
-    await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, model_name, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="azure")
 
     with create_span("azure_audio_translation", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {
@@ -756,6 +763,7 @@ async def azure_audio_translation(
     "/openai/deployments/{provider_name}/responses",
     tags=["azure_openai"],
 )
+@enforces_limits
 async def azure_responses_create(
     request_obj: Request,
     provider_name: str,
@@ -789,12 +797,11 @@ async def azure_responses_create(
                 f"'{provider_name}' named in the URL",
             )
 
-    request.model = apply_alias(request.model)
+    request.model = await canonicalize_provider_prefix(request_obj, apply_alias(request.model))
 
-    # Enforce group rate limit + per-user model access, mirroring the sibling
+    # Enforce per-user model access + the group rate limit, mirroring the sibling
     # azure_chat_completions handler.
-    await enforce_group_rate_limit(request_obj, auth, request.model, envelope_override="azure")
-    await enforce_model_access(request_obj, auth, request.model, envelope_override="azure")
+    await enforce_access_and_limits(request_obj, auth, request.model, envelope_override="azure")
 
     with create_span("azure_responses_create", kind=trace.SpanKind.INTERNAL) as span:
         add_span_attributes(span, {

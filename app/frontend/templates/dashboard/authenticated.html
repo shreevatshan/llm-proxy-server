@@ -17,8 +17,8 @@
 
     /* ── Quota buckets (unified quota view) ────────────────────────── */
     /* Each block is one quota bucket shared by the models under it. Model
-       groups, instance groups, and the ungrouped "Other Models" bucket are
-       rendered identically — the reader shouldn't have to care which is which.
+       groups and the built-in "Default" group are rendered identically — the
+       reader shouldn't have to care which is which.
        The hairline meter is the signature: a bucket's fill against its ceiling,
        in pure grayscale. Unlimited buckets show no meter — no ceiling, no bar. */
     .quota-block {
@@ -220,6 +220,13 @@
     .api-badge.openai, .api-badge.anthropic, .api-badge.azure_openai {
         background-color: var(--mono-3); color: var(--mono-text-secondary);
         border: 1px solid var(--mono-5); font-family: var(--font-family-mono);
+    }
+    .model-list-item.disabled .model-name,
+    .model-list-item.disabled .api-badge:not(.model-disabled-badge) { opacity: 0.5; }
+    .model-list-item.disabled .model-name { text-decoration: line-through; }
+    .api-badge.model-disabled-badge {
+        background: transparent; color: var(--mono-text-secondary);
+        border: 1px dashed var(--mono-5);
     }
     .copy-button {
         padding: 6px 16px; background-color: transparent; color: var(--mono-text-primary);
@@ -591,7 +598,7 @@
                 <i class="fas fa-gauge-high me-2"></i>Usage &amp; Quotas
                 <i class="fas fa-info-circle text-muted ms-1 quota-info" style="font-size:0.8rem;cursor:help;"
                    data-bs-toggle="tooltip" data-bs-placement="top"
-                   title="Each section is a quota bucket shared by the models listed under it. The header shows today's requests used, the daily limit (RPD), and how many remain; RPM is your per-minute limit. Models are grouped so that any group sharing one quota is shown together; models not in any group appear under 'Other Models'. ∞ means unlimited."></i>
+                   title="Each section is a quota bucket shared by the models listed under it. The header shows today's requests used, the daily limit (RPD), and how many remain; RPM is your per-minute limit. Models are grouped so that any group sharing one quota is shown together; models not in any other group appear under 'Default'. ∞ means unlimited."></i>
             <span id="quotaPoolChip"></span>
             </h5>
         </div>

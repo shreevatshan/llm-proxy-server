@@ -18,7 +18,7 @@ from datetime import date
 
 from app.auth import pools as pool_settlement
 from app.auth.models import (
-    InstanceGroup, InstanceGroupMember, ModelGroup, ModelGroupMember,
+    ModelGroup, ModelGroupMember,
     RequestPoolLedger, RequestPoolMember, RequestUsage, UserModelGroupRateLimit,
     UserRpdCarry,
 )
@@ -690,19 +690,20 @@ class GroupScopeSettlementTests(PoolTestCase):
         self.assertEqual(await self.charged(pool.id, alice.id), 0,
                          "grouped rows do not touch the overall scope")
 
-    async def test_instance_group_takes_precedence_over_model_group(self):
+    async def test_an_explicit_model_takes_precedence_over_an_instance(self):
         alice = await self.make_user("alice", rpd_limit=100)
         bob = await self.make_user("bob", rpd_limit=100)
         mg = await self.make_model_group("by-model", "azure/gpt-4o", rpd_default=10)
         ig = await self.make_instance_group("by-instance", "azure", rpd_default=20)
         pool = await self.make_pool("team", alice, [bob])
         await self.seed_usage("alice", 4, model="azure/gpt-4o")
+        await self.seed_usage("alice", 6, model="azure/gpt-5")
 
         await pool_settlement.settle_pool(self.db, pool.id)
         await self.db.commit()
 
-        self.assertEqual(await self.charged(pool.id, alice.id, ("instance_group", ig.id)), 2)
-        self.assertEqual(await self.charged(pool.id, alice.id, ("model_group", mg.id)), 0)
+        self.assertEqual(await self.charged(pool.id, alice.id, ("model_group", mg.id)), 2)
+        self.assertEqual(await self.charged(pool.id, alice.id, ("model_group", ig.id)), 3)
 
     async def test_unlimited_on_one_scope_does_not_unlimit_the_others(self):
         """Scopes settle independently, so the grant does not leak sideways.

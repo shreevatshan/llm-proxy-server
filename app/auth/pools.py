@@ -166,12 +166,10 @@ def _fold_models_into_scopes(usage_rows: List[dict]) -> Dict[Tuple[int, str, int
     """Fold per-model usage rows into (user_id, scope_kind, scope_id) -> request count.
 
     Each row lands in **exactly one** scope, because that is how enforcement counts it:
-    ``get_today_count`` excludes any model that belongs to a model group or whose
-    instance belongs to an instance group, since those are governed by the group's own
-    limit. So a grouped row counts toward its group scope only -- instance group taking
-    precedence, the same order enforcement resolves in -- and an ungrouped row counts
-    toward 'overall'. Folding a grouped row into both would charge a member's overall
-    quota for requests the overall gate never sees.
+    every model belongs to one group (rate_limit_tracker.group_for), so a row counts
+    toward its named group's scope, or toward 'overall' -- the Default group -- when no
+    group claims it. Folding a grouped row into both would charge a member's Default
+    quota for requests the Default gate never sees.
 
     Known imprecision: moving a model into a different group mid-day changes which scope
     its rows fold into, so carries written before the move describe a partition that no

@@ -1,30 +1,51 @@
-"""Helper for per-group rate limit enforcement, called from route handlers.
+"""Access check and rate limiting for a resolved model, called from route handlers.
 
-Precedence (most-specific wins): instance group > model group > overall.
-If the request's instance (provider_key) belongs to an instance group, only the
-instance-group limit applies and the model-group check is skipped. Otherwise the
-model-group limit applies. The overall request limit is handled in auth middleware
-and skipped there whenever either group governs the request.
+Every model belongs to exactly one model group: a named group that claims it (an
+explicit model member beats an instance member), or else the built-in Default group,
+whose limits are the profile's own rpm/rpd. See rate_limit_tracker.group_for.
+
+Routes call enforce_access_and_limits once the model is resolved. It checks access
+first, so a request denied with 403 never spends quota, then charges exactly one group.
+Endpoints that do this are marked @enforces_limits, and the auth middleware leaves them
+alone; anything unmarked is charged to the Default group in the middleware instead.
 """
 
-from typing import Optional, Union
+from typing import Callable, Optional, TypeVar, Union
 
 from fastapi import Request
 
 from app.api_envelope import envelope_for
 from app.auth.admin import AdminUser
 from app.auth.models import APIKey, User
+from app.model_access_dep import enforce_model_access
+from app.profiles import DEFAULT_GROUP_ID
 from app.rate_limit import RateLimitExceeded, rate_limit_tracker
 
+F = TypeVar("F", bound=Callable)
 
-def _provider_key_of(model_id: str) -> Optional[str]:
-    """Extract the instance identifier (provider_key) from a model id.
+ROUTE_ENFORCES_LIMITS = "_route_enforces_limits"
 
-    Model ids are '{provider_key}/{model_name}' (e.g. 'azure:primary/gpt-4').
+
+def enforces_limits(endpoint: F) -> F:
+    """Mark an endpoint that calls enforce_access_and_limits itself.
+
+    The auth middleware reads the mark off request.scope["endpoint"] and skips its own
+    Default-group charge, so the request is charged once, after the model is resolved
+    and access is checked. Deciding by endpoint rather than by whether the tracking
+    middleware sniffed a model matters: it never does for large multipart uploads or
+    count_tokens, both of which still enforce here.
     """
-    if model_id and "/" in model_id:
-        return model_id.split("/", 1)[0]
-    return None
+    setattr(endpoint, ROUTE_ENFORCES_LIMITS, True)
+    return endpoint
+
+
+def _raise(request: Request, decision, envelope_override: Optional[str]) -> None:
+    envelope = envelope_for(request.url.path, envelope_override)
+    if envelope == "anthropic":
+        raise RateLimitExceeded.anthropic(decision)
+    if envelope == "azure":
+        raise RateLimitExceeded.azure(decision)
+    raise RateLimitExceeded.openai(decision)
 
 
 async def enforce_group_rate_limit(
@@ -33,16 +54,12 @@ async def enforce_group_rate_limit(
     model_id: str,
     envelope_override: Optional[str] = None,
 ) -> None:
-    """Check group limits for the authenticated user, with instance-group precedence.
+    """Charge the request to the group governing `model_id` -- a named group, or Default.
 
-    Request-level RPM/RPD limits are already enforced in auth middleware.
-    If the model's instance belongs to an instance group, only that limit is
-    checked; otherwise the model-group limit is checked.
-    Raises RateLimitExceeded if a group limit is hit.
+    Raises RateLimitExceeded if that group's limit is hit. Prefer
+    enforce_access_and_limits, which runs the access check first.
     """
     if isinstance(auth, AdminUser):
-        return
-    if not model_id:
         return
 
     user_id = getattr(auth, "user_id", None) or getattr(auth, "id", None)
@@ -53,17 +70,27 @@ async def enforce_group_rate_limit(
     if user_id is None or username is None:
         return
 
-    # Instance group takes precedence over model group.
-    provider_key = _provider_key_of(model_id)
-    if provider_key and rate_limit_tracker.instance_belongs_to_group(provider_key):
-        decision = await rate_limit_tracker.check_instance_group_limit(user_id, username, provider_key)
+    if rate_limit_tracker.group_for(model_id) == DEFAULT_GROUP_ID:
+        decision = await rate_limit_tracker.check_and_increment(user_id, username)
     else:
         decision = await rate_limit_tracker.check_group_limit(user_id, username, model_id)
 
     if decision is not None and not decision.allowed:
-        envelope = envelope_for(request.url.path, envelope_override)
-        if envelope == "anthropic":
-            raise RateLimitExceeded.anthropic(decision)
-        if envelope == "azure":
-            raise RateLimitExceeded.azure(decision)
-        raise RateLimitExceeded.openai(decision)
+        _raise(request, decision, envelope_override)
+
+
+async def enforce_access_and_limits(
+    request: Request,
+    auth: Union[User, AdminUser, APIKey],
+    model_id: str,
+    envelope_override: Optional[str] = None,
+    consume_quota: bool = True,
+) -> None:
+    """Deny (403) if the caller may not use the model, then charge its group (429).
+
+    consume_quota=False checks access only, for endpoints that do no upstream work
+    worth metering (count_tokens).
+    """
+    await enforce_model_access(request, auth, model_id, envelope_override=envelope_override)
+    if consume_quota:
+        await enforce_group_rate_limit(request, auth, model_id, envelope_override=envelope_override)

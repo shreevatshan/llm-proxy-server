@@ -8,8 +8,8 @@ from app.routes._errors import openai_provider_error_response
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
-from app.rate_limit_dep import enforce_group_rate_limit
-from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
+from app.model_access_dep import ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.model_alias import apply_alias
@@ -23,6 +23,7 @@ router = APIRouter()
 
 
 @router.post("/v1/images/generations", response_model=ImageResponse)
+@enforces_limits
 async def create_image(
     request_obj: Request,
     request: ImageGenerationRequest,
@@ -33,9 +34,8 @@ async def create_image(
     with create_span("image_generation_request") as span:
         try:
             request.model = await resolve_model_for_request(request_obj, auth, request.model)
-            # Group rate limit check (request-level limits already handled in middleware)
-            await enforce_group_rate_limit(request_obj, auth, request.model)
-            await enforce_model_access(request_obj, auth, request.model)
+            # Access first, so a 403 spends no quota; then the model's group limit.
+            await enforce_access_and_limits(request_obj, auth, request.model)
             # Add span attributes
             add_span_attributes(span, {
                 "model": request.model,
@@ -98,6 +98,7 @@ async def create_image(
 
 
 @router.post("/v1/images/edits", response_model=ImageResponse)
+@enforces_limits
 async def edit_image(
     request_obj: Request,
     image: UploadFile = File(...),
@@ -116,9 +117,8 @@ async def edit_image(
         try:
             model = apply_alias(model)
             model = await resolve_model_for_request(request_obj, auth, model)
-            # Group rate limit check (request-level limits already handled in middleware)
-            await enforce_group_rate_limit(request_obj, auth, model)
-            await enforce_model_access(request_obj, auth, model)
+            # Access first, so a 403 spends no quota; then the model's group limit.
+            await enforce_access_and_limits(request_obj, auth, model)
 
             # Read and encode image file
             image_content = await image.read()
@@ -209,6 +209,7 @@ async def edit_image(
 
 
 @router.post("/v1/images/variations", response_model=ImageResponse)
+@enforces_limits
 async def create_image_variation(
     request_obj: Request,
     image: UploadFile = File(...),
@@ -225,9 +226,8 @@ async def create_image_variation(
         try:
             model = apply_alias(model)
             model = await resolve_model_for_request(request_obj, auth, model)
-            # Group rate limit check (request-level limits already handled in middleware)
-            await enforce_group_rate_limit(request_obj, auth, model)
-            await enforce_model_access(request_obj, auth, model)
+            # Access first, so a 403 spends no quota; then the model's group limit.
+            await enforce_access_and_limits(request_obj, auth, model)
 
             # Read and encode image file
             image_content = await image.read()

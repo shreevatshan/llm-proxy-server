@@ -28,8 +28,8 @@ from app.routes.stream_utils import (
     STREAM_TIMEOUT_SECONDS,
     STREAM_CHUNK_TIMEOUT_SECONDS,
 )
-from app.rate_limit_dep import enforce_group_rate_limit
-from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
+from app.model_access_dep import ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.websearch import HEADER_NAME as WEBSEARCH_HEADER, maybe_intercept_chat, provider_key_for_model
@@ -42,6 +42,7 @@ router = APIRouter()
 
 
 @router.post("/v1/chat/completions", tags=["chat"])
+@enforces_limits
 async def chat_completions(
     request_obj: Request,  # FastAPI request for disconnect detection
     request: ChatCompletionRequest,
@@ -68,11 +69,8 @@ async def chat_completions(
             # rate-limit, access and usage layers below all key on the prefix.
             request.model = await resolve_model_for_request(request_obj, auth, request.model)
 
-            # Group rate limit check (request-level limits already handled in middleware)
-            await enforce_group_rate_limit(request_obj, auth, request.model)
-
-            # Per-user model access check
-            await enforce_model_access(request_obj, auth, request.model)
+            # Access first, so a 403 spends no quota; then the model's group limit.
+            await enforce_access_and_limits(request_obj, auth, request.model)
 
             # Apply request transformations
             transformation_manager = get_transformation_manager()

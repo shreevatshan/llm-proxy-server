@@ -3,7 +3,7 @@ import threading
 import time
 import logging
 import os
-from typing import List, Optional, Dict, Set
+from typing import List, Optional, Dict, Set, Tuple
 from opentelemetry import context as otel_context
 from app.openai_models import ModelInfo
 from app.tracing import create_span, add_span_attributes, set_span_error, safe_detach
@@ -426,61 +426,25 @@ class ModelCache:
             print(f"Updated provider {provider_key} and its models to {'enabled' if enabled else 'disabled'}")
     
     def get_enabled_models(self) -> List[ModelInfo]:
-        """Get only enabled models from cache (snapshot-based, minimal lock time)."""
-        # Take snapshots outside of heavy computation
-        models_snapshot = list(self._models)
-        model_configs_snapshot = dict(self._model_configs)
-        provider_configs_snapshot = dict(self._provider_configs)
-        
-        # Filter using snapshots (no locks held during filtering)
-        enabled_models = []
-        for model in models_snapshot:
-            # Check if model is enabled
-            model_enabled = model_configs_snapshot.get(model.id, True)
-            if model_enabled:
-                # Extract provider key from model id
-                if '/' in model.id:
-                    provider_key = model.id.split('/', 1)[0]
-                    provider_enabled = provider_configs_snapshot.get(provider_key, True)
-                    if provider_enabled:
-                        enabled_models.append(model)
-                else:
-                    enabled_models.append(model)
-        return enabled_models
-    
+        """Models that pass the global gate: the model, its provider and its group are on."""
+        return self.filter_enabled_models(list(self._models))
+
     def filter_enabled_models(self, models: List[ModelInfo]) -> List[ModelInfo]:
-        """Filter out disabled models from a list (snapshot-based, minimal lock time)."""
-        # Take snapshots
-        model_configs_snapshot = dict(self._model_configs)
-        provider_configs_snapshot = dict(self._provider_configs)
-        
-        # Filter using snapshots (no locks held during filtering)
-        enabled_models = []
-        for model in models:
-            # Check if model is enabled
-            model_enabled = model_configs_snapshot.get(model.id, True)
-            if model_enabled:
-                # Extract provider key from model id
-                if '/' in model.id:
-                    provider_key = model.id.split('/', 1)[0]
-                    provider_enabled = provider_configs_snapshot.get(provider_key, True)
-                    if provider_enabled:
-                        enabled_models.append(model)
-                else:
-                    enabled_models.append(model)
-        return enabled_models
+        """Drop models the global gate blocks (see _passes_global_gate)."""
+        return [model for model in models if self._passes_global_gate(model.id)]
     
     # ==================== Model Access ====================
 
     def _passes_global_gate(self, model_id: str) -> bool:
-        """True if the model and its provider are globally enabled."""
+        """True if the model, its provider and its model group are globally enabled."""
         if not self.is_model_enabled(model_id):
             return False
         if '/' in model_id:
             provider_key = model_id.split('/', 1)[0]
             if not self.is_provider_enabled(provider_key):
                 return False
-        return True
+        from app.rate_limit import rate_limit_tracker
+        return rate_limit_tracker.blocking_group(model_id) is None
 
     def is_model_allowed_for_profile(self, profile, model_id: str) -> bool:
         """Access decision for a model under a profile (app.profiles.ProfileSnapshot), by mode:
@@ -512,6 +476,18 @@ class ModelCache:
         profile = profile_registry.for_user(user_id)
         models_snapshot = list(self._models)
         return [m for m in models_snapshot if self.is_model_allowed_for_profile(profile, m.id)]
+
+    def get_models_with_access_for_user(self, user_id: int) -> List[Tuple[ModelInfo, bool]]:
+        """(model, allowed) for every model the user can use, plus globally-enabled
+        models their profile disables (allowed=False) so the UI can show them as disabled."""
+        from app.profiles import profile_registry
+        profile = profile_registry.for_user(user_id)
+        out = []
+        for m in list(self._models):
+            allowed = self.is_model_allowed_for_profile(profile, m.id)
+            if allowed or self._passes_global_gate(m.id):
+                out.append((m, allowed))
+        return out
 
     def get_config_cache_age(self) -> float:
         """Get configuration cache age in seconds."""

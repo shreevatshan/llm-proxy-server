@@ -10,7 +10,35 @@ let currentEditingProvider = null;
 
 
 class ProviderManager {
+    constructor() {
+        this.view = 'providers';   // the Providers & Models tab's view: 'providers' or 'models'
+        try { if (sessionStorage.getItem('providers:view') === 'models') this.view = 'models'; } catch (e) { /* storage blocked */ }
+    }
+
+    /** Opening the tab: restore the last view, then load (loadUnifiedProviderData covers both views). */
+    async loadTab() {
+        this.showView(this.view, { load: false });
+        await this.loadUnifiedProviderData();
+    }
+
+    showView(name, { load = true } = {}) {
+        this.view = name === 'models' ? 'models' : 'providers';
+        try { sessionStorage.setItem('providers:view', this.view); } catch (e) { /* storage blocked */ }
+        ['providers', 'models'].forEach(v => {
+            const pane = document.getElementById(`pm-view-${v}`);
+            if (pane) pane.style.display = v === this.view ? '' : 'none';
+            const btn = document.getElementById(`pm-view-${v}-btn`);
+            if (btn) {
+                btn.classList.toggle('active', v === this.view);
+                btn.setAttribute('aria-selected', String(v === this.view));
+            }
+        });
+        if (load && this.view === 'models') window.ModelsView?.load();
+    }
+
     async loadUnifiedProviderData() {
+        // Whatever reloaded the providers (sync, import, reinit) changed the models too.
+        if (this.view === 'models') window.ModelsView?.load();
         this.showProvidersLoading();
 
         try {
@@ -50,6 +78,26 @@ class ProviderManager {
             window.UIUtils.showToast('Failed to load provider data: ' + error.message, 'error');
             this.showProvidersEmpty();
         }
+    }
+
+    /**
+     * Refresh the provider counts in place after a model switch, without re-rendering:
+     * open model lists and search results stay as they are.
+     */
+    async refreshProviderCounts() {
+        const response = await fetch('/admin/providers', { credentials: 'include' });
+        if (!response.ok) return;
+        const providers = await response.json();
+        providersData = providers;
+        window.providersData = providers;
+        window.SearchManager?.refreshCachedData();
+        this.updateProviderStats(providers);
+        providers.forEach(p => {
+            [`provider-${p.provider_key}`, `search-provider-${p.provider_key}`].forEach(id => {
+                const stats = document.getElementById(id)?.querySelector('.provider-stats');
+                if (stats) stats.innerHTML = this.modelLine(p);
+            });
+        });
     }
 
     updateProviderStats(providers) {
@@ -258,7 +306,6 @@ class ProviderManager {
         listContainer.querySelectorAll('[data-action="delete-provider"]').forEach(el => {
             el.addEventListener('click', () => this.deleteProvider(el.dataset.providerKey));
         });
-
         // Restore collapsed state
         collapsedSections.forEach(id => {
             const content = document.getElementById(id);
@@ -356,6 +403,7 @@ class ProviderManager {
     }
 
     showProviderForm() {
+        this.showView('providers');   // the form lives in the Providers view
         document.getElementById('provider-form-container').style.display = 'block';
         document.getElementById('providers-list').style.display = 'none';
         document.getElementById('providers-empty').style.display = 'none';
@@ -437,8 +485,9 @@ class ProviderManager {
     }
 
     _revertProviderCheckbox(providerKey, enabled) {
+        // Model switches carry data-provider-key too; only the provider's own switch reverts.
         const checkboxes = document.querySelectorAll(
-            `input[data-provider-key="${CSS.escape(providerKey)}"]`
+            `input[data-action="toggle-provider"][data-provider-key="${CSS.escape(providerKey)}"]`
         );
         checkboxes.forEach(cb => { cb.checked = !enabled; });
     }

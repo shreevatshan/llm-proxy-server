@@ -74,7 +74,7 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         # distinct value; group limits are written into every profile, so they behave
         # like the group-wide defaults these tests were written against.
         self._limit_profiles = {}   # rpd_limit -> profile id
-        self._group_limits = []     # (instance?, group_id, rpm, rpd)
+        self._group_limits = []     # (group_id, rpm, rpd)
 
     async def asyncTearDown(self):
         from app.auth import database as auth_database
@@ -94,15 +94,18 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         self.tracker._carries_date = None
         self.tracker._pool_share_default = None
         self.tracker._pool_share_override = {}
+        # A switched-off group blocks its models in the global gate; never let one
+        # outlive its test.
+        self.tracker._groups = {}
+        self.tracker._model_to_group = {}
+        self.tracker._provider_to_group = {}
         from app.profiles import profile_registry
         profile_registry.reset()
         # User ids repeat across tests, so per-minute counts must not carry over.
         self.tracker._minute_buckets = {}
         self.tracker._group_minute_buckets = {}
-        self.tracker._instance_group_minute_buckets = {}
         self.tracker._rpd_cache = {}
         self.tracker._group_rpd_cache = {}
-        self.tracker._instance_group_rpd_cache = {}
         self.request_tracker._usage_buffer.clear()
         self.request_tracker._usage_buffer.update(self._saved_buffer)
         await self.db.close()
@@ -134,8 +137,8 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
             profile = UserProfile(name=f"rpd-{rpd_limit}", rpd_limit=rpd_limit)
             self.db.add(profile)
             await self.db.flush()
-            for instance, gid, rpm, rpd in self._group_limits:
-                self._add_group_limit(profile.id, instance, gid, rpm, rpd)
+            for gid, rpm, rpd in self._group_limits:
+                self._add_group_limit(profile.id, gid, rpm, rpd)
             await self.db.commit()
             self._limit_profiles[rpd_limit] = profile.id
         return self._limit_profiles[rpd_limit]
@@ -147,8 +150,8 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         profile = UserProfile(name=name, **limits)
         self.db.add(profile)
         await self.db.flush()
-        for instance, gid, rpm, rpd in self._group_limits:
-            self._add_group_limit(profile.id, instance, gid, rpm, rpd)
+        for gid, rpm, rpd in self._group_limits:
+            self._add_group_limit(profile.id, gid, rpm, rpd)
         await self.db.commit()
         await self.refresh()
         return profile
@@ -158,34 +161,35 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         await self.refresh()
 
-    async def set_group_limit(self, profile_id, group, *, rpm=None, rpd=None, instance=False):
+    async def set_group_limit(self, profile_id, group, *, rpm=None, rpd=None):
         """Give one profile its own limit on a group, replacing the shared one."""
         from sqlalchemy import delete as sa_delete
-        from app.auth.models import ProfileInstanceGroupLimit, ProfileModelGroupLimit
+        from app.auth.models import ProfileModelGroupLimit
 
-        model = ProfileInstanceGroupLimit if instance else ProfileModelGroupLimit
+        model = ProfileModelGroupLimit
         await self.db.execute(sa_delete(model).where(
             model.profile_id == profile_id, model.group_id == group.id,
         ))
-        self._add_group_limit(profile_id, instance, group.id, rpm, rpd)
+        self._add_group_limit(profile_id, group.id, rpm, rpd)
         await self.db.commit()
         await self.refresh()
 
-    def _add_group_limit(self, profile_id, instance, group_id, rpm, rpd):
-        from app.auth.models import ProfileInstanceGroupLimit, ProfileModelGroupLimit
+    def _add_group_limit(self, profile_id, group_id, rpm, rpd):
+        from app.auth.models import ProfileModelGroupLimit
 
         if rpm is None and rpd is None:
             return
-        model = ProfileInstanceGroupLimit if instance else ProfileModelGroupLimit
-        self.db.add(model(profile_id=profile_id, group_id=group_id, rpm_limit=rpm, rpd_limit=rpd))
+        self.db.add(ProfileModelGroupLimit(
+            profile_id=profile_id, group_id=group_id, rpm_limit=rpm, rpd_limit=rpd,
+        ))
 
-    async def _limit_group_in_every_profile(self, instance, group_id, rpm, rpd):
+    async def _limit_group_in_every_profile(self, group_id, rpm, rpd):
         from sqlalchemy import select
         from app.auth.models import UserProfile
 
-        self._group_limits.append((instance, group_id, rpm, rpd))
+        self._group_limits.append((group_id, rpm, rpd))
         for pid in (await self.db.execute(select(UserProfile.id))).scalars().all():
-            self._add_group_limit(pid, instance, group_id, rpm, rpd)
+            self._add_group_limit(pid, group_id, rpm, rpd)
 
     async def user_id_of(self, username):
         from sqlalchemy import select
@@ -275,20 +279,21 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         self.db.add(group)
         await self.db.flush()
         self.db.add(ModelGroupMember(group_id=group.id, model_id=model_id))
-        await self._limit_group_in_every_profile(False, group.id, None, rpd_default)
+        await self._limit_group_in_every_profile(group.id, None, rpd_default)
         await self.db.commit()
         await self.refresh()
         return group
 
     async def make_instance_group(self, name, provider_key, rpd_default):
-        """An instance group containing one provider, with the tracker refreshed."""
-        from app.auth.models import InstanceGroup, InstanceGroupMember
+        """A model group whose one member is a whole provider instance, with the
+        tracker refreshed."""
+        from app.auth.models import ModelGroup, ModelGroupInstanceMember
 
-        group = InstanceGroup(name=name)
+        group = ModelGroup(name=name)
         self.db.add(group)
         await self.db.flush()
-        self.db.add(InstanceGroupMember(group_id=group.id, provider_key=provider_key))
-        await self._limit_group_in_every_profile(True, group.id, None, rpd_default)
+        self.db.add(ModelGroupInstanceMember(group_id=group.id, provider_key=provider_key))
+        await self._limit_group_in_every_profile(group.id, None, rpd_default)
         await self.db.commit()
         await self.refresh()
         return group

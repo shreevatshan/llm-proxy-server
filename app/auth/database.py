@@ -13,8 +13,8 @@ from sqlalchemy.orm import sessionmaker, Session, selectinload
 from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict
-from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, UserModelGroupRateLimit, InstanceGroup, InstanceGroupMember, UserInstanceGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileInstanceGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
+from typing import Optional, List, Dict, Sequence, Tuple
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, ModelGroupInstanceMember, UserModelGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -751,7 +751,6 @@ async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
         for _model in (
             UserRateLimit,
             UserModelGroupRateLimit,
-            UserInstanceGroupRateLimit,
             UserModelAccessPolicy,
             UserModelAccessException,
         ):
@@ -970,22 +969,19 @@ async def create_or_update_model_configuration(
 
 
 async def toggle_provider_configuration(db: AsyncSession, provider_key: str, enabled: bool) -> bool:
-    """Toggle provider configuration and all its models (uses ProviderCredentials now)."""
+    """Turn a provider on or off.
+
+    The provider flag is a master switch over its models' own flags, never a bulk
+    write to them: a model is served only when both are on (cache._passes_global_gate),
+    so switching a provider back on restores each model's individual setting.
+    """
     try:
-        # Update provider
         provider = await get_provider_credentials(db, provider_key)
         if not provider:
             return False
-        
-        provider.enabled = enabled  # Changed from is_enabled to enabled
+
+        provider.enabled = enabled
         provider.updated_at = datetime.utcnow()
-        
-        # Update all models under this provider
-        models = await get_models_by_provider(db, provider_key)
-        for model in models:
-            model.is_enabled = enabled
-            model.updated_at = datetime.utcnow()
-        
         await db.commit()
         
         # Trigger cache update
@@ -998,22 +994,15 @@ async def toggle_provider_configuration(db: AsyncSession, provider_key: str, ena
 
 
 async def toggle_model_configuration(db: AsyncSession, model_id: str, enabled: bool) -> bool:
-    """Toggle model configuration and auto-enable provider if needed (uses ProviderCredentials now)."""
+    """Turn one model on or off. Never touches its provider's flag; see
+    toggle_provider_configuration."""
     try:
         model = await get_model_configuration(db, model_id)
         if not model:
             return False
-        
+
         model.is_enabled = enabled
         model.updated_at = datetime.utcnow()
-        
-        # If enabling a model, auto-enable its provider
-        if enabled:
-            provider = await get_provider_credentials(db, model.provider_key)
-            if provider and not provider.enabled:  # Changed from is_enabled to enabled
-                provider.enabled = True  # Changed from is_enabled to enabled
-                provider.updated_at = datetime.utcnow()
-        
         await db.commit()
         
         # Trigger cache update
@@ -1027,14 +1016,9 @@ async def toggle_model_configuration(db: AsyncSession, model_id: str, enabled: b
 
 @with_db_retry()
 async def bulk_toggle_all_models(db: AsyncSession, enabled: bool) -> bool:
-    """Enable or disable all models and providers (uses ProviderCredentials now)."""
+    """Enable or disable every model. Provider flags are left alone; see
+    toggle_provider_configuration."""
     try:
-        # Update all providers
-        providers = await get_all_provider_configurations(db)
-        for provider in providers:
-            provider.enabled = enabled  # Changed from is_enabled to enabled
-            provider.updated_at = datetime.utcnow()
-        
         # Update all models
         models = await get_all_model_configurations(db)
         for model in models:
@@ -1340,7 +1324,9 @@ async def _rename_provider_with_models(
             model.model_id = new_model_id
             model.provider_key = new_provider_key
             model.updated_at = datetime.utcnow()
-        
+
+        await _rename_provider_references(db, old_provider_key, new_provider_key)
+
         # Delete the old provider
         await db.delete(old_credentials)
         
@@ -1371,7 +1357,9 @@ async def delete_provider_credentials(db: AsyncSession, provider_key: str) -> bo
         models = await get_models_by_provider(db, provider_key)
         for model in models:
             await db.delete(model)
-        
+
+        await _remove_model_references(db, provider_keys=[provider_key])
+
         # Then delete the provider credentials
         await db.delete(credentials)
         await db.commit()
@@ -1502,7 +1490,8 @@ async def delete_stale_models(db: AsyncSession, stale_model_ids: List[str]) -> i
             if model:
                 await db.delete(model)
                 deleted_count += 1
-        
+
+        await _remove_model_references(db, model_ids=stale_model_ids)
         await db.commit()
         
         # Trigger cache update
@@ -1512,6 +1501,105 @@ async def delete_stale_models(db: AsyncSession, stale_model_ids: List[str]) -> i
     except Exception as e:
         await db.rollback()
         raise e
+
+
+# ---------------------------------------------------------------------------
+# Keeping references to models and providers in step with them. Group members,
+# access exceptions, aliases and web-search settings all name models and
+# instances by string, with no foreign key, so a rename or a deliberate removal
+# has to carry them along by hand. Only those two paths call these: a model sync
+# deletes and re-creates the same ids, and must leave references alone.
+# ---------------------------------------------------------------------------
+
+def _on_instance(column, provider_key: str):
+    """SQL predicate: `column` is a model id on this instance. substr, not LIKE, so
+    '_' in a provider_key is not a wildcard."""
+    from sqlalchemy import func
+    prefix = f"{provider_key}/"
+    return func.substr(column, 1, len(prefix)) == prefix
+
+
+async def _rename_provider_references(db: AsyncSession, old_key: str, new_key: str) -> None:
+    """Point every reference at old_key's models and instance at new_key. No commit."""
+    import json
+    from sqlalchemy import func, update as sa_update
+
+    def moved(column):
+        return new_key + "/" + func.substr(column, len(old_key) + 2)
+
+    for model, column in (
+        (ModelGroupMember, ModelGroupMember.model_id),
+        (ProfileModelAccessException, ProfileModelAccessException.model_id),
+        (ModelAlias, ModelAlias.target_model_id),
+    ):
+        await db.execute(
+            sa_update(model).where(_on_instance(column, old_key))
+            .values({column.key: moved(column)}).execution_options(synchronize_session=False)
+        )
+    await db.execute(
+        sa_update(ModelGroupInstanceMember).where(ModelGroupInstanceMember.provider_key == old_key)
+        .values(provider_key=new_key).execution_options(synchronize_session=False)
+    )
+    settings = (await db.execute(select(WebSearchSettings))).scalars().all()
+    for row in settings:
+        keys = json.loads(row.enabled_providers) if row.enabled_providers else None
+        if isinstance(keys, list) and old_key in keys:
+            row.enabled_providers = json.dumps([new_key if k == old_key else k for k in keys])
+
+
+async def _remove_model_references(
+    db: AsyncSession, model_ids: Sequence[str] = (), provider_keys: Sequence[str] = (),
+) -> None:
+    """Drop references to removed models (or every model of removed instances). No commit.
+
+    Group members and access exceptions are deleted. Aliases are switched off rather
+    than deleted, so the admin still sees what used to be mapped and can repoint it.
+    """
+    import json
+    from sqlalchemy import delete as sa_delete, or_, update as sa_update
+
+    def matching(column):
+        conds = [column.in_(list(model_ids))] if model_ids else []
+        conds += [_on_instance(column, pk) for pk in provider_keys]
+        return or_(*conds)
+
+    if not model_ids and not provider_keys:
+        return
+    await db.execute(sa_delete(ModelGroupMember).where(matching(ModelGroupMember.model_id)))
+    await db.execute(sa_delete(ProfileModelAccessException).where(
+        matching(ProfileModelAccessException.model_id)))
+    await db.execute(
+        sa_update(ModelAlias).where(matching(ModelAlias.target_model_id))
+        .values(enabled=False).execution_options(synchronize_session=False)
+    )
+    if provider_keys:
+        await db.execute(sa_delete(ModelGroupInstanceMember).where(
+            ModelGroupInstanceMember.provider_key.in_(list(provider_keys))))
+        for row in (await db.execute(select(WebSearchSettings))).scalars().all():
+            keys = json.loads(row.enabled_providers) if row.enabled_providers else None
+            if isinstance(keys, list) and any(k in provider_keys for k in keys):
+                row.enabled_providers = json.dumps([k for k in keys if k not in provider_keys])
+
+
+async def clear_model_group_members(db: AsyncSession) -> None:
+    """Empty every group's member lists (system reinit, which drops every model). No commit."""
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(ModelGroupMember))
+    await db.execute(sa_delete(ModelGroupInstanceMember))
+
+
+async def reload_reference_caches() -> None:
+    """Reload what the reference cleanups above can change: groups and access
+    exceptions (the rate-limit snapshot), aliases, and web-search settings."""
+    from app.rate_limit import rate_limit_tracker
+    from app.model_alias import model_alias_resolver
+    from app.websearch.settings import websearch_settings_cache
+    for reload in (rate_limit_tracker.refresh_now, model_alias_resolver.load_from_database,
+                   websearch_settings_cache.load_from_database):
+        try:
+            await reload()
+        except Exception as e:
+            logger.warning("Reference cache reload (%s) failed: %s", getattr(reload, "__qualname__", reload), e)
 
 
 async def _update_cache_after_database_change(operation: str, **kwargs) -> None:
@@ -1529,19 +1617,15 @@ async def _update_cache_after_database_change(operation: str, **kwargs) -> None:
             if model_id and enabled is not None:
                 provider_manager.model_cache.update_single_model_config(model_id, enabled)
                 print(f"Cache updated: model {model_id} {'enabled' if enabled else 'disabled'}")
-                
-                # If enabling model, also ensure provider is enabled in cache
-                if enabled and provider_key:
-                    provider_manager.model_cache.update_single_provider_config(provider_key, True)
-        
+
         elif operation == "provider_toggle":
-            # Update provider and all its models in cache
+            # The provider flag only; its models keep their own flags.
             provider_key = kwargs.get("provider_key")
             enabled = kwargs.get("enabled")
-            
+
             if provider_key and enabled is not None:
-                provider_manager.model_cache.update_provider_and_models_config(provider_key, enabled)
-                print(f"Cache updated: provider {provider_key} and its models {'enabled' if enabled else 'disabled'}")
+                provider_manager.model_cache.update_single_provider_config(provider_key, enabled)
+                print(f"Cache updated: provider {provider_key} {'enabled' if enabled else 'disabled'}")
         
         elif operation == "bulk_toggle":
             # Refresh entire cache from database
@@ -2211,6 +2295,26 @@ async def get_usage_aggregates(
     return result
 
 
+async def get_usage_report_aggregates(db: AsyncSession, start, end) -> dict:
+    """Per-user and per-model totals over the inclusive local-date range [start, end].
+
+    Reads request_usage alone: rollup_to_monthly only moves a month whose last day is
+    more than 30 days old, so any range with start >= today - 30 is still entirely in
+    the daily table. Callers must keep to that bound. Unlike the dashboard's '30d'
+    window this takes explicit dates, so a report can end at yesterday and stay final.
+    """
+    where = [RequestUsage.date >= start, RequestUsage.date <= end]
+    user_rows = (await db.execute(_user_rows_q(RequestUsage, where))).all()
+    model_rows = (await db.execute(_model_rows_q(RequestUsage, where))).all()
+
+    per_user = _fold_identities(_user_row_dicts(user_rows))
+    return {
+        "per_user": per_user,
+        "per_model": _merge_model_rows(model_rows),
+        "total": sum(r["request_count"] for r in per_user),
+    }
+
+
 async def get_usage_by_user_and_model(
     db: AsyncSession,
     user_ids: Optional[list] = None,
@@ -2869,6 +2973,25 @@ async def _run_auto_migrations():
         except Exception as e:
             logger.warning("Auto-migration: pre-profiles backup failed: %s", e)
 
+    # Folding instance groups into model groups drops the old tables, so it gets a
+    # backup of its own and, like the usage rekey, refuses to run without one.
+    async with engine.connect() as conn:
+        groups_unify_pending = await _instance_groups_pending(conn)
+    if groups_unify_pending:
+        try:
+            backup = await asyncio.to_thread(_backup_sqlite_file, "pre-group-unify")
+        except Exception as e:
+            raise RuntimeError(
+                f"instance groups need folding into model groups but the pre-migration "
+                f"backup failed: {e}"
+            ) from e
+        if not backup:
+            raise RuntimeError(
+                "instance groups need folding into model groups but the database file "
+                "could not be located to back up first"
+            )
+        logger.info("Auto-migration: database backed up to %s", backup)
+
     async with engine.begin() as conn:
         # Check if is_pending_approval column exists on users table
         try:
@@ -3038,6 +3161,16 @@ async def _run_auto_migrations():
                         await conn.execute(text(ddl))
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add request_pools override columns: {e}")
+
+        # Model groups can be switched off; existing groups stay on.
+        try:
+            result = await conn.execute(text("PRAGMA table_info(model_groups)"))
+            columns = [row[1] for row in result.fetchall()]
+            if columns and 'enabled' not in columns:
+                logger.info("Auto-migration: Adding 'enabled' column to model_groups")
+                await conn.execute(text("ALTER TABLE model_groups ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT 1"))
+        except Exception as e:
+            logger.warning(f"Auto-migration: Could not add model_groups.enabled column: {e}")
 
         # Migrate api_version → discovery_api_version and drop legacy Azure AD columns.
         try:
@@ -3271,6 +3404,12 @@ async def _run_auto_migrations():
 
         await _migrate_profiles(conn, profiles_pending)
 
+        # Fold instance groups into model groups (as instance members). Runs after
+        # _migrate_profiles, which reads the old instance tables on a pre-profiles
+        # database. Not wrapped in a swallow-all try: it drops tables, so a failure
+        # must abort startup with the transaction rolled back.
+        await _unify_model_groups(conn, groups_unify_pending)
+
         # Rebuild the usage tables onto (user_id, pool_id) keys. Runs last: it needs
         # the users, api_keys and pool_membership_intervals tables in their final
         # shape, and the backup was taken before this block opened. Not wrapped in a
@@ -3370,6 +3509,170 @@ async def _make_aliases_profile_scoped(conn) -> None:
     ))
 
 
+# Set when this start folded instance groups into model groups. The precedence flip
+# (an explicit model now beats an instance) moves some of today's usage between
+# scopes, so startup re-settles every pool once; see app.main.
+GROUPS_UNIFIED_THIS_START = False
+
+
+async def _instance_groups_pending(conn) -> bool:
+    from sqlalchemy import text
+    return bool((await conn.execute(text(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'instance_groups'"
+    ))).first())
+
+
+def _unique_group_name(base: str, taken: set) -> str:
+    """`base`, or `base (2)`, `base (3)`... -- unique case-insensitively, within 64 chars."""
+    name, n = base[:64], 1
+    while name.lower() in taken or name.lower() == "default":
+        n += 1
+        suffix = f" ({n})"
+        name = base[:64 - len(suffix)] + suffix
+    taken.add(name.lower())
+    return name
+
+
+async def _normalise_coupled_model_flags(conn) -> int:
+    """Undo the old provider toggle's write-through to model flags.
+
+    The old toggle forced every model of a provider off with it, so a disabled
+    provider whose models are *all* off says nothing about the models; switch them
+    back on so re-enabling the provider restores them. A provider with mixed flags was
+    edited model by model, so it is left alone. Returns the models switched on.
+    """
+    from sqlalchemy import text
+    rows = (await conn.execute(text(
+        "SELECT p.provider_key, "
+        "  SUM(CASE WHEN m.is_enabled THEN 1 ELSE 0 END), COUNT(m.id) "
+        "FROM provider_credentials p JOIN model_configurations m ON m.provider_key = p.provider_key "
+        "WHERE NOT p.enabled GROUP BY p.provider_key"
+    ))).fetchall()
+    switched, mixed = 0, []
+    for provider_key, on, total in rows:
+        if on == 0:
+            await conn.execute(text(
+                "UPDATE model_configurations SET is_enabled = 1 WHERE provider_key = :pk"
+            ), {"pk": provider_key})
+            switched += total
+        elif on < total:
+            mixed.append(provider_key)
+    if mixed:
+        logger.warning(
+            "Auto-migration: disabled providers with individually disabled models were left "
+            "as they are (their model flags now apply when the provider is re-enabled): %s", mixed,
+        )
+    return switched
+
+
+async def _unify_model_groups(conn, instance_groups_pending: bool) -> None:
+    """Bring model groups onto the single-concept schema.
+
+    Every start: names must be unique case-insensitively and "Default" is reserved for
+    the built-in group, so clashing rows are renamed before the lower(name) index goes on.
+
+    Once, while the instance_groups table still exists: each instance group becomes a
+    model group whose members are instances, carrying its per-profile limits and its
+    pool ledger and carry rows across; then the old tables are dropped.
+    """
+    from sqlalchemy import text
+    global GROUPS_UNIFIED_THIS_START
+
+    taken: set = set()
+    for gid, name in (await conn.execute(text("SELECT id, name FROM model_groups ORDER BY id"))).fetchall():
+        new = _unique_group_name(name, taken)
+        if new != name:
+            logger.warning("Auto-migration: renaming model group %r to %r (names are unique "
+                           "ignoring case, and 'Default' is reserved)", name, new)
+            await conn.execute(text("UPDATE model_groups SET name = :n WHERE id = :id"), {"n": new, "id": gid})
+
+    if instance_groups_pending:
+        tables = {r[0] for r in (await conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type = 'table'")
+        )).fetchall()}
+        explicit = dict((await conn.execute(text(
+            "SELECT m.model_id, g.name FROM model_group_members m JOIN model_groups g ON g.id = m.group_id"
+        ))).fetchall())
+        groups = (await conn.execute(text(
+            "SELECT id, name, description, created_at, updated_at, updated_by FROM instance_groups ORDER BY id"
+        ))).fetchall()
+        for old_id, name, description, created_at, updated_at, updated_by in groups:
+            new_name = name if name.lower() not in taken and name.lower() != "default" \
+                else _unique_group_name(f"{name} (instance)", taken)
+            taken.add(new_name.lower())
+            await conn.execute(text(
+                "INSERT INTO model_groups (name, description, created_at, updated_at, updated_by) "
+                "VALUES (:n, :d, :c, :u, :b)"
+            ), {"n": new_name, "d": description, "c": created_at, "u": updated_at, "b": updated_by})
+            new_id = (await conn.execute(text("SELECT last_insert_rowid()"))).scalar_one()
+            members = [r[0] for r in (await conn.execute(text(
+                "SELECT provider_key FROM instance_group_members WHERE group_id = :g"
+            ), {"g": old_id})).fetchall()]
+            for pk in members:
+                await conn.execute(text(
+                    "INSERT INTO model_group_instance_members (group_id, provider_key, created_at) "
+                    "VALUES (:g, :pk, CURRENT_TIMESTAMP)"
+                ), {"g": new_id, "pk": pk})
+                for model_id, owner in explicit.items():
+                    if model_id.startswith(pk + "/"):
+                        logger.warning(
+                            "Auto-migration: %s is in model group %r and its instance was in instance "
+                            "group %r; the model group's limits now govern it (explicit models win)",
+                            model_id, owner, new_name,
+                        )
+            if "profile_instance_group_limits" in tables:
+                await conn.execute(text(
+                    "INSERT INTO profile_model_group_limits "
+                    "(profile_id, group_id, rpm_limit, rpd_limit, updated_at, updated_by) "
+                    "SELECT profile_id, :new, rpm_limit, rpd_limit, updated_at, updated_by "
+                    "FROM profile_instance_group_limits WHERE group_id = :old"
+                ), {"new": new_id, "old": old_id})
+            else:
+                # A database from before profiles: the group's own defaults applied to
+                # everyone, and _migrate_profiles had no limits table to seed them into.
+                await conn.execute(text(
+                    "INSERT INTO profile_model_group_limits "
+                    "(profile_id, group_id, rpm_limit, rpd_limit, updated_at, updated_by) "
+                    "SELECT :pid, :new, rpm_default, rpd_default, CURRENT_TIMESTAMP, 'migration' "
+                    "FROM instance_groups WHERE id = :old "
+                    "AND (rpm_default IS NOT NULL OR rpd_default IS NOT NULL)"
+                ), {"pid": DEFAULT_PROFILE_ID, "new": new_id, "old": old_id})
+            for table in ("request_pool_ledger", "user_rpd_carries"):
+                if table in tables:
+                    # model_groups ids are reused once the highest is deleted, and these
+                    # rows have no foreign key: any already under new_id belong to a
+                    # deleted group. Drop them, or they collide with (or pass for) the
+                    # rows moved across.
+                    await conn.execute(text(
+                        f"DELETE FROM {table} WHERE scope_kind = 'model_group' AND scope_id = :new"
+                    ), {"new": new_id})
+                    await conn.execute(text(
+                        f"UPDATE {table} SET scope_kind = 'model_group', scope_id = :new "
+                        f"WHERE scope_kind = 'instance_group' AND scope_id = :old"
+                    ), {"new": new_id, "old": old_id})
+            logger.info("Auto-migration: instance group %r -> model group %r (id %s) with %d instance(s)",
+                        name, new_name, new_id, len(members))
+
+        switched = await _normalise_coupled_model_flags(conn)
+        if switched:
+            logger.info("Auto-migration: re-enabled %d model(s) the old provider toggle had switched "
+                        "off; a disabled provider still keeps them out of service", switched)
+
+        # Children first: foreign keys are enforced.
+        for table in ("instance_group_members", "profile_instance_group_limits",
+                      "user_instance_group_rate_limits", "instance_groups"):
+            await conn.execute(text(f"DROP TABLE IF EXISTS {table}"))
+        GROUPS_UNIFIED_THIS_START = True
+
+    try:
+        await conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_groups_name_lower ON model_groups (lower(name))"
+        ))
+    except Exception as e:
+        logger.warning("Auto-migration: could not create case-insensitive unique index on "
+                       "model_groups(name): %s", e)
+
+
 async def _migrate_profiles(conn, profiles_pending: bool) -> None:
     """Bring a database onto user profiles.
 
@@ -3409,7 +3712,9 @@ async def _migrate_profiles(conn, profiles_pending: bool) -> None:
             ("model_groups", "profile_model_group_limits"),
             ("instance_groups", "profile_instance_group_limits"),
         ):
-            if groups in tables:
+            # profile_instance_group_limits is no longer created by create_all; it
+            # exists only on a database that had instance groups with profiles.
+            if groups in tables and limits in tables:
                 await conn.execute(text(
                     f"INSERT OR IGNORE INTO {limits} "
                     f"(profile_id, group_id, rpm_limit, rpd_limit, updated_at, updated_by) "
@@ -3465,9 +3770,9 @@ def init_database_sync():
 # ---------------------------------------------------------------------------
 
 async def list_model_groups(db: AsyncSession, group_id: Optional[int] = None):
-    """Return all model groups (with members loaded), or a single group if group_id given."""
+    """Return all model groups (with both member kinds loaded), or one if group_id given."""
     from sqlalchemy.orm import selectinload as _sil
-    q = select(ModelGroup).options(_sil(ModelGroup.members))
+    q = select(ModelGroup).options(_sil(ModelGroup.members), _sil(ModelGroup.instance_members)).order_by(ModelGroup.name)
     if group_id is not None:
         q = q.where(ModelGroup.id == group_id)
     result = await db.execute(q)
@@ -3477,10 +3782,54 @@ async def list_model_groups(db: AsyncSession, group_id: Optional[int] = None):
 
 async def create_model_group(
     db: AsyncSession, name: str, description: Optional[str], admin_username: str,
+    model_ids: Sequence[str] = (), provider_keys: Sequence[str] = (),
 ) -> ModelGroup:
-    """Create an empty group. Its limits are set per profile (see set_group_limit_for_all_profiles)."""
+    """Create a group with its members, in one transaction.
+
+    Each profile's limits for it start as the strictest of the limits that governed
+    the members until now, so they never get looser or become unlimited for everyone.
+    That is the profile's Default limits for members no group claimed, and the owning
+    group's limits for a model carved out of another group's instance.
+    """
+    from app.profiles import DEFAULT_GROUP_ID
+    from app.rate_limit import provider_key_of
+
+    # Instances belong to one group at most, so a new instance member was in Default;
+    # an explicit model was in whichever group holds its instance, if any.
+    instance_owner = dict((await db.execute(
+        select(ModelGroupInstanceMember.provider_key, ModelGroupInstanceMember.group_id)
+    )).all())
+    sources = {instance_owner.get(provider_key_of(mid), DEFAULT_GROUP_ID) for mid in model_ids}
+    if provider_keys or not sources:
+        sources.add(DEFAULT_GROUP_ID)
+    group_limits = {
+        (r.profile_id, r.group_id): (r.rpm_limit, r.rpd_limit)
+        for r in (await db.execute(select(ProfileModelGroupLimit).where(
+            ProfileModelGroupLimit.group_id.in_(sources - {DEFAULT_GROUP_ID})
+        ))).scalars()
+    }
+
+    def strictest(values):
+        values = [v for v in values if v is not None]
+        return min(values) if values else None
+
     row = ModelGroup(name=name, description=description, updated_by=admin_username)
     db.add(row)
+    await db.flush()
+    db.add_all([ModelGroupMember(group_id=row.id, model_id=mid) for mid in model_ids])
+    db.add_all([ModelGroupInstanceMember(group_id=row.id, provider_key=pk) for pk in provider_keys])
+    for profile in (await db.execute(select(UserProfile))).scalars().all():
+        limits = [
+            (profile.rpm_limit, profile.rpd_limit) if gid == DEFAULT_GROUP_ID
+            else group_limits.get((profile.id, gid), (None, None))
+            for gid in sources
+        ]
+        rpm, rpd = strictest(l[0] for l in limits), strictest(l[1] for l in limits)
+        if rpm is not None or rpd is not None:
+            db.add(ProfileModelGroupLimit(
+                profile_id=profile.id, group_id=row.id, rpm_limit=rpm,
+                rpd_limit=rpd, updated_by=admin_username,
+            ))
     await db.commit()
     await db.refresh(row)
     return row
@@ -3488,7 +3837,10 @@ async def create_model_group(
 
 async def update_model_group(
     db: AsyncSession, group_id: int, fields: dict, admin_username: str,
+    members: Optional[Tuple[Sequence[str], Sequence[str]]] = None,
 ) -> Optional[ModelGroup]:
+    """Update a group's fields and, when `members` is (model_ids, provider_keys), replace
+    its members too -- in one commit, so a rejected member list leaves the name alone."""
     result = await db.execute(select(ModelGroup).where(ModelGroup.id == group_id))
     row = result.scalar_one_or_none()
     if row is None:
@@ -3497,6 +3849,8 @@ async def update_model_group(
         setattr(row, k, v)
     row.updated_by = admin_username
     row.updated_at = datetime.utcnow()
+    if members is not None:
+        await _replace_group_members(db, group_id, *members)
     await db.commit()
     await db.refresh(row)
     return row
@@ -3512,85 +3866,61 @@ async def delete_model_group(db: AsyncSession, group_id: int) -> bool:
     return True
 
 
-async def set_group_members(db: AsyncSession, group_id: int, model_ids: list) -> list:
-    """Replace the member list for a group. Returns list of ModelGroupMember rows."""
+async def set_group_members(
+    db: AsyncSession, group_id: int, model_ids: Sequence[str], provider_keys: Sequence[str] = (),
+) -> None:
+    """Replace both member lists for a group."""
+    await _replace_group_members(db, group_id, model_ids, provider_keys)
+    await db.commit()
+
+
+async def _replace_group_members(
+    db: AsyncSession, group_id: int, model_ids: Sequence[str], provider_keys: Sequence[str],
+) -> None:
+    """Replace both member lists for a group. No commit."""
     from sqlalchemy import delete as sa_delete
     await db.execute(sa_delete(ModelGroupMember).where(ModelGroupMember.group_id == group_id))
-    new_members = [ModelGroupMember(group_id=group_id, model_id=mid) for mid in model_ids]
-    db.add_all(new_members)
-    await db.commit()
-    return new_members
+    await db.execute(sa_delete(ModelGroupInstanceMember).where(ModelGroupInstanceMember.group_id == group_id))
+    # Flush the deletes first: a key moving between this group's own rows must not
+    # meet itself in the unique index.
+    await db.flush()
+    db.add_all([ModelGroupMember(group_id=group_id, model_id=mid) for mid in model_ids])
+    db.add_all([ModelGroupInstanceMember(group_id=group_id, provider_key=pk) for pk in provider_keys])
+
+
+async def model_group_overview(db: AsyncSession) -> dict:
+    """Resolve every model to its group from the database, the way
+    rate_limit_tracker.group_for does at request time.
+
+    Returns {"groups": [ModelGroup rows], "models": {model_id: is_enabled},
+    "providers": {provider_key: enabled}, "effective": {group_id: [model_id]}}, with
+    the Default group under DEFAULT_GROUP_ID. Used by the admin views, which must show
+    stale members and live instance coverage that the tracker snapshot does not keep.
+    """
+    from app.profiles import DEFAULT_GROUP_ID
+    from app.rate_limit import provider_key_of
+
+    groups = await list_model_groups(db)
+    models = {m.model_id: bool(m.is_enabled) for m in (await db.execute(select(ModelConfiguration))).scalars()}
+    providers = {
+        p.provider_key: bool(p.enabled)
+        for p in (await db.execute(select(ProviderCredentials))).scalars()
+    }
+    by_model = {m.model_id: g.id for g in groups for m in g.members}
+    by_instance = {m.provider_key: g.id for g in groups for m in g.instance_members}
+    effective: Dict[int, List[str]] = {g.id: [] for g in groups}
+    effective[DEFAULT_GROUP_ID] = []
+    for model_id in sorted(models):
+        gid = by_model.get(model_id)
+        if gid is None:
+            gid = by_instance.get(provider_key_of(model_id), DEFAULT_GROUP_ID)
+        effective[gid].append(model_id)
+    return {"groups": groups, "models": models, "providers": providers, "effective": effective,
+            "by_model": by_model, "by_instance": by_instance}
 
 
 async def get_model_group_limits(db: AsyncSession, group_id: int) -> Optional[ModelGroup]:
     result = await db.execute(select(ModelGroup).where(ModelGroup.id == group_id))
-    return result.scalar_one_or_none()
-
-
-# ---------------------------------------------------------------------------
-# Instance-group helpers (mirror the model-group helpers, keyed on provider_key)
-# ---------------------------------------------------------------------------
-
-async def list_instance_groups(db: AsyncSession, group_id: Optional[int] = None):
-    """Return all instance groups (with members loaded), or a single group if group_id given."""
-    from sqlalchemy.orm import selectinload as _sil
-    q = select(InstanceGroup).options(_sil(InstanceGroup.members))
-    if group_id is not None:
-        q = q.where(InstanceGroup.id == group_id)
-    result = await db.execute(q)
-    rows = result.scalars().all()
-    return rows[0] if group_id is not None and rows else (None if group_id is not None else rows)
-
-
-async def create_instance_group(
-    db: AsyncSession, name: str, description: Optional[str], admin_username: str,
-) -> InstanceGroup:
-    """Create an empty group. Its limits are set per profile (see set_group_limit_for_all_profiles)."""
-    row = InstanceGroup(name=name, description=description, updated_by=admin_username)
-    db.add(row)
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-async def update_instance_group(
-    db: AsyncSession, group_id: int, fields: dict, admin_username: str,
-) -> Optional[InstanceGroup]:
-    result = await db.execute(select(InstanceGroup).where(InstanceGroup.id == group_id))
-    row = result.scalar_one_or_none()
-    if row is None:
-        return None
-    for k, v in fields.items():
-        setattr(row, k, v)
-    row.updated_by = admin_username
-    row.updated_at = datetime.utcnow()
-    await db.commit()
-    await db.refresh(row)
-    return row
-
-
-async def delete_instance_group(db: AsyncSession, group_id: int) -> bool:
-    result = await db.execute(select(InstanceGroup).where(InstanceGroup.id == group_id))
-    row = result.scalar_one_or_none()
-    if row is None:
-        return False
-    await db.delete(row)
-    await db.commit()
-    return True
-
-
-async def set_instance_group_members(db: AsyncSession, group_id: int, provider_keys: list) -> list:
-    """Replace the member list for an instance group. Returns list of InstanceGroupMember rows."""
-    from sqlalchemy import delete as sa_delete
-    await db.execute(sa_delete(InstanceGroupMember).where(InstanceGroupMember.group_id == group_id))
-    new_members = [InstanceGroupMember(group_id=group_id, provider_key=pk) for pk in provider_keys]
-    db.add_all(new_members)
-    await db.commit()
-    return new_members
-
-
-async def get_instance_group_limits(db: AsyncSession, group_id: int) -> Optional[InstanceGroup]:
-    result = await db.execute(select(InstanceGroup).where(InstanceGroup.id == group_id))
     return result.scalar_one_or_none()
 
 
@@ -3673,10 +4003,10 @@ async def create_profile(
         if src is not None:
             row.rpm_limit, row.rpd_limit = src.rpm_limit, src.rpd_limit
             row.model_access_mode = src.model_access_mode
-            for model in (ProfileModelGroupLimit, ProfileInstanceGroupLimit):
-                for lim in (await db.execute(select(model).where(model.profile_id == src.id))).scalars():
-                    db.add(model(profile_id=row.id, group_id=lim.group_id, rpm_limit=lim.rpm_limit,
-                                 rpd_limit=lim.rpd_limit, updated_by=admin_username))
+            for lim in (await db.execute(select(ProfileModelGroupLimit)
+                                         .where(ProfileModelGroupLimit.profile_id == src.id))).scalars():
+                db.add(ProfileModelGroupLimit(profile_id=row.id, group_id=lim.group_id, rpm_limit=lim.rpm_limit,
+                                              rpd_limit=lim.rpd_limit, updated_by=admin_username))
             for ex in (await db.execute(select(ProfileModelAccessException)
                                         .where(ProfileModelAccessException.profile_id == src.id))).scalars():
                 db.add(ProfileModelAccessException(profile_id=row.id, model_id=ex.model_id,
@@ -3722,7 +4052,7 @@ async def delete_profile(db: AsyncSession, profile_id: int, reassign_to: int) ->
     )).scalars().all())
     if moved:
         await db.execute(sa_update(User).where(_profile_id_expr() == profile_id).values(profile_id=reassign_to))
-    for model in (ProfileModelGroupLimit, ProfileInstanceGroupLimit, ProfileModelAccessException, ModelAlias):
+    for model in (ProfileModelGroupLimit, ProfileModelAccessException, ModelAlias):
         await db.execute(sa_delete(model).where(model.profile_id == profile_id))
     await db.execute(sa_delete(UserProfile).where(UserProfile.id == profile_id))
     await db.commit()
@@ -3755,7 +4085,7 @@ async def upsert_profile_limits(
     db: AsyncSession, profile_id: int, rpm: Optional[int], rpd: Optional[int],
     admin_username: str, fields_set: set,
 ) -> Optional[UserProfile]:
-    """Set a profile's overall limits; only fields in fields_set change."""
+    """Set a profile's Default-group limits; only fields in fields_set change."""
     fields = {}
     if "rpm_limit" in fields_set:
         fields["rpm_limit"] = rpm
@@ -3791,55 +4121,73 @@ async def _upsert_profile_group_row(
 
 async def upsert_profile_group_limit(
     db: AsyncSession, profile_id: int, group_id: int, rpm: Optional[int], rpd: Optional[int],
-    admin_username: str, fields_set: set, instance: bool = False,
+    admin_username: str, fields_set: set,
 ) -> None:
-    """Set one profile's limits for a model group (or, with instance=True, an instance group)."""
-    model = ProfileInstanceGroupLimit if instance else ProfileModelGroupLimit
-    await _upsert_profile_group_row(db, model, profile_id, group_id, rpm, rpd, admin_username, fields_set)
+    """Set one profile's limits for a group. DEFAULT_GROUP_ID writes the profile's own columns."""
+    from app.profiles import DEFAULT_GROUP_ID
+    if group_id == DEFAULT_GROUP_ID:
+        await upsert_profile_limits(db, profile_id, rpm, rpd, admin_username, fields_set)
+        return
+    await _upsert_profile_group_row(
+        db, ProfileModelGroupLimit, profile_id, group_id, rpm, rpd, admin_username, fields_set,
+    )
     await db.commit()
 
 
 async def set_group_limit_for_all_profiles(
     db: AsyncSession, group_id: int, rpm: Optional[int], rpd: Optional[int],
-    admin_username: str, instance: bool = False,
-    fields_set: set = frozenset({"rpm_limit", "rpd_limit"}),
+    admin_username: str, fields_set: set = frozenset({"rpm_limit", "rpd_limit"}),
 ) -> None:
-    """Give every profile the same limits for one group (the group modal's shortcut).
+    """Give every profile the same limits for one group (DEFAULT_GROUP_ID included).
 
     Only fields in fields_set change, so a limit the admin left blank keeps each
     profile's own value.
     """
-    model = ProfileInstanceGroupLimit if instance else ProfileModelGroupLimit
+    from app.profiles import DEFAULT_GROUP_ID
     for pid in (await db.execute(select(UserProfile.id))).scalars().all():
-        await _upsert_profile_group_row(
-            db, model, pid, group_id, rpm, rpd, admin_username, fields_set,
-        )
+        if group_id == DEFAULT_GROUP_ID:
+            row = await get_profile(db, pid)
+            if "rpm_limit" in fields_set:
+                row.rpm_limit = rpm
+            if "rpd_limit" in fields_set:
+                row.rpd_limit = rpd
+            row.updated_by = admin_username
+            row.updated_at = datetime.utcnow()
+        else:
+            await _upsert_profile_group_row(
+                db, ProfileModelGroupLimit, pid, group_id, rpm, rpd, admin_username, fields_set,
+            )
     await db.commit()
 
 
-async def get_profile_limits(db: AsyncSession, profile_id: int) -> dict:
-    """The profile's limits for every model group and instance group, set or not."""
-    out = {}
-    for key, group_model, member_attr, limit_model in (
-        ("model_groups", ModelGroup, ModelGroup.members, ProfileModelGroupLimit),
-        ("instance_groups", InstanceGroup, InstanceGroup.members, ProfileInstanceGroupLimit),
-    ):
-        groups = (await db.execute(
-            select(group_model).options(selectinload(member_attr)).order_by(group_model.name)
-        )).scalars().all()
-        limits = {
-            row.group_id: row for row in (await db.execute(
-                select(limit_model).where(limit_model.profile_id == profile_id)
-            )).scalars()
+async def get_profile_limits(db: AsyncSession, profile_id: int) -> List[dict]:
+    """The profile's limits for every group, Default first, set or not.
+
+    member_count is the number of models each group governs right now.
+    """
+    from app.profiles import DEFAULT_GROUP_ID
+    overview = await model_group_overview(db)
+    profile = await get_profile(db, profile_id)
+    limits = {
+        row.group_id: row for row in (await db.execute(
+            select(ProfileModelGroupLimit).where(ProfileModelGroupLimit.profile_id == profile_id)
+        )).scalars()
+    }
+    out = [{
+        "group_id": DEFAULT_GROUP_ID, "name": "Default", "is_default": True,
+        "member_count": len(overview["effective"][DEFAULT_GROUP_ID]),
+        "rpm_limit": profile.rpm_limit if profile else None,
+        "rpd_limit": profile.rpd_limit if profile else None,
+    }]
+    out += [
+        {
+            "group_id": g.id, "name": g.name, "is_default": False, "enabled": g.enabled,
+            "member_count": len(overview["effective"].get(g.id, [])),
+            "rpm_limit": limits[g.id].rpm_limit if g.id in limits else None,
+            "rpd_limit": limits[g.id].rpd_limit if g.id in limits else None,
         }
-        out[key] = [
-            {
-                "group_id": g.id, "name": g.name, "member_count": len(g.members),
-                "rpm_limit": limits[g.id].rpm_limit if g.id in limits else None,
-                "rpd_limit": limits[g.id].rpd_limit if g.id in limits else None,
-            }
-            for g in groups
-        ]
+        for g in overview["groups"]
+    ]
     return out
 
 

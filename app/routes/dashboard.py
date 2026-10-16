@@ -126,13 +126,13 @@ async def dashboard_home(
         if ep["path"].startswith("/v1"):
             ep["path"] = ep["path"][3:]
 
-    # Get enabled models with supported_apis for badge rendering, filtered
-    # by the caller's per-user model access policy (mirrors /v1/models).
-    enabled_models = await provider_manager.get_all_models(
-        user_id=_caller_user_id(current_user_or_admin)
+    # Models with supported_apis for badge rendering. Models the user's profile
+    # disables (but that are globally enabled) are included, flagged disabled.
+    models_with_access = provider_manager.model_cache.get_models_with_access_for_user(
+        _caller_user_id(current_user_or_admin)
     )
     models_list = []
-    for model in enabled_models:
+    for model, allowed in models_with_access:
         provider = provider_manager.providers.get(model.provider)
         supported_apis = provider.get_supported_apis_for_model(model.id) if provider else ["openai"]
         models_list.append({
@@ -142,6 +142,7 @@ async def dashboard_home(
             "owned_by": model.owned_by,
             "supported_apis": supported_apis,
             "anthropic_mode": _anthropic_mode(provider, model.id, supported_apis),
+            "disabled": not allowed,
         })
 
     # Regular user - show normal dashboard

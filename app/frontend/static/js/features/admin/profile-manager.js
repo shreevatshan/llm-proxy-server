@@ -2,7 +2,7 @@
  * User profiles.
  *
  * ProfileStore is the shared list every tab picks a profile from (Users, Rate Limits,
- * Models, Model Mapping). Each tab remembers its own choice for the session, and every
+ * Model Access, Model Mapping). Each tab remembers its own choice for the session, and every
  * tab rebuilds its picker on the `profiles:changed` event fired after any profile edit.
  *
  * ProfileManager drives the Profiles tab: create (optionally as a copy), rename, delete
@@ -82,7 +82,7 @@ class ProfileStore {
 
 
 /**
- * The profile heading of a per-profile tab (Rate Limits, Model Mapping): the selected
+ * The profile heading of a per-profile tab (Rate Limits, Model Access, Model Mapping): the selected
  * profile's name is the title, and clicking it opens the list of profiles.
  * `stats(profile)` returns [count, singular noun] pairs shown beside the title.
  */

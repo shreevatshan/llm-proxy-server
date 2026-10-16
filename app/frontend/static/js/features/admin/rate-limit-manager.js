@@ -1,6 +1,7 @@
 /**
  * Rate Limits tab. Every limit belongs to a user profile: the profile switcher at the
- * top picks which one the Overall, Model and Instance panes edit.
+ * top picks whose limits the table edits -- one row per model group, Default first.
+ * Groups themselves are managed in the Model Groups tab.
  */
 class RateLimitManager {
     constructor() {
@@ -39,14 +40,9 @@ class RateLimitManager {
     }
 
     async _loadProfile() {
-        // One GET serves all three panes (overall, model groups, instance groups).
-        // On failure the group panes fall back to fetching for themselves.
+        // On failure the table falls back to fetching for itself.
         const limits = await this._fetchLimits();
-        this._renderOverall(limits);
-        await Promise.all([
-            window.ModelGroupManager?.setProfile(this._profileId, limits),
-            window.InstanceGroupManager?.setProfile(this._profileId, limits),
-        ]);
+        await window.ModelGroupManager?.setProfile(this._profileId, limits);
     }
 
     async _fetchLimits() {
@@ -57,40 +53,6 @@ class RateLimitManager {
         } catch (e) {
             console.error('RateLimitManager: failed to load profile limits', e);
             return null;
-        }
-    }
-
-    _renderOverall(limits) {
-        const profile = limits?.profile;
-        if (!profile) return;
-        document.getElementById('rl-profile-rpm').value = profile.rpm_limit ?? '';
-        document.getElementById('rl-profile-rpd').value = profile.rpd_limit ?? '';
-    }
-
-    async saveProfileLimits() {
-        if (!this._profileId) return;
-        const rpmRaw = document.getElementById('rl-profile-rpm')?.value.trim();
-        const rpdRaw = document.getElementById('rl-profile-rpd')?.value.trim();
-        const body = {
-            rpm_limit: rpmRaw !== '' ? parseInt(rpmRaw, 10) : null,
-            rpd_limit: rpdRaw !== '' ? parseInt(rpdRaw, 10) : null,
-        };
-        try {
-            const resp = await fetch(`/admin/profiles/limits?profile_id=${this._profileId}`, {
-                method: 'PUT',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
-            if (resp.ok) {
-                window.UIUtils?.showToast('Profile limits saved.', 'success');
-                await window.ProfileStore.notifyChanged();
-            } else {
-                const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(err.detail || 'Failed to save limits.', 'error');
-            }
-        } catch (e) {
-            window.UIUtils?.showToast('Network error saving limits.', 'error');
         }
     }
 }

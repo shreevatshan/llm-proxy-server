@@ -18,8 +18,8 @@ from app.routes._errors import openai_provider_error_response
 from app.auth.middleware import authenticate_jwt_or_api_key
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
-from app.rate_limit_dep import enforce_group_rate_limit
-from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
+from app.model_access_dep import ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.model_alias import apply_alias
@@ -43,6 +43,7 @@ _SPEECH_CONTENT_TYPES = {
 
 
 @router.post("/v1/audio/speech")
+@enforces_limits
 async def create_speech(
     request_obj: Request,
     request: AudioSpeechRequest,
@@ -53,9 +54,8 @@ async def create_speech(
     """
     try:
         request.model = await resolve_model_for_request(request_obj, auth, request.model)
-        # Group rate limit check (request-level limits already handled in middleware)
-        await enforce_group_rate_limit(request_obj, auth, request.model)
-        await enforce_model_access(request_obj, auth, request.model)
+        # Access first, so a 403 spends no quota; then the model's group limit.
+        await enforce_access_and_limits(request_obj, auth, request.model)
 
         # Validate response_format before it is interpolated into the
         # Content-Disposition header (guards against header injection).
@@ -101,6 +101,7 @@ async def create_speech(
 
 
 @router.post("/v1/audio/transcriptions", response_model=AudioTranscriptionResponse)
+@enforces_limits
 async def create_transcription(
     request_obj: Request,
     file: UploadFile = File(...),
@@ -118,9 +119,8 @@ async def create_transcription(
     try:
         model = apply_alias(model)
         model = await resolve_model_for_request(request_obj, auth, model)
-        # Group rate limit check (request-level limits already handled in middleware)
-        await enforce_group_rate_limit(request_obj, auth, model)
-        await enforce_model_access(request_obj, auth, model)
+        # Access first, so a 403 spends no quota; then the model's group limit.
+        await enforce_access_and_limits(request_obj, auth, model)
 
         # Read file content
         file_content = await file.read()
@@ -186,6 +186,7 @@ async def create_transcription(
 
 
 @router.post("/v1/audio/translations", response_model=AudioTranslationResponse)
+@enforces_limits
 async def create_translation(
     request_obj: Request,
     file: UploadFile = File(...),
@@ -201,9 +202,8 @@ async def create_translation(
     try:
         model = apply_alias(model)
         model = await resolve_model_for_request(request_obj, auth, model)
-        # Group rate limit check (request-level limits already handled in middleware)
-        await enforce_group_rate_limit(request_obj, auth, model)
-        await enforce_model_access(request_obj, auth, model)
+        # Access first, so a 403 spends no quota; then the model's group limit.
+        await enforce_access_and_limits(request_obj, auth, model)
 
         # Read file content
         file_content = await file.read()

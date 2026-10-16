@@ -160,3 +160,58 @@ async def send_signup_webhook(
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         return False
+
+
+async def _post_webhook(payload: Dict[str, Any], log_label: str) -> bool:
+    """POST a payload to the notification webhook; log and swallow every failure."""
+    webhook_url = config.webhook.notification_webhook_url
+
+    if not webhook_url:
+        logger.debug(f"Notification webhook URL not configured, skipping {log_label}")
+        return False
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=10.0,
+            verify=True,
+            follow_redirects=True
+        ) as client:
+            logger.debug(f"Sending {log_label} to {webhook_url}")
+            logger.debug(f"Payload: {payload}")
+
+            response = await client.post(webhook_url, json=payload)
+
+            logger.debug(f"Webhook response status: {response.status_code}")
+            logger.debug(f"Webhook response body: {response.text[:200]}")
+
+            response.raise_for_status()
+            logger.info(f"{log_label} sent successfully")
+            return True
+    except httpx.TimeoutException as e:
+        logger.error(f"{log_label} timeout: {webhook_url}")
+        logger.error(f"Timeout details: {e}")
+        return False
+    except httpx.HTTPStatusError as e:
+        logger.error(f"{log_label} HTTP status error: {e.response.status_code}")
+        logger.error(f"Response body: {e.response.text[:500]}")
+        return False
+    except httpx.RequestError as e:
+        logger.error(f"{log_label} request error: {type(e).__name__}: {e}")
+        logger.error(f"URL: {webhook_url}")
+        return False
+    except Exception as e:
+        logger.error(f"{log_label} unexpected error: {type(e).__name__}: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
+
+
+async def send_usage_report_webhook(text: str) -> bool:
+    """
+    Send the daily usage report.
+    Sends in {"text": "..."} format for messaging platform compatibility.
+
+    Returns:
+        bool: True if webhook was sent successfully, False otherwise
+    """
+    return await _post_webhook({"text": text}, "Usage report webhook")

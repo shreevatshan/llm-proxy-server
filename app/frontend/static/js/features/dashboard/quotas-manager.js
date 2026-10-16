@@ -1,8 +1,8 @@
 /**
  * Quotas Manager — per-user read-only quota view
  * Renders the authenticated user's quota as a single unified list of sections. Each
- * section is one quota bucket (a model group, an instance group, or the ungrouped
- * "Other Models" bucket — indistinguishable in the UI) showing today's usage,
+ * section is one quota bucket (a model group, or the built-in "Default" group for
+ * every model no other group claims — indistinguishable in the UI) showing today's usage,
  * remaining, and the models it governs.
  * Fetches GET /auth/quotas once on first tab open (no time window, no auto-refresh needed).
  */

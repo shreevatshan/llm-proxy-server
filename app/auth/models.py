@@ -518,12 +518,22 @@ class UsageMeta(Base):
 
 
 class ModelGroup(Base):
-    """Named group of models sharing a rate-limit bucket."""
+    """Named group of models sharing a rate-limit bucket.
+
+    Members are explicit models (ModelGroupMember) and/or whole provider instances
+    (ModelGroupInstanceMember). Instance membership is live: every model on the
+    instance belongs to the group, including ones synced later, unless another group
+    claims that model explicitly. Models no group claims form the built-in Default
+    group, which has no row (app.profiles.DEFAULT_GROUP_ID).
+    """
     __tablename__ = "model_groups"
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(64), unique=True, nullable=False)
     description = Column(String(256), nullable=True)
+    # Off = the group's models are not served (cache._passes_global_gate), like a
+    # disabled model. Members and per-profile limits are kept for when it is back on.
+    enabled = Column(Boolean, default=True, nullable=False, server_default="1")
     rpm_default = Column(Integer, nullable=True)  # null = unlimited
     rpd_default = Column(Integer, nullable=True)  # null = unlimited
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -531,6 +541,7 @@ class ModelGroup(Base):
     updated_by = Column(String(50), nullable=True)
 
     members = relationship("ModelGroupMember", back_populates="group", cascade="all, delete-orphan")
+    instance_members = relationship("ModelGroupInstanceMember", back_populates="group", cascade="all, delete-orphan")
     user_limits = relationship("UserModelGroupRateLimit", back_populates="group", cascade="all, delete-orphan")
     profile_limits = relationship("ProfileModelGroupLimit", back_populates="group", cascade="all, delete-orphan")
 
@@ -551,6 +562,22 @@ class ModelGroupMember(Base):
     )
 
 
+class ModelGroupInstanceMember(Base):
+    """Puts every model of one provider instance in a ModelGroup (unique on provider_key)."""
+    __tablename__ = "model_group_instance_members"
+
+    id = Column(Integer, primary_key=True, index=True)
+    group_id = Column(Integer, ForeignKey("model_groups.id", ondelete="CASCADE"), nullable=False)
+    provider_key = Column(String(100), unique=True, nullable=False)  # unique enforces single-group membership
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    group = relationship("ModelGroup", back_populates="instance_members")
+
+    __table_args__ = (
+        Index("ix_model_group_instance_members_group_id", "group_id"),
+    )
+
+
 class UserModelGroupRateLimit(Base):
     """Per-user override for a model group's rate limits. Absent row = inherit group default."""
     __tablename__ = "user_model_group_rate_limits"
@@ -567,59 +594,6 @@ class UserModelGroupRateLimit(Base):
 
     __table_args__ = (
         UniqueConstraint("user_id", "group_id", name="uq_user_model_group_rate_limit"),
-    )
-
-
-class InstanceGroup(Base):
-    """Named group of provider instances sharing a rate-limit bucket."""
-    __tablename__ = "instance_groups"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(64), unique=True, nullable=False)
-    description = Column(String(256), nullable=True)
-    rpm_default = Column(Integer, nullable=True)  # null = unlimited
-    rpd_default = Column(Integer, nullable=True)  # null = unlimited
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    updated_by = Column(String(50), nullable=True)
-
-    members = relationship("InstanceGroupMember", back_populates="group", cascade="all, delete-orphan")
-    user_limits = relationship("UserInstanceGroupRateLimit", back_populates="group", cascade="all, delete-orphan")
-    profile_limits = relationship("ProfileInstanceGroupLimit", back_populates="group", cascade="all, delete-orphan")
-
-
-class InstanceGroupMember(Base):
-    """Maps a provider_key (instance) to exactly one InstanceGroup (unique on provider_key)."""
-    __tablename__ = "instance_group_members"
-
-    id = Column(Integer, primary_key=True, index=True)
-    group_id = Column(Integer, ForeignKey("instance_groups.id", ondelete="CASCADE"), nullable=False)
-    provider_key = Column(String(100), unique=True, nullable=False)  # unique enforces single-group membership
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    group = relationship("InstanceGroup", back_populates="members")
-
-    __table_args__ = (
-        Index("ix_instance_group_members_group_id", "group_id"),
-    )
-
-
-class UserInstanceGroupRateLimit(Base):
-    """Per-user override for an instance group's rate limits. Absent row = inherit group default."""
-    __tablename__ = "user_instance_group_rate_limits"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    group_id = Column(Integer, ForeignKey("instance_groups.id", ondelete="CASCADE"), nullable=False)
-    rpm_limit = Column(Integer, nullable=True)  # null = inherit group default
-    rpd_limit = Column(Integer, nullable=True)  # null = inherit group default
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    updated_by = Column(String(50), nullable=True)
-
-    group = relationship("InstanceGroup", back_populates="user_limits")
-
-    __table_args__ = (
-        UniqueConstraint("user_id", "group_id", name="uq_user_instance_group_rate_limit"),
     )
 
 
@@ -676,25 +650,6 @@ class ProfileModelGroupLimit(Base):
 
     __table_args__ = (
         UniqueConstraint("profile_id", "group_id", name="uq_profile_model_group_limit"),
-    )
-
-
-class ProfileInstanceGroupLimit(Base):
-    """A profile's RPM/RPD for one instance group. Absent row or NULL = unlimited."""
-    __tablename__ = "profile_instance_group_limits"
-
-    id = Column(Integer, primary_key=True, index=True)
-    profile_id = Column(Integer, ForeignKey("user_profiles.id", ondelete="CASCADE"), nullable=False)
-    group_id = Column(Integer, ForeignKey("instance_groups.id", ondelete="CASCADE"), nullable=False)
-    rpm_limit = Column(Integer, nullable=True)
-    rpd_limit = Column(Integer, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    updated_by = Column(String(50), nullable=True)
-
-    group = relationship("InstanceGroup", back_populates="profile_limits")
-
-    __table_args__ = (
-        UniqueConstraint("profile_id", "group_id", name="uq_profile_instance_group_limit"),
     )
 
 
@@ -776,7 +731,6 @@ POOL_INVITE_STATUSES = frozenset({"pending", "accepted", "declined", "cancelled"
 # Scope kinds for the ledger/carry tables. Mirrors the three rate-limit tiers.
 POOL_SCOPE_OVERALL = "overall"
 POOL_SCOPE_MODEL_GROUP = "model_group"
-POOL_SCOPE_INSTANCE_GROUP = "instance_group"
 
 
 class RequestPool(Base):
@@ -904,7 +858,7 @@ class RequestPoolLedger(Base):
     pool_id = Column(Integer, ForeignKey("request_pools.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     usage_date = Column(Date, index=True, nullable=False)    # time_utils.local_today()
-    scope_kind = Column(String(16), nullable=False)          # overall | model_group | instance_group
+    scope_kind = Column(String(16), nullable=False)          # overall (Default group) | model_group
     scope_id = Column(Integer, default=0, nullable=False)    # 0 for overall, else group id
     charged = Column(Integer, default=0, nullable=False)     # whole requests, >= 0
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -933,7 +887,7 @@ class UserRpdCarry(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     usage_date = Column(Date, index=True, nullable=False)    # time_utils.local_today()
-    scope_kind = Column(String(16), nullable=False)          # overall | model_group | instance_group
+    scope_kind = Column(String(16), nullable=False)          # overall (Default group) | model_group
     scope_id = Column(Integer, default=0, nullable=False)    # 0 for overall, else group id
     carry = Column(Integer, default=0, nullable=False)       # whole requests; may be negative
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -1102,17 +1056,18 @@ class ProfileResponse(BaseModel):
 
 
 class ProfileGroupLimitResponse(BaseModel):
-    group_id: int
+    group_id: int                  # 0 = the built-in Default group
     name: str
-    member_count: int = 0          # models (or instances) in the group
+    is_default: bool = False
+    enabled: bool = True           # off = the group's models are not served
+    member_count: int = 0          # models the group currently governs
     rpm_limit: Optional[int] = None
     rpd_limit: Optional[int] = None
 
 
 class ProfileLimitsResponse(BaseModel):
     profile: ProfileResponse
-    model_groups: List[ProfileGroupLimitResponse] = []
-    instance_groups: List[ProfileGroupLimitResponse] = []
+    groups: List[ProfileGroupLimitResponse] = []   # Default first
 
 
 class ProfileMemberResponse(BaseModel):
@@ -1360,27 +1315,52 @@ class AccountDelete(BaseModel):
 # Model-group Pydantic models
 # ---------------------------------------------------------------------------
 
-class ModelGroupCreate(BaseModel):
+def _clean_keys(values: List[str], what: str, max_len: int) -> List[str]:
+    seen = set()
+    clean = []
+    for v in values:
+        v = v.strip()
+        if not v or len(v) > max_len:
+            raise ValueError(f"{what} '{v}' is invalid (must be 1–{max_len} chars)")
+        if v not in seen:
+            seen.add(v)
+            clean.append(v)
+    return clean
+
+
+class ModelGroupMembersUpdate(BaseModel):
+    """A group's full member list: explicit models and whole provider instances."""
+    model_ids: List[str] = []
+    provider_keys: List[str] = []
+
+    @model_validator(mode="after")
+    def validate_members(self):
+        self.model_ids = _clean_keys(self.model_ids, "model_id", 200)
+        self.provider_keys = _clean_keys(self.provider_keys, "provider_key", 100)
+        return self
+
+
+class ModelGroupCreate(ModelGroupMembersUpdate):
+    # No limit fields: a new group starts with the strictest limits its members had
+    # (database.create_model_group), so moving models in never loosens them.
     name: str
     description: Optional[str] = None
-    rpm_default: Optional[int] = None
-    rpd_default: Optional[int] = None
 
     @model_validator(mode="after")
     def validate_fields(self):
         self.name = _clean_name(self.name)
         if self.description is not None:
             self.description = self.description.strip()[:256]
-        if self.rpm_default is not None and self.rpm_default < 0:
-            raise ValueError("rpm_default must be >= 0")
-        if self.rpd_default is not None and self.rpd_default < 0:
-            raise ValueError("rpd_default must be >= 0")
         return self
 
 
 class ModelGroupUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    # Both lists together replace the members, in the same commit as the fields; leave
+    # both out to keep the members as they are.
+    model_ids: Optional[List[str]] = None
+    provider_keys: Optional[List[str]] = None
 
     @model_validator(mode="after")
     def validate_fields(self):
@@ -1388,60 +1368,41 @@ class ModelGroupUpdate(BaseModel):
             self.name = _clean_name(self.name)
         if self.description is not None:
             self.description = self.description.strip()[:256]
+        if self.model_ids is not None:
+            self.model_ids = _clean_keys(self.model_ids, "model_id", 200)
+        if self.provider_keys is not None:
+            self.provider_keys = _clean_keys(self.provider_keys, "provider_key", 100)
         return self
 
-
-class ModelGroupLimitsUpdate(BaseModel):
-    rpm_default: Optional[int] = None
-    rpd_default: Optional[int] = None
-
-    @model_validator(mode="after")
-    def validate_non_negative(self):
-        if self.rpm_default is not None and self.rpm_default < 0:
-            raise ValueError("rpm_default must be >= 0")
-        if self.rpd_default is not None and self.rpd_default < 0:
-            raise ValueError("rpd_default must be >= 0")
-        return self
-
-
-class ModelGroupMembersUpdate(BaseModel):
-    model_ids: List[str]
-
-    @model_validator(mode="after")
-    def validate_model_ids(self):
-        seen = set()
-        clean = []
-        for mid in self.model_ids:
-            mid = mid.strip()
-            if not mid or len(mid) > 200:
-                raise ValueError(f"model_id '{mid}' is invalid (must be 1–200 chars)")
-            if mid not in seen:
-                seen.add(mid)
-                clean.append(mid)
-        self.model_ids = clean
-        return self
+    def members(self) -> Optional["ModelGroupMembersUpdate"]:
+        if self.model_ids is None and self.provider_keys is None:
+            return None
+        return ModelGroupMembersUpdate(model_ids=self.model_ids or [], provider_keys=self.provider_keys or [])
 
 
 class ModelGroupMemberResponse(BaseModel):
-    model_id: str
-    created_at: Optional[datetime] = None
-
-    class Config:
-        from_attributes = True
+    kind: str                      # model | instance
+    key: str                       # model_id or provider_key
+    # ok | model_disabled | provider_disabled | missing (deleted or renamed upstream)
+    status: str = "ok"
+    covers: List[str] = []         # instance members: the models it currently brings in
+    overrides_group: Optional[str] = None  # model members: the group whose instance it is carved out of
 
 
 class ModelGroupResponse(BaseModel):
     # Limits live on profiles: see ProfileGroupLimitResponse.
-    id: int
+    id: int                        # 0 = the built-in Default group
     name: str
     description: Optional[str] = None
-    member_count: int = 0
-    members: List[str] = []
+    is_default: bool = False
+    enabled: bool = True           # off = the group's models are not served
+    member_count: int = 0          # explicit members (models + instances)
+    model_ids: List[str] = []      # explicit model members
+    provider_keys: List[str] = []  # instance members
+    members: List[ModelGroupMemberResponse] = []
+    effective_models: List[str] = []  # every model the group governs right now
     updated_at: Optional[datetime] = None
     updated_by: Optional[str] = None
-
-    class Config:
-        from_attributes = True
 
 
 # ---------------------------------------------------------------------------
@@ -1451,10 +1412,9 @@ class ModelGroupResponse(BaseModel):
 class QuotaSectionResponse(BaseModel):
     """A single unified quota section for the user dashboard.
 
-    Model groups, instance groups and the ungrouped 'Other Models' bucket are all
-    represented the same way so the UI never has to distinguish them. `models` lists
-    the model ids governed by this section, with instance-group precedence already
-    applied — a model whose instance is in an instance group appears only there.
+    Named model groups and the built-in Default group are represented the same way.
+    `models` lists the model ids governed by this section, resolved the way
+    enforcement resolves them (rate_limit_tracker.group_for).
     """
     name: str
     description: Optional[str] = None
@@ -1463,7 +1423,7 @@ class QuotaSectionResponse(BaseModel):
     rpd_count: int = 0                   # requests used today (local day) in this section
     rpd_remaining: Optional[int] = None  # null = unlimited
     models: List[str] = []               # model ids listed under this section
-    is_other: bool = False               # true for the ungrouped 'Other Models' bucket
+    is_default: bool = False             # true for the built-in Default group
     # Pooling. rpm_limit above always stays the caller's OWN per-minute limit; only the
     # daily numbers are shared, so the UI can say "shared across N members" against the
     # daily figures without implying the per-minute one moved.
@@ -1510,9 +1470,9 @@ class PoolMemberScope(BaseModel):
     their quota. The two differ whenever the pool's composition changed today, which is
     the whole reason both are surfaced rather than just one.
     """
-    scope_kind: str                       # overall | model_group | instance_group
+    scope_kind: str                       # overall (Default group) | model_group
     scope_id: int = 0
-    name: str = "Overall"
+    name: str = "Default"
     limit: Optional[int] = None           # this member's own RPD; null means unlimited
     sent: int = 0                         # raw request_usage rows today
     charged: int = 0                      # settled share of the pool's consumption
@@ -1678,86 +1638,6 @@ class MyQuotasResponse(BaseModel):
     sections: List[QuotaSectionResponse] = []  # unified list; empty when is_admin
     pool: Optional[PoolSummary] = None         # null when the user is not in a pool
     profile_name: Optional[str] = None         # the profile the limits come from
-
-
-# ---------------------------------------------------------------------------
-# Instance group Pydantic models (mirror the model-group ones)
-# ---------------------------------------------------------------------------
-
-class InstanceGroupCreate(BaseModel):
-    name: str
-    description: Optional[str] = None
-    rpm_default: Optional[int] = None
-    rpd_default: Optional[int] = None
-
-    @model_validator(mode="after")
-    def validate_fields(self):
-        self.name = _clean_name(self.name)
-        if self.description is not None:
-            self.description = self.description.strip()[:256]
-        if self.rpm_default is not None and self.rpm_default < 0:
-            raise ValueError("rpm_default must be >= 0")
-        if self.rpd_default is not None and self.rpd_default < 0:
-            raise ValueError("rpd_default must be >= 0")
-        return self
-
-
-class InstanceGroupUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_fields(self):
-        if self.name is not None:
-            self.name = _clean_name(self.name)
-        if self.description is not None:
-            self.description = self.description.strip()[:256]
-        return self
-
-
-class InstanceGroupLimitsUpdate(BaseModel):
-    rpm_default: Optional[int] = None
-    rpd_default: Optional[int] = None
-
-    @model_validator(mode="after")
-    def validate_non_negative(self):
-        if self.rpm_default is not None and self.rpm_default < 0:
-            raise ValueError("rpm_default must be >= 0")
-        if self.rpd_default is not None and self.rpd_default < 0:
-            raise ValueError("rpd_default must be >= 0")
-        return self
-
-
-class InstanceGroupMembersUpdate(BaseModel):
-    provider_keys: List[str]
-
-    @model_validator(mode="after")
-    def validate_provider_keys(self):
-        seen = set()
-        clean = []
-        for pk in self.provider_keys:
-            pk = pk.strip()
-            if not pk or len(pk) > 100:
-                raise ValueError(f"provider_key '{pk}' is invalid (must be 1–100 chars)")
-            if pk not in seen:
-                seen.add(pk)
-                clean.append(pk)
-        self.provider_keys = clean
-        return self
-
-
-class InstanceGroupResponse(BaseModel):
-    # Limits live on profiles: see ProfileGroupLimitResponse.
-    id: int
-    name: str
-    description: Optional[str] = None
-    member_count: int = 0
-    members: List[str] = []               # member provider_keys
-    updated_at: Optional[datetime] = None
-    updated_by: Optional[str] = None
-
-    class Config:
-        from_attributes = True
 
 
 class ModelAliasUpsert(BaseModel):

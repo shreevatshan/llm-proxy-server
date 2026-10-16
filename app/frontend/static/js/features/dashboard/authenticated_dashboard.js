@@ -316,8 +316,10 @@ function initModelsTab() {
     });
 
     _allModels = modelsData
-        .map(m => ({ model_id: m.id, model_name: m.id }))
-        .sort((a, b) => a.model_name.toLowerCase().localeCompare(b.model_name.toLowerCase()));
+        .map(m => ({ model_id: m.id, model_name: m.id, disabled: !!m.disabled }))
+        // Enabled first, then disabled; each group by name.
+        .sort((a, b) => (a.disabled - b.disabled)
+            || a.model_name.toLowerCase().localeCompare(b.model_name.toLowerCase()));
 
     _filteredModels = [..._allModels];
     _displayModels();
@@ -339,10 +341,14 @@ function _displayModels() {
     const stats    = document.getElementById('search-stats');
     if (!listBody) return;
 
-    const n = _filteredModels.length;
-    if (stats) stats.textContent = `Showing ${n} enabled model${n !== 1 ? 's' : ''}`;
+    const disabledCount = _filteredModels.filter(m => m.disabled).length;
+    const enabledCount = _filteredModels.length - disabledCount;
+    if (stats) {
+        stats.textContent = `Showing ${enabledCount} enabled model${enabledCount !== 1 ? 's' : ''}`
+            + (disabledCount ? `, ${disabledCount} disabled` : '');
+    }
 
-    if (n === 0) {
+    if (_filteredModels.length === 0) {
         listBody.innerHTML = `<div class="text-center py-5 text-muted"><i class="fas fa-search fa-3x mb-3"></i><p>No models found</p></div>`;
         return;
     }
@@ -352,11 +358,14 @@ function _displayModels() {
         const name = model.model_name;
         const apis = _modelApiSupport[name] || ['openai'];
         const badges = apis.map(a => _apiBadge(a, _modelAnthropicMode[name])).join('');
+        const disabledTag = model.disabled
+            ? `<span class="api-badge model-disabled-badge" title="Disabled for your profile — contact an admin for access"><i class="fas fa-ban me-1"></i>disabled</span>`
+            : '';
         html += `
-            <div class="model-list-item">
+            <div class="model-list-item${model.disabled ? ' disabled' : ''}">
                 <div class="model-info">
                     <div class="model-name">${escapeHtml(name)}</div>
-                    <div class="api-badges">${badges}</div>
+                    <div class="api-badges">${badges}${disabledTag}</div>
                 </div>
                 <button class="copy-button" data-model-name="${escapeHtml(name)}" onclick="copyModelName(this)">
                     <i class="fas fa-copy"></i> Copy

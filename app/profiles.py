@@ -15,6 +15,9 @@ from types import MappingProxyType
 from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 DEFAULT_PROFILE_ID = 1  # mirrors app.auth.models.DEFAULT_PROFILE_ID without importing it
+# The built-in Default model group: every model no named group claims. It has no row;
+# its limits are the profile's own rpm/rpd columns.
+DEFAULT_GROUP_ID = 0
 
 _NO_LIMITS: Tuple[Optional[int], Optional[int]] = (None, None)
 
@@ -23,21 +26,18 @@ _NO_LIMITS: Tuple[Optional[int], Optional[int]] = (None, None)
 class ProfileSnapshot:
     id: int
     name: str
-    rpm: Optional[int] = None    # overall; None = unlimited
+    rpm: Optional[int] = None    # Default group; None = unlimited
     rpd: Optional[int] = None
     model_group_limits: Mapping[int, Tuple[Optional[int], Optional[int]]] = field(
-        default_factory=lambda: MappingProxyType({}))
-    instance_group_limits: Mapping[int, Tuple[Optional[int], Optional[int]]] = field(
         default_factory=lambda: MappingProxyType({}))
     access_mode: str = "default"  # default | allow | deny | custom
     access_exceptions: Mapping[str, bool] = field(
         default_factory=lambda: MappingProxyType({}))
 
     def model_group_limit(self, group_id: int) -> Tuple[Optional[int], Optional[int]]:
+        if group_id == DEFAULT_GROUP_ID:
+            return (self.rpm, self.rpd)
         return self.model_group_limits.get(group_id, _NO_LIMITS)
-
-    def instance_group_limit(self, group_id: int) -> Tuple[Optional[int], Optional[int]]:
-        return self.instance_group_limits.get(group_id, _NO_LIMITS)
 
 
 # What an empty registry (before the first load, or a DB with no Default row)
@@ -94,22 +94,17 @@ class ProfileRegistry:
         """Re-read every profile and every user's assignment from *db*."""
         from sqlalchemy.future import select
         from app.auth.models import (
-            ProfileInstanceGroupLimit, ProfileModelAccessException, ProfileModelGroupLimit,
-            User, UserProfile,
+            ProfileModelAccessException, ProfileModelGroupLimit, User, UserProfile,
         )
 
         profile_rows = (await db.execute(select(UserProfile))).scalars().all()
         mg_rows = (await db.execute(select(ProfileModelGroupLimit))).scalars().all()
-        ig_rows = (await db.execute(select(ProfileInstanceGroupLimit))).scalars().all()
         ex_rows = (await db.execute(select(ProfileModelAccessException))).scalars().all()
         user_rows = (await db.execute(select(User.id, User.profile_id))).all()
 
         mg: Dict[int, Dict[int, tuple]] = {}
         for r in mg_rows:
             mg.setdefault(r.profile_id, {})[r.group_id] = (r.rpm_limit, r.rpd_limit)
-        ig: Dict[int, Dict[int, tuple]] = {}
-        for r in ig_rows:
-            ig.setdefault(r.profile_id, {})[r.group_id] = (r.rpm_limit, r.rpd_limit)
         ex: Dict[int, Dict[str, bool]] = {}
         for r in ex_rows:
             ex.setdefault(r.profile_id, {})[r.model_id] = bool(r.is_allowed)
@@ -118,7 +113,6 @@ class ProfileRegistry:
             ProfileSnapshot(
                 id=p.id, name=p.name, rpm=p.rpm_limit, rpd=p.rpd_limit,
                 model_group_limits=MappingProxyType(mg.get(p.id, {})),
-                instance_group_limits=MappingProxyType(ig.get(p.id, {})),
                 access_mode=p.model_access_mode or "default",
                 access_exceptions=MappingProxyType(ex.get(p.id, {})),
             )

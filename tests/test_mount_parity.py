@@ -267,6 +267,15 @@ class UsageBufferParityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gpt-4o", direct[0])
         self.assertIn("openai", direct[0])
 
+    async def test_azure_v1_path_records_usage(self):
+        _, call = post(build_azure_sub(), "/openai/v1/chat/completions",
+                       json={"model": "gpt-4o"})
+        self.assertIsNotNone(call, "/openai/v1 request was never tracked")
+        keys = await self._usage_keys_from(call)
+        self.assertEqual(len(keys), 1)
+        self.assertIn("gpt-4o", keys[0])
+        self.assertIn("azure_openai", keys[0])
+
     def test_streaming_response_is_tracked_and_completes(self):
         """SSE is the main provider path; BaseHTTPMiddleware wrapping is delicate."""
         import asyncio
@@ -334,6 +343,19 @@ class AzureParityTests(unittest.TestCase):
         self.assertEqual(direct.json()["preserve"], True)
         self.assertEqual(mounted.json(), direct.json())
         self.assertEqual(mounted.json()["extra_headers"], {"aoai-evt-stream": "on"})
+
+    def test_v1_path_is_tracked(self):
+        """/openai/v1/* re-mounts the OpenAI routers; it must open a tracker entry
+        (and so record usage) like every other inference path."""
+        path = "/openai/v1/chat/completions"
+        _, direct_call = post(build_azure_sub(), path, json={"model": "gpt-4o"})
+        _, mounted_call = post(mount(build_azure_sub(), "/azure-openai"),
+                               "/azure-openai" + path, json={"model": "gpt-4o"})
+        for call in (direct_call, mounted_call):
+            self.assertIsNotNone(call, "start_request was never called")
+            self.assertEqual(call["server"], "azure_openai")
+            self.assertEqual(call["endpoint"], path)
+            self.assertEqual(call["model"], "gpt-4o")
 
     def test_deployment_path_reconstructs_model(self):
         path = "/openai/deployments/prov/my-deployment/chat/completions"

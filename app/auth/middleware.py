@@ -87,34 +87,16 @@ async def _enforce_rate_limit(
         return
 
     from app.rate_limit import rate_limit_tracker, RateLimitExceeded
-    # Precedence (most-specific wins): instance group > model group > overall.
-    # If the request's instance belongs to an instance group, or the model belongs
-    # to a model group, that group's limit governs and is enforced at the route
-    # level (enforce_group_rate_limit). Skip the overall gate here so an unlimited
-    # group means truly unlimited. If the model is unknown, fall through to the
-    # overall limit (the safe, stricter default).
-    model = getattr(request.state, "model", None)
-    if model:
-        provider_key = model.split("/", 1)[0] if "/" in model else None
-        if (provider_key and rate_limit_tracker.instance_belongs_to_group(provider_key)) \
-                or rate_limit_tracker.model_belongs_to_group(model):
-            return
-        # Prefix-less name: the canonical id is not chosen until the route
-        # resolves it (app/model_resolution.py), which runs after this. Skip the
-        # overall gate only when EVERY candidate it could resolve to is grouped.
-        # Deciding from a single provisional pick would be unsound: if the pick
-        # were grouped but the route landed on an ungrouped candidate,
-        # check_group_limit returns None and the request would be governed by no
-        # limit at all. A mixed pool falls through here and is group-checked
-        # again at the route -- double-governed, never ungoverned.
-        from app.model_resolution import candidate_ids  # local: keeps app.auth leaf-ward
-        candidates = candidate_ids(model)
-        if candidates and all(
-            rate_limit_tracker.instance_belongs_to_group(c.split("/", 1)[0])
-            or rate_limit_tracker.model_belongs_to_group(c)
-            for c in candidates
-        ):
-            return
+    from app.rate_limit_dep import ROUTE_ENFORCES_LIMITS  # local: keeps app.auth leaf-ward
+    # A route that names a model charges the request itself, once the model is resolved
+    # and access is checked (enforce_access_and_limits): to that model's group, or to
+    # the Default group. Charging here as well would bill it twice. Decided by the
+    # endpoint, not by request.state.model: the tracking middleware never sniffs a model
+    # for large multipart uploads or count_tokens, both of which still enforce at the
+    # route. Every other request is charged to Default here.
+    endpoint = request.scope.get("endpoint") if hasattr(request, "scope") else None
+    if getattr(endpoint, ROUTE_ENFORCES_LIMITS, False) is True:
+        return
     decision = await rate_limit_tracker.check_and_increment(user_id, username)
     if not decision.allowed:
         envelope = envelope_for(request.url.path, envelope_override)
@@ -203,9 +185,9 @@ async def _update_tracking_identity(request: Request, auth_result) -> None:
         identity, kind, user_id = None, None, None
 
     # Deliberately above the tracking_request_id guard: requests outside
-    # _TRACKED_PREFIXES -- notably the OpenAI routers re-mounted under /openai on
-    # the Azure port -- never get a tracking id, but they do reach providers and
-    # still need user.id on their spans. set_trace_user() swallows its own errors,
+    # _TRACKED_PREFIXES -- notably /v1/messages/count_tokens -- never get a
+    # tracking id, but they can reach providers and still need user.id on their
+    # spans. set_trace_user() swallows its own errors,
     # so this cannot fail the request.
     if identity is not None:
         set_trace_user(identity)

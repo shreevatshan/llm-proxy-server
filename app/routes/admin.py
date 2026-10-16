@@ -5,6 +5,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy.exc import IntegrityError
 from typing import Annotated, List, Optional, Literal
 import os
 import json
@@ -28,9 +29,8 @@ from app.auth.database import (
     load_user_management_settings, upsert_user_management_settings,
     load_pool_settings, upsert_pool_settings,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
-    set_group_members, get_model_group_limits,
-    list_instance_groups, create_instance_group, update_instance_group, delete_instance_group,
-    set_instance_group_members, get_instance_group_limits,
+    set_group_members, get_model_group_limits, model_group_overview,
+    reload_reference_caches, clear_model_group_members,
     get_websearch_settings, upsert_websearch_settings,
     normalize_new_username, get_profile, get_profile_by_name, list_profiles, create_profile,
     update_profile, delete_profile, assign_users_profile, list_profile_member_ids, list_profile_members,
@@ -49,7 +49,7 @@ from app.auth.models import (
     AdminPasswordReset, AdminUserModify, VALID_AZURE_BACKENDS,
     UserManagementSettingsResponse, UserManagementSettingsUpdate,
     ModelGroupCreate, ModelGroupUpdate, ModelGroupMembersUpdate, ModelGroupResponse,
-    InstanceGroupCreate, InstanceGroupUpdate, InstanceGroupMembersUpdate, InstanceGroupResponse,
+    ModelGroupMemberResponse, ProfileGroupLimitResponse,
     ModelAliasUpsert, ModelAliasResponse, ModelAliasReorder, ModelAliasTestMatch,
     MODEL_ALIAS_API_SURFACES, validate_alias_pattern,
     AdminPoolResponse, AdminPoolLimitsUpdate, PoolSettingsResponse, PoolSettingsUpdate,
@@ -449,7 +449,9 @@ async def remove_stale_models(
         from app.auth.database import delete_stale_models
         
         deleted_count = await delete_stale_models(db, request.model_ids)
-        
+        # Group members, access exceptions and aliases naming them were cleaned up too.
+        await reload_reference_caches()
+
         return {
             "message": f"Successfully removed {deleted_count} stale model(s)",
             "deleted_count": deleted_count
@@ -506,11 +508,14 @@ async def reinit_system(
         
         for provider in providers:
             await db.delete(provider)
-        
+
+        # Nothing is left for a group to name; empty them rather than keep stale members.
+        await clear_model_group_members(db)
         await db.commit()
-        
+
         # Refresh provider manager from database (should now be empty)
         await provider_manager.refresh_providers_from_database()
+        await reload_reference_caches()
         
         return {
             "message": f"System reinitialized: cleared {providers_cleared} providers and {models_cleared} models",
@@ -532,7 +537,8 @@ async def toggle_provider(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Toggle provider and all its models using unified ProviderCredentials system (query parameter version)."""
+    """Turn a provider on or off. Its models keep their own flags: a model is served
+    only while both it and its provider are on."""
     try:
         # Log for debugging
         logging.info(f"Admin provider toggle request - Provider Key: {provider_key}, Enabled: {toggle_data.enabled}")
@@ -545,6 +551,9 @@ async def toggle_provider(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Provider not found: {provider_key}"
             )
+        # The registry only loads enabled providers, and dispatch goes through it, so
+        # the change takes effect now rather than at the next sync or provider edit.
+        await provider_manager.refresh_providers_from_database()
         
         return {
             "message": f"Provider {provider_key} {'enabled' if toggle_data.enabled else 'disabled'}",
@@ -1484,10 +1493,12 @@ async def get_profile_limits_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """A profile's overall limits plus its limit for every model and instance group."""
+    """A profile's limit for every model group, the built-in Default group first."""
     await _require_profile(db, profile_id)
-    groups = await get_profile_limits(db, profile_id)
-    return ProfileLimitsResponse(profile=await _profile_response(db, profile_id), **groups)
+    return ProfileLimitsResponse(
+        profile=await _profile_response(db, profile_id),
+        groups=await get_profile_limits(db, profile_id),
+    )
 
 
 @router.put("/profiles/limits", response_model=ProfileResponse)
@@ -1497,7 +1508,10 @@ async def update_profile_limits_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set a profile's overall RPM/RPD (null = unlimited; omitted = unchanged)."""
+    """Set a profile's Default-group RPM/RPD (null = unlimited; omitted = unchanged).
+
+    The same as PUT /profiles/model-group-limits with group_id=0.
+    """
     await _require_profile(db, profile_id)
     await upsert_profile_limits(db, profile_id, body.rpm_limit, body.rpd_limit,
                                 current_admin.username, body.model_fields_set)
@@ -1505,78 +1519,49 @@ async def update_profile_limits_endpoint(
     return await _profile_response(db, profile_id)
 
 
-async def _set_profile_group_limit(db, admin, profile_id, group_id, body, instance: bool):
-    await _require_profile(db, profile_id)
-    getter = get_instance_group_limits if instance else get_model_group_limits
-    if await getter(db, group_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=("Instance" if instance else "Model") + " group not found")
-    await upsert_profile_group_limit(db, profile_id, group_id, body.rpm_limit, body.rpd_limit,
-                                     admin.username, body.model_fields_set, instance=instance)
-    await _resettle_profile(db, profile_id)
-    groups = await get_profile_limits(db, profile_id)
-    return ProfileLimitsResponse(profile=await _profile_response(db, profile_id), **groups)
-
-
-async def _set_group_limit_everywhere(db, admin, group_id, body, instance: bool):
-    getter = get_instance_group_limits if instance else get_model_group_limits
-    if await getter(db, group_id) is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                            detail=("Instance" if instance else "Model") + " group not found")
-    await set_group_limit_for_all_profiles(db, group_id, body.rpm_limit, body.rpd_limit,
-                                           admin.username, instance=instance,
-                                           fields_set=body.model_fields_set)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, all_pools=True)
-    # Echo only what changed: an omitted field kept each profile's own value, and
-    # reporting it as null would read as "set to unlimited".
-    return {"group_id": group_id, **body.model_dump(include=body.model_fields_set)}
+async def _require_group(db, group_id: int) -> None:
+    """404 unless group_id is a model group or the built-in Default group."""
+    from app.profiles import DEFAULT_GROUP_ID
+    if group_id != DEFAULT_GROUP_ID and await get_model_group_limits(db, group_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
 
 
 @router.put("/profiles/model-group-limits", response_model=ProfileLimitsResponse)
 async def update_profile_model_group_limit_endpoint(
     body: ProfileLimitsUpdate,
     profile_id: int = Query(...),
-    group_id: int = Query(...),
+    group_id: int = Query(..., description="Model group id; 0 for the Default group"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set one profile's RPM/RPD for a model group (null = unlimited)."""
-    return await _set_profile_group_limit(db, current_admin, profile_id, group_id, body, instance=False)
-
-
-@router.put("/profiles/instance-group-limits", response_model=ProfileLimitsResponse)
-async def update_profile_instance_group_limit_endpoint(
-    body: ProfileLimitsUpdate,
-    profile_id: int = Query(...),
-    group_id: int = Query(...),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Set one profile's RPM/RPD for an instance group (null = unlimited)."""
-    return await _set_profile_group_limit(db, current_admin, profile_id, group_id, body, instance=True)
+    """Set one profile's RPM/RPD for a group (null = unlimited)."""
+    await _require_profile(db, profile_id)
+    await _require_group(db, group_id)
+    await upsert_profile_group_limit(db, profile_id, group_id, body.rpm_limit, body.rpd_limit,
+                                     current_admin.username, body.model_fields_set)
+    await _resettle_profile(db, profile_id)
+    return ProfileLimitsResponse(
+        profile=await _profile_response(db, profile_id),
+        groups=await get_profile_limits(db, profile_id),
+    )
 
 
 @router.put("/profiles/model-group-limits/all")
 async def update_model_group_limit_all_profiles_endpoint(
     body: ProfileLimitsUpdate,
-    group_id: int = Query(...),
+    group_id: int = Query(..., description="Model group id; 0 for the Default group"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Give every profile the same limits for one model group."""
-    return await _set_group_limit_everywhere(db, current_admin, group_id, body, instance=False)
-
-
-@router.put("/profiles/instance-group-limits/all")
-async def update_instance_group_limit_all_profiles_endpoint(
-    body: ProfileLimitsUpdate,
-    group_id: int = Query(...),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Give every profile the same limits for one instance group."""
-    return await _set_group_limit_everywhere(db, current_admin, group_id, body, instance=True)
+    """Give every profile the same limits for one group."""
+    await _require_group(db, group_id)
+    await set_group_limit_for_all_profiles(db, group_id, body.rpm_limit, body.rpd_limit,
+                                           current_admin.username, fields_set=body.model_fields_set)
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
+    # Echo only what changed: an omitted field kept each profile's own value, and
+    # reporting it as null would read as "set to unlimited".
+    return {"group_id": group_id, **body.model_dump(include=body.model_fields_set)}
 
 
 @router.get("/profiles/members", response_model=List[ProfileMemberResponse])
@@ -1585,7 +1570,8 @@ async def list_profile_members_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """The profile's members with their live per-minute and today's request counts."""
+    """The profile's members with their live per-minute and today's request counts
+    in the Default group."""
     from app.rate_limit import rate_limit_tracker
     await _require_profile(db, profile_id)
     users = await list_profile_members(db, profile_id)
@@ -1876,33 +1862,148 @@ async def delete_model_alias_endpoint(
 
 
 # ==================== Model Group Management API Endpoints ====================
+#
+# One kind of group. Members are explicit models and/or whole provider instances;
+# instance membership is live (models synced later join by themselves) and an explicit
+# model beats an instance (rate_limit_tracker.group_for). Every model no group claims
+# is in the built-in Default group, id 0, which has no row and cannot be edited.
+
+def _group_responses(overview: dict) -> List[ModelGroupResponse]:
+    """Default first, then every named group, with member status and live coverage."""
+    from app.profiles import DEFAULT_GROUP_ID
+    from app.rate_limit import provider_key_of
+
+    models, providers = overview["models"], overview["providers"]
+    by_instance = overview["by_instance"]
+    names = {g.id: g.name for g in overview["groups"]}
+
+    def model_status(model_id: str) -> str:
+        if model_id not in models:
+            return "missing"
+        if providers.get(provider_key_of(model_id)) is False:
+            return "provider_disabled"
+        return "ok" if models[model_id] else "model_disabled"
+
+    out = [ModelGroupResponse(
+        id=DEFAULT_GROUP_ID, name="Default", is_default=True,
+        description="Every model no other group claims",
+        effective_models=overview["effective"][DEFAULT_GROUP_ID],
+    )]
+    for g in overview["groups"]:
+        members = []
+        for pk in sorted(m.provider_key for m in g.instance_members):
+            members.append(ModelGroupMemberResponse(
+                kind="instance", key=pk,
+                status="missing" if pk not in providers else ("ok" if providers[pk] else "provider_disabled"),
+                covers=[mid for mid in overview["effective"][g.id] if provider_key_of(mid) == pk],
+            ))
+        for mid in sorted(m.model_id for m in g.members):
+            owner = by_instance.get(provider_key_of(mid))
+            members.append(ModelGroupMemberResponse(
+                kind="model", key=mid, status=model_status(mid),
+                overrides_group=names.get(owner) if owner not in (None, g.id) else None,
+            ))
+        out.append(ModelGroupResponse(
+            id=g.id, name=g.name, description=g.description, enabled=g.enabled,
+            member_count=len(g.members) + len(g.instance_members),
+            model_ids=sorted(m.model_id for m in g.members),
+            provider_keys=sorted(m.provider_key for m in g.instance_members),
+            members=members, effective_models=overview["effective"][g.id],
+            updated_at=g.updated_at, updated_by=g.updated_by,
+        ))
+    return out
+
+
+async def _check_group_name(db: AsyncSession, name: str, group_id: Optional[int] = None) -> None:
+    """409 when the name is taken (ignoring case) or is the reserved "Default"."""
+    from app.auth.models import ModelGroup as ModelGroupTable
+    if name.strip().lower() == "default":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="'Default' is the built-in group's name")
+    q = select(ModelGroupTable).where(ModelGroupTable.name.ilike(name))
+    if group_id is not None:
+        q = q.where(ModelGroupTable.id != group_id)
+    if (await db.execute(q)).scalar_one_or_none():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Model group '{name}' already exists")
+
+
+async def _check_members(
+    db: AsyncSession, body: ModelGroupMembersUpdate, group_id: Optional[int] = None,
+) -> None:
+    """Validate a member list before it replaces a group's (or a new group's) members.
+
+    Only members being *added* must exist: one the group already has may have been
+    deleted or renamed upstream since, and the admin must still be able to save the
+    group -- with it kept, or unticked -- rather than be locked out of editing it.
+    Each model and each instance may belong to one group only (409, naming the owner).
+    """
+    from app.auth.models import (
+        ModelConfiguration, ModelGroup as ModelGroupTable, ModelGroupInstanceMember, ModelGroupMember,
+    )
+    current_models, current_instances = set(), set()
+    if group_id is not None:
+        current_models = set((await db.execute(
+            select(ModelGroupMember.model_id).where(ModelGroupMember.group_id == group_id)
+        )).scalars().all())
+        current_instances = set((await db.execute(
+            select(ModelGroupInstanceMember.provider_key).where(ModelGroupInstanceMember.group_id == group_id)
+        )).scalars().all())
+
+    new_models = [m for m in body.model_ids if m not in current_models]
+    if new_models:
+        found = set((await db.execute(
+            select(ModelConfiguration.model_id).where(ModelConfiguration.model_id.in_(new_models))
+        )).scalars().all())
+        missing = [m for m in new_models if m not in found]
+        if missing:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"model_id(s) not found: {missing}")
+    new_instances = [pk for pk in body.provider_keys if pk not in current_instances]
+    if new_instances:
+        found = {p.provider_key for p in await get_all_provider_credentials(db)}
+        missing = [pk for pk in new_instances if pk not in found]
+        if missing:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"provider_key(s) not found: {missing}")
+
+    conflicts = []
+    for member, column, keys, kind in (
+        (ModelGroupMember, ModelGroupMember.model_id, body.model_ids, "model"),
+        (ModelGroupInstanceMember, ModelGroupInstanceMember.provider_key, body.provider_keys, "instance"),
+    ):
+        if not keys:
+            continue
+        q = (select(column, ModelGroupTable.id, ModelGroupTable.name)
+             .join(ModelGroupTable, ModelGroupTable.id == member.group_id).where(column.in_(keys)))
+        if group_id is not None:
+            q = q.where(member.group_id != group_id)
+        conflicts += [{"kind": kind, "key": key, "current_group_id": gid, "current_group": gname}
+                      for key, gid, gname in (await db.execute(q)).all()]
+    if conflicts:
+        names = ", ".join(f"{c['key']} (in '{c['current_group']}')" for c in conflicts)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail={"message": f"Already in another group: {names}", "conflicts": conflicts})
+
+
+def _reject_default(group_id: int) -> None:
+    from app.profiles import DEFAULT_GROUP_ID
+    if group_id == DEFAULT_GROUP_ID:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="The Default group is built in: it holds every model no other group claims")
+
 
 @router.get("/model-groups")
 async def get_model_groups(
-    group_id: Optional[int] = Query(None, description="Omit to list all groups; provide to fetch one"),
+    group_id: Optional[int] = Query(None, description="Omit to list all groups; provide to fetch one (0 = Default)"),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """List all model groups, or fetch a single group's details including members."""
-    def _to_response(g) -> ModelGroupResponse:
-        return ModelGroupResponse(
-            id=g.id,
-            name=g.name,
-            description=g.description,
-            member_count=len(g.members),
-            members=[m.model_id for m in g.members],
-            updated_at=g.updated_at,
-            updated_by=g.updated_by,
-        )
-
-    if group_id is not None:
-        group = await list_model_groups(db, group_id=group_id)
-        if group is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
-        return _to_response(group)
-
-    groups = await list_model_groups(db)
-    return [_to_response(g) for g in groups]
+    """List every model group, Default first, with members and the models each governs."""
+    groups = _group_responses(await model_group_overview(db))
+    if group_id is None:
+        return groups
+    for g in groups:
+        if g.id == group_id:
+            return g
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
 
 
 @router.post("/model-groups")
@@ -1911,33 +2012,26 @@ async def create_model_group_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a new model group."""
-    from sqlalchemy.future import select as sa_select
-    from app.auth.models import ModelGroup as ModelGroupTable
+    """Create a model group with its members.
 
-    existing = await db.execute(
-        sa_select(ModelGroupTable).where(ModelGroupTable.name.ilike(body.name))
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Model group '{body.name}' already exists")
+    Each profile's limits for it start as the strictest limits its members had until
+    now (see database.create_model_group), so moving models in never loosens them.
+    """
+    await _check_group_name(db, body.name)
+    await _check_members(db, body)
+    try:
+        group = await create_model_group(db, body.name, body.description, current_admin.username,
+                                         body.model_ids, body.provider_keys)
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A member or the name was taken by a concurrent edit; reload and retry")
 
-    group = await create_model_group(db, body.name, body.description, current_admin.username)
-    # Limits live on profiles. The create form's values (if any) apply to every
-    # profile, so a new group is never silently unlimited for everyone.
-    if body.rpm_default is not None or body.rpd_default is not None:
-        await set_group_limit_for_all_profiles(
-            db, group.id, body.rpm_default, body.rpd_default, current_admin.username,
-        )
-
-    from app.rate_limit import rate_limit_tracker
-    # No re-settle: a group created now has no members, so scope_for_model maps
-    # nothing into it, its usage is 0 and settlement would find delta == 0.
-    # Its limits start mattering when set_model_group_members_endpoint runs.
-
-    return ModelGroupResponse(
-        id=group.id, name=group.name, description=group.description,
-        member_count=0, members=[], updated_at=group.updated_at, updated_by=group.updated_by,
-    )
+    # Members moved out of Default: the tracker must see them now, and pools settled
+    # by the old split re-apportioned (resettle refreshes the snapshot first).
+    from app.routes.pools import resettle_pools_after_commit
+    await resettle_pools_after_commit(db, all_pools=True)
+    return next(g for g in _group_responses(await model_group_overview(db)) if g.id == group.id)
 
 
 @router.put("/model-groups")
@@ -1947,39 +2041,62 @@ async def update_model_group_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Rename or update description of a model group."""
-    from sqlalchemy.future import select as sa_select
-    from app.auth.models import ModelGroup as ModelGroupTable
+    """Rename or update the description of a model group, and optionally replace its
+    members in the same commit (see ModelGroupUpdate)."""
+    _reject_default(group_id)
+    body = body or ModelGroupUpdate()
+    fields = body.model_dump(exclude_unset=True, exclude={"model_ids", "provider_keys"})
+    members = body.members()
+    if members is not None and await list_model_groups(db, group_id=group_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
+    if "name" in fields:
+        await _check_group_name(db, fields["name"], group_id)
+    if members is not None:
+        await _check_members(db, members, group_id)
 
-    fields = {}
-    if body:
-        update_data = body.model_dump(exclude_unset=True)
-        if "name" in update_data:
-            existing = await db.execute(
-                sa_select(ModelGroupTable).where(
-                    ModelGroupTable.name.ilike(update_data["name"]),
-                    ModelGroupTable.id != group_id,
-                )
-            )
-            if existing.scalar_one_or_none():
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Model group name '{update_data['name']}' already exists")
-        fields = update_data
-
-    group = await update_model_group(db, group_id, fields, current_admin.username)
+    try:
+        group = await update_model_group(
+            db, group_id, fields, current_admin.username,
+            members=None if members is None else (members.model_ids, members.provider_keys),
+        )
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A member or the name was taken by a concurrent edit; reload and retry")
     if group is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
 
     from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_group(group_id)
-    # No re-settle: ModelGroupUpdate carries name and description only, neither of
-    # which is an apportionment weight.
+    if members is None:
+        # The name is in every 429 the group returns. No re-settle: neither field is
+        # an apportionment weight.
+        await rate_limit_tracker.reload_config()
+    else:
+        rate_limit_tracker.invalidate_group(group_id)
+        # Refreshes the snapshot before settling, so the new membership applies at once.
+        from app.routes.pools import resettle_pools_after_commit
+        await resettle_pools_after_commit(db, all_pools=True)
+    return next(g for g in _group_responses(await model_group_overview(db)) if g.id == group_id)
 
-    refreshed = await list_model_groups(db, group_id=group_id)
-    return ModelGroupResponse(
-        id=refreshed.id, name=refreshed.name, description=refreshed.description,
-        member_count=len(refreshed.members), members=[m.model_id for m in refreshed.members],
-        updated_at=refreshed.updated_at, updated_by=refreshed.updated_by,
-    )
+
+@router.put("/model-groups/toggle")
+async def toggle_model_group_endpoint(
+    toggle_data: ToggleRequest,
+    group_id: int = Query(..., description="Group ID to enable or disable"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Switch a model group on or off. While off, its models are not served, like a
+    disabled model; profiles that override the global config still get them."""
+    _reject_default(group_id)
+    group = await update_model_group(db, group_id, {"enabled": toggle_data.enabled}, current_admin.username)
+    if group is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
+
+    from app.rate_limit import rate_limit_tracker
+    # Access only: membership and limits are unchanged, so no count or settlement moves.
+    await rate_limit_tracker.reload_config()
+    return next(g for g in _group_responses(await model_group_overview(db)) if g.id == group_id)
 
 
 @router.delete("/model-groups")
@@ -1988,7 +2105,8 @@ async def delete_model_group_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Delete a model group (cascades members and per-user overrides)."""
+    """Delete a model group; its models return to the Default group."""
+    _reject_default(group_id)
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_group(group_id)
 
@@ -2008,51 +2126,26 @@ async def set_model_group_members_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Replace the member list for a model group. Validates each model_id exists and is not in another group."""
-    from app.auth.models import ModelGroupMember as ModelGroupMemberTable, ModelConfiguration
-    from sqlalchemy.future import select as sa_select
-
-    # Confirm group exists
-    group = await list_model_groups(db, group_id=group_id)
-    if group is None:
+    """Replace a group's members: explicit models and whole provider instances."""
+    _reject_default(group_id)
+    if await list_model_groups(db, group_id=group_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
-
-    model_ids = body.model_ids if body else []
-
-    # Validate all model_ids exist
-    if model_ids:
-        result = await db.execute(sa_select(ModelConfiguration).where(ModelConfiguration.model_id.in_(model_ids)))
-        found = {r.model_id for r in result.scalars().all()}
-        missing = [mid for mid in model_ids if mid not in found]
-        if missing:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"model_id(s) not found: {missing}",
-            )
-
-    # Check for conflicts: model_id already in another group
-    if model_ids:
-        result = await db.execute(
-            sa_select(ModelGroupMemberTable).where(
-                ModelGroupMemberTable.model_id.in_(model_ids),
-                ModelGroupMemberTable.group_id != group_id,
-            )
-        )
-        conflicts = [
-            {"model_id": r.model_id, "current_group_id": r.group_id}
-            for r in result.scalars().all()
-        ]
-        if conflicts:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"conflicts": conflicts})
-
-    await set_group_members(db, group_id, model_ids)
+    body = body or ModelGroupMembersUpdate()
+    await _check_members(db, body, group_id)
+    try:
+        await set_group_members(db, group_id, body.model_ids, body.provider_keys)
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="A member was claimed by a concurrent edit; reload and retry")
 
     from app.rate_limit import rate_limit_tracker
     rate_limit_tracker.invalidate_group(group_id)
+    # Refreshes the snapshot before settling, so the new membership applies at once.
     from app.routes.pools import resettle_pools_after_commit
     await resettle_pools_after_commit(db, all_pools=True)
 
-    return {"group_id": group_id, "model_ids": model_ids}
+    return {"group_id": group_id, "model_ids": body.model_ids, "provider_keys": body.provider_keys}
 
 
 # ==================== Profile Model Access API Endpoints ====================
@@ -2064,9 +2157,18 @@ class UserModelAccessItem(BaseModel):
     model_name: str
     provider_key: str
     globally_enabled: bool          # ModelConfiguration.is_enabled
-    is_exception: bool              # explicit profile override exists
+    blocked_by_group: Optional[str] = None  # name of the disabled group that blocks it
+    group_id: int = 0               # the model group governing it (0 = Default)
+    is_exception: bool             # explicit profile override exists
     is_allowed: Optional[bool]      # exception value; None if no exception
     effective_allowed: bool         # final decision (global AND policy/exception)
+
+
+class ProfileGroupAccessItem(BaseModel):
+    group_id: int                   # 0 = the built-in Default group
+    name: str
+    is_default: bool = False
+    enabled: bool = True            # the group's global switch (Model Groups tab)
 
 
 class ProfileModelAccessResponse(BaseModel):
@@ -2077,6 +2179,7 @@ class ProfileModelAccessResponse(BaseModel):
     member_count: int = 0
     mode: str                       # default|allow|deny|custom
     models: List[UserModelAccessItem]
+    groups: List[ProfileGroupAccessItem] = []   # Default first; models carry their group_id
 
 
 class UserModelPolicyUpdate(BaseModel):
@@ -2104,6 +2207,7 @@ def _compute_access_item(
     exception_map: dict,
 ) -> UserModelAccessItem:
     """Build one model's access state under a profile, mirroring the cache decision."""
+    from app.rate_limit import rate_limit_tracker
     has_override = model.model_id in exception_map
     exc_val = exception_map.get(model.model_id)
 
@@ -2130,24 +2234,39 @@ def _compute_access_item(
         model_name=model.model_name,
         provider_key=model.provider_key,
         globally_enabled=model.is_enabled,
+        blocked_by_group=rate_limit_tracker.blocking_group(model.model_id),
         is_exception=is_exception,
         is_allowed=exc_val if is_exception else None,
         effective_allowed=effective,
     )
 
 
-async def _build_profile_model_access(db: AsyncSession, profile_id: int) -> ProfileModelAccessResponse:
-    """Assemble the full model-access view of one profile."""
+async def _build_profile_model_access(
+    db: AsyncSession, profile_id: int, models=None, overview: Optional[dict] = None,
+) -> ProfileModelAccessResponse:
+    """Assemble the full model-access view of one profile.
+
+    A caller that already loaded the model rows or the group overview passes them in;
+    an access edit changes neither.
+    """
+    from app.profiles import DEFAULT_GROUP_ID
     profile = await _profile_response(db, profile_id)
-    models = await get_all_model_configurations(db)
+    if models is None:
+        models = await get_all_model_configurations(db)
     exception_map = await list_profile_model_exceptions(db, profile_id)
-    items = [
-        _compute_access_item(ModelConfigurationResponse.from_orm(m), profile.model_access_mode, exception_map)
-        for m in models
-    ]
+    if overview is None:
+        overview = await model_group_overview(db)
+    group_of = {mid: gid for gid, mids in overview["effective"].items() for mid in mids}
+    items = []
+    for m in models:
+        item = _compute_access_item(ModelConfigurationResponse.from_orm(m), profile.model_access_mode, exception_map)
+        item.group_id = group_of.get(m.model_id, DEFAULT_GROUP_ID)
+        items.append(item)
+    groups = [ProfileGroupAccessItem(group_id=DEFAULT_GROUP_ID, name="Default", is_default=True)]
+    groups += [ProfileGroupAccessItem(group_id=g.id, name=g.name, enabled=g.enabled) for g in overview["groups"]]
     return ProfileModelAccessResponse(
         profile_id=profile.id, name=profile.name, member_count=profile.member_count,
-        mode=profile.model_access_mode, models=items,
+        mode=profile.model_access_mode, models=items, groups=groups,
     )
 
 
@@ -2220,6 +2339,42 @@ async def upsert_profile_model_access_exception(
     return await _build_profile_model_access(db, profile_id)
 
 
+@router.put("/profiles/model-access/group", response_model=ProfileModelAccessResponse)
+async def set_profile_group_access(
+    body: UserModelExceptionUpdate,
+    profile_id: int = Query(...),
+    group_id: int = Query(..., description="Model group ID (0 = Default)"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Allow or deny every model a group governs right now, for one profile.
+
+    The same per-model overrides as toggling each model by hand, written in one go, so
+    the profile switches to 'custom' the same way (seeded loss-lessly from allow/deny).
+    A model that joins the group later follows the profile's rules like any new model.
+    """
+    profile = await _require_profile(db, profile_id)
+    overview = await model_group_overview(db)
+    if group_id not in overview["effective"]:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model group not found")
+    members = overview["effective"][group_id]
+    if not members:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="The group has no models")
+
+    models = await get_all_model_configurations(db)
+    prev_mode = profile.model_access_mode or "default"
+    if prev_mode in ("allow", "deny"):
+        overrides = {m.model_id: prev_mode == "allow" for m in models}
+    else:
+        overrides = await list_profile_model_exceptions(db, profile_id)
+    overrides.update({mid: body.is_allowed for mid in members})
+    await set_profile_model_exceptions_bulk(db, profile_id, overrides, current_admin.username)
+    if prev_mode != "custom":
+        await set_profile_model_mode(db, profile_id, "custom", current_admin.username)
+    await _reload_access()
+    return await _build_profile_model_access(db, profile_id, models=models, overview=overview)
+
+
 @router.delete("/profiles/model-access")
 async def delete_profile_model_access_exception(
     profile_id: int = Query(...),
@@ -2233,182 +2388,6 @@ async def delete_profile_model_access_exception(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No override found for this profile and model")
     await _reload_access()
     return {"message": f"Override removed for profile {profile.name} on model {model_id}"}
-
-
-# ==================== Instance Group Management API Endpoints ====================
-
-@router.get("/instance-groups")
-async def get_instance_groups(
-    group_id: Optional[int] = Query(None, description="Omit to list all groups; provide to fetch one"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """List all instance groups, or fetch a single group's details including members."""
-    def _to_response(g) -> InstanceGroupResponse:
-        return InstanceGroupResponse(
-            id=g.id,
-            name=g.name,
-            description=g.description,
-            member_count=len(g.members),
-            members=[m.provider_key for m in g.members],
-            updated_at=g.updated_at,
-            updated_by=g.updated_by,
-        )
-
-    if group_id is not None:
-        group = await list_instance_groups(db, group_id=group_id)
-        if group is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-        return _to_response(group)
-
-    groups = await list_instance_groups(db)
-    return [_to_response(g) for g in groups]
-
-
-@router.post("/instance-groups")
-async def create_instance_group_endpoint(
-    body: InstanceGroupCreate,
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Create a new instance group."""
-    from sqlalchemy.future import select as sa_select
-    from app.auth.models import InstanceGroup as InstanceGroupTable
-
-    existing = await db.execute(
-        sa_select(InstanceGroupTable).where(InstanceGroupTable.name.ilike(body.name))
-    )
-    if existing.scalar_one_or_none():
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Instance group '{body.name}' already exists")
-
-    group = await create_instance_group(db, body.name, body.description, current_admin.username)
-    if body.rpm_default is not None or body.rpd_default is not None:
-        await set_group_limit_for_all_profiles(
-            db, group.id, body.rpm_default, body.rpd_default, current_admin.username, instance=True,
-        )
-
-    from app.rate_limit import rate_limit_tracker
-    # No re-settle: an empty group folds no usage into its scope, so delta == 0.
-    # See create_model_group_endpoint.
-
-    return InstanceGroupResponse(
-        id=group.id, name=group.name, description=group.description,
-        member_count=0, members=[], updated_at=group.updated_at, updated_by=group.updated_by,
-    )
-
-
-@router.put("/instance-groups")
-async def update_instance_group_endpoint(
-    group_id: int = Query(..., description="Group ID to update"),
-    body: InstanceGroupUpdate = None,
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Rename or update description of an instance group."""
-    from sqlalchemy.future import select as sa_select
-    from app.auth.models import InstanceGroup as InstanceGroupTable
-
-    fields = {}
-    if body:
-        update_data = body.model_dump(exclude_unset=True)
-        if "name" in update_data:
-            existing = await db.execute(
-                sa_select(InstanceGroupTable).where(
-                    InstanceGroupTable.name.ilike(update_data["name"]),
-                    InstanceGroupTable.id != group_id,
-                )
-            )
-            if existing.scalar_one_or_none():
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Instance group name '{update_data['name']}' already exists")
-        fields = update_data
-
-    group = await update_instance_group(db, group_id, fields, current_admin.username)
-    if group is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_instance_group(group_id)
-    # No re-settle: InstanceGroupUpdate is name and description only.
-
-    refreshed = await list_instance_groups(db, group_id=group_id)
-    return InstanceGroupResponse(
-        id=refreshed.id, name=refreshed.name, description=refreshed.description,
-        member_count=len(refreshed.members), members=[m.provider_key for m in refreshed.members],
-        updated_at=refreshed.updated_at, updated_by=refreshed.updated_by,
-    )
-
-
-@router.delete("/instance-groups")
-async def delete_instance_group_endpoint(
-    group_id: int = Query(..., description="Group ID to delete"),
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Delete an instance group (cascades members and per-user overrides)."""
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_instance_group(group_id)
-
-    deleted = await delete_instance_group(db, group_id)
-    if not deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, all_pools=True)
-    return {"message": f"Instance group {group_id} deleted"}
-
-
-@router.put("/instance-groups/members")
-async def set_instance_group_members_endpoint(
-    group_id: int = Query(..., description="Group ID to update members for"),
-    body: InstanceGroupMembersUpdate = None,
-    current_admin: AdminUser = Depends(get_current_admin),
-    db: AsyncSession = Depends(get_db),
-):
-    """Replace the member list for an instance group. Validates each provider_key exists and is not in another group."""
-    from app.auth.models import InstanceGroupMember as InstanceGroupMemberTable, ProviderCredentials
-    from sqlalchemy.future import select as sa_select
-
-    # Confirm group exists
-    group = await list_instance_groups(db, group_id=group_id)
-    if group is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instance group not found")
-
-    provider_keys = body.provider_keys if body else []
-
-    # Validate all provider_keys exist
-    if provider_keys:
-        result = await db.execute(sa_select(ProviderCredentials).where(ProviderCredentials.provider_key.in_(provider_keys)))
-        found = {r.provider_key for r in result.scalars().all()}
-        missing = [pk for pk in provider_keys if pk not in found]
-        if missing:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"provider_key(s) not found: {missing}",
-            )
-
-    # Check for conflicts: provider_key already in another group
-    if provider_keys:
-        result = await db.execute(
-            sa_select(InstanceGroupMemberTable).where(
-                InstanceGroupMemberTable.provider_key.in_(provider_keys),
-                InstanceGroupMemberTable.group_id != group_id,
-            )
-        )
-        conflicts = [
-            {"provider_key": r.provider_key, "current_group_id": r.group_id}
-            for r in result.scalars().all()
-        ]
-        if conflicts:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail={"conflicts": conflicts})
-
-    await set_instance_group_members(db, group_id, provider_keys)
-
-    from app.rate_limit import rate_limit_tracker
-    rate_limit_tracker.invalidate_instance_group(group_id)
-    from app.routes.pools import resettle_pools_after_commit
-    await resettle_pools_after_commit(db, all_pools=True)
-
-    return {"group_id": group_id, "provider_keys": provider_keys}
 
 
 @router.post("/logout")
@@ -2773,6 +2752,9 @@ async def update_provider_credential(
         # Automatically sync models for the updated provider
         sync_result = await auto_sync_on_provider_change(db, credentials.provider_key, action="update")
         logging.info(f"Auto-sync result for updated provider {credentials.provider_key}: {sync_result}")
+        if credentials.provider_key != decoded_provider_key:
+            # A rename rewrote group members, aliases and access exceptions too.
+            await reload_reference_caches()
         
         # Parse deployments JSON for response
         deployment_groups, deployments = _parse_azure_deployment_fields(credentials.deployments_json)
@@ -2852,7 +2834,9 @@ async def delete_provider_credential(
         
         # Refresh provider manager to ensure it only has valid providers from database
         await provider_manager.refresh_providers_from_database()
-        
+        # Group members, aliases and access exceptions naming it were cleaned up too.
+        await reload_reference_caches()
+
         return {"message": f"Provider credentials deleted: {decoded_provider_key}"}
     except HTTPException:
         raise
@@ -3100,15 +3084,30 @@ async def import_provider_config(
             except Exception as e:
                 errors.append(f"Failed to import provider '{provider_data.get('provider_key', '?')}': {str(e)}")
 
-        # Restore model enabled/disabled states
-        for model_data in data.get("model_configurations", []):
+        # Restore model enabled/disabled states. Exports from before the provider and
+        # model flags were decoupled carry every model of a disabled provider as off,
+        # because the old provider toggle wrote through to them. When all of a disabled
+        # provider's models are off that way, the flags say nothing about the models:
+        # import them as on, so re-enabling the provider restores them (the same rule
+        # as the startup migration, _normalise_coupled_model_flags).
+        model_rows = data.get("model_configurations", [])
+        disabled_providers = {
+            p.get("provider_key") for p in data.get("providers", [])
+            if isinstance(p, dict) and p.get("enabled") is False
+        }
+        coupled = {
+            pk for pk in disabled_providers
+            if (rows := [m for m in model_rows if m.get("provider_key") == pk])
+            and not any(m.get("is_enabled", True) for m in rows)
+        }
+        for model_data in model_rows:
             try:
                 await create_or_update_model_configuration(
                     db,
                     model_id=model_data["model_id"],
                     provider_key=model_data["provider_key"],
                     model_name=model_data["model_name"],
-                    is_enabled=model_data.get("is_enabled", True),
+                    is_enabled=model_data.get("is_enabled", True) or model_data["provider_key"] in coupled,
                 )
             except Exception as e:
                 logging.warning(f"Failed to restore model config '{model_data.get('model_id')}': {e}")

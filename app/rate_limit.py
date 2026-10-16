@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 from app import time_utils
 from app.concurrency import TaskReentrantLock, lock_in_use
-from app.profiles import profile_registry
+from app.profiles import DEFAULT_GROUP_ID, profile_registry
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,18 @@ _RPD_TTL = 5           # seconds — local cache TTL for today-count DB reads
 # be served as a last-known value on a transient DB failure, before eviction
 # reclaims it. Bounds per-identity memory growth in long-lived processes.
 _RPD_CACHE_RETENTION = 300  # seconds
+
+
+def provider_key_of(model_id: Optional[str]) -> Optional[str]:
+    """The instance (provider_key) a model id belongs to.
+
+    Model ids are '{provider_key}/{model_name}' (e.g. 'azure:primary/gpt-4'); an id
+    with no '/' is treated as its own provider_key. The one parser every group lookup,
+    usage count and settlement shares, so they cannot disagree about an instance.
+    """
+    if not model_id:
+        return None
+    return model_id.split("/", 1)[0]
 
 
 def _user_scope_key(username: str) -> str:
@@ -68,7 +80,7 @@ class RateLimitDecision:
     rpd_limit: Optional[int]
     rpd_remaining: Optional[int]
     retry_after_seconds: int
-    limited_by: Optional[str]  # "rpm"|"rpd"|"group_rpm"|"group_rpd"|"instance_group_rpm"|"instance_group_rpd"|None
+    limited_by: Optional[str]  # "rpm"|"rpd" (Default group)|"group_rpm"|"group_rpd"|None
     # Group context (set when limited_by is group_rpm or group_rpd, or for headers)
     group_id: Optional[int] = None
     group_name: Optional[str] = None
@@ -96,14 +108,9 @@ class _MinuteBucket:
 class _ModelGroupSnapshot:
     group_id: int
     name: str
-    model_ids: List[str]
-
-
-@dataclass
-class _InstanceGroupSnapshot:
-    group_id: int
-    name: str
-    provider_keys: List[str]
+    model_ids: List[str]                                     # explicit model members
+    provider_keys: List[str] = field(default_factory=list)  # instance members (live)
+    enabled: bool = True                                     # off = its models are not served
 
 
 @dataclass
@@ -217,23 +224,9 @@ def _share_message(d: RateLimitDecision, scope: str, pool_limit: Optional[int]) 
 
 def _limit_message(d: RateLimitDecision) -> str:
     if d.pool_share_cap is not None:
-        if d.limited_by == "instance_group_rpd":
-            return _share_message(d, f" for instance group '{d.group_name}'", d.group_rpd_limit)
         if d.limited_by == "group_rpd":
             return _share_message(d, f" for model group '{d.group_name}'", d.group_rpd_limit)
         return _share_message(d, "", d.rpd_limit)
-    if d.limited_by == "instance_group_rpm":
-        return (
-            f"Rate limit exceeded for instance group '{d.group_name}': {d.group_rpm_limit} requests per minute. "
-            f"Retry after {_human_duration(d.retry_after_seconds)}, or use an instance outside this group. "
-            f"View your allowed quota in the console."
-        )
-    if d.limited_by == "instance_group_rpd":
-        return (
-            f"Rate limit exceeded for instance group '{d.group_name}': {d.group_rpd_limit} requests per day. "
-            f"Retry after {_human_duration(d.retry_after_seconds)}, or use an instance outside this group. "
-            f"View your allowed quota in the console." + _pooling_hint(d)
-        )
     if d.limited_by == "group_rpm":
         return (
             f"Rate limit exceeded for model group '{d.group_name}': {d.group_rpm_limit} requests per minute. "
@@ -265,8 +258,8 @@ def _rl_headers(d: RateLimitDecision) -> dict:
     if d.pool_share_cap is not None:
         # The member's own ceiling is the limit they actually ran into.
         limit = d.pool_share_cap
-    elif d.limited_by in ("group_rpm", "group_rpd", "instance_group_rpm", "instance_group_rpd"):
-        limit = d.group_rpm_limit if d.limited_by in ("group_rpm", "instance_group_rpm") else d.group_rpd_limit
+    elif d.limited_by in ("group_rpm", "group_rpd"):
+        limit = d.group_rpm_limit if d.limited_by == "group_rpm" else d.group_rpd_limit
     else:
         limit = d.rpm_limit if d.limited_by == "rpm" else d.rpd_limit
     return {
@@ -313,14 +306,11 @@ class RateLimitTracker:
         self._reload_lock: Optional[asyncio.Lock] = None
         self._running = False
         self._refresh_task: Optional[asyncio.Task] = None
-        # Model-group state
+        # Model-group state. A group claims models explicitly and/or whole instances;
+        # see group_for() for how a model id resolves.
         self._groups: Dict[int, _ModelGroupSnapshot] = {}        # group_id → snapshot
-        self._model_to_group: Dict[str, int] = {}               # model_id → group_id
-        # Instance-group state (keyed on provider_key)
-        self._instance_groups: Dict[int, _InstanceGroupSnapshot] = {}    # group_id → snapshot
-        self._provider_to_group: Dict[str, int] = {}                     # provider_key → group_id
-        self._instance_group_minute_buckets: Dict[Tuple[int, int], _MinuteBucket] = {}  # (user_id, group_id)
-        self._instance_group_rpd_cache: Dict[Tuple[str, int], _RpdCacheEntry] = {}      # (scope_key, group_id)
+        self._model_to_group: Dict[str, int] = {}               # explicit model_id → group_id
+        self._provider_to_group: Dict[str, int] = {}            # instance provider_key → group_id
         # Request-pool state. Only RPD is pooled; every RPM structure above stays
         # strictly per-user. RPD counting itself goes through the member user ids
         # (RequestUsage.user_id); usernames are cached alongside them so
@@ -410,7 +400,7 @@ class RateLimitTracker:
     async def _load_config_locked(self) -> None:
         try:
             from app.auth.models import (
-                ModelGroup, InstanceGroup, RequestPoolMember, User, UserRpdCarry,
+                ModelGroup, RequestPoolMember, User, UserRpdCarry,
             )
             from app.profiles import profile_registry
             from app import time_utils
@@ -422,17 +412,14 @@ class RateLimitTracker:
                 # shared with model access, so reloading it here keeps both in step.
                 await profile_registry.load(db)
 
-                # Load model groups with members
+                # Load model groups with both kinds of member
                 result = await db.execute(
-                    select(ModelGroup).options(selectinload(ModelGroup.members))
+                    select(ModelGroup).options(
+                        selectinload(ModelGroup.members),
+                        selectinload(ModelGroup.instance_members),
+                    )
                 )
                 group_rows = result.scalars().all()
-
-                # Load instance groups with members
-                result = await db.execute(
-                    select(InstanceGroup).options(selectinload(InstanceGroup.members))
-                )
-                instance_group_rows = result.scalars().all()
 
                 # Load pool membership joined to User for the usernames the RPD
                 # counters are keyed by.
@@ -463,6 +450,8 @@ class RateLimitTracker:
                         group_id=g.id,
                         name=g.name,
                         model_ids=[m.model_id for m in g.members],
+                        provider_keys=[m.provider_key for m in g.instance_members],
+                        enabled=bool(g.enabled),
                     )
                     for g in group_rows
                 }
@@ -471,18 +460,10 @@ class RateLimitTracker:
                     for g in group_rows
                     for m in g.members
                 }
-                self._instance_groups = {
-                    g.id: _InstanceGroupSnapshot(
-                        group_id=g.id,
-                        name=g.name,
-                        provider_keys=[m.provider_key for m in g.members],
-                    )
-                    for g in instance_group_rows
-                }
                 self._provider_to_group = {
                     m.provider_key: g.id
-                    for g in instance_group_rows
-                    for m in g.members
+                    for g in group_rows
+                    for m in g.instance_members
                 }
                 pool_members: Dict[int, List[Tuple[int, str]]] = {}
                 user_to_pool: Dict[int, int] = {}
@@ -541,14 +522,11 @@ class RateLimitTracker:
         stale_g = [k for k, b in self._group_minute_buckets.items() if b.window < current_window - 1]
         for k in stale_g:
             del self._group_minute_buckets[k]
-        stale_ig = [k for k, b in self._instance_group_minute_buckets.items() if b.window < current_window - 1]
-        for k in stale_ig:
-            del self._instance_group_minute_buckets[k]
 
         # Sweep RPD cache entries whose last-known value has aged out past the
         # retention window (these otherwise grow one entry per identity/group).
         cutoff = now - _RPD_CACHE_RETENTION
-        for cache in (self._rpd_cache, self._group_rpd_cache, self._instance_group_rpd_cache):
+        for cache in (self._rpd_cache, self._group_rpd_cache):
             expired = [k for k, e in cache.items() if e.expires_at < cutoff]
             for k in expired:
                 del cache[k]
@@ -575,6 +553,8 @@ class RateLimitTracker:
         if snap:
             for mid in snap.model_ids:
                 self._model_to_group.pop(mid, None)
+            for pk in snap.provider_keys:
+                self._provider_to_group.pop(pk, None)
         # Remove group RPM buckets for this group
         stale = [k for k in self._group_minute_buckets if k[1] == group_id]
         for k in stale:
@@ -583,19 +563,6 @@ class RateLimitTracker:
         stale_rpd = [k for k in self._group_rpd_cache if k[1] == group_id]
         for k in stale_rpd:
             del self._group_rpd_cache[k]
-
-    def invalidate_instance_group(self, group_id: int) -> None:
-        """Remove cached instance-group snapshot and all related RPM buckets."""
-        snap = self._instance_groups.pop(group_id, None)
-        if snap:
-            for pk in snap.provider_keys:
-                self._provider_to_group.pop(pk, None)
-        stale = [k for k in self._instance_group_minute_buckets if k[1] == group_id]
-        for k in stale:
-            del self._instance_group_minute_buckets[k]
-        stale_rpd = [k for k in self._instance_group_rpd_cache if k[1] == group_id]
-        for k in stale_rpd:
-            del self._instance_group_rpd_cache[k]
 
     async def refresh_now(self) -> None:
         """Force an immediate config reload from DB (called after admin edits).
@@ -622,20 +589,42 @@ class RateLimitTracker:
         """
         await self._load_config()
 
-    def model_belongs_to_group(self, model_id: str) -> bool:
-        """True if the model is mapped to a configured model group."""
-        return bool(model_id) and model_id in self._model_to_group
+    def group_for(self, model_id: Optional[str]) -> int:
+        """The model group governing a model id; DEFAULT_GROUP_ID when none claims it.
 
-    def instance_belongs_to_group(self, provider_key: str) -> bool:
-        """True if the provider instance is mapped to a configured instance group."""
-        return bool(provider_key) and provider_key in self._provider_to_group
+        An explicit model member wins over an instance member, so one model can be
+        carved out of an instance another group claims. Instance membership is
+        resolved here on every call rather than expanded when the group is saved,
+        so a model synced from that instance later joins the group by itself.
+        """
+        if not model_id:
+            return DEFAULT_GROUP_ID
+        gid = self._model_to_group.get(model_id)
+        if gid is not None:
+            return gid
+        gid = self._provider_to_group.get(provider_key_of(model_id))
+        return DEFAULT_GROUP_ID if gid is None else gid
+
+    def blocking_group(self, model_id: Optional[str]) -> Optional[str]:
+        """Name of the switched-off group governing a model, or None when it is served.
+
+        Follows group_for, so a model carved out of a disabled instance's group into an
+        enabled one is still served. Default cannot be switched off.
+        """
+        snap = self._groups.get(self.group_for(model_id))
+        return snap.name if snap is not None and not snap.enabled else None
+
+    def group_name(self, group_id: int) -> Optional[str]:
+        if group_id == DEFAULT_GROUP_ID:
+            return "Default"
+        snap = self._groups.get(group_id)
+        return snap.name if snap else None
 
     def grouped_keys(self) -> Tuple[set, set]:
-        """Return (grouped_model_ids, grouped_provider_keys) currently configured.
+        """Return (explicit_model_ids, instance_provider_keys) claimed by named groups.
 
-        A request is excluded from the overall (ungrouped) quota when its model is
-        in a model group OR its instance is in an instance group — the same predicate
-        the auth middleware uses to skip the overall gate.
+        A row belongs to the Default group exactly when neither set claims it; see
+        request_tracker.get_today_count.
         """
         return set(self._model_to_group.keys()), set(self._provider_to_group.keys())
 
@@ -655,18 +644,14 @@ class RateLimitTracker:
         """Return (effective_group_rpm, effective_group_rpd) for user_id in group."""
         return self.group_limits_for(user_id, group.group_id)
 
-    def _resolve_instance_group_limits(
-        self, user_id: int, group: _InstanceGroupSnapshot
-    ) -> Tuple[Optional[int], Optional[int]]:
-        """Return (effective_group_rpm, effective_group_rpd) for user_id in an instance group."""
-        return self.group_limits_for(user_id, group.group_id, instance=True)
-
     def group_limits_for(
-        self, user_id: int, group_id: int, instance: bool = False
+        self, user_id: int, group_id: int
     ) -> Tuple[Optional[int], Optional[int]]:
-        """(rpm, rpd) this user's profile sets for a group; the one lookup enforcement and display share."""
-        snap = profile_registry.for_user(user_id)
-        return snap.instance_group_limit(group_id) if instance else snap.model_group_limit(group_id)
+        """(rpm, rpd) this user's profile sets for a group; the one lookup enforcement and display share.
+
+        DEFAULT_GROUP_ID resolves to the profile's own rpm/rpd.
+        """
+        return profile_registry.for_user(user_id).model_group_limit(group_id)
 
     # -- request pooling ---------------------------------------------------
     #
@@ -777,9 +762,8 @@ class RateLimitTracker:
         """
         scope_key = _pool_scope_key(pool_id)
         self._rpd_cache.pop(scope_key, None)
-        for cache in (self._group_rpd_cache, self._instance_group_rpd_cache):
-            for key in [k for k in cache if k[0] == scope_key]:
-                cache.pop(key, None)
+        for key in [k for k in self._group_rpd_cache if k[0] == scope_key]:
+            self._group_rpd_cache.pop(key, None)
 
     async def get_user_status(self, user_id: int, username: str) -> "UserStatus":
         """Read-only — returns current usage without incrementing."""
@@ -814,15 +798,17 @@ class RateLimitTracker:
     async def check_group_limit(
         self, user_id: int, username: str, model_id: str
     ) -> Optional[RateLimitDecision]:
-        """Check only model-group limits. Returns a denied decision or None if allowed/no group.
+        """Check a named model group's limits. Returns a denied decision, or None if
+        allowed or the model is in the Default group.
 
-        Called from route handlers after model resolution, where the request-level
-        limits have already been enforced by auth middleware.
+        Called from route handlers after model resolution and the access check (see
+        app.rate_limit_dep.enforce_access_and_limits). The Default group is checked
+        by check_and_increment instead.
         """
         global_lock = await self._get_lock()
         async with global_lock:
-            group_id = self._model_to_group.get(model_id)
-            if group_id is None:
+            group_id = self.group_for(model_id)
+            if group_id == DEFAULT_GROUP_ID:
                 return None
             group = self._groups.get(group_id)
             if group is None:
@@ -874,7 +860,7 @@ class RateLimitTracker:
             # Group RPD check
             if g_rpd is not None:
                 group_today_count = await self._get_today_group_count(
-                    scope_key, member_ids, group.model_ids, group.group_id
+                    scope_key, member_ids, group
                 )
                 if group_today_count >= g_rpd:
                     return RateLimitDecision(
@@ -893,7 +879,7 @@ class RateLimitTracker:
                 # The pool has room, but this member may have used their share of it.
                 if share_cap is not None:
                     own_count = await self._get_today_group_count(
-                        _user_scope_key(username), [user_id], group.model_ids, group.group_id
+                        _user_scope_key(username), [user_id], group
                     )
                     if own_count >= share_cap:
                         return RateLimitDecision(
@@ -917,112 +903,6 @@ class RateLimitTracker:
 
         return None  # group checks passed
 
-    async def check_instance_group_limit(
-        self, user_id: int, username: str, provider_key: str
-    ) -> Optional[RateLimitDecision]:
-        """Check only instance-group limits. Returns a denied decision or None if allowed/no group.
-
-        Called from route handlers after the instance (provider_key) is resolved.
-        Takes precedence over model-group limits.
-        """
-        global_lock = await self._get_lock()
-        async with global_lock:
-            group_id = self._provider_to_group.get(provider_key)
-            if group_id is None:
-                return None
-            group = self._instance_groups.get(group_id)
-            if group is None:
-                return None
-            g_rpm, _own_rpd = self._resolve_instance_group_limits(user_id, group)
-
-            # RPD may be pooled across the members' group limits; RPM stays per-user.
-            scope_key, member_ids, pool_id = self._rpd_scope(user_id, username)
-            share_cap = None
-            if pool_id is None:
-                g_rpd = _own_rpd
-            else:
-                g_rpd = self._pooled_rpd_limit(
-                    member_ids, lambda uid: self._resolve_instance_group_limits(uid, group)[1]
-                )
-                share_cap = self.member_share_cap(pool_id, _own_rpd, g_rpd)
-            share_pct = self.share_pct_for(pool_id)
-
-        if g_rpm is None and g_rpd is None:
-            return None
-
-        user_lock = self._get_user_lock(user_id)
-        async with user_lock:
-            now = time.time()
-            current_window = int(now // 60)
-
-            gk = (user_id, group.group_id)
-            group_bucket = self._instance_group_minute_buckets.get(gk)
-            if group_bucket is None or group_bucket.window != current_window:
-                group_bucket = _MinuteBucket(window=current_window, count=0)
-                self._instance_group_minute_buckets[gk] = group_bucket
-
-            # Instance-group RPM check
-            if g_rpm is not None and group_bucket.count >= g_rpm:
-                retry_after = max(1, 60 - int(now - current_window * 60))
-                return RateLimitDecision(
-                    allowed=False,
-                    rpm_limit=None, rpm_remaining=None,
-                    rpd_limit=None, rpd_remaining=None,
-                    retry_after_seconds=retry_after,
-                    limited_by="instance_group_rpm",
-                    group_id=group.group_id,
-                    group_name=group.name,
-                    group_rpm_limit=g_rpm,
-                    group_rpm_remaining=0,
-                    group_rpd_limit=g_rpd,
-                )
-
-            # Instance-group RPD check
-            if g_rpd is not None:
-                group_today_count = await self._get_today_instance_group_count(
-                    scope_key, member_ids, group.provider_keys, group.group_id
-                )
-                if group_today_count >= g_rpd:
-                    return RateLimitDecision(
-                        allowed=False,
-                        rpm_limit=None, rpm_remaining=None,
-                        rpd_limit=None, rpd_remaining=None,
-                        retry_after_seconds=_seconds_until_local_midnight(),
-                        limited_by="instance_group_rpd",
-                        group_id=group.group_id,
-                        group_name=group.name,
-                        group_rpm_limit=g_rpm,
-                        group_rpd_limit=g_rpd,
-                        group_rpd_remaining=0,
-                        pooled=pool_id is not None,
-                    )
-                # The pool has room, but this member may have used their share of it.
-                if share_cap is not None:
-                    own_count = await self._get_today_instance_group_count(
-                        _user_scope_key(username), [user_id], group.provider_keys, group.group_id
-                    )
-                    if own_count >= share_cap:
-                        return RateLimitDecision(
-                            allowed=False,
-                            rpm_limit=None, rpm_remaining=None,
-                            rpd_limit=None, rpd_remaining=None,
-                            retry_after_seconds=_seconds_until_local_midnight(),
-                            limited_by="instance_group_rpd",
-                            group_id=group.group_id,
-                            group_name=group.name,
-                            group_rpm_limit=g_rpm,
-                            group_rpd_limit=g_rpd,
-                            group_rpd_remaining=0,
-                            pooled=True,
-                            pool_share_cap=share_cap,
-                            pool_share_pct=share_pct,
-                        )
-
-            # Passed — increment instance-group RPM bucket
-            group_bucket.count += 1
-
-        return None  # instance-group checks passed
-
     def invalidate_identity(self, identity: str) -> None:
         """Drop every cached RPD count for a user_identity.
 
@@ -1036,9 +916,8 @@ class RateLimitTracker:
         """
         scope_key = _user_scope_key(identity)
         self._rpd_cache.pop(scope_key, None)
-        for cache in (self._group_rpd_cache, self._instance_group_rpd_cache):
-            for key in [k for k in cache if k[0] == scope_key]:
-                cache.pop(key, None)
+        for key in [k for k in self._group_rpd_cache if k[0] == scope_key]:
+            self._group_rpd_cache.pop(key, None)
         pool_id = self._identity_to_pool.get(identity)
         if pool_id is not None:
             self.invalidate_pool(pool_id)
@@ -1052,19 +931,16 @@ class RateLimitTracker:
         """
         self._rpd_cache.clear()
         self._group_rpd_cache.clear()
-        self._instance_group_rpd_cache.clear()
 
     async def check_and_increment(
         self, user_id: int, username: str
     ) -> RateLimitDecision:
-        """Enforce the per-user overall (ungrouped) RPM/RPD limits and increment
-        the RPM bucket.
+        """Enforce the Default group's RPM/RPD (the profile's own limits) and
+        increment the RPM bucket.
 
-        Model-group and instance-group limits are enforced separately by
-        check_group_limit / check_instance_group_limit from the route handlers.
-        The sole caller (auth middleware) passes no model, so this method
-        deliberately handles only the overall quota — the previous per-model
-        group branches here were unreachable dead code and have been removed.
+        Named groups are enforced by check_group_limit. Callers are the routes, for a
+        model in the Default group (app.rate_limit_dep.enforce_access_and_limits), and
+        the auth middleware, for requests that name no model at all.
         """
         global_lock = await self._get_lock()
         async with global_lock:
@@ -1148,28 +1024,20 @@ class RateLimitTracker:
         )
 
     async def get_group_rpd_count(
-        self, user_id: int, user_identity: str, model_ids: List[str], group_id: int
+        self, user_id: int, user_identity: str, group_id: int
     ) -> int:
-        """Read-only — today's request count for a model group (TTL-cached, no increment).
+        """Read-only — today's request count for a group (TTL-cached, no increment).
 
-        Pooled callers get the whole pool's count, matching what enforcement sees.
+        DEFAULT_GROUP_ID reads the Default count. Pooled callers get the whole pool's
+        count, matching what enforcement sees.
         """
         scope_key, member_ids, _ = self._rpd_scope(user_id, user_identity)
-        return await self._get_today_group_count(
-            scope_key, member_ids, model_ids, group_id
-        )
-
-    async def get_instance_group_rpd_count(
-        self, user_id: int, user_identity: str, provider_keys: List[str], group_id: int
-    ) -> int:
-        """Read-only — today's request count for an instance group (TTL-cached, no increment).
-
-        Pooled callers get the whole pool's count, matching what enforcement sees.
-        """
-        scope_key, member_ids, _ = self._rpd_scope(user_id, user_identity)
-        return await self._get_today_instance_group_count(
-            scope_key, member_ids, provider_keys, group_id
-        )
+        if group_id == DEFAULT_GROUP_ID:
+            return await self._get_today_count(scope_key, member_ids)
+        group = self._groups.get(group_id)
+        if group is None:
+            return 0
+        return await self._get_today_group_count(scope_key, member_ids, group)
 
     def pooled_rpd_limits(self, user_id: int, username: str) -> Tuple[Optional[int], int, Optional[int]]:
         """Return (pool_id, member_count, pooled_overall_rpd) for the quotas endpoint.
@@ -1184,7 +1052,7 @@ class RateLimitTracker:
         member_ids = [uid for uid, _ in members]
         return pool_id, len(members), self._pooled_rpd_limit(member_ids, self._own_rpd_limit)
 
-    def pooled_group_rpd_limit(self, user_id: int, group_id: int, instance: bool = False) -> Optional[int]:
+    def pooled_group_rpd_limit(self, user_id: int, group_id: int) -> Optional[int]:
         """Pooled effective RPD for one group tier, or None when unlimited/unpooled.
 
         Returns None both for "no pool" and for "unlimited pool"; callers that need to
@@ -1195,13 +1063,6 @@ class RateLimitTracker:
         if not members:
             return None
         member_ids = [uid for uid, _ in members]
-        if instance:
-            group = self._instance_groups.get(group_id)
-            if group is None:
-                return None
-            return self._pooled_rpd_limit(
-                member_ids, lambda uid: self._resolve_instance_group_limits(uid, group)[1]
-            )
         group = self._groups.get(group_id)
         if group is None:
             return None
@@ -1216,30 +1077,22 @@ class RateLimitTracker:
     # than re-deriving them from the DB.
 
     def settlement_scopes(self) -> List[Tuple[str, int]]:
-        """Every scope a pool can be settled on: ('overall', 0) plus each group."""
+        """Every scope a pool can be settled on: ('overall', 0) -- the Default group --
+        plus each named group."""
         scopes: List[Tuple[str, int]] = [("overall", 0)]
         scopes.extend(("model_group", gid) for gid in self._groups)
-        scopes.extend(("instance_group", gid) for gid in self._instance_groups)
         return scopes
 
     def scope_for_model(self, model_id: str) -> Optional[Tuple[str, int]]:
-        """Which group scope a model's usage rows count against, or None if ungrouped.
+        """Which named group scope a model's usage rows count against, or None for the
+        Default group (scope ('overall', 0)).
 
-        Instance groups take precedence over model groups, matching the enforcement
-        order in check_instance_group_limit / check_group_limit. None means the model is
-        ungrouped and its rows count against the overall quota -- grouped rows do not,
-        because get_today_count excludes them from the overall count.
+        Resolves through group_for, the same lookup enforcement uses.
         """
-        if not model_id:
+        gid = self.group_for(model_id)
+        if gid == DEFAULT_GROUP_ID:
             return None
-        provider_key = model_id.split('/', 1)[0] if '/' in model_id else model_id
-        gid = self._provider_to_group.get(provider_key)
-        if gid is not None:
-            return ("instance_group", gid)
-        gid = self._model_to_group.get(model_id)
-        if gid is not None:
-            return ("model_group", gid)
-        return None
+        return ("model_group", gid)
 
     def member_limit_for_scope(
         self, user_id: int, scope_kind: str, scope_id: int
@@ -1255,9 +1108,6 @@ class RateLimitTracker:
         if scope_kind == "model_group":
             group = self._groups.get(scope_id)
             return None if group is None else self._resolve_group_limits(user_id, group)[1]
-        if scope_kind == "instance_group":
-            group = self._instance_groups.get(scope_id)
-            return None if group is None else self._resolve_instance_group_limits(user_id, group)[1]
         return None
 
     async def member_share_status(
@@ -1283,14 +1133,7 @@ class RateLimitTracker:
             group = self._groups.get(scope_id)
             if group is None:
                 return None, None
-            used = await self._get_today_group_count(own_key, [user_id], group.model_ids, scope_id)
-        elif scope_kind == "instance_group":
-            group = self._instance_groups.get(scope_id)
-            if group is None:
-                return None, None
-            used = await self._get_today_instance_group_count(
-                own_key, [user_id], group.provider_keys, scope_id
-            )
+            used = await self._get_today_group_count(own_key, [user_id], group)
         else:
             used = await self._get_today_count(own_key, [user_id])
         return cap, used
@@ -1377,34 +1220,21 @@ class RateLimitTracker:
                 del self._rpd_inflight[flight_key]
 
     async def _get_today_group_count(
-        self, scope_key: str, member_ids: List[int],
-        model_ids: List[str], group_id: int,
+        self, scope_key: str, member_ids: List[int], group: _ModelGroupSnapshot,
     ) -> int:
-        """Return today's effective request count for all models in the group, TTL-cached."""
+        """Return today's effective request count for every model the group governs, TTL-cached."""
+        group_id = group.group_id
+
         async def load() -> int:
             from app.request_tracker import request_tracker
-            rows = await request_tracker.get_today_group_count(member_ids, model_ids)
+            rows = await request_tracker.get_today_group_count(
+                member_ids, group.model_ids, group.provider_keys
+            )
             return max(0, rows + self._carry_sum(member_ids, "model_group", group_id))
 
         return await self._read_rpd_cached(
             "model_group", self._group_rpd_cache, (scope_key, group_id), load,
             "Group RPD count read failed for %s group %s; serving last-known count",
-            (scope_key, group_id),
-        )
-
-    async def _get_today_instance_group_count(
-        self, scope_key: str, member_ids: List[int],
-        provider_keys: List[str], group_id: int,
-    ) -> int:
-        """Return today's effective request count across all instances in the group, TTL-cached."""
-        async def load() -> int:
-            from app.request_tracker import request_tracker
-            rows = await request_tracker.get_today_instance_group_count(member_ids, provider_keys)
-            return max(0, rows + self._carry_sum(member_ids, "instance_group", group_id))
-
-        return await self._read_rpd_cached(
-            "instance_group", self._instance_group_rpd_cache, (scope_key, group_id), load,
-            "Instance-group RPD count read failed for %s group %s; serving last-known count",
             (scope_key, group_id),
         )
 

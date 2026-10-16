@@ -577,17 +577,13 @@ async def get_my_quotas(
     """Return the authenticated user's read-only quota information as a unified list of
     sections, one quota bucket each.
 
-    Every model the user can access is placed under exactly one section:
-      - Instance groups take precedence over model groups: a model whose instance
-        (provider_key) is in an instance group is listed under that instance group.
-      - Remaining models that belong to a model group are listed under it.
-      - Everything else falls under the ungrouped 'Other Models' section, governed by
-        the overall request quota.
-    Model groups and instance groups are not distinguished in the response — the UI
-    renders them identically. Admins are exempt and receive is_admin=True, sections=[].
+    Every model the user can access is placed under exactly one section, resolved
+    the way enforcement resolves it (rate_limit_tracker.group_for): the named model
+    group that claims it, or else the built-in Default group, governed by the
+    profile's own limits. Admins are exempt and receive is_admin=True, sections=[].
     """
-    from app.auth.database import list_model_groups, list_instance_groups
-    from app.profiles import profile_registry
+    from app.auth.database import list_model_groups
+    from app.profiles import DEFAULT_GROUP_ID
     from app.rate_limit import rate_limit_tracker
     from app.providers.provider_manager import provider_manager
 
@@ -597,31 +593,17 @@ async def get_my_quotas(
 
     # Accessible models for this user (same filter as GET /v1/models and /auth/api/models).
     accessible = await provider_manager.get_all_models(user_id=current_user.id)
-    accessible_ids = [m.id for m in accessible]
-    provider_key_of = {mid: (mid.split('/', 1)[0] if '/' in mid else mid) for mid in accessible_ids}
-
-    claimed: set[str] = set()  # model ids already placed in a section (precedence tracking)
-    named_sections: list[QuotaSectionResponse] = []
+    models_by_group: dict[int, list[str]] = {}
+    for m in accessible:
+        models_by_group.setdefault(rate_limit_tracker.group_for(m.id), []).append(m.id)
 
     # Pool membership, resolved once. When pooled, the daily limit of every section is
     # the sum of the members' limits for that same section and the count covers them
     # all; the per-minute limit stays the caller's own throughout.
-    pool_id, member_count, _ = rate_limit_tracker.pooled_rpd_limits(
+    pool_id, member_count, pooled_default_rpd = rate_limit_tracker.pooled_rpd_limits(
         current_user.id, current_user.username
     )
     is_pooled = pool_id is not None
-
-    def _pooled_rpd(own_rpd, group_id, instance):
-        """Replace a section's own daily limit with the pool's, when pooled.
-
-        An unlimited member makes the pool unlimited on that tier, which the tracker
-        reports as None — the same value an unlimited section already uses.
-        """
-        if not is_pooled:
-            return own_rpd
-        return rate_limit_tracker.pooled_group_rpd_limit(
-            current_user.id, group_id, instance=instance
-        )
 
     async def _share(scope_kind, scope_id, pool_rpd, rpd_remaining):
         """(share_cap, share_used, rpd_remaining) once the pool's per-member cap applies.
@@ -641,95 +623,41 @@ async def get_my_quotas(
             own_left = min(own_left, rpd_remaining)
         return cap, used, own_left
 
-    # --- Instance-group sections (highest precedence) ---
-    instance_group_rows = await list_instance_groups(db)  # eager-loads .members
-    for group in instance_group_rows:
-        member_keys = {m.provider_key for m in group.members}
-        section_models = [mid for mid in accessible_ids if provider_key_of[mid] in member_keys]
-        if not section_models:
-            continue
-        claimed.update(section_models)
+    async def _section(group_id, name, description, scope_kind) -> QuotaSectionResponse:
         # From the same profile snapshot enforcement reads, so the two never disagree.
-        eff_rpm, eff_rpd = rate_limit_tracker.group_limits_for(current_user.id, group.id, instance=True)
-        # Count is enforced across the group's full member set (matches enforcement).
-        cnt = await rate_limit_tracker.get_instance_group_rpd_count(
-            current_user.id, current_user.username,
-            [m.provider_key for m in group.members], group.id,
-        )
-        eff_rpd = _pooled_rpd(eff_rpd, group.id, instance=True)
-        rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
-        share_cap, share_used, rpd_remaining = await _share(
-            "instance_group", group.id, eff_rpd, rpd_remaining,
-        )
-        named_sections.append(QuotaSectionResponse(
-            name=group.name, description=group.description,
-            rpm_limit=eff_rpm, rpd_limit=eff_rpd,
-            rpd_count=cnt, rpd_remaining=rpd_remaining,
-            models=section_models,
-            is_pooled=is_pooled,
-            pooled_from_members=member_count if is_pooled else 0,
-            carry_adjustment=rate_limit_tracker.carry_for(
-                current_user.id, "instance_group", group.id
-            ),
-            share_cap=share_cap, share_used=share_used,
-        ))
-
-    # --- Model-group sections (exclude models already claimed by an instance group) ---
-    group_rows = await list_model_groups(db)  # eager-loads .members
-    for group in group_rows:
-        member_ids = {m.model_id for m in group.members}
-        section_models = [mid for mid in accessible_ids if mid in member_ids and mid not in claimed]
-        if not section_models:
-            continue
-        claimed.update(section_models)
-        eff_rpm, eff_rpd = rate_limit_tracker.group_limits_for(current_user.id, group.id)
-        # Count is enforced across the group's full member set (matches enforcement).
+        eff_rpm, eff_rpd = rate_limit_tracker.group_limits_for(current_user.id, group_id)
         cnt = await rate_limit_tracker.get_group_rpd_count(
-            current_user.id, current_user.username,
-            [m.model_id for m in group.members], group.id,
+            current_user.id, current_user.username, group_id,
         )
-        eff_rpd = _pooled_rpd(eff_rpd, group.id, instance=False)
+        if is_pooled:
+            # An unlimited member makes the pool unlimited on that tier, which the
+            # tracker reports as None -- the same value an unlimited section uses.
+            eff_rpd = (pooled_default_rpd if group_id == DEFAULT_GROUP_ID
+                       else rate_limit_tracker.pooled_group_rpd_limit(current_user.id, group_id))
         rpd_remaining = max(0, eff_rpd - cnt) if eff_rpd is not None else None
-        share_cap, share_used, rpd_remaining = await _share(
-            "model_group", group.id, eff_rpd, rpd_remaining,
-        )
-        named_sections.append(QuotaSectionResponse(
-            name=group.name, description=group.description,
+        scope_id = 0 if group_id == DEFAULT_GROUP_ID else group_id
+        share_cap, share_used, rpd_remaining = await _share(scope_kind, scope_id, eff_rpd, rpd_remaining)
+        return QuotaSectionResponse(
+            name=name, description=description,
             rpm_limit=eff_rpm, rpd_limit=eff_rpd,
             rpd_count=cnt, rpd_remaining=rpd_remaining,
-            models=section_models,
+            models=models_by_group.get(group_id, []),
+            is_default=group_id == DEFAULT_GROUP_ID,
             is_pooled=is_pooled,
             pooled_from_members=member_count if is_pooled else 0,
-            carry_adjustment=rate_limit_tracker.carry_for(
-                current_user.id, "model_group", group.id
-            ),
+            carry_adjustment=rate_limit_tracker.carry_for(current_user.id, scope_kind, scope_id),
             share_cap=share_cap, share_used=share_used,
-        ))
-
-    # Named groups share one visual treatment; order alphabetically.
-    named_sections.sort(key=lambda s: s.name.lower())
-
-    # --- 'Other Models' section: everything ungrouped, under the overall quota ---
-    sections = list(named_sections)
-    other_models = [mid for mid in accessible_ids if mid not in claimed]
-    if other_models:
-        status_obj = await rate_limit_tracker.get_user_status(current_user.id, current_user.username)
-        share_cap, share_used, rpd_remaining = await _share(
-            "overall", 0, status_obj.rpd_limit, status_obj.rpd_remaining,
         )
-        sections.append(QuotaSectionResponse(
-            name="Other Models",
-            description="Models not assigned to any group",
-            rpm_limit=status_obj.rpm_limit,
-            rpd_limit=status_obj.rpd_limit,
-            rpd_count=status_obj.rpd_count,
-            rpd_remaining=rpd_remaining,
-            models=other_models,
-            is_other=True,
-            is_pooled=is_pooled,
-            pooled_from_members=member_count if is_pooled else 0,
-            carry_adjustment=rate_limit_tracker.carry_for(current_user.id, "overall", 0),
-            share_cap=share_cap, share_used=share_used,
+
+    # Named groups, alphabetically (list_model_groups orders by name), then Default.
+    sections = [
+        await _section(group.id, group.name, group.description, "model_group")
+        for group in await list_model_groups(db)
+        if models_by_group.get(group.id)
+    ]
+    if models_by_group.get(DEFAULT_GROUP_ID):
+        sections.append(await _section(
+            DEFAULT_GROUP_ID, "Default", "Models not assigned to any other group", "overall",
         ))
 
     # The pool summary is a header chip, so only the name is needed beyond what the

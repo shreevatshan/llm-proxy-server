@@ -79,6 +79,29 @@ def test_model_access_follows_the_users_profile(registry):
     assert not cache.is_model_allowed_for_user(99, "p:a/m2")
 
 
+def test_models_with_access_shows_profile_disabled_models(registry):
+    from app.cache import ModelCache
+    from app.openai_models import ModelInfo
+    cache = ModelCache()
+    cache.update_models([ModelInfo(id=i, created=0, owned_by="x", provider="p:a") for i in ("p:a/m1", "p:a/m2")])
+    cache.update_model_configurations({"p:a/m1": True, "p:a/m2": False}, {"p:a": True})
+    registry.install({1: 2, 2: 3, 3: 4}, [
+        ProfileSnapshot(2, "deny", access_mode="deny"),
+        ProfileSnapshot(3, "allow", access_mode="allow"),
+        ProfileSnapshot(4, "custom", access_mode="custom",
+                        access_exceptions={"p:a/m1": False, "p:a/m2": True}),
+    ])
+
+    def access(user_id):
+        return {m.id: allowed for m, allowed in cache.get_models_with_access_for_user(user_id)}
+
+    # Globally-off models stay hidden unless the profile allows them.
+    assert access(1) == {"p:a/m1": False}
+    assert access(2) == {"p:a/m1": True, "p:a/m2": True}
+    assert access(3) == {"p:a/m1": False, "p:a/m2": True}
+    assert access(99) == {"p:a/m1": True}
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution
 # ---------------------------------------------------------------------------
@@ -196,17 +219,18 @@ class ProfileRateLimitTests(PoolTestCase):
         ig = await self.make_instance_group("edge", "edge", rpd_default=None)
         team = await self.make_profile("team")
         await self.set_group_limit(team.id, mg, rpm=1)
-        await self.set_group_limit(team.id, ig, rpm=1, instance=True)
+        await self.set_group_limit(team.id, ig, rpm=1)
         self.assertIsNone(await self.tracker.check_group_limit(alice.id, "alice", "p/opus"),
                           "Default has no limit on the group")
         await self.set_profile(alice, team.id)
         self.assertIsNone(await self.tracker.check_group_limit(alice.id, "alice", "p/opus"))
         self.assertEqual(
             (await self.tracker.check_group_limit(alice.id, "alice", "p/opus")).limited_by, "group_rpm")
-        self.assertIsNone(await self.tracker.check_instance_group_limit(alice.id, "alice", "edge"))
+        # A model on the instance, synced after the group was made, is governed by it.
+        self.assertIsNone(await self.tracker.check_group_limit(alice.id, "alice", "edge/m"))
         self.assertEqual(
-            (await self.tracker.check_instance_group_limit(alice.id, "alice", "edge")).limited_by,
-            "instance_group_rpm")
+            (await self.tracker.check_group_limit(alice.id, "alice", "edge/m")).limited_by,
+            "group_rpm")
 
     async def test_pooled_daily_limit_sums_across_profiles(self):
         alice = await self.make_user("alice", rpd_limit=10)
@@ -222,7 +246,7 @@ class ProfileRateLimitTests(PoolTestCase):
         created = await admin_routes.create_profile_endpoint(
             ProfileCreate(name="Team A", clone_from_id=DEFAULT_PROFILE_ID), ADMIN, self.db)
         limits = await admin_routes.get_profile_limits_endpoint(created.id, ADMIN, self.db)
-        self.assertEqual([g.rpd_limit for g in limits.model_groups if g.group_id == mg.id], [7],
+        self.assertEqual([g.rpd_limit for g in limits.groups if g.group_id == mg.id], [7],
                          "a clone carries the group limits")
 
         with self.assertRaises(HTTPException) as ctx:
@@ -248,7 +272,7 @@ class ProfileRateLimitTests(PoolTestCase):
 
         for pid, rpd in ((DEFAULT_PROFILE_ID, 500), (team.id, 50)):
             limits = await admin_routes.get_profile_limits_endpoint(pid, ADMIN, self.db)
-            row = next(g for g in limits.model_groups if g.group_id == mg.id)
+            row = next(g for g in limits.groups if g.group_id == mg.id)
             self.assertEqual((row.rpm_limit, row.rpd_limit), (10, rpd),
                              "an omitted RPD keeps each profile's own value")
 

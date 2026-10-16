@@ -286,11 +286,11 @@ class ShareCapTests(PoolTestCase):
         await self.seed_usage("alice", 15, model="fastprov/m")
         await self.refresh()
 
-        decision = await self.tracker.check_instance_group_limit(alice.id, "alice", "fastprov")
+        decision = await self.tracker.check_group_limit(alice.id, "alice", "fastprov/m")
         self.assertIsNotNone(decision)
-        self.assertEqual(decision.limited_by, "instance_group_rpd")
+        self.assertEqual(decision.limited_by, "group_rpd")
         self.assertEqual(decision.pool_share_cap, 15)
-        self.assertIsNone(await self.tracker.check_instance_group_limit(bob.id, "bob", "fastprov"))
+        self.assertIsNone(await self.tracker.check_group_limit(bob.id, "bob", "fastprov/m"))
 
     async def test_mover_is_measured_by_settled_share_not_raw_rows(self):
         """Heavy use in a pool she has left must not lock Alice out of the next one.

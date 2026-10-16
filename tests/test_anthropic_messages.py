@@ -397,9 +397,7 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
             "add_span_attributes",
             side_effect=lambda span, attrs: span_attrs.append(dict(attrs)),
         ), patch.object(
-            anthropic_messages, "enforce_group_rate_limit", AsyncMock(return_value=None)
-        ), patch.object(
-            anthropic_messages, "enforce_model_access", AsyncMock(return_value=None)
+            anthropic_messages, "enforce_access_and_limits", AsyncMock(return_value=None)
         ):
             response = asyncio.run(
                 anthropic_messages.count_message_tokens(
@@ -425,9 +423,7 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
             "get_anthropic_provider_for_model",
             AsyncMock(return_value=provider),
         ), patch.object(
-            anthropic_messages, "enforce_group_rate_limit", AsyncMock(return_value=None)
-        ), patch.object(
-            anthropic_messages, "enforce_model_access", AsyncMock(return_value=None)
+            anthropic_messages, "enforce_access_and_limits", AsyncMock(return_value=None)
         ):
             response = asyncio.run(
                 anthropic_messages.count_message_tokens(

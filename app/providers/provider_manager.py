@@ -876,7 +876,18 @@ class ProviderManager:
         clients, so a request currently streaming/awaiting an upstream call
         (which holds a reference to an old provider) is not torn down mid-flight.
         Old clients are then closed after a short grace period (best-effort).
+
+        Serialised: two overlapping refreshes would each capture the same "old"
+        registry, so the first one's freshly built registry would be swapped out by
+        the second without ever having its clients closed.
         """
+        lock = getattr(self, "_refresh_lock", None)
+        if lock is None:
+            lock = self._refresh_lock = asyncio.Lock()
+        async with lock:
+            await self._refresh_providers_from_database_locked()
+
+    async def _refresh_providers_from_database_locked(self) -> None:
         try:
             old_providers = self.providers
             # Build the fresh registry off to the side, then swap it in with a

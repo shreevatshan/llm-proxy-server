@@ -1,252 +1,68 @@
 /**
- * Unified Models manager.
+ * Model Access tab. Every rule belongs to a user profile: the profile switcher at the
+ * top (the same one Rate Limits and Model Mapping use) picks whose access the cards
+ * edit -- the access mode (Default / Allow all / Deny all / Custom) plus per-model
+ * allow/deny exceptions. Every member of the profile gets exactly this access.
  *
- * One view, two scopes selected from the left column:
- *   - "Global"   → enable/disable each model for everyone (global availability).
- *   - a profile  → set that profile's access mode (Default / Allow all / Deny all /
- *                  Custom) plus per-model allow/deny exceptions. Every member of the
- *                  profile gets exactly this access.
+ * The models list switches by model group (one switch per group, writing an exception
+ * for each model it governs) or by individual model; a group row expands to its models.
  *
- * The right pane swaps between the global panel (#ma-global) and the profile
- * panel (#ma-detail); #ma-empty is the pre-selection placeholder.
+ * Global availability (provider and model switches) lives in Providers & Models, and
+ * model groups in their own tab.
  */
 class ModelsManager {
     constructor() {
-        this._scope = 'global';        // 'global' or 'profile'
         this._selectedProfileId = null;
         this._detail = null;           // ProfileModelAccessResponse for the selected profile
-        this._globalModels = [];       // [{model_id, model_name, provider_key, is_enabled}]
-        document.addEventListener('profiles:changed', () => this._renderProfiles());
+        this._view = 'groups';         // models list: 'groups' or 'models' (individual)
+        try { if (sessionStorage.getItem('model-access:view') === 'models') this._view = 'models'; } catch (e) { /* storage blocked */ }
+        this._expanded = new Set();    // group ids opened in the groups view
+        this._switcher = new window.ProfileSwitcher(document.getElementById('ma-profile-switcher'), {
+            label: 'Model access for',
+            hint: 'Every member of this profile gets this access.',
+            stats: p => [
+                [p.member_count, 'member'],
+                ...(p.model_access_mode === 'custom' ? [[p.exception_count || 0, 'exception']] : []),
+            ],
+            onSelect: id => this.selectProfile(id),
+        });
+        document.addEventListener('profiles:changed', () => this._onProfilesChanged());
+    }
+
+    async _onProfilesChanged() {
+        const before = this._selectedProfileId;
+        await this._fillProfileSwitcher();
+        // The shown profile was deleted and the switcher fell back to another: reload the
+        // cards, or the next toggle would write into the profile the switcher now shows.
+        if (before !== null && this._selectedProfileId !== before) await this._loadDetail(this._selectedProfileId);
     }
 
     async load() {
         await window.ProfileStore.list({ force: true });
-        // A quick link from the Profiles tab (or the last visit) picks the scope.
-        const wanted = window.ProfileStore.selected('model-access', null);
-        if (wanted != null && window.ProfileStore.byId(wanted)) {
-            await this.selectProfile(wanted);
-        } else {
-            await this.selectScope('global');
-        }
+        await this._fillProfileSwitcher();
+        await this._loadDetail(this._selectedProfileId);
     }
 
-    // ── Left column: scope list ──────────────────────────────────────────────
-
-    filterProfiles() {
-        this._renderProfiles();
+    async _fillProfileSwitcher() {
+        // A stored '' is the old "Global" scope, now in Providers & Models: show Default.
+        const want = this._selectedProfileId
+            ?? window.ProfileStore.selected('model-access', null)
+            ?? window.ProfileStore.DEFAULT_ID;
+        this._selectedProfileId = await this._switcher.render(want);
     }
 
-    _renderProfiles() {
-        const list = document.getElementById('ma-profile-list');
-        if (!list) return;
-        const profiles = window.ProfileStore._profiles || [];
-        const q = (document.getElementById('ma-profile-search')?.value || '').trim().toLowerCase();
-        const filtered = q ? profiles.filter(p => (p.name || '').toLowerCase().includes(q)) : profiles;
-        if (!filtered.length) {
-            list.innerHTML = `<div class="text-muted small py-3 text-center">${profiles.length ? 'No profiles match your search.' : 'No profiles found.'}</div>`;
-            return;
-        }
-        list.innerHTML = filtered.map(p => this._renderProfileRow(p)).join('');
-    }
-
-    _renderProfileRow(p) {
-        const esc = window.UIUtils.escapeHtml;
-        const active = (this._scope === 'profile' && p.id === this._selectedProfileId) ? ' active' : '';
-        const exceptions = p.model_access_mode === 'custom' && p.exception_count
-            ? ` · ${p.exception_count} exception${p.exception_count === 1 ? '' : 's'}` : '';
-        return `
-        <button type="button" class="ma-user-item${active}" data-profile-id="${p.id}"
-            onclick="window.ModelsManager.selectProfile(${p.id})">
-            <span class="ma-user-text">
-                <span class="ma-user-name">${esc(p.name)}</span>
-                <span class="ma-user-email">${p.member_count} member${p.member_count === 1 ? '' : 's'} · ${esc(p.model_access_mode)}${exceptions}</span>
-            </span>
-            <span class="ma-user-trailing">
-                <span class="ma-editing-flag"><i class="fas fa-pen me-1"></i>Editing</span>
-            </span>
-        </button>`;
-    }
-
-    _updateScopeHighlight() {
-        const globalBtn = document.getElementById('ma-scope-global');
-        if (globalBtn) globalBtn.classList.toggle('active', this._scope === 'global');
-        this._renderProfiles();  // refresh the per-profile active highlight
+    async selectProfile(profileId) {
+        this._selectedProfileId = profileId;
+        window.ProfileStore.select('model-access', profileId);
+        await this._loadDetail(profileId);
     }
 
     _showPanel(which) {
-        const map = { empty: 'ma-empty', global: 'ma-global', detail: 'ma-detail' };
+        const map = { error: 'ma-error', detail: 'ma-detail' };
         Object.entries(map).forEach(([key, id]) => {
             const el = document.getElementById(id);
             if (el) el.style.display = key === which ? '' : 'none';
         });
-    }
-
-    // ── Global scope ─────────────────────────────────────────────────────────
-
-    async selectScope(scope) {
-        if (scope !== 'global') return;
-        this._scope = 'global';
-        this._selectedProfileId = null;
-        window.ProfileStore.select('model-access', null);
-        this._updateScopeHighlight();
-        await this._loadGlobal();
-    }
-
-    async _loadGlobal() {
-        const list = document.getElementById('ma-global-list');
-        try {
-            const resp = await fetch('/admin/models/all', { credentials: 'include' });
-            if (!resp.ok) {
-                this._showPanel('global');
-                if (list) list.innerHTML = '<div class="text-danger small py-4 text-center">Couldn\'t load models. Retry.</div>';
-                return;
-            }
-            this._globalModels = await resp.json();
-            this._showPanel('global');
-            this._renderGlobal();
-        } catch (e) {
-            console.error('ModelsManager: failed to load global models', e);
-            this._showPanel('global');
-            if (list) list.innerHTML = '<div class="text-danger small py-4 text-center">Error loading models.</div>';
-        }
-    }
-
-    filterGlobal() {
-        this._renderGlobal();
-    }
-
-    _renderGlobal() {
-        const container = document.getElementById('ma-global-list');
-        const summary = document.getElementById('ma-global-summary');
-        if (!container) return;
-
-        const total = this._globalModels.length;
-        const enabled = this._globalModels.filter(m => m.is_enabled).length;
-        if (summary) summary.textContent = `${enabled} of ${total} enabled`;
-
-        const q = (document.getElementById('ma-global-search')?.value || '').trim().toLowerCase();
-        const filtered = q
-            ? this._globalModels.filter(m =>
-                (m.model_id || '').toLowerCase().includes(q)
-                || (m.model_name || '').toLowerCase().includes(q))
-            : this._globalModels;
-
-        if (!filtered.length) {
-            container.innerHTML = '<div class="text-muted small py-4 text-center">No models match your search.</div>';
-            return;
-        }
-        container.innerHTML = filtered.map(m => this._renderGlobalRow(m)).join('');
-    }
-
-    _renderGlobalRow(m) {
-        const safeId = window.UIUtils.escapeHtml(m.model_id);
-        const rowCls = ['ma-model-row'];
-        if (!m.is_enabled) rowCls.push('is-off');
-        const checked = m.is_enabled ? ' checked' : '';
-        return `
-        <div class="${rowCls.join(' ')}" data-model-id="${safeId}">
-            <div class="ma-model-id">${safeId}</div>
-            <div class="ma-model-controls">
-                <label class="ma-switch">
-                    <input type="checkbox"${checked}
-                        onchange="window.ModelsManager.toggleGlobal('${encodeURIComponent(m.model_id)}', this.checked)">
-                    <span class="ma-slider"></span>
-                </label>
-            </div>
-        </div>`;
-    }
-
-    async toggleGlobal(encodedModelId, enabled) {
-        const modelId = decodeURIComponent(encodedModelId);
-        try {
-            const resp = await fetch(`/admin/models/toggle?model_id=${encodeURIComponent(modelId)}`, {
-                method: 'PUT',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ enabled }),
-            });
-            if (resp.ok) {
-                const model = this._globalModels.find(m => m.model_id === modelId);
-                if (model) model.is_enabled = enabled;
-                if (window.SearchManager) window.SearchManager.clearModelsCache();
-                this._renderGlobal();
-                window.UIUtils?.showToast(`Model ${enabled ? 'enabled' : 'disabled'}.`, 'success');
-            } else {
-                const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(err.detail || 'Failed to update model.', 'error');
-                await this._loadGlobal();
-            }
-        } catch (e) {
-            window.UIUtils?.showToast('Network error updating model.', 'error');
-            await this._loadGlobal();
-        }
-    }
-
-    async bulkGlobal(action) {
-        const enabling = action === 'enable_all';
-        const confirmed = await window.UIUtils?.showConfirmModal(
-            enabling ? 'Enable all models' : 'Disable all models',
-            `${enabling ? 'Enable' : 'Disable'} every model for all users?`,
-        );
-        if (!confirmed) return;
-        try {
-            const resp = await fetch('/admin/models/bulk-toggle', {
-                method: 'PUT',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action }),
-            });
-            if (resp.ok) {
-                const result = await resp.json();
-                if (window.SearchManager) window.SearchManager.clearModelsCache();
-                window.UIUtils?.showToast(result.message || 'Models updated.', 'success');
-                await this._loadGlobal();
-            } else {
-                const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(err.detail || 'Failed to update models.', 'error');
-            }
-        } catch (e) {
-            window.UIUtils?.showToast('Network error updating models.', 'error');
-        }
-    }
-
-    async syncGlobal() {
-        const confirmed = await window.UIUtils?.showConfirmModal(
-            'Sync models',
-            'Refresh the model list from all providers. Continue?',
-        );
-        if (!confirmed) return;
-        try {
-            const resp = await fetch('/admin/models/sync', { method: 'POST', credentials: 'include' });
-            if (resp.ok) {
-                const result = await resp.json();
-                window.UIUtils?.showToast(
-                    `Synced ${result.providers_synced || 0} providers and ${result.models_synced || 0} models.`,
-                    'success',
-                );
-                if (window.SearchManager) window.SearchManager.clearModelsCache();
-                await this._loadGlobal();
-                if (result.stale_count > 0 && result.stale_models?.length
-                    && window.ModelManager?.showStaleModelsDialog) {
-                    window.ModelManager.showStaleModelsDialog(result.stale_models);
-                }
-            } else {
-                const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(err.detail || 'Failed to sync models.', 'error');
-            }
-        } catch (e) {
-            window.UIUtils?.showToast('Network error syncing models.', 'error');
-        }
-    }
-
-    // ── Profile scope ────────────────────────────────────────────────────────
-
-    async selectProfile(profileId) {
-        this._scope = 'profile';
-        this._selectedProfileId = profileId;
-        window.ProfileStore.select('model-access', profileId);
-        this._updateScopeHighlight();
-        await this._loadDetail(profileId);
     }
 
     _url(path, modelId) {
@@ -256,12 +72,13 @@ class ModelsManager {
     }
 
     async _loadDetail(profileId) {
+        if (profileId == null) return;
         try {
             const resp = await fetch(`/admin/profiles/model-access?profile_id=${profileId}`, { credentials: 'include' });
+            // A slower response for a profile the switcher has since moved off: drop it.
+            if (profileId !== this._selectedProfileId) return;
             if (!resp.ok) {
-                this._showPanel('empty');
-                const empty = document.getElementById('ma-empty');
-                if (empty) empty.querySelector('p').textContent = "Couldn't load model access. Retry.";
+                this._showPanel('error');
                 return;
             }
             this._detail = await resp.json();
@@ -269,13 +86,11 @@ class ModelsManager {
             this._renderDetail();
         } catch (e) {
             console.error('ModelsManager: failed to load detail', e);
-            this._showPanel('empty');
-            const empty = document.getElementById('ma-empty');
-            if (empty) empty.querySelector('p').textContent = "Couldn't load model access. Retry.";
+            this._showPanel('error');
         }
     }
 
-    /** The server's view changed (mode, exceptions): refresh the left-column counts too. */
+    /** The server's view changed (mode, exceptions): refresh the switcher's counts too. */
     async _afterChange() {
         this._renderDetail();
         await window.ProfileStore.notifyChanged();
@@ -283,13 +98,6 @@ class ModelsManager {
 
     _renderDetail() {
         if (!this._detail) return;
-        const nameEl = document.getElementById('ma-selected-username');
-        if (nameEl) nameEl.textContent = this._detail.name;
-        const membersEl = document.getElementById('ma-selected-members');
-        if (membersEl) {
-            const n = this._detail.member_count;
-            membersEl.textContent = `Applies to ${n} member${n === 1 ? '' : 's'}`;
-        }
 
         // Reflect the mode in the 4-option segmented control.
         const mode = this._detail.mode || 'default';
@@ -319,7 +127,7 @@ class ModelsManager {
             case 'custom':
                 return 'Per-model overrides win. New models follow the global config; overrides can enable a globally-disabled model.';
             default:
-                return 'Follows the global model config. Toggle any model to switch this profile to Custom.';
+                return 'Follows the global config in Providers & Models. Toggle any group or model to switch this profile to Custom.';
         }
     }
 
@@ -327,10 +135,23 @@ class ModelsManager {
         this._renderModels();
     }
 
+    showView(view) {
+        this._view = view === 'models' ? 'models' : 'groups';
+        try { sessionStorage.setItem('model-access:view', this._view); } catch (e) { /* storage blocked */ }
+        this._renderModels();
+    }
+
     _renderModels() {
         const container = document.getElementById('ma-model-list');
         const summary = document.getElementById('ma-summary');
         if (!container || !this._detail) return;
+        ['groups', 'models'].forEach(v => {
+            const btn = document.getElementById(`ma-view-${v}-btn`);
+            if (btn) {
+                btn.classList.toggle('active', v === this._view);
+                btn.setAttribute('aria-selected', String(v === this._view));
+            }
+        });
 
         const models = this._detail.models;
         const enabledCount = models.filter(m => m.effective_allowed).length;
@@ -340,31 +161,123 @@ class ModelsManager {
         }
 
         const q = (document.getElementById('ma-model-search')?.value || '').trim().toLowerCase();
-        const filtered = q
-            ? models.filter(m => (m.model_id || '').toLowerCase().includes(q))
-            : models;
+        const matches = m => !q || (m.model_id || '').toLowerCase().includes(q);
 
+        if (this._view === 'groups') {
+            this._renderGroups(container, q, matches);
+            return;
+        }
+
+        const filtered = models.filter(matches);
         if (!filtered.length) {
-            container.innerHTML = '<div class="text-muted small py-4 text-center">No models match your search.</div>';
+            container.innerHTML = `<div class="text-muted small py-4 text-center">${models.length ? 'No models match your search.' : 'No models found.'}</div>`;
             return;
         }
         container.innerHTML = filtered.map(m => this._renderModelRow(m)).join('');
     }
 
+    /** One row per model group with a switch for all its models; a row expands to them. */
+    _renderGroups(container, q, matches) {
+        const esc = window.UIUtils.escapeHtml;
+        const rows = [];
+        const indeterminate = [];
+        (this._detail.groups || []).forEach(g => {
+            const members = this._detail.models.filter(m => m.group_id === g.group_id);
+            // A search shows groups whose name matches, or that hold a matching model.
+            const nameHit = !q || g.name.toLowerCase().includes(q);
+            const shown = nameHit ? members : members.filter(matches);
+            if (!nameHit && !shown.length) return;
+
+            const allowed = members.filter(m => m.effective_allowed).length;
+            const all = members.length > 0 && allowed === members.length;
+            if (allowed > 0 && !all) indeterminate.push(g.group_id);
+            const open = this._expanded.has(g.group_id) || (!!q && !nameHit);
+            const tags = [
+                g.is_default ? '<span class="ma-tag ma-tag-off">models in no other group</span>' : '',
+                g.enabled ? '' : '<span class="ma-tag ma-tag-off" title="Switched off in Model Groups: only profiles that allow its models get them"><i class="fas fa-ban me-1"></i>group off</span>',
+            ].join('');
+            const count = members.length
+                ? `${allowed}/${members.length} allowed`
+                : 'no models';
+            rows.push(`
+            <div class="ma-model-row ma-group-row${allowed ? '' : ' is-off'}">
+                <button type="button" class="ma-group-toggle" aria-expanded="${open}"
+                    onclick="window.ModelsManager.toggleGroupExpand(${g.group_id})">
+                    <i class="fas fa-chevron-${open ? 'down' : 'right'}"></i>
+                    <i class="fas fa-layer-group"></i><span class="ma-group-name">${esc(g.name)}</span>${tags}
+                    <span class="ma-group-count">${count}</span>
+                </button>
+                <div class="ma-model-controls">
+                    <label class="ma-switch" title="${all ? 'Deny' : 'Allow'} every model in this group for this profile">
+                        <input type="checkbox" data-group-id="${g.group_id}"${all ? ' checked' : ''}${members.length ? '' : ' disabled'}
+                            onchange="window.ModelsManager.toggleGroup(${g.group_id}, this.checked)">
+                        <span class="ma-slider"></span>
+                    </label>
+                </div>
+            </div>`);
+            if (open) {
+                rows.push(shown.length
+                    ? `<div class="ma-group-members">${shown.map(m => this._renderModelRow(m)).join('')}</div>`
+                    : '<div class="ma-group-members text-muted small py-2 px-4">No models in this group.</div>');
+            }
+        });
+        container.innerHTML = rows.join('')
+            || '<div class="text-muted small py-4 text-center">No groups or models match your search.</div>';
+        // Some but not all of a group's models allowed: show the switch as mixed.
+        indeterminate.forEach(gid => {
+            const cb = container.querySelector(`input[data-group-id="${gid}"]`);
+            if (cb) cb.indeterminate = true;
+        });
+    }
+
+    toggleGroupExpand(groupId) {
+        if (this._expanded.has(groupId)) this._expanded.delete(groupId); else this._expanded.add(groupId);
+        this._renderModels();
+    }
+
+    async toggleGroup(groupId, isAllowed) {
+        if (this._selectedProfileId == null) return;
+        try {
+            const resp = await fetch(`/admin/profiles/model-access/group?profile_id=${this._selectedProfileId}&group_id=${groupId}`, {
+                method: 'PUT',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ is_allowed: isAllowed }),
+            });
+            if (resp.ok) {
+                this._detail = await resp.json();
+                const g = (this._detail.groups || []).find(x => x.group_id === groupId);
+                window.UIUtils?.showToast(`${g ? `Group '${g.name}'` : 'Group'} ${isAllowed ? 'allowed' : 'denied'} for this profile.`, 'success');
+                await this._afterChange();
+            } else {
+                const err = await resp.json().catch(() => ({}));
+                window.UIUtils?.showToast(err.detail || 'Failed to update group access.', 'error');
+                await this._loadDetail(this._selectedProfileId);
+            }
+        } catch (e) {
+            window.UIUtils?.showToast('Network error updating group access.', 'error');
+            await this._loadDetail(this._selectedProfileId);
+        }
+    }
+
     _renderModelRow(m) {
-        const safeId = window.UIUtils.escapeHtml(m.model_id);
+        const esc = window.UIUtils.escapeHtml;
+        const safeId = esc(m.model_id);
         const disabledGlobally = !m.globally_enabled;
         const rowCls = ['ma-model-row'];
         if (m.is_exception) rowCls.push('is-exception');
-        if (disabledGlobally) rowCls.push('is-global-off');
+        if (disabledGlobally || m.blocked_by_group) rowCls.push('is-global-off');
 
         // Toggle reflects effective state. Toggles stay active in every mode so an
         // admin can enable a globally-disabled model for one profile (switches to custom).
         const checked = m.effective_allowed ? ' checked' : '';
 
-        const tag = disabledGlobally
-            ? '<span class="ma-tag ma-tag-off"><i class="fas fa-ban me-1"></i>globally disabled</span>'
-            : '';
+        let tag = '';
+        if (disabledGlobally) {
+            tag = '<span class="ma-tag ma-tag-off"><i class="fas fa-ban me-1"></i>globally disabled</span>';
+        } else if (m.blocked_by_group) {
+            tag = `<span class="ma-tag ma-tag-off" title="Its model group is switched off in Model Groups"><i class="fas fa-ban me-1"></i>group ${esc(m.blocked_by_group)} disabled</span>`;
+        }
 
         return `
         <div class="${rowCls.join(' ')}" data-model-id="${safeId}">

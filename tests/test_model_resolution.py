@@ -11,6 +11,7 @@ import asyncio
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app import model_resolution
 from app.auth.admin import AdminUser
@@ -227,6 +228,18 @@ class ResolutionOrderTests(unittest.TestCase):
             self.assertEqual(_resolve(_request(), None, "azure:primary/whatever"),
                              "azure:primary/whatever")
 
+    def test_provider_family_prefix_becomes_the_canonical_id(self):
+        """'azure/gpt-4' with one azure instance is that instance's model, so groups,
+        access rules and the enable flags all see the id they know."""
+        with _Env(["azure:primary/gpt-4"]):
+            request = _request()
+            self.assertEqual(_resolve(request, None, "azure/gpt-4"), "azure:primary/gpt-4")
+            self.assertEqual(request.state.model, "azure:primary/gpt-4")
+
+    def test_ambiguous_provider_family_passes_through(self):
+        with _Env(["azure:a/gpt-4", "azure:b/gpt-4"]):
+            self.assertEqual(_resolve(_request(), None, "azure/gpt-4"), "azure/gpt-4")
+
     def test_dead_provider_prefix_falls_back_to_a_live_one(self):
         with _Env(["azure:foundry/gpt-5.4"]):
             self.assertEqual(_resolve(_request(), None, "azure:gone/gpt-5.4"),
@@ -307,6 +320,15 @@ class PoolFilterTests(unittest.TestCase):
     def test_disabled_provider_drops_its_models(self):
         with _Env(["azure:foundry/gpt-5.4"], disabled_providers=["azure:foundry"]):
             self.assertEqual(candidate_ids("gpt-5.4"), [])
+
+    def test_disabled_model_group_drops_its_models(self):
+        from app.rate_limit import _ModelGroupSnapshot, rate_limit_tracker
+        off = {7: _ModelGroupSnapshot(group_id=7, name="premium", model_ids=["azure:foundry/gpt-5.4"],
+                                      enabled=False)}
+        with patch.object(rate_limit_tracker, "_groups", off), \
+                patch.object(rate_limit_tracker, "_model_to_group", {"azure:foundry/gpt-5.4": 7}), \
+                _Env(["azure:foundry/gpt-5.4", "openai:main/gpt-5.4"]):
+            self.assertEqual(candidate_ids("gpt-5.4"), ["openai:main/gpt-5.4"])
 
     def test_candidate_ids_is_empty_for_names_needing_no_resolution(self):
         """It answers "what could this bare name become", not "what serves this"."""
@@ -486,7 +508,7 @@ class SideEffectTests(unittest.TestCase):
 
 
 # ======================================================================
-# The overall-quota bypass in the auth middleware
+# Who charges a request: the route (marked endpoints) or the auth middleware
 # ======================================================================
 
 class _StubAuth:
@@ -494,76 +516,105 @@ class _StubAuth:
     username = "alice"
 
 
-class OverallQuotaBypassTests(unittest.IsolatedAsyncioTestCase):
-    """A prefix-less name must never end up governed by *no* limit.
+class DefaultGroupChargeTests(unittest.IsolatedAsyncioTestCase):
+    """A request is charged exactly once.
 
-    _enforce_rate_limit skips the overall RPM/RPD gate when the model or its
-    instance is grouped, on the premise that a group limit governs at the route.
-    The canonical id is not chosen until the route resolves it, so the bypass has
-    to hold for every candidate: if it were decided from one provisional pick and
-    the route landed on an ungrouped candidate, check_group_limit would return
-    None and nothing would govern the request.
+    A route that names a model charges it after resolution and the access check
+    (enforce_access_and_limits) and is marked @enforces_limits; the middleware
+    leaves marked endpoints alone and charges everything else to the Default group.
+    The decision is by endpoint, never by request.state.model, which the tracking
+    middleware does not set on /openai/v1, large uploads or count_tokens.
     """
 
-    def _request(self, model):
-        request = SimpleNamespace(
+    def _request(self, endpoint, model=None):
+        return SimpleNamespace(
             url=SimpleNamespace(path="/v1/chat/completions"),
             state=SimpleNamespace(model=model),
+            scope={"endpoint": endpoint},
         )
-        return request
 
-    async def _overall_limiter_consulted(self, model, grouped_models=(), grouped_instances=()):
+    async def _middleware_charges(self, endpoint, model=None):
         from unittest.mock import AsyncMock, patch
         from app.rate_limit import rate_limit_tracker
 
-        grouped_models = set(grouped_models)
-        grouped_instances = set(grouped_instances)
-        with patch.object(rate_limit_tracker, "model_belongs_to_group",
-                          lambda m: m in grouped_models), \
-             patch.object(rate_limit_tracker, "instance_belongs_to_group",
-                          lambda p: p in grouped_instances), \
-             patch.object(rate_limit_tracker, "check_and_increment",
-                          new_callable=AsyncMock) as check:
+        with patch.object(rate_limit_tracker, "check_and_increment", new_callable=AsyncMock) as check:
             check.return_value = SimpleNamespace(allowed=True)
-            await _enforce_rate_limit(self._request(model), _StubAuth())
-        return check.await_count > 0
+            await _enforce_rate_limit(self._request(endpoint, model), _StubAuth())
+        return check.await_count
 
-    async def test_all_candidates_grouped_skips_the_overall_gate(self):
-        with _Env(["azure:foundry/gpt-5.4", "openai:main/gpt-5.4"]):
-            consulted = await self._overall_limiter_consulted(
-                "gpt-5.4",
-                grouped_models={"azure:foundry/gpt-5.4", "openai:main/gpt-5.4"},
-            )
-        self.assertFalse(consulted)
+    async def test_marked_endpoint_is_left_to_the_route(self):
+        from app.routes import chat
+        self.assertEqual(await self._middleware_charges(chat.chat_completions, "gpt-5.4"), 0)
+        self.assertEqual(await self._middleware_charges(chat.chat_completions, None), 0,
+                         "no sniffed model (/openai/v1, large upload) is still the route's to charge")
 
-    async def test_all_candidates_grouped_by_instance_skips_the_overall_gate(self):
-        with _Env(["azure:foundry/gpt-5.4", "openai:main/gpt-5.4"]):
-            consulted = await self._overall_limiter_consulted(
-                "gpt-5.4", grouped_instances={"azure:foundry", "openai:main"},
-            )
-        self.assertFalse(consulted)
+    async def test_unmarked_endpoint_is_charged_to_default(self):
+        async def cancel():
+            pass
+        self.assertEqual(await self._middleware_charges(cancel), 1)
+        self.assertEqual(await self._middleware_charges(None), 1)
 
-    async def test_a_mixed_pool_still_hits_the_overall_gate(self):
-        """The quota hole: one grouped candidate must not exempt the request."""
-        with _Env(["azure:foundry/gpt-5.4", "openai:main/gpt-5.4"]):
-            consulted = await self._overall_limiter_consulted(
-                "gpt-5.4", grouped_models={"azure:foundry/gpt-5.4"},
-            )
-        self.assertTrue(consulted)
+    async def test_every_model_route_is_marked(self):
+        from fastapi.routing import APIRoute
+        from app.main import create_anthropic_app, create_azure_openai_app, create_openai_app
 
-    async def test_an_unresolvable_name_hits_the_overall_gate(self):
-        with _Env(["azure:foundry/gpt-5.4"]):
-            consulted = await self._overall_limiter_consulted("nothing-serves-this")
-        self.assertTrue(consulted)
+        unmarked = []
+        for make in (create_openai_app, create_anthropic_app, create_azure_openai_app):
+            for route in make().routes:
+                if not isinstance(route, APIRoute) or "POST" not in route.methods:
+                    continue
+                if route.path.endswith("/cancel"):
+                    continue  # names no model: the middleware charges it to Default
+                if getattr(route.endpoint, "_route_enforces_limits", False) is not True:
+                    unmarked.append(route.path)
+        self.assertEqual(unmarked, [])
 
-    async def test_canonical_ids_are_unaffected(self):
-        with _Env(["azure:foundry/gpt-5.4"]):
-            grouped = await self._overall_limiter_consulted(
-                "azure:foundry/gpt-5.4", grouped_models={"azure:foundry/gpt-5.4"},
-            )
-            ungrouped = await self._overall_limiter_consulted("azure:foundry/gpt-5.4")
-        self.assertFalse(grouped)
-        self.assertTrue(ungrouped)
+
+class EnforceAccessAndLimitsTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from app.rate_limit import rate_limit_tracker
+        self.tracker = rate_limit_tracker
+        self._saved = (dict(self.tracker._model_to_group), dict(self.tracker._provider_to_group))
+        self.tracker._model_to_group = {"azure:foundry/gpt-5.4": 7}
+        self.tracker._provider_to_group = {}
+
+    def tearDown(self):
+        self.tracker._model_to_group, self.tracker._provider_to_group = self._saved
+
+    async def _run(self, model, *, allowed=True, consume_quota=True):
+        from unittest.mock import AsyncMock, patch
+        from app import rate_limit_dep
+        from app.model_access_dep import ModelAccessDenied
+
+        async def access(*_a, **_k):
+            if not allowed:
+                raise ModelAccessDenied.openai(model)
+
+        with patch.object(rate_limit_dep, "enforce_model_access", access), \
+             patch.object(self.tracker, "check_and_increment", new_callable=AsyncMock) as default, \
+             patch.object(self.tracker, "check_group_limit", new_callable=AsyncMock) as group:
+            default.return_value = SimpleNamespace(allowed=True)
+            group.return_value = None
+            request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"))
+            try:
+                await rate_limit_dep.enforce_access_and_limits(
+                    request, _StubAuth(), model, consume_quota=consume_quota)
+            except ModelAccessDenied:
+                pass
+        return default.await_count, group.await_count
+
+    async def test_grouped_model_charges_its_group_only(self):
+        self.assertEqual(await self._run("azure:foundry/gpt-5.4"), (0, 1))
+
+    async def test_ungrouped_model_charges_default_only(self):
+        self.assertEqual(await self._run("openai:main/gpt-5.4"), (1, 0))
+
+    async def test_a_denied_request_spends_no_quota(self):
+        self.assertEqual(await self._run("azure:foundry/gpt-5.4", allowed=False), (0, 0))
+        self.assertEqual(await self._run("openai:main/gpt-5.4", allowed=False), (0, 0))
+
+    async def test_access_only_spends_no_quota(self):
+        self.assertEqual(await self._run("openai:main/gpt-5.4", consume_quota=False), (0, 0))
 
 
 if __name__ == "__main__":

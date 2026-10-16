@@ -115,6 +115,19 @@ async def shared_startup():
                 rate_limit_tracker.set_db_session_factory(AsyncSessionLocal)
                 await rate_limit_tracker.start()
 
+                # Folding instance groups into model groups flipped precedence (an
+                # explicit model now beats an instance), which moves some of today's
+                # usage between scopes; re-apportion every pool once against it.
+                from app.auth import database as _database
+                if _database.GROUPS_UNIFIED_THIS_START:
+                    from app.routes.pools import resettle_pools_after_commit
+                    async with AsyncSessionLocal() as db:
+                        await resettle_pools_after_commit(db, all_pools=True)
+
+            with create_span("app.startup.init_usage_report"):
+                from app.usage_report import usage_report_scheduler
+                await usage_report_scheduler.start()
+
             with create_span("app.startup.init_model_aliases"):
                 from app.model_alias import model_alias_resolver
                 await model_alias_resolver.load_from_database()
@@ -138,9 +151,11 @@ async def shared_shutdown():
     from app.rate_limit import rate_limit_tracker
     from app.websearch.settings import websearch_settings_cache
     from app.websearch.client import close_client as close_search_client
+    from app.usage_report import usage_report_scheduler
 
     # Phase 1: Stop background tasks and caches (may be using provider clients)
     phase1_tasks = [
+        asyncio.create_task(usage_report_scheduler.stop()),
         asyncio.create_task(provider_manager.model_cache.stop()),
         asyncio.create_task(auth_cache.stop()),
         asyncio.create_task(provider_manager.cleanup_background_tasks()),
@@ -254,7 +269,9 @@ def _instrument_app(app: FastAPI, name: str, *, excluded_prefixes=()):
         print(f"⚠ FastAPI instrumentation failed for {name}: {e}")
 
 
-_TRACKED_PREFIXES = ("/v1/", "/openai/deployments/")
+# "/openai/v1/" is the Azure app's re-mount of the OpenAI routers; without it those
+# requests never open a tracker entry and so never record usage.
+_TRACKED_PREFIXES = ("/v1/", "/openai/deployments/", "/openai/v1/")
 _EXCLUDED_PATHS = ("/v1/messages/count_tokens",)
 
 # Max non-JSON body size the tracking middleware will buffer purely to sniff the
@@ -339,8 +356,8 @@ def _add_request_tracking(app: FastAPI, server_name: str):
     @app.middleware("http")
     async def track_requests(request: Request, call_next):
         # Tag the API surface first, before the _TRACKED_PREFIXES gate: paths
-        # outside it (e.g. /openai/v1/audio/*, /openai/v1/images/*) skip the
-        # alias block below but still call apply_alias() inside their handlers.
+        # outside it (e.g. /v1/messages/count_tokens) skip the alias block below
+        # but still call apply_alias() inside their handlers.
         from app.model_alias import current_api_surface, reset_alias_context
         current_api_surface.set(server_name)
         reset_alias_context()

@@ -11,7 +11,7 @@ payload is built by the same function members get, so the two cannot drift apart
 from fastapi import HTTPException
 
 from app.auth.models import (
-    InstanceGroup, InstanceGroupMember, ModelGroup, ModelGroupMember,
+    ModelGroup, ModelGroupInstanceMember, ModelGroupMember,
     UserModelGroupRateLimit, UserRpdCarry,
 )
 from app.routes import pools as pool_routes
@@ -70,34 +70,35 @@ class PoolUsageVisibilityTests(PoolTestCase):
         self.assertEqual(payload["totals"]["requests"], 10)
         self.assertEqual(payload["totals"]["unique_members"], 2)
 
-    async def test_per_group_totals_apply_instance_group_precedence(self):
+    async def test_per_group_totals_apply_explicit_model_precedence(self):
         alice = await self.make_user("alice", rpd_limit=100)
         bob = await self.make_user("bob", rpd_limit=100)
         pool = await self.make_pool("team", alice, [bob])
 
-        mg = ModelGroup(name="by-model", rpm_default=None, rpd_default=10)
-        ig = InstanceGroup(name="by-instance", rpm_default=None, rpd_default=10)
+        mg = ModelGroup(name="by-model")
+        ig = ModelGroup(name="by-instance")
         self.db.add_all([mg, ig])
         await self.db.flush()
         self.db.add_all([
             ModelGroupMember(group_id=mg.id, model_id="azure/gpt-4o"),
-            InstanceGroupMember(group_id=ig.id, provider_key="azure"),
+            ModelGroupInstanceMember(group_id=ig.id, provider_key="azure"),
         ])
         await self.db.commit()
         await self.refresh()
 
         await self.seed_usage("alice", 3, model="azure/gpt-4o")
+        await self.seed_usage("alice", 2, model="azure/gpt-5")
         await self.seed_usage("bob", 1, model="loose/model")
 
         payload = await pool_routes.build_pool_usage(self.db, pool.id, window="today")
         groups = {g["name"]: g for g in payload["per_group"]}
-        self.assertEqual(groups["by-instance"]["request_count"], 3)
-        self.assertNotIn("by-model", groups,
-                         "a model in both groups belongs to the instance group")
-        self.assertEqual(groups["Other Models"]["request_count"], 1)
+        self.assertEqual(groups["by-model"]["request_count"], 3,
+                         "a model claimed explicitly is carved out of the instance's group")
+        self.assertEqual(groups["by-instance"]["request_count"], 2)
+        self.assertEqual(groups["Default"]["request_count"], 1)
         self.assertEqual(
             groups["by-instance"]["per_member"],
-            [{"user_identity": "alice", "request_count": 3}],
+            [{"user_identity": "alice", "request_count": 2}],
         )
 
     async def test_usage_views_never_include_carry_adjustments(self):
@@ -269,13 +270,13 @@ class PoolUsageVisibilityTests(PoolTestCase):
         alice = await self.make_user("alice", rpd_limit=100)
         pool = await self.make_pool("team", alice)
 
-        mg = ModelGroup(name="opus", rpm_default=None, rpd_default=10)
-        ig = InstanceGroup(name="edge", rpm_default=None, rpd_default=10)
+        mg = ModelGroup(name="opus")
+        ig = ModelGroup(name="edge")
         self.db.add_all([mg, ig])
         await self.db.flush()
         self.db.add_all([
             ModelGroupMember(group_id=mg.id, model_id="anthropic/opus"),
-            InstanceGroupMember(group_id=ig.id, provider_key="azure"),
+            ModelGroupInstanceMember(group_id=ig.id, provider_key="azure"),
         ])
         await self.db.commit()
         await self.refresh()
@@ -287,6 +288,6 @@ class PoolUsageVisibilityTests(PoolTestCase):
         payload = await pool_routes.build_pool_usage(self.db, pool.id, window="today")
         scoped = {g["name"]: (g["kind"], g["scope_id"]) for g in payload["per_group"]}
         self.assertEqual(scoped["opus"], ("model_group", mg.id))
-        self.assertEqual(scoped["edge"], ("instance_group", ig.id))
-        self.assertEqual(scoped["Other Models"], ("other", 0),
-                         "ungrouped traffic has no quota scope of its own")
+        self.assertEqual(scoped["edge"], ("model_group", ig.id))
+        self.assertEqual(scoped["Default"], ("overall", 0),
+                         "Default-group traffic joins the Default quota scope")

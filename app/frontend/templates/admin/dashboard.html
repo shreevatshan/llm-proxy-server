@@ -36,10 +36,13 @@
         <i class="fas fa-map-signs"></i> Model Mapping
     </button>
     <button class="tab-button" onclick="showTab('providers')">
-        <i class="fas fa-server"></i> Providers
+        <i class="fas fa-server"></i> Providers &amp; Models
     </button>
     <button class="tab-button" onclick="showTab('models')">
-        <i class="fas fa-cubes"></i> Models
+        <i class="fas fa-cubes"></i> Model Access
+    </button>
+    <button class="tab-button" onclick="showTab('model-groups')">
+        <i class="fas fa-layer-group"></i> Model Groups
     </button>
     <button class="tab-button" onclick="showTab('websearch')">
         <i class="fas fa-magnifying-glass"></i> Web Search
@@ -273,7 +276,7 @@
 
         <label class="form-label ps-share-label" for="pool-settings-share">Max share per member (%)</label>
         <input type="number" id="pool-settings-share" class="form-control ps-share-input" min="0" max="100" step="1" placeholder="No cap">
-        <div class="form-text ps-share-hint">Of the pool's daily limit, on each quota (overall and every group). A member
+        <div class="form-text ps-share-hint">Of the pool's daily limit, on each quota (every model group, Default included). A member
             always keeps at least their own limit. Blank = no cap.</div>
 
         <button type="submit" class="btn btn-primary ps-save" id="pool-settings-save">
@@ -304,17 +307,16 @@
 
 <!-- Providers Section -->
 <div class="section tab-content" id="providers-tab" style="display: none;">
-    <!-- Provider Stats -->
-    <div class="dashboard-stats mb-4">
-        <div class="stat-card" id="provider-stats">
-            <div class="stat-number" id="enabled-providers">-</div>
-            <div class="stat-label">Active Providers</div>
-        </div>
-    </div>
-
     <div class="section-header">
-        <div class="d-flex align-items-center gap-2">
-            <h2 class="section-title mb-0">Providers</h2>
+        <div class="d-flex align-items-center gap-3 flex-wrap">
+            <h2 class="section-title mb-0">Providers &amp; Models</h2>
+            <!-- View toggle: provider cards or every model in one list -->
+            <div class="ma-segment" role="tablist" aria-label="View">
+                <button type="button" class="ma-segment-btn active" id="pm-view-providers-btn" role="tab"
+                    aria-selected="true" onclick="window.ProviderManager?.showView('providers')">Providers</button>
+                <button type="button" class="ma-segment-btn" id="pm-view-models-btn" role="tab"
+                    aria-selected="false" onclick="window.ProviderManager?.showView('models')">Models</button>
+            </div>
         </div>
         <div class="section-actions">
             <button class="btn btn-primary btn-sm tip" aria-label="Add Provider" onclick="showAddProviderForm()">
@@ -333,6 +335,59 @@
             <button class="btn btn-danger btn-sm tip" aria-label="Reinit System" onclick="reinitSystem()">
                 <i class="fas fa-power-off"></i>
             </button>
+        </div>
+    </div>
+    <p class="text-muted small mb-3">
+        The switches here turn providers and models on or off for everyone. A profile can
+        override them in Model Access.
+    </p>
+
+    <!-- Models view: every model with its global switch -->
+    <div id="pm-view-models" style="display: none;">
+        <div class="card">
+            <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+                <div class="d-flex align-items-center">
+                    <h5 class="mb-0"><i class="fas fa-cubes me-2"></i>Models</h5>
+                    <span id="pm-model-summary" class="text-muted small ms-3"></span>
+                </div>
+                <div class="ma-models-head">
+                    <button class="btn btn-outline-success btn-sm" onclick="window.ModelsView?.bulk('enable_all')">
+                        <i class="fas fa-check-circle me-1"></i>Enable all
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm" onclick="window.ModelsView?.bulk('disable_all')">
+                        <i class="fas fa-times-circle me-1"></i>Disable all
+                    </button>
+                </div>
+            </div>
+            <div class="card-body pt-3 px-0 pb-0">
+                <div class="d-flex gap-2 flex-wrap px-3 mb-3">
+                    <div class="position-relative flex-grow-1">
+                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                        <input type="text" id="pm-model-search" class="form-control form-control-sm ps-5"
+                            placeholder="Search models" autocomplete="off"
+                            oninput="window.ModelsView?.render()">
+                    </div>
+                    <select id="pm-model-status" class="form-select form-select-sm" style="width: auto;"
+                        aria-label="Filter by status" onchange="window.ModelsView?.render()">
+                        <option value="">All models</option>
+                        <option value="on">Enabled</option>
+                        <option value="off">Disabled</option>
+                    </select>
+                </div>
+                <div id="pm-model-list" class="ma-model-list">
+                    <div class="text-muted small py-4 text-center">Loading…</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Providers view -->
+    <div id="pm-view-providers">
+    <!-- Provider Stats -->
+    <div class="dashboard-stats mb-4">
+        <div class="stat-card" id="provider-stats">
+            <div class="stat-number" id="enabled-providers">-</div>
+            <div class="stat-label">Active Providers</div>
         </div>
     </div>
 
@@ -451,6 +506,7 @@
         <div class="empty-state-icon">🔌</div>
         <h3>No Providers Configured</h3>
         <p>Click "Add Provider" to configure your first provider.</p>
+    </div>
     </div>
 </div>
 
@@ -590,350 +646,121 @@
 
 <!-- Rate Limits Section -->
 <div class="section tab-content" id="rate-limits-tab" style="display: none;">
-    <!-- Profile switcher: every pane below edits this profile's limits -->
+    <!-- Profile switcher: the table below edits this profile's limits -->
     <div class="profile-switcher" id="rl-profile-switcher"></div>
 
-    <!-- Sub-tab nav -->
-    <div class="subtab-navigation mb-4" id="rateLimitSubTabs" role="tablist">
-        <button class="subtab-button active" id="rl-subtab-request-btn" onclick="showRateLimitSubTab('request')" type="button" role="tab">
-            <i class="fas fa-gauge-high"></i> Overall
-        </button>
-        <button class="subtab-button" id="rl-subtab-model-groups-btn" onclick="showRateLimitSubTab('model-groups')" type="button" role="tab">
-            <i class="fas fa-layer-group"></i> Model
-        </button>
-        <button class="subtab-button" id="rl-subtab-instance-groups-btn" onclick="showRateLimitSubTab('instance-groups')" type="button" role="tab">
-            <i class="fas fa-server"></i> Instance
-        </button>
+    <div class="card">
+        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Limits for <span id="mg-profile-name"></span></h5>
+            <span class="text-muted small">
+                One limit per model group. Every model is in exactly one group; models no group
+                claims are in <strong>Default</strong>. Empty means unlimited.
+                <a href="#" onclick="showTab('model-groups'); return false;">Manage groups</a>
+            </span>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead>
+                        <tr>
+                            <th>Group</th>
+                            <th>RPM Limit</th>
+                            <th>RPD Limit</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="mg-profile-limits-tbody">
+                        <tr><td colspan="4" class="text-center text-muted py-4">Select a profile above.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Model Access Section: per-profile access, picked like Rate Limits and Model Mapping.
+     Global enable/disable lives in Providers & Models. -->
+<div class="section tab-content" id="models-tab" style="display: none;">
+    <!-- Profile switcher: the cards below edit this profile's access -->
+    <div class="profile-switcher" id="ma-profile-switcher"></div>
+
+    <div id="ma-error" class="card" style="display: none;">
+        <div class="card-body empty-state text-center py-5">
+            <i class="fas fa-cubes fa-2x mb-3 text-muted"></i>
+            <p class="text-muted mb-0">Couldn't load model access. Retry.</p>
+        </div>
     </div>
 
-    <!-- Sub-pane: Request Rate Limits -->
-    <div id="rl-subtab-request">
-        <!-- Profile overall limits -->
-        <div class="card mb-4">
-            <div class="card-header d-flex align-items-center justify-content-between">
-                <h5 class="mb-0"><i class="fas fa-gauge-high me-2"></i>Overall limits</h5>
-                <button class="btn btn-primary btn-sm" onclick="window.RateLimitManager?.saveProfileLimits()">
-                    <i class="fas fa-save me-1"></i>Save
-                </button>
+    <div id="ma-detail" style="display: none;">
+        <!-- Access policy card -->
+        <div class="card mb-3">
+            <div class="card-header">
+                <h5 class="mb-0"><i class="fas fa-sliders-h me-2"></i>Access policy</h5>
             </div>
             <div class="card-body">
-                <p class="text-muted small mb-3">Applies to models outside any model or instance group. Leave empty for no limit.</p>
-                <div class="row g-3">
-                    <div class="col-md-4">
-                        <label class="form-label" for="rl-profile-rpm">Requests per Minute (RPM)</label>
-                        <input type="number" id="rl-profile-rpm" class="form-control" min="0" placeholder="Unlimited">
-                    </div>
-                    <div class="col-md-4">
-                        <label class="form-label" for="rl-profile-rpd">Requests per Day (RPD)</label>
-                        <input type="number" id="rl-profile-rpd" class="form-control" min="0" placeholder="Unlimited">
+                <div class="d-flex align-items-center gap-3 flex-wrap">
+                    <div class="ma-segment" role="group" aria-label="Model access mode">
+                        <button type="button" class="ma-segment-btn" id="ma-policy-default"
+                            onclick="window.ModelsManager?.setMode('default')">Default</button>
+                        <button type="button" class="ma-segment-btn" id="ma-policy-allow"
+                            onclick="window.ModelsManager?.setMode('allow')">Allow all</button>
+                        <button type="button" class="ma-segment-btn" id="ma-policy-deny"
+                            onclick="window.ModelsManager?.setMode('deny')">Deny all</button>
+                        <button type="button" class="ma-segment-btn" id="ma-policy-custom"
+                            onclick="window.ModelsManager?.setMode('custom')">Custom</button>
                     </div>
                 </div>
+                <p class="text-muted small mb-0 mt-2" id="ma-mode-hint"></p>
             </div>
         </div>
 
-    </div>
-
-    <!-- Sub-pane: Model Groups -->
-    <div id="rl-subtab-model-groups" style="display:none;">
-
-        <!-- Global Defaults card -->
-        <div class="card mb-4">
-            <div class="card-header d-flex align-items-center justify-content-between">
-                <h5 class="mb-0"><i class="fas fa-layer-group me-2"></i>Model Groups</h5>
-                <div>
-                    <button class="btn btn-outline-secondary btn-sm me-2" onclick="window.ModelGroupManager?.load()">
-                        <i class="fas fa-sync-alt me-1"></i>Refresh
-                    </button>
-                    <button class="btn btn-primary btn-sm" onclick="window.ModelGroupManager?.openCreateModal()">
-                        <i class="fas fa-plus me-1"></i>Create Model Group
-                    </button>
-                </div>
-            </div>
-            <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead>
-                            <tr>
-                                <th>Name</th>
-                                <th>Models</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="model-groups-tbody">
-                            <tr><td colspan="3" class="text-center text-muted py-4">Loading…</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- Limits for the selected profile -->
+        <!-- Models card: switch whole model groups, or individual models -->
         <div class="card">
             <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Limits for <span id="mg-profile-name"></span></h5>
-                <span class="text-muted small">A grouped model is governed only by its group limit. Empty means unlimited.</span>
-            </div>
-            <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead>
-                            <tr>
-                                <th>Group</th>
-                                <th>RPM Limit</th>
-                                <th>RPD Limit</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="mg-profile-limits-tbody">
-                            <tr><td colspan="4" class="text-center text-muted py-4">Select a profile above.</td></tr>
-                        </tbody>
-                    </table>
+                <div class="ma-models-head">
+                    <h5 class="mb-0"><i class="fas fa-cubes me-2"></i>Models</h5>
+                    <div class="ma-segment" role="tablist" aria-label="Switch by">
+                        <button type="button" class="ma-segment-btn" id="ma-view-groups-btn" role="tab"
+                            onclick="window.ModelsManager?.showView('groups')">Groups</button>
+                        <button type="button" class="ma-segment-btn" id="ma-view-models-btn" role="tab"
+                            onclick="window.ModelsManager?.showView('models')">Individual</button>
+                    </div>
+                    <span id="ma-summary" class="text-muted small"></span>
                 </div>
-            </div>
-        </div>
-    </div>
-
-    <!-- Sub-pane: Instance Groups -->
-    <div id="rl-subtab-instance-groups" style="display:none;">
-
-        <div class="card mb-4">
-            <div class="card-header d-flex align-items-center justify-content-between">
-                <h5 class="mb-0"><i class="fas fa-server me-2"></i>Instance Groups</h5>
-                <div>
-                    <button class="btn btn-outline-secondary btn-sm me-2" onclick="window.InstanceGroupManager?.load()">
-                        <i class="fas fa-sync-alt me-1"></i>Refresh
-                    </button>
-                    <button class="btn btn-primary btn-sm" onclick="window.InstanceGroupManager?.openCreateModal()">
-                        <i class="fas fa-plus me-1"></i>Create Instance Group
-                    </button>
+                <div class="position-relative flex-shrink-0" style="width: 240px;">
+                    <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                    <input type="text" id="ma-model-search" class="form-control form-control-sm ps-5"
+                        placeholder="Search models"
+                        oninput="window.ModelsManager?.filterModels()">
                 </div>
             </div>
             <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead>
-                            <tr>
-                                <th>Name</th>
-                                <th>Instances</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="instance-groups-tbody">
-                            <tr><td colspan="3" class="text-center text-muted py-4">Loading…</td></tr>
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <!-- Limits for the selected profile -->
-        <div class="card">
-            <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Limits for <span id="ig-profile-name"></span></h5>
-                <span class="text-muted small">A grouped instance is governed only by its group limit. Empty means unlimited.</span>
-            </div>
-            <div class="card-body p-0">
-                <div class="table-responsive">
-                    <table class="table table-hover mb-0">
-                        <thead>
-                            <tr>
-                                <th>Group</th>
-                                <th>RPM Limit</th>
-                                <th>RPD Limit</th>
-                                <th>Actions</th>
-                            </tr>
-                        </thead>
-                        <tbody id="ig-profile-limits-tbody">
-                            <tr><td colspan="4" class="text-center text-muted py-4">Select a profile above.</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+                <div id="ma-model-list" class="ma-model-list"></div>
             </div>
         </div>
     </div>
 </div>
 
-<!-- Models Section (unified global + per-profile management) -->
-<div class="section tab-content" id="models-tab" style="display: none;">
-    <div class="row g-3 model-access-grid">
-        <!-- Left: scope picker (Global + profiles) -->
-        <div class="col-lg-4">
-            <div class="card h-100">
-                <div class="card-header d-flex align-items-center justify-content-between">
-                    <h5 class="mb-0"><i class="fas fa-layer-group me-2"></i>Scope</h5>
-                    <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelsManager?.load()" title="Refresh">
-                        <i class="fas fa-sync-alt"></i>
-                    </button>
-                </div>
-                <div class="card-body">
-                    <!-- Global scope (applies to everyone) -->
-                    <button type="button" class="ma-user-item ma-scope-global" id="ma-scope-global"
-                        onclick="window.ModelsManager?.selectScope('global')">
-                        <span class="ma-scope-lead">
-                            <span class="ma-scope-icon"><i class="fas fa-globe"></i></span>
-                            <span class="ma-user-text">
-                                <span class="ma-user-name">All users</span>
-                                <span class="ma-user-email">Global availability</span>
-                            </span>
-                        </span>
-                        <span class="ma-editing-flag"><i class="fas fa-pen me-1"></i>Editing</span>
-                    </button>
-
-                    <div class="ma-scope-group-label">Profiles</div>
-                    <div class="position-relative mb-3">
-                        <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
-                        <input type="text" id="ma-profile-search" class="form-control form-control-sm ps-5"
-                            placeholder="Search profiles"
-                            oninput="window.ModelsManager?.filterProfiles()">
-                    </div>
-                    <div id="ma-profile-list" class="ma-user-list">
-                        <div class="text-muted small py-3 text-center">Loading…</div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Right: global availability OR per-profile policy + models -->
-        <div class="col-lg-8">
-            <!-- Scope banner — states in words which scope is being edited -->
-            <div id="ma-scope-banner" class="ma-scope-banner" style="display: none;"></div>
-
-            <!-- Empty state (no scope selected) -->
-            <div id="ma-empty" class="card" style="display: none;">
-                <div class="card-body empty-state text-center py-5">
-                    <i class="fas fa-cubes fa-2x mb-3 text-muted"></i>
-                    <p class="text-muted mb-0">Select Global or a profile to manage models.</p>
-                </div>
-            </div>
-
-            <!-- Global scope: enable/disable models for everyone -->
-            <div id="ma-global" style="display: none;">
-                <div class="card">
-                    <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                        <div class="d-flex align-items-center">
-                            <h5 class="mb-0"><i class="fas fa-globe me-2"></i>Global model availability</h5>
-                            <span id="ma-global-summary" class="text-muted small ms-3"></span>
-                        </div>
-                        <div class="d-flex align-items-center gap-3 flex-wrap ma-global-actions">
-                            <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelsManager?.syncGlobal()">
-                                <i class="fas fa-sync me-2"></i>Sync models
-                            </button>
-                            <button class="btn btn-outline-success btn-sm" onclick="window.ModelsManager?.bulkGlobal('enable_all')">
-                                <i class="fas fa-check-circle me-2"></i>Enable all
-                            </button>
-                            <button class="btn btn-outline-danger btn-sm" onclick="window.ModelsManager?.bulkGlobal('disable_all')">
-                                <i class="fas fa-times-circle me-2"></i>Disable all
-                            </button>
-                        </div>
-                    </div>
-                    <div class="card-body pt-3">
-                        <div class="position-relative mb-3">
-                            <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
-                            <input type="text" id="ma-global-search" class="form-control form-control-sm ps-5"
-                                placeholder="Search models"
-                                oninput="window.ModelsManager?.filterGlobal()">
-                        </div>
-                        <div id="ma-global-list" class="ma-model-list"></div>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Profile scope (shown once a profile is picked) -->
-            <div id="ma-detail" style="display: none;">
-                <!-- Access policy card -->
-                <div class="card mb-3">
-                    <div class="card-header">
-                        <h5 class="mb-0"><i class="fas fa-sliders-h me-2"></i>Access policy —
-                            <span id="ma-selected-username" class="text-accent"></span>
-                            <span id="ma-selected-members" class="text-muted small fw-normal ms-2"></span></h5>
-                    </div>
-                    <div class="card-body">
-                        <div class="d-flex align-items-center gap-3 flex-wrap">
-                            <div class="ma-segment" role="group" aria-label="Model access mode">
-                                <button type="button" class="ma-segment-btn" id="ma-policy-default"
-                                    onclick="window.ModelsManager?.setMode('default')">Default</button>
-                                <button type="button" class="ma-segment-btn" id="ma-policy-allow"
-                                    onclick="window.ModelsManager?.setMode('allow')">Allow all</button>
-                                <button type="button" class="ma-segment-btn" id="ma-policy-deny"
-                                    onclick="window.ModelsManager?.setMode('deny')">Deny all</button>
-                                <button type="button" class="ma-segment-btn" id="ma-policy-custom"
-                                    onclick="window.ModelsManager?.setMode('custom')">Custom</button>
-                            </div>
-                        </div>
-                        <p class="text-muted small mb-0 mt-2" id="ma-mode-hint"></p>
-                    </div>
-                </div>
-
-                <!-- Models card -->
-                <div class="card">
-                    <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-                        <div class="d-flex align-items-center">
-                            <h5 class="mb-0"><i class="fas fa-cubes me-2"></i>Models</h5>
-                            <span id="ma-summary" class="text-muted small ms-3"></span>
-                        </div>
-                        <div class="position-relative flex-shrink-0" style="width: 240px;">
-                            <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
-                            <input type="text" id="ma-model-search" class="form-control form-control-sm ps-5"
-                                placeholder="Search models"
-                                oninput="window.ModelsManager?.filterModels()">
-                        </div>
-                    </div>
-                    <div class="card-body p-0">
-                        <div id="ma-model-list" class="ma-model-list"></div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-</div>
-
-<!-- Instance Group Create/Edit Modal -->
-<div class="modal fade" id="instanceGroupModal" tabindex="-1" aria-hidden="true">
-    <div class="modal-dialog modal-lg modal-dialog-centered">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h5 class="modal-title" id="instanceGroupModalTitle">New Instance Group</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-            </div>
-            <div class="modal-body">
-                <input type="hidden" id="ig-group-id">
-                <div class="row g-3">
-                    <div class="col-md-6">
-                        <label class="form-label">Name <span class="text-danger">*</span></label>
-                        <input type="text" id="ig-name" class="form-control" maxlength="64" placeholder="e.g. primary-pool">
-                        <div class="form-text">Letters, digits, spaces, hyphens, underscores. Max 64 chars.</div>
-                    </div>
-                    <div class="col-md-6">
-                        <label class="form-label">Description</label>
-                        <input type="text" id="ig-description" class="form-control" maxlength="256" placeholder="Optional">
-                    </div>
-                    <div class="col-md-3">
-                        <label class="form-label" for="ig-rpm">RPM for all profiles</label>
-                        <input type="number" id="ig-rpm" class="form-control" min="0" placeholder="Leave as is">
-                    </div>
-                    <div class="col-md-3">
-                        <label class="form-label" for="ig-rpd">RPD for all profiles</label>
-                        <input type="number" id="ig-rpd" class="form-control" min="0" placeholder="Leave as is">
-                    </div>
-                    <div class="col-12 form-text mt-1">Optional. When filled in, every profile gets this limit for the group;
-                        adjust individual profiles afterwards. A group with no limit is unlimited for that profile.</div>
-                    <div class="col-12">
-                        <label class="form-label">Instances in this group</label>
-                        <input type="text" id="ig-instance-search" class="form-control form-control-sm mb-2"
-                            placeholder="Search instances…" oninput="window.InstanceGroupManager?.filterInstances(this.value)">
-                        <div class="border rounded p-2" style="max-height:200px;overflow-y:auto;" id="ig-instance-picker">
-                            <div class="text-muted small">Loading instances…</div>
-                        </div>
-                        <div class="form-text">Each instance can belong to at most one group.</div>
-                    </div>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-primary" onclick="window.InstanceGroupManager?.saveGroup()">
-                    <i class="fas fa-save me-1"></i>Save Group
+<!-- Model Groups Section -->
+<div class="section tab-content" id="model-groups-tab" style="display: none;">
+    <div class="card">
+        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <h5 class="mb-0"><i class="fas fa-layer-group me-2"></i>Model groups</h5>
+            <div>
+                <button type="button" class="btn btn-outline-secondary btn-sm me-2" id="model-groups-back" style="display:none;"
+                    onclick="window.ModelGroupManager?.back()">
+                    <i class="fas fa-arrow-left"></i> Back
+                </button>
+                <button class="btn btn-outline-secondary btn-sm me-2" onclick="window.ModelGroupManager?.load()">
+                    <i class="fas fa-sync-alt me-1"></i>Refresh
+                </button>
+                <button class="btn btn-primary btn-sm" onclick="window.ModelGroupManager?.openCreateModal()">
+                    <i class="fas fa-plus me-1"></i>Create group
                 </button>
             </div>
+        </div>
+        <div class="card-body p-0" id="model-groups-container">
+            <p class="text-center text-muted py-4">Loading…</p>
         </div>
     </div>
 </div>
@@ -958,24 +785,31 @@
                         <label class="form-label">Description</label>
                         <input type="text" id="mg-description" class="form-control" maxlength="256" placeholder="Optional">
                     </div>
-                    <div class="col-md-3">
-                        <label class="form-label" for="mg-rpm">RPM for all profiles</label>
-                        <input type="number" id="mg-rpm" class="form-control" min="0" placeholder="Leave as is">
-                    </div>
-                    <div class="col-md-3">
-                        <label class="form-label" for="mg-rpd">RPD for all profiles</label>
-                        <input type="number" id="mg-rpd" class="form-control" min="0" placeholder="Leave as is">
-                    </div>
-                    <div class="col-12 form-text mt-1">Optional. When filled in, every profile gets this limit for the group;
-                        adjust individual profiles afterwards. A group with no limit is unlimited for that profile.</div>
                     <div class="col-12">
-                        <label class="form-label">Models in this group</label>
-                        <input type="text" id="mg-model-search" class="form-control form-control-sm mb-2"
-                            placeholder="Search models…" oninput="window.ModelGroupManager?.filterModels(this.value)">
-                        <div class="border rounded p-2" style="max-height:200px;overflow-y:auto;" id="mg-model-picker">
-                            <div class="text-muted small">Loading models…</div>
+                        <input type="text" id="mg-member-search" class="form-control form-control-sm mb-2"
+                            placeholder="Search instances and models…" oninput="window.ModelGroupManager?.filterMembers(this.value)">
+                        <div class="row g-3">
+                            <div class="col-md-5">
+                                <label class="form-label mb-1">Provider instances</label>
+                                <div class="form-text mt-0 mb-1">Every model of the instance, including ones synced later.</div>
+                                <div class="border rounded p-2" style="max-height:260px;overflow-y:auto;" id="mg-instance-picker">
+                                    <div class="text-muted small">Loading…</div>
+                                </div>
+                            </div>
+                            <div class="col-md-7">
+                                <label class="form-label mb-1">Individual models</label>
+                                <div class="form-text mt-0 mb-1">A model listed here wins over an instance in another group.</div>
+                                <div class="border rounded p-2" style="max-height:260px;overflow-y:auto;" id="mg-model-picker">
+                                    <div class="text-muted small">Loading…</div>
+                                </div>
+                            </div>
                         </div>
-                        <div class="form-text">Each model can belong to at most one group.</div>
+                        <div id="mg-member-warnings" class="small mt-2"></div>
+                        <div class="form-text">
+                            Each model and each instance can belong to one group. A new group starts with
+                            the limits its models already had (the strictest, if they differed); change
+                            them in Rate Limits.
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1599,6 +1433,7 @@
 <script src="/static/js/features/providers/provider-forms.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/model-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/search-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/models-view.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/azure-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/tracking/user-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/tracking/request-tracker.js?v={{ cache_version }}"></script>
@@ -1606,7 +1441,6 @@
 <script src="/static/js/features/admin/rate-limit-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/profile-group-limits.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-group-manager.js?v={{ cache_version }}"></script>
-<script src="/static/js/features/admin/instance-group-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-access-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-alias-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/websearch-manager.js?v={{ cache_version }}"></script>

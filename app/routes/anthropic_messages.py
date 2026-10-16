@@ -43,8 +43,8 @@ from app.routes.stream_utils import (
     format_stream_log_context,
     set_request_tracking_outcome,
 )
-from app.rate_limit_dep import enforce_group_rate_limit
-from app.model_access_dep import enforce_model_access, ModelAccessDenied
+from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
+from app.model_access_dep import ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
 from app.websearch import (
@@ -209,6 +209,7 @@ async def _sync_request_tracking_streaming_mode(
 
 
 @router.post("/v1/messages", tags=["anthropic"])
+@enforces_limits
 async def create_message(
     request_obj: Request,
     request: AnthropicMessagesRequest,
@@ -268,9 +269,8 @@ async def create_message(
                     f"Model '{model_name}' not found or not available via Anthropic API"
                 )
 
-            # Group rate limit check (request-level limits already handled in middleware)
-            await enforce_group_rate_limit(request_obj, auth, model_name, envelope_override="anthropic")
-            await enforce_model_access(request_obj, auth, model_name, envelope_override="anthropic")
+            # Access first, so a 403 spends no quota; then the model's group limit.
+            await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="anthropic")
 
             # Pre-flight: confirm the specific model exists in the cached model list.
             preflight_result = await _check_model_exists(provider, model_name)
@@ -487,6 +487,7 @@ async def create_message(
 
 
 @router.post("/v1/messages/count_tokens", response_model=AnthropicCountTokensResponse, tags=["anthropic"])
+@enforces_limits
 async def count_message_tokens(
     request_obj: Request,
     payload: Dict[str, Any] = Body(...),
@@ -522,15 +523,10 @@ async def count_message_tokens(
                 "anthropic.provider_resolved": bool(provider),
             })
 
-            # Group rate limit + per-user model access enforcement — this can
+            # Per-user model access enforcement (no quota is spent) — this can
             # invoke provider.anthropic_count_tokens upstream, so gate it.
             if isinstance(model_name, str) and model_name:
-                await enforce_group_rate_limit(
-                    request_obj, auth, model_name, envelope_override="anthropic"
-                )
-                await enforce_model_access(
-                    request_obj, auth, model_name, envelope_override="anthropic"
-                )
+                await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="anthropic", consume_quota=False)
 
             if provider:
                 payload = rewrite_anthropic_count_tokens_payload(payload, provider)

@@ -132,7 +132,7 @@ function showTab(tabName) {
 
     // Load data when switching to providers tab
     if (tabName === 'providers') {
-        window.ProviderManager?.loadUnifiedProviderData();
+        window.ProviderManager?.loadTab();
     }
 
     // Connect/disconnect SSE for active requests tab
@@ -170,25 +170,13 @@ function showTab(tabName) {
         window.WebSearchManager?.load();
     }
 
-    // Load unified model management when switching to the models tab
+    // Per-profile model access
     if (tabName === 'models') {
         window.ModelsManager?.load();
     }
-}
 
-// Sub-tab switcher inside the Rate Limits tab
-function showRateLimitSubTab(name) {
-    const panes = ['request', 'model-groups', 'instance-groups'];
-    panes.forEach(p => {
-        const el = document.getElementById(`rl-subtab-${p}`);
-        if (el) el.style.display = p === name ? '' : 'none';
-        const btn = document.getElementById(`rl-subtab-${p}-btn`);
-        if (btn) btn.classList.toggle('active', p === name);
-    });
-    if (name === 'model-groups') {
+    if (tabName === 'model-groups') {
         window.ModelGroupManager?.load();
-    } else if (name === 'instance-groups') {
-        window.InstanceGroupManager?.load();
     }
 }
 
@@ -215,8 +203,5 @@ window.UIUtils = {
     closeToast,
     showConfirmModal,
     showTab,
-    showRateLimitSubTab,
     escapeHtml
 };
-
-window.showRateLimitSubTab = showRateLimitSubTab;

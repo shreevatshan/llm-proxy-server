@@ -254,13 +254,8 @@ def _scope_name(scope_kind: str, scope_id: int) -> str:
     from app.rate_limit import rate_limit_tracker
 
     if scope_kind == "overall":
-        return "Overall"
-    snapshot = (
-        rate_limit_tracker._instance_groups if scope_kind == "instance_group"
-        else rate_limit_tracker._groups
-    )
-    group = snapshot.get(scope_id)
-    return getattr(group, "name", None) or f"Group {scope_id}"
+        return "Default"
+    return rate_limit_tracker.group_name(scope_id) or f"Group {scope_id}"
 
 
 @asynccontextmanager
@@ -328,11 +323,11 @@ async def _member_scopes(
 
 
 def _relevant_scopes() -> List[tuple]:
-    """Every settlement scope: 'overall' first, then each group by name.
+    """Every settlement scope: 'overall' (the Default group) first, then each group by name.
 
     Idle groups are listed too. The Quotas tab shows a member their limit on every
     group unconditionally, so hiding the quiet ones here made a per-user override look
-    like it had not taken effect -- the pool's Overall row still reads the overall
+    like it had not taken effect -- the pool's Default row still reads the Default
     quota, which the override never touched.
     """
     from app.rate_limit import rate_limit_tracker
@@ -1366,7 +1361,6 @@ async def build_pool_usage(
     """
     from app.auth.database import (
         get_usage_by_user_and_model, get_usage_timeseries,
-        list_instance_groups, list_model_groups,
     )
     from app.request_tracker import request_tracker
 
@@ -1439,32 +1433,18 @@ async def build_pool_usage(
         per_member_totals[r["user_identity"]] = per_member_totals.get(r["user_identity"], 0) + r["request_count"]
         per_model_totals[r["model"]] = per_model_totals.get(r["model"], 0) + r["request_count"]
 
-    # Map each model to its group, instance group first — the same precedence
-    # enforcement resolves in, so the usage tab and the quota tab agree on grouping.
-    model_groups = await list_model_groups(db)
-    instance_groups = await list_instance_groups(db)
-    # Each entry carries the settlement scope it belongs to, so the Pool tab can join
-    # this fold to the quota numbers in GET /auth/pools/me on (kind, scope_id) rather
-    # than on a display name. Ungrouped traffic gets scope_id 0, which matches no scope
-    # -- correctly, since it has no quota of its own.
-    model_to_group = {
-        m.model_id: (g.name, "model_group", g.id)
-        for g in model_groups for m in g.members
-    }
-    provider_to_group = {
-        m.provider_key: (g.name, "instance_group", g.id)
-        for g in instance_groups for m in g.members
-    }
+    # Map each model to its group the way enforcement does (rate_limit_tracker.group_for),
+    # so the usage tab and the quota tab agree on grouping. Each entry carries the
+    # settlement scope it belongs to, so the Pool tab can join this fold to the quota
+    # numbers in GET /auth/pools/me on (kind, scope_id) rather than on a display name.
+    # Default-group traffic is scope ('overall', 0), the same as its quota.
+    from app.rate_limit import rate_limit_tracker
 
     def _group_of(model: str):
-        if not model:
-            return ("Other Models", "other", 0)
-        prefix = model.split('/', 1)[0] if '/' in model else model
-        return (
-            provider_to_group.get(prefix)
-            or model_to_group.get(model)
-            or ("Other Models", "other", 0)
-        )
+        scope = rate_limit_tracker.scope_for_model(model)
+        if scope is None:
+            return ("Default", "overall", 0)
+        return (_scope_name(*scope), scope[0], scope[1])
 
     groups: dict = {}
     for r in cross:

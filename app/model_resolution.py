@@ -251,8 +251,8 @@ async def resolve_model_for_request(
 
     Applies admin aliases first. That is usually a no-op (the middleware or the
     handler already applied them, and apply_alias never re-maps its own output),
-    but it covers paths the middleware skips, such as /openai/v1/* and
-    /v1/messages/count_tokens. Raises ModelUnavailable (404) when nothing serves
+    but it covers paths the middleware skips, such as /v1/messages/count_tokens.
+    Raises ModelUnavailable (404) when nothing serves
     the model, and ModelAccessDenied (403) when candidates exist but the caller
     may use none of them -- so a user asking for 'gpt-5.4' gets the same answer
     they would get asking for 'azure:foundry/gpt-5.4'.
@@ -270,7 +270,7 @@ async def resolve_model_for_request(
 
     head, rest = model.split('/', 1) if '/' in model else ('', '')
     if rest and provider_manager.has_provider_prefix(head):
-        return model
+        return await canonicalize_provider_prefix(request_obj, model)
 
     api = current_api_surface.get()
     pool = _filter_pool(cache.bare_model_candidates(model), api)
@@ -299,12 +299,40 @@ async def resolve_model_for_request(
     return chosen
 
 
+async def canonicalize_provider_prefix(request_obj, model: Optional[str]) -> Optional[str]:
+    """'azure/gpt-4' -> 'azure:primary/gpt-4' when the family names a single instance.
+
+    A provider family that names one instance is that instance's model: canonicalise
+    it, so group limits, access rules, the enable flags and usage all see the
+    instance's id rather than a name none of them know (which would land in the
+    Default group and skip the global gate). An exact provider_key, an ambiguous
+    family, or no provider at all passes through for dispatch to accept or reject.
+    Callers that build the id from a URL (the Azure deployment routes) call this
+    directly; resolve_model_for_request calls it for every prefixed name.
+    """
+    if not model:
+        return model
+    head, rest = model.split('/', 1) if '/' in model else ('', '')
+    provider_key = provider_manager.find_provider_key(head) if rest else None
+    if provider_key is None or provider_key == head:
+        return model
+    canonical = f"{provider_key}/{rest}"
+    if original_model_name.get() is None:
+        original_model_name.set(model)
+    try:
+        request_obj.state.model = canonical
+    except Exception:
+        logger.debug("Unable to record resolved model on request state", exc_info=True)
+    await _retag_tracker(request_obj, canonical)
+    return canonical
+
+
 async def _retag_tracker(request_obj, chosen: str) -> None:
     """Point the in-flight tracker entry at the canonical id.
 
     end_request builds the usage key from entry.model, so without this the same
     logical model splits across a bare row and a prefixed row. A no-op on
-    untracked paths (count_tokens, everything under /openai/v1/*), and never
+    untracked paths (count_tokens), and never
     allowed to break the request.
     """
     request_id = getattr(getattr(request_obj, "state", None), "tracking_request_id", None)

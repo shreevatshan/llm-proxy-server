@@ -8,7 +8,7 @@ rename, since usage rows are keyed by the username string rather than the user i
 """
 
 from app.auth.models import (
-    InstanceGroup, InstanceGroupMember, ModelGroup, ModelGroupMember,
+    ModelGroup, ModelGroupMember,
     RequestPoolMember, UserRateLimit, UserRpdCarry,
 )
 from tests.pool_test_base import DAY, PoolTestCase
@@ -278,12 +278,10 @@ class PooledGroupLimitTests(PoolTestCase):
         await self.seed_usage("alice", 4, model="openai/gpt-4o")
 
         self.assertEqual(
-            self.tracker.pooled_group_rpd_limit(alice.id, group.id, instance=False), 6,
+            self.tracker.pooled_group_rpd_limit(alice.id, group.id), 6,
             "3 + 3 across the two members",
         )
-        count = await self.tracker.get_group_rpd_count(
-            bob.id, "bob", ["openai/gpt-4o"], group.id
-        )
+        count = await self.tracker.get_group_rpd_count(bob.id, "bob", group.id)
         self.assertEqual(count, 4, "Bob's group count includes Alice's requests")
 
         # Under the pooled ceiling of 6 the fifth request is still allowed...
@@ -295,23 +293,20 @@ class PooledGroupLimitTests(PoolTestCase):
         self.assertIsNotNone(decision)
         self.assertFalse(decision.allowed)
 
-    async def test_instance_group_rpd_is_pooled_and_takes_precedence(self):
+    async def test_instance_member_rpd_is_pooled_and_yields_to_an_explicit_model(self):
         alice = await self.make_user("alice", rpd_limit=100)
         bob = await self.make_user("bob", rpd_limit=100)
-        await self.make_model_group("by-model", "azure/gpt-4o", rpd_default=3)
+        mg = await self.make_model_group("by-model", "azure/gpt-4o", rpd_default=3)
         ig = await self.make_instance_group("by-instance", "azure", rpd_default=4)
         await self.make_pool("team", alice, [bob])
-        await self.seed_usage("alice", 5, model="azure/gpt-4o")
+        await self.seed_usage("alice", 5, model="azure/gpt-5")
+        await self.seed_usage("alice", 1, model="azure/gpt-4o")
 
+        self.assertEqual(self.tracker.pooled_group_rpd_limit(alice.id, ig.id), 8)
+        self.assertEqual(await self.tracker.get_group_rpd_count(bob.id, "bob", ig.id), 5)
         self.assertEqual(
-            self.tracker.pooled_group_rpd_limit(alice.id, ig.id, instance=True), 8)
-        count = await self.tracker.get_instance_group_rpd_count(
-            bob.id, "bob", ["azure"], ig.id
-        )
-        self.assertEqual(count, 5)
-        self.assertEqual(
-            self.tracker.scope_for_model("azure/gpt-4o"), ("instance_group", ig.id),
-            "the instance group wins, matching enforcement order",
+            self.tracker.scope_for_model("azure/gpt-4o"), ("model_group", mg.id),
+            "the explicit model wins, matching enforcement",
         )
 
     async def test_grouped_requests_do_not_count_against_the_pooled_overall_quota(self):

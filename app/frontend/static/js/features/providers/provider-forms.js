@@ -345,8 +345,11 @@ class ProviderFormManager {
             const formData = {
                 provider_type: providerType,
                 instance_name: instanceName,
-                enabled: true
             };
+            // A new provider starts on. An edit leaves the on/off switch alone: it is the
+            // provider toggle's to set, and sending true here re-enabled a disabled
+            // provider (and with it every model) whenever its form was saved.
+            if (!isEdit) formData.enabled = true;
 
             // Collect provider-specific fields
             const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name'];

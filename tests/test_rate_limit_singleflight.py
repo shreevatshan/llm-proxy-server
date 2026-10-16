@@ -41,15 +41,17 @@ class RpdSingleFlightTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, 2)
 
     async def test_group_counts_single_flight(self):
-        with patch.object(self.request_tracker, "get_today_group_count", self._slow_count), \
-             patch.object(self.request_tracker, "get_today_instance_group_count", self._slow_count):
+        from app.rate_limit import _ModelGroupSnapshot
+        explicit = _ModelGroupSnapshot(group_id=3, name="g", model_ids=["p/m"])
+        by_instance = _ModelGroupSnapshot(group_id=4, name="h", model_ids=[], provider_keys=["p"])
+        with patch.object(self.request_tracker, "get_today_group_count", self._slow_count):
             await asyncio.gather(
-                *(self.tracker._get_today_group_count("user:alice", [1], ["p/m"], 3)
+                *(self.tracker._get_today_group_count("user:alice", [1], explicit)
                   for _ in range(10)),
-                *(self.tracker._get_today_instance_group_count("user:alice", [1], ["p"], 3)
+                *(self.tracker._get_today_group_count("user:alice", [1], by_instance)
                   for _ in range(10)),
             )
-        # One read per cache (model group, instance group), not per request.
+        # One read per (scope, group) key, not per request.
         self.assertEqual(self.calls, 2)
 
     async def test_failure_serves_stale_and_does_not_cache_zero(self):

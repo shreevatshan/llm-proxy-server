@@ -24,7 +24,7 @@ class AdminDashboard {
         
         // Load initial data if on providers tab
         if (document.getElementById('providers-tab')?.style.display !== 'none') {
-            window.ProviderManager.loadUnifiedProviderData();
+            window.ProviderManager.loadTab();
         }
 
 
