@@ -1922,3 +1922,179 @@ input:checked + .model-toggle-slider:before {
     .pool-settings-form .ps-share-label { margin-top: 1rem; }
     .pool-settings-form .ps-save { justify-self: start; margin-top: 1rem; }
 }
+
+
+/* ── Model groups: member picker ───────────────────────────────────────── */
+/* One tree in the create/edit modal: an instance row takes the whole instance and
+   opens onto its models, joined to it by a hairline guide. Instance and model
+   checkboxes share a column, so a model picked singly lines up under the instance
+   it came from. State is luminance: what the group holds is bright, the rest
+   secondary, and a row another group holds is muted with that group's name picked
+   out in the name hue. Instance rows stick while their models scroll under them. */
+
+.mg-members__head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    gap: 4px 16px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.mg-readout { font-size: var(--text-xs); color: var(--mono-text-muted); text-align: right; }
+.mg-readout__n {
+    font-size: var(--text-sm); font-weight: var(--font-semibold);
+    color: var(--mono-text-primary); font-variant-numeric: tabular-nums;
+}
+
+.mg-toolbar { display: flex; gap: 8px; margin-bottom: 8px; }
+.mg-search { position: relative; flex: 1 1 auto; min-width: 0; }
+.mg-search > i {
+    position: absolute; left: 11px; top: 50%; transform: translateY(-50%);
+    font-size: 0.7rem; color: var(--mono-text-muted); pointer-events: none;
+}
+.mg-search .form-control { height: 100%; padding-left: 30px; }
+.mg-filter { flex-shrink: 0; white-space: nowrap; }
+.mg-filter[aria-pressed="true"],
+.mg-filter[aria-pressed="true"]:hover {
+    background-color: var(--mono-text-primary);
+    border-color: var(--mono-text-primary);
+    color: var(--mono-text-inverse);
+}
+
+/* A fixed height, so searching or filtering doesn't make the dialog jump. */
+.mg-tree {
+    height: min(44vh, 420px); overflow-y: auto; overscroll-behavior: contain;
+    border: 1px solid var(--dark-border); border-radius: var(--radius-md);
+    background-color: var(--mono-0);
+}
+.mg-empty {
+    padding: 40px 16px; text-align: center;
+    font-size: var(--text-sm); color: var(--mono-text-muted);
+}
+
+.mg-inst + .mg-inst { border-top: 1px solid var(--mono-3); }
+.mg-inst__row {
+    position: sticky; top: 0; z-index: 1;
+    display: grid; grid-template-columns: 28px minmax(0, 1fr) auto;
+    align-items: center; column-gap: 6px;
+    min-height: 40px; padding: 0 14px 0 6px;
+    background-color: var(--mono-1);
+}
+.mg-inst__row:hover { background-color: var(--mono-2); }
+
+.mg-twisty {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; padding: 0;
+    border: 0; border-radius: var(--radius-sm);
+    background: none; color: var(--mono-text-muted);
+}
+.mg-twisty i { font-size: 0.6rem; transition: transform 0.15s ease; }
+.mg-twisty[aria-expanded="true"] i { transform: rotate(90deg); }
+.mg-twisty:hover:not(:disabled) { color: var(--mono-text-primary); }
+.mg-twisty:disabled { opacity: 0.25; }
+.mg-twisty:focus-visible { outline: 2px solid var(--mono-text-primary); outline-offset: -2px; }
+
+.mg-check {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 2px 10px;
+    min-width: 0; margin: 0; padding: 7px 0;
+    font-size: var(--text-sm); color: var(--mono-text-secondary); cursor: pointer;
+}
+.mg-inst__key,
+.mg-model__name { min-width: 0; overflow-wrap: anywhere; }
+.mg-inst.is-on .mg-inst__key { color: var(--mono-text-primary); font-weight: var(--font-semibold); }
+.mg-inst.is-partial .mg-inst__key,
+.mg-model.is-on .mg-model__name { color: var(--mono-text-primary); }
+.mg-inst.is-taken .mg-check,
+.mg-model.is-taken .mg-check { color: var(--mono-text-muted); cursor: not-allowed; }
+.mg-model.is-covered .mg-check { cursor: default; }
+.mg-inst.is-stale .mg-check { cursor: default; }
+
+.mg-count {
+    padding-left: 12px;
+    font-size: var(--text-xs); color: var(--mono-text-muted);
+    white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.mg-inst.is-on .mg-count,
+.mg-inst.is-partial .mg-count { color: var(--mono-text-secondary); }
+
+.mg-tag {
+    flex-shrink: 0; padding: 0 6px;
+    border: 1px solid var(--mono-5); border-radius: var(--radius-sm);
+    font-size: 0.65rem; line-height: 1.6; color: var(--mono-text-secondary); white-space: nowrap;
+}
+.mg-where {
+    flex-shrink: 0; margin-left: auto;
+    font-size: var(--text-xs); color: var(--mono-text-muted); white-space: nowrap;
+}
+.mg-owner { color: var(--mono-text-name); }
+
+.mg-models {
+    position: relative; list-style: none; margin: 0; padding: 0 0 6px;
+    background-color: var(--mono-0);
+}
+/* The guide drops from the chevron's centre: 6px row inset + half the 28px twisty. */
+.mg-models::before {
+    content: ''; position: absolute; left: 20px; top: 0; bottom: 16px;
+    width: 1px; background-color: var(--mono-4);
+}
+.mg-model { padding: 0 14px 0 40px; }
+.mg-model:hover { background-color: var(--mono-1); }
+.mg-model .mg-check { padding: 4px 0; font-size: 0.8rem; }
+
+.mg-box {
+    appearance: none; -webkit-appearance: none;
+    flex-shrink: 0; width: 15px; height: 15px; margin: 0;
+    border: 1px solid var(--mono-5); border-radius: 3px;
+    background: var(--mono-1) center / 100% 100% no-repeat;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.mg-box:hover:not(:disabled) { border-color: var(--mono-text-primary); }
+.mg-box:focus-visible { outline: 2px solid var(--mono-text-primary); outline-offset: 2px; }
+.mg-box:checked,
+.mg-box:indeterminate {
+    background-color: var(--mono-text-primary);
+    border-color: var(--mono-text-primary);
+}
+.mg-box:checked {
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%230d0d0d' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round' d='M4 8.5l2.5 2.5L12 5'/%3e%3c/svg%3e");
+}
+/* An instance with some models picked singly: a dash, not a tick. */
+.mg-box:indeterminate {
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%230d0d0d' stroke-width='2.5' stroke-linecap='round' d='M4 8h8'/%3e%3c/svg%3e");
+}
+/* Included with its instance: still ticked, but dimmer, since it isn't this row's own pick. */
+.mg-box:checked:disabled {
+    background-color: var(--mono-3);
+    border-color: var(--mono-5);
+    background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3e%3cpath fill='none' stroke='%23b8b8b8' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round' d='M4 8.5l2.5 2.5L12 5'/%3e%3c/svg%3e");
+    cursor: default;
+}
+/* Held by another group: an empty dashed box. */
+.mg-box:disabled:not(:checked) {
+    border-style: dashed; background-color: transparent; cursor: not-allowed;
+}
+.mg-box-spacer { flex-shrink: 0; width: 15px; }
+
+.mg-legend {
+    max-width: 76ch; margin: 10px 0 0;
+    font-size: var(--text-xs); line-height: 1.55; color: var(--mono-text-muted);
+}
+.mg-notes:empty { display: none; }
+.mg-notes p {
+    display: flex; gap: 8px; margin: 8px 0 0;
+    font-size: var(--text-xs); line-height: 1.5; color: var(--mono-text-secondary);
+}
+.mg-notes i { margin-top: 3px; color: var(--mono-text-primary); }
+
+.mg-modal .modal-footer { flex-wrap: nowrap; }
+.mg-footnote {
+    flex: 1 1 auto; max-width: 48ch; margin: 0 auto 0 0;
+    font-size: var(--text-xs); line-height: 1.5; color: var(--mono-text-muted);
+}
+
+@media (max-width: 576px) {
+    .mg-modal .modal-footer { flex-wrap: wrap; }
+    .mg-footnote { flex-basis: 100%; max-width: none; }
+    .mg-readout { text-align: left; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .mg-twisty i, .mg-box { transition: none; }
+}

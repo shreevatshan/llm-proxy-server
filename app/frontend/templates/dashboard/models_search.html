@@ -191,7 +191,6 @@
     let allModels = [];
     let filteredModels = [];
     let modelApiSupport = {};  // model_id -> ["openai", "anthropic"]
-    let modelAnthropicMode = {};  // model_id -> "native" | "adapter"
 
     // Load all enabled models on page load
     async function loadAllModels() {
@@ -212,9 +211,6 @@
 
             // Build API support map from the response
             response.data.forEach(model => {
-                if (model.anthropic_mode) {
-                    modelAnthropicMode[model.id] = model.anthropic_mode;
-                }
                 if (model.supported_apis) {
                     modelApiSupport[model.id] = model.supported_apis;
                 }
@@ -294,11 +290,7 @@
             const apis = modelApiSupport[fullModelName] || ['openai'];
             let badgesHtml = '';
             apis.forEach(api => {
-                // Adapter-served models are converted from OpenAI chat completions.
-                const converted = api === 'anthropic' && modelAnthropicMode[fullModelName] === 'adapter';
-                const label = converted ? 'anthropic (converted)' : api;
-                const title = converted ? ' title="Served on the Anthropic Messages API by converting to/from OpenAI chat completions"' : '';
-                badgesHtml += `<span class="api-badge ${escapeHtml(api)}"${title}>${escapeHtml(label)}</span>`;
+                badgesHtml += `<span class="api-badge ${escapeHtml(api)}">${escapeHtml(api)}</span>`;
             });
             
             html += `

@@ -70,85 +70,9 @@
 }
 
 /* ================================
-   FLAT DESIGN TABS
-   ================================ */
-
-.tab-navigation {
-    display: flex;
-    background: var(--dark-surface);
-    border-radius: var(--radius-xl);
-    box-shadow: none;
-    border: 1px solid var(--dark-border);
-    margin-bottom: 2rem;
-    overflow: hidden;
-    position: relative;
-}
-
-.tab-button {
-    flex: 1;
-    padding: 1rem 1.5rem;
-    background: transparent;
-    border: none;
-    cursor: pointer;
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: var(--dark-text-secondary);
-    transition: none;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0.75rem;
-    position: relative;
-    z-index: 2;
-    font-family: var(--font-family-mono);
-}
-
-.tab-button:hover {
-    background: var(--dark-bg-secondary);
-    color: var(--dark-text-primary);
-}
-
-.tab-button.active {
-    background: var(--mono-text-primary);
-    color: var(--mono-0);
-    font-weight: 600;
-}
-
-.tab-button.active::after {
-    content: '';
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    height: 2px;
-    background: var(--mono-text-primary);
-}
-
-.tab-button i,
-.tab-button .material-icons {
-    font-size: 1.125rem;
-    color: inherit;
-}
-
-/* Specific support for FontAwesome icons in tab buttons */
-.tab-button .fas,
-.tab-button .far,
-.tab-button .fab {
-    color: inherit;
-    font-size: 1.125rem;
-}
-
-.tab-button.active i,
-.tab-button.active .material-icons,
-.tab-button.active .fas,
-.tab-button.active .far,
-.tab-button.active .fab {
-    color: var(--mono-0);
-}
-
-/* ================================
    SUB-TAB NAVIGATION (segmented, in-card)
-   Lighter-weight sibling of .tab-navigation for sub-sections.
+   In-card segmented control for sub-sections; the dashboard's main sections
+   live in the sidebar (components/sidebar.css).
    ================================ */
 .subtab-navigation {
     display: inline-flex;
@@ -331,15 +255,6 @@
    ================================ */
 
 @media (max-width: 768px) {
-    .tab-navigation {
-        flex-direction: column;
-    }
-    
-    .tab-button {
-        padding: 0.75rem 1rem;
-        justify-content: flex-start;
-    }
-    
     .table th,
     .table td {
         padding: 0.75rem 1rem;
@@ -363,22 +278,10 @@
 }
 
 @media (max-width: 480px) {
-    .tab-button {
-        padding: 0.625rem 0.75rem;
-    }
-    
-    .tab-button span {
-        display: none;
-    }
-    
     .table th,
     .table td {
         padding: 0.5rem;
     }
-}
-
-.tab-button i {
-    font-size: 1.1rem;
 }
 
 /* Actions */

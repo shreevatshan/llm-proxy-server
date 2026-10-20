@@ -1,0 +1,25 @@
+{#
+  Dashboard section sidebar (admin + user dashboards).
+  tabs: [{'id', 'label', 'icon'}]
+  Buttons keep the `tab-button` class and the exact onclick="showTab('x')" text:
+  UIUtils.showTab and showInitialTab look the active button up by that attribute.
+  Must render before the page content so it is the first match for querySelector.
+#}
+{% macro dash_sidebar(tabs, active, label) %}
+<aside class="dash-sidebar" id="dashSidebar">
+    <div class="dash-sidebar__panel">
+        <nav class="tab-navigation dash-sidebar__nav" aria-label="{{ label }}">
+            {% for tab in tabs %}
+            <button class="tab-button{% if tab.id == active %} active{% endif %}" onclick="showTab('{{ tab.id }}')" data-label="{{ tab.label }}">
+                {# No aria-hidden: accessibility.css hides [aria-hidden="true"] with display:none #}
+                <i class="fas {{ tab.icon }}"></i><span class="tab-label">{{ tab.label }}</span>
+            </button>
+            {% endfor %}
+        </nav>
+        <button type="button" class="dash-sidebar__toggle" aria-controls="dashSidebar" aria-expanded="true" aria-label="Collapse sidebar" data-label="Collapse sidebar">
+            <i class="fas fa-angles-left"></i>
+        </button>
+    </div>
+    <div class="dash-sidebar__tooltip" role="tooltip" hidden></div>
+</aside>
+{% endmacro %}

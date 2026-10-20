@@ -1,0 +1,12 @@
+<!-- Dashboard sidebar: versioned so a cached copy never lags the markup -->
+<link href="/static/css/components/sidebar.css?v={{ cache_version | default('1') }}" rel="stylesheet">
+<script>
+    // Apply the remembered rail state before first paint. With no stored choice,
+    // start as a rail below 1200px, where page layouts were tuned for full width.
+    try {
+        var dashCollapsed = localStorage.getItem('dashSidebar:collapsed');
+        if (dashCollapsed === '1' || (dashCollapsed === null && window.innerWidth < 1200)) {
+            document.documentElement.classList.add('dash-sidebar-collapsed');
+        }
+    } catch (e) {}
+</script>

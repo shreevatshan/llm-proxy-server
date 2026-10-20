@@ -20,6 +20,9 @@ class ModelGroupManager {
         this._selectedModels = new Set();
         this._selectedInstances = new Set();
         this._staleMembers = [];   // members of the edited group that no longer exist
+        this._filter = '';           // the picker's search, lower-cased
+        this._selectedOnly = false;  // the picker shows only what the group holds
+        this._expanded = new Set();  // instances opened in the picker to show their models
         this._openGroupId = null;    // the group drilled into, or null for the list
         this._openInstance = null;   // an instance member of that group drilled into, or null
         this._profileLimits = new window.ProfileGroupLimits({ manager: 'ModelGroupManager' });
@@ -310,10 +313,16 @@ class ModelGroupManager {
         document.getElementById('mg-group-id').value = group ? group.id : '';
         document.getElementById('mg-name').value = group ? group.name : '';
         document.getElementById('mg-description').value = group ? (group.description || '') : '';
-        document.getElementById('modelGroupModalTitle').textContent = group ? `Edit: ${group.name}` : 'New Model Group';
+        document.getElementById('modelGroupModalTitle').textContent = group ? 'Edit group' : 'New group';
+        document.getElementById('mg-save').textContent = group ? 'Save changes' : 'Create group';
+        // The limits note is about where a new group's limits come from; an edit keeps its own.
+        document.getElementById('mg-limits-note').hidden = !!group;
         const search = document.getElementById('mg-member-search');
         if (search) search.value = '';
-        this._renderPickers();
+        this._filter = '';
+        this._setSelectedOnly(false);
+        this._autoExpand();
+        this._renderTree();
         this._getModal()?.show();
     }
 
@@ -328,83 +337,237 @@ class ModelGroupManager {
         return { instances, models };
     }
 
-    _renderPickers(filter = '') {
-        const esc = window.UIUtils.escapeHtml;
-        const q = filter.trim().toLowerCase();
+    // ---- Member picker ----
+    //
+    // One tree: each instance is a row whose checkbox takes the whole instance, and opens
+    // onto its models, each with its own checkbox. A checked instance shows its models as
+    // included; a model another group names stays there and can't be checked here.
+
+    /** Instances in key order, each with its models; providers known only from models come last. */
+    _tree() {
+        const byProvider = new Map();
+        this._models.forEach(m => {
+            if (!byProvider.has(m.provider)) byProvider.set(m.provider, []);
+            byProvider.get(m.provider).push(m);
+        });
+        byProvider.forEach(list => list.sort((a, b) => a.label.localeCompare(b.label)));
+        const nodes = this._instances.map(i => ({ ...i, listed: true, models: byProvider.get(i.provider_key) || [] }));
+        byProvider.forEach((models, key) => {
+            if (!this._instances.some(i => i.provider_key === key)) {
+                nodes.push({ provider_key: key, enabled: true, model_count: models.length, listed: false, models });
+            }
+        });
+        return nodes;
+    }
+
+    _matches(...xs) {
+        return !this._filter || xs.some(x => (x || '').toLowerCase().includes(this._filter));
+    }
+
+    /** Open the instances whose models the filter picked out, or that hold single picks. */
+    _autoExpand() {
+        this._expanded = new Set();
+        this._tree().forEach(node => {
+            const key = node.provider_key;
+            const byModel = this._filter && !this._matches(key) && node.models.some(m => this._matches(m.model_id, m.label));
+            const partial = !this._selectedInstances.has(key) && node.models.some(m => this._selectedModels.has(m.model_id));
+            if (byModel || partial) this._expanded.add(key);
+        });
+    }
+
+    _renderTree() {
+        const el = document.getElementById('mg-member-tree');
+        if (!el) return;
         const owners = this._owners();
-        const match = (...xs) => !q || xs.some(x => (x || '').toLowerCase().includes(q));
-        const stale = kind => this._staleMembers.filter(m => m.kind === kind && match(m.key));
+        const nodes = this._tree();
+        const html = [this._staleHtml(), ...nodes.map((node, i) => this._instanceHtml(node, i, owners))].join('');
+        let empty = 'No instances or models yet.';
+        if (this._filter) empty = `Nothing matches “${window.UIUtils.escapeHtml(this._filter)}”.`;
+        else if (this._selectedOnly) empty = 'Nothing selected yet. Check an instance, or open one to pick models.';
+        el.innerHTML = html || `<div class="mg-empty">${empty}</div>`;
+        el.querySelectorAll('input[data-partial]').forEach(box => { box.indeterminate = true; });
+        this._renderReadout(owners);
+        this._renderWarnings(owners);
+    }
 
-        const row = (kind, key, label, checked, owner, badges) => {
-            const id = `mg-${kind}-${CSS.escape(key)}`;
-            const disabled = owner && !checked ? 'disabled' : '';
-            const ownerNote = owner && !checked ? ` <span class="text-muted">in ${esc(owner)}</span>` : '';
+    /** Re-render after a click, keeping keyboard focus on the control that had it. */
+    _refreshTree() {
+        const focus = document.activeElement?.dataset?.focus;
+        this._renderTree();
+        if (focus) document.querySelector(`#mg-member-tree [data-focus="${CSS.escape(focus)}"]`)?.focus();
+    }
+
+    _instanceHtml(node, index, owners) {
+        const esc = window.UIUtils.escapeHtml;
+        const key = node.provider_key;
+        const on = this._selectedInstances.has(key);
+        const owner = on ? null : owners.instances[key];
+        const total = node.models.length || node.model_count;
+        const picked = node.models.filter(m => this._selectedModels.has(m.model_id)).length;
+        const keptElsewhere = node.models.filter(m => owners.models[m.model_id]).length;
+
+        // A match on the instance shows all of it; otherwise only the models that match.
+        let models = this._matches(key) ? node.models : node.models.filter(m => this._matches(m.model_id, m.label));
+        if (this._selectedOnly) models = models.filter(m => on || this._selectedModels.has(m.model_id));
+        if (!models.length && !(this._matches(key) && (!this._selectedOnly || on))) return '';
+
+        const open = this._expanded.has(key) && models.length > 0;
+        const listId = `mg-inst-${index}-models`;
+        const state = on ? 'is-on' : picked ? 'is-partial' : owner ? 'is-taken' : '';
+        const count = on
+            ? (keptElsewhere ? `${total - keptElsewhere} of ${total}` : this._plural(total, 'model'))
+            : picked ? `${picked} of ${total}` : this._plural(total, 'model');
+
+        const box = node.listed
+            ? `<input type="checkbox" class="mg-box" id="mg-inst-${index}" value="${esc(key)}" data-kind="instance"
+                    data-focus="i:${esc(key)}" ${on ? 'checked' : ''} ${owner ? 'disabled' : ''}
+                    ${!on && picked ? 'data-partial' : ''} onchange="window.ModelGroupManager?._onToggle(this)">`
+            : '<span class="mg-box-spacer"></span>';
+        const tags = [
+            node.enabled ? '' : '<span class="mg-tag">provider off</span>',
+            owner ? `<span class="mg-where">in <span class="mg-owner">${esc(owner)}</span></span>` : '',
+        ].join('');
+
+        return `
+        <div class="mg-inst ${state}">
+            <div class="mg-inst__row">
+                <button type="button" class="mg-twisty" aria-expanded="${open}" aria-controls="${listId}"
+                    aria-label="${open ? 'Hide' : 'Show'} models of ${esc(key)}" data-key="${esc(key)}" data-focus="t:${esc(key)}"
+                    ${models.length ? '' : 'disabled'} onclick="window.ModelGroupManager?._toggleExpand(this.dataset.key)">
+                    <i class="fas fa-chevron-right"></i>
+                </button>
+                <label class="mg-check" ${node.listed ? `for="mg-inst-${index}"` : ''}>
+                    ${box}<span class="mg-inst__key">${esc(key)}</span>${tags}
+                </label>
+                <span class="mg-count">${count}</span>
+            </div>
+            ${open ? `<ul class="mg-models" id="${listId}">${models.map((m, j) => this._modelHtml(m, `${index}-${j}`, on, owners)).join('')}</ul>` : ''}
+        </div>`;
+    }
+
+    _modelHtml(m, id, instanceOn, owners) {
+        const esc = window.UIUtils.escapeHtml;
+        const named = this._selectedModels.has(m.model_id);
+        const owner = named ? null : owners.models[m.model_id];
+        // Included with its instance: checked, and only changed by unchecking the instance.
+        const covered = instanceOn && !owner;
+        const state = owner ? 'is-taken' : covered ? 'is-covered' : named ? 'is-on' : '';
+        const title = owner
+            ? `${owner} picks this model by name; remove it there first`
+            : covered ? `Included with ${m.provider}` : '';
+        return `
+            <li class="mg-model ${state}"${title ? ` title="${esc(title)}"` : ''}>
+                <label class="mg-check" for="mg-model-${id}">
+                    <input type="checkbox" class="mg-box" id="mg-model-${id}" value="${esc(m.model_id)}" data-kind="model"
+                        data-focus="m:${esc(m.model_id)}" ${named || covered ? 'checked' : ''} ${owner || covered ? 'disabled' : ''}
+                        onchange="window.ModelGroupManager?._onToggle(this)">
+                    <span class="mg-model__name">${esc(m.label)}</span>
+                    ${m.enabled ? '' : '<span class="mg-tag">model off</span>'}
+                    ${owner ? `<span class="mg-where">in <span class="mg-owner">${esc(owner)}</span></span>` : ''}
+                    ${covered ? `<span class="visually-hidden">, included with ${esc(m.provider)}</span>` : ''}
+                </label>
+            </li>`;
+    }
+
+    /** Members of the edited group whose instance or model is gone; unchecking drops them. */
+    _staleHtml() {
+        const esc = window.UIUtils.escapeHtml;
+        const stale = this._staleMembers.filter(m => this._matches(m.key));
+        if (!stale.length) return '';
+        const rows = stale.map((m, i) => {
+            const set = m.kind === 'instance' ? this._selectedInstances : this._selectedModels;
             return `
-            <div class="form-check">
-                <input class="form-check-input" type="checkbox" id="${id}" value="${esc(key)}" data-kind="${kind}"
-                    ${checked ? 'checked' : ''} ${disabled}
-                    onchange="window.ModelGroupManager?._onToggle(this)">
-                <label class="form-check-label small${disabled ? ' text-muted' : ''}" for="${id}">${label}${badges}${ownerNote}</label>
-            </div>`;
-        };
+            <li class="mg-model${set.has(m.key) ? ' is-on' : ''}">
+                <label class="mg-check" for="mg-stale-${i}">
+                    <input type="checkbox" class="mg-box" id="mg-stale-${i}" value="${esc(m.key)}" data-kind="${m.kind}"
+                        data-focus="s:${esc(m.key)}" ${set.has(m.key) ? 'checked' : ''}
+                        onchange="window.ModelGroupManager?._onToggle(this)">
+                    <span class="mg-model__name">${esc(m.key)}</span><span class="mg-tag">${m.kind === 'instance' ? 'instance ' : ''}missing</span>
+                </label>
+            </li>`;
+        }).join('');
+        return `
+        <div class="mg-inst is-stale">
+            <div class="mg-inst__row">
+                <span class="mg-twisty"></span>
+                <span class="mg-check"><span class="mg-inst__key">No longer available</span></span>
+                <span class="mg-count">${stale.length}</span>
+            </div>
+            <ul class="mg-models">${rows}</ul>
+        </div>`;
+    }
 
-        const instHtml = [
-            ...stale('instance').map(m => row('instance', m.key, esc(m.key), this._selectedInstances.has(m.key), null,
-                this._statusBadge('missing'))),
-            ...this._instances.filter(i => match(i.provider_key)).map(i => row(
-                'instance', i.provider_key, esc(i.provider_key), this._selectedInstances.has(i.provider_key),
-                owners.instances[i.provider_key],
-                ` <span class="text-muted">· ${i.model_count} model${i.model_count === 1 ? '' : 's'}</span>`
-                    + (i.enabled ? '' : this._statusBadge('provider_disabled')))),
-        ].join('');
-        const modelHtml = [
-            ...stale('model').map(m => row('model', m.key, esc(m.key), this._selectedModels.has(m.key), null,
-                this._statusBadge('missing'))),
-            ...this._models.filter(m => match(m.model_id, m.label)).map(m => row(
-                'model', m.model_id, `<span class="text-muted">${esc(m.provider)}</span> / ${esc(m.label)}`,
-                this._selectedModels.has(m.model_id), owners.models[m.model_id],
-                m.enabled ? '' : this._statusBadge('model_disabled'))),
-        ].join('');
-
-        const inst = document.getElementById('mg-instance-picker');
-        const mod = document.getElementById('mg-model-picker');
-        if (inst) inst.innerHTML = instHtml || '<div class="text-muted small">No instances.</div>';
-        if (mod) mod.innerHTML = modelHtml || '<div class="text-muted small">No models.</div>';
-        this._renderWarnings();
+    /** What the group adds up to: the models it would serve, and how they got in. */
+    _renderReadout(owners) {
+        const el = document.getElementById('mg-readout');
+        if (!el) return;
+        // Counted from the catalogue, so members that no longer exist add nothing.
+        const instanceKeys = new Set(this._instances.map(i => i.provider_key));
+        const serves = this._models.filter(m => this._selectedModels.has(m.model_id)
+            || (this._selectedInstances.has(m.provider) && !owners.models[m.model_id])).length;
+        const instances = [...this._selectedInstances].filter(k => instanceKeys.has(k)).length;
+        const singles = this._models.filter(m => this._selectedModels.has(m.model_id)
+            && !this._selectedInstances.has(m.provider)).length;
+        if (!instances && !singles) { el.innerHTML = '<span class="mg-readout__how">Nothing selected</span>'; return; }
+        const how = [];
+        if (instances) how.push(this._plural(instances, 'instance'));
+        if (singles) how.push(`${singles} single pick${singles === 1 ? '' : 's'}`);
+        el.innerHTML = `<span class="mg-readout__n">${this._plural(serves, 'model')}</span>
+            <span class="mg-readout__how">from ${how.join(' and ')}</span>`;
     }
 
     /** Explain the precedence the admin is setting up, before they save it. */
-    _renderWarnings() {
+    _renderWarnings(owners) {
         const esc = window.UIUtils.escapeHtml;
         const el = document.getElementById('mg-member-warnings');
         if (!el) return;
-        const owners = this._owners();
+        const tally = (counts, k) => { counts[k] = (counts[k] || 0) + 1; return counts; };
         const notes = [];
-        this._selectedModels.forEach(mid => {
-            const pk = mid.split('/')[0];
-            if (owners.instances[pk]) {
-                notes.push(`<i class="fas fa-circle-info me-1"></i>${esc(mid)} is taken out of
-                    '${esc(owners.instances[pk])}', which holds its instance: this group's limit will govern it.`);
-            }
+
+        // Models picked here whose instance another group holds.
+        const takenFrom = [...this._selectedModels]
+            .map(mid => owners.instances[mid.split('/')[0]]).filter(Boolean).reduce(tally, {});
+        Object.entries(takenFrom).forEach(([group, n]) => {
+            notes.push(`${this._plural(n, 'model')} ${n === 1 ? 'moves' : 'move'} out of <span class="mg-owner">${esc(group)}</span>,
+                which holds ${n === 1 ? 'its' : 'their'} instance. This group's limits apply to ${n === 1 ? 'it' : 'them'}.`);
         });
+        // Instances checked here with models another group picks by name.
         this._selectedInstances.forEach(pk => {
-            const carved = Object.keys(owners.models).filter(mid => mid.split('/')[0] === pk);
-            if (carved.length) {
-                notes.push(`<i class="fas fa-circle-info me-1"></i>${carved.length} model(s) of ${esc(pk)} stay in
-                    the group that lists them by name.`);
-            }
+            const keptBy = Object.entries(owners.models)
+                .filter(([mid]) => mid.split('/')[0] === pk).map(([, group]) => group).reduce(tally, {});
+            Object.entries(keptBy).forEach(([group, n]) => {
+                notes.push(`${this._plural(n, 'model')} of ${esc(pk)} ${n === 1 ? 'stays' : 'stay'} in <span class="mg-owner">${esc(group)}</span>,
+                    which picks ${n === 1 ? 'it' : 'them'} by name.`);
+            });
         });
-        el.innerHTML = notes.map(n => `<div class="text-warning">${n}</div>`).join('');
+        el.innerHTML = notes.map(n => `<p><i class="fas fa-circle-info"></i><span>${n}</span></p>`).join('');
     }
 
     _onToggle(checkbox) {
         const set = checkbox.dataset.kind === 'instance' ? this._selectedInstances : this._selectedModels;
         if (checkbox.checked) set.add(checkbox.value); else set.delete(checkbox.value);
-        this._renderWarnings();
+        this._refreshTree();
+    }
+
+    _toggleExpand(key) {
+        if (this._expanded.has(key)) this._expanded.delete(key); else this._expanded.add(key);
+        this._refreshTree();
     }
 
     filterMembers(query) {
-        this._renderPickers(query);
+        this._filter = query.trim().toLowerCase();
+        this._autoExpand();
+        this._renderTree();
+    }
+
+    toggleSelectedOnly() {
+        this._setSelectedOnly(!this._selectedOnly);
+        this._renderTree();
+    }
+
+    _setSelectedOnly(on) {
+        this._selectedOnly = on;
+        document.getElementById('mg-selected-only')?.setAttribute('aria-pressed', String(on));
     }
 
     _errorText(detail, fallback) {
@@ -419,7 +582,11 @@ class ModelGroupManager {
         const groupId = document.getElementById('mg-group-id').value;
         const name = document.getElementById('mg-name').value.trim();
         const description = document.getElementById('mg-description').value.trim() || null;
-        if (!name) { window.UIUtils.showToast('Name is required.', 'error'); return; }
+        if (!name) {
+            window.UIUtils.showToast('Give the group a name.', 'error');
+            document.getElementById('mg-name').focus();
+            return;
+        }
         const members = {
             model_ids: [...this._selectedModels],
             provider_keys: [...this._selectedInstances],

@@ -6,53 +6,35 @@
 <!-- Load admin page styles through a versioned URL so new rules aren't masked
      by a stale copy the browser cached from main.css's unversioned @import. -->
 <link href="/static/css/pages/admin.css?v={{ cache_version | default('1') }}" rel="stylesheet">
+{% include 'components/_dash_sidebar_head.html' %}
 {% endblock %}
 
+{% block main_class %}app-main--with-sidebar{% endblock %}
+
 {% block content %}
+{% from 'components/_dash_sidebar.html' import dash_sidebar %}
+{% set sidebar_tabs = [
+    {'id': 'users', 'label': 'User Management', 'icon': 'fa-users'},
+    {'id': 'profiles', 'label': 'Profiles', 'icon': 'fa-id-badge'},
+    {'id': 'pools', 'label': 'Pools', 'icon': 'fa-users-rectangle'},
+    {'id': 'rate-limits', 'label': 'Rate Limits', 'icon': 'fa-tachometer-alt'},
+    {'id': 'model-mapping', 'label': 'Model Mapping', 'icon': 'fa-map-signs'},
+    {'id': 'providers', 'label': 'Providers & Models', 'icon': 'fa-server'},
+    {'id': 'models', 'label': 'Model Access', 'icon': 'fa-cubes'},
+    {'id': 'model-groups', 'label': 'Model Groups', 'icon': 'fa-layer-group'},
+    {'id': 'websearch', 'label': 'Web Search', 'icon': 'fa-magnifying-glass'},
+    {'id': 'requests', 'label': 'Active Requests', 'icon': 'fa-satellite-dish'},
+    {'id': 'usage', 'label': 'Usage', 'icon': 'fa-chart-bar'},
+] %}
+<div class="dash-layout">
+{{ dash_sidebar(sidebar_tabs, 'users', 'Admin sections') }}
+<div class="dash-content reveal-on-load">
 <!-- Admin Dashboard Header -->
 <div class="d-flex justify-content-between align-items-center mb-4">
     <div>
         <h1 class="h2 mb-0">Admin Dashboard</h1>
         <p class="text-muted mb-0">Welcome, {{ admin.username }}</p>
     </div>
-</div>
-
-
-<!-- Tab Navigation -->
-<div class="tab-navigation">
-    <button class="tab-button active" onclick="showTab('users')">
-        <i class="fas fa-users"></i> User Management
-    </button>
-    <button class="tab-button" onclick="showTab('profiles')">
-        <i class="fas fa-id-badge"></i> Profiles
-    </button>
-    <button class="tab-button" onclick="showTab('pools')">
-        <i class="fas fa-users-rectangle"></i> Pools
-    </button>
-    <button class="tab-button" onclick="showTab('rate-limits')">
-        <i class="fas fa-tachometer-alt"></i> Rate Limits
-    </button>
-    <button class="tab-button" onclick="showTab('model-mapping')">
-        <i class="fas fa-map-signs"></i> Model Mapping
-    </button>
-    <button class="tab-button" onclick="showTab('providers')">
-        <i class="fas fa-server"></i> Providers &amp; Models
-    </button>
-    <button class="tab-button" onclick="showTab('models')">
-        <i class="fas fa-cubes"></i> Model Access
-    </button>
-    <button class="tab-button" onclick="showTab('model-groups')">
-        <i class="fas fa-layer-group"></i> Model Groups
-    </button>
-    <button class="tab-button" onclick="showTab('websearch')">
-        <i class="fas fa-magnifying-glass"></i> Web Search
-    </button>
-    <button class="tab-button" onclick="showTab('requests')">
-        <i class="fas fa-satellite-dish"></i> Active Requests
-    </button>
-    <button class="tab-button" onclick="showTab('usage')">
-        <i class="fas fa-chart-bar"></i> Usage
-    </button>
 </div>
 
 <!-- Users Management Section -->
@@ -766,57 +748,63 @@
 </div>
 
 <!-- Model Group Create/Edit Modal -->
-<div class="modal fade" id="modelGroupModal" tabindex="-1" aria-hidden="true">
+<div class="modal fade mg-modal" id="modelGroupModal" tabindex="-1" aria-hidden="true" aria-labelledby="modelGroupModalTitle">
     <div class="modal-dialog modal-lg modal-dialog-centered">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title" id="modelGroupModalTitle">New Model Group</h5>
-                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                <h5 class="modal-title" id="modelGroupModalTitle">New group</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
             </div>
             <div class="modal-body">
                 <input type="hidden" id="mg-group-id">
-                <div class="row g-3">
+                <div class="row g-3 mb-4">
                     <div class="col-md-6">
-                        <label class="form-label">Name <span class="text-danger">*</span></label>
-                        <input type="text" id="mg-name" class="form-control" maxlength="64" placeholder="e.g. premium-bedrock">
-                        <div class="form-text">Letters, digits, spaces, hyphens, underscores. Max 64 chars.</div>
+                        <label class="form-label" for="mg-name">Name <span class="text-danger">*</span></label>
+                        <input type="text" id="mg-name" class="form-control" maxlength="64" aria-required="true"
+                            placeholder="e.g. premium-bedrock" aria-describedby="mg-name-hint">
+                        <div class="form-text" id="mg-name-hint">Letters, digits, spaces, hyphens and underscores, up to 64.</div>
                     </div>
                     <div class="col-md-6">
-                        <label class="form-label">Description</label>
+                        <label class="form-label" for="mg-description">Description</label>
                         <input type="text" id="mg-description" class="form-control" maxlength="256" placeholder="Optional">
                     </div>
-                    <div class="col-12">
-                        <input type="text" id="mg-member-search" class="form-control form-control-sm mb-2"
-                            placeholder="Search instances and models…" oninput="window.ModelGroupManager?.filterMembers(this.value)">
-                        <div class="row g-3">
-                            <div class="col-md-5">
-                                <label class="form-label mb-1">Provider instances</label>
-                                <div class="form-text mt-0 mb-1">Every model of the instance, including ones synced later.</div>
-                                <div class="border rounded p-2" style="max-height:260px;overflow-y:auto;" id="mg-instance-picker">
-                                    <div class="text-muted small">Loading…</div>
-                                </div>
-                            </div>
-                            <div class="col-md-7">
-                                <label class="form-label mb-1">Individual models</label>
-                                <div class="form-text mt-0 mb-1">A model listed here wins over an instance in another group.</div>
-                                <div class="border rounded p-2" style="max-height:260px;overflow-y:auto;" id="mg-model-picker">
-                                    <div class="text-muted small">Loading…</div>
-                                </div>
-                            </div>
-                        </div>
-                        <div id="mg-member-warnings" class="small mt-2"></div>
-                        <div class="form-text">
-                            Each model and each instance can belong to one group. A new group starts with
-                            the limits its models already had (the strictest, if they differed); change
-                            them in Rate Limits.
-                        </div>
-                    </div>
                 </div>
+
+                <section class="mg-members" aria-labelledby="mg-members-label">
+                    <div class="mg-members__head">
+                        <span class="form-label mb-0" id="mg-members-label">Members</span>
+                        <span class="mg-readout" id="mg-readout" aria-live="polite"></span>
+                    </div>
+                    <div class="mg-toolbar">
+                        <div class="mg-search">
+                            <i class="fas fa-search"></i>
+                            <input type="search" id="mg-member-search" class="form-control form-control-sm"
+                                placeholder="Find an instance or model" aria-label="Find an instance or model"
+                                oninput="window.ModelGroupManager?.filterMembers(this.value)">
+                        </div>
+                        <button type="button" class="btn btn-outline-secondary btn-sm mg-filter" id="mg-selected-only"
+                            aria-pressed="false" onclick="window.ModelGroupManager?.toggleSelectedOnly()">
+                            Selected only
+                        </button>
+                    </div>
+                    <div class="mg-tree" id="mg-member-tree">
+                        <div class="mg-empty">Loading…</div>
+                    </div>
+                    <p class="mg-legend">
+                        Check an instance to include every model it has, including ones synced later.
+                        Open it to pick single models instead: a model picked by name stays in this
+                        group even when another group holds its instance.
+                    </p>
+                    <div id="mg-member-warnings" class="mg-notes"></div>
+                </section>
             </div>
             <div class="modal-footer">
+                <p class="mg-footnote" id="mg-limits-note">
+                    A new group starts with the strictest limits its models already had. Change them in Rate Limits.
+                </p>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-primary" onclick="window.ModelGroupManager?.saveGroup()">
-                    <i class="fas fa-save me-1"></i>Save Group
+                <button type="button" class="btn btn-primary" id="mg-save" onclick="window.ModelGroupManager?.saveGroup()">
+                    Save changes
                 </button>
             </div>
         </div>
@@ -1422,6 +1410,8 @@
     </div>
     <div class="ws-updated" id="ws-updated"></div>
 </div>
+</div><!-- /.dash-content -->
+</div><!-- /.dash-layout -->
 {% endblock %}
 
 {% block extra_js %}
@@ -1445,4 +1435,5 @@
 <script src="/static/js/features/admin/model-alias-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/websearch-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/admin-dashboard.js?v={{ cache_version }}"></script>
+<script src="/static/js/core/dash-sidebar.js?v={{ cache_version }}"></script>
 {% endblock %}

@@ -294,14 +294,9 @@ function showCopied(button, text) {
 let _allModels = [];
 let _filteredModels = [];
 let _modelApiSupport = {};
-let _modelAnthropicMode = {};
 
-// "anthropic" badge text; adapter-served models are converted from OpenAI.
-function _apiBadge(api, anthropicMode) {
-    const converted = api === 'anthropic' && anthropicMode === 'adapter';
-    const label = converted ? 'anthropic (converted)' : api;
-    const title = converted ? ' title="Served on the Anthropic Messages API by converting to/from OpenAI chat completions"' : '';
-    return `<span class="api-badge ${escapeHtml(api)}"${title}>${escapeHtml(label)}</span>`;
+function _apiBadge(api) {
+    return `<span class="api-badge ${escapeHtml(api)}">${escapeHtml(api)}</span>`;
 }
 
 function initModelsTab() {
@@ -309,10 +304,8 @@ function initModelsTab() {
 
     // Build support map and model list from embedded data
     _modelApiSupport = {};
-    _modelAnthropicMode = {};
     modelsData.forEach(m => {
         if (m.supported_apis) _modelApiSupport[m.id] = m.supported_apis;
-        if (m.anthropic_mode) _modelAnthropicMode[m.id] = m.anthropic_mode;
     });
 
     _allModels = modelsData
@@ -357,7 +350,7 @@ function _displayModels() {
     _filteredModels.forEach(model => {
         const name = model.model_name;
         const apis = _modelApiSupport[name] || ['openai'];
-        const badges = apis.map(a => _apiBadge(a, _modelAnthropicMode[name])).join('');
+        const badges = apis.map(_apiBadge).join('');
         const disabledTag = model.disabled
             ? `<span class="api-badge model-disabled-badge" title="Disabled for your profile — contact an admin for access"><i class="fas fa-ban me-1"></i>disabled</span>`
             : '';

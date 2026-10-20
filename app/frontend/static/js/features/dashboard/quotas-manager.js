@@ -90,7 +90,7 @@ class QuotasManager {
             });
         });
 
-        // Wire the footer-bar model dropdowns for large buckets (mirrors the
+        // Wire the footer-bar model dropdowns (mirrors the
         // endpoints tab: click or Enter/Space on the bar expands the list).
         container.querySelectorAll('.quota-foot').forEach(foot => {
             foot.addEventListener('click', () => this._toggleModels(foot));
@@ -102,10 +102,6 @@ class QuotasManager {
             });
         });
     }
-
-    // Buckets with more than this many models tuck their chip wall behind an
-    // endpoints-style footer bar so the quota header + meter stay the focus.
-    static COLLAPSE_THRESHOLD = 8;
 
     _renderSection(s, index) {
         const models = s.models || [];
@@ -119,17 +115,14 @@ class QuotasManager {
             ? `<span class="quota-desc">${this._escapeHtml(s.description)}</span>`
             : '';
 
-        const collapsible = count > QuotasManager.COLLAPSE_THRESHOLD;
-        const chips = count ? models.map(m => this._renderChip(m)).join('') : '';
+        const chips = models.map(m => this._renderChip(m)).join('');
 
-        // Small buckets: models sit inline under the RPM label. Large buckets:
-        // the foot carries RPM only, and models move to the collapsible footer bar.
-        const inlineModels = collapsible
-            ? ''
-            : (count ? `<div class="quota-models">${chips}</div>` : `<span class="quota-empty">No models</span>`);
+        // Models always live in an endpoints-style collapsible footer bar so the
+        // quota header + meter stay the focus; an empty bucket just says so inline.
+        const inlineModels = count ? '' : `<span class="quota-empty">No models</span>`;
 
         const listId = `quota-models-${index}`;
-        const dropdown = collapsible ? `
+        const dropdown = count ? `
             <div class="quota-foot" role="button" tabindex="0" aria-expanded="false"
                  aria-controls="${listId}" data-target="${listId}">
                 <span class="foot-label"><span class="foot-count">${count}</span> models</span>

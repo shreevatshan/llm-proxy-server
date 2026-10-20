@@ -285,37 +285,30 @@
         to { transform: translateX(0); opacity: 1; }
     }
 </style>
+{% include 'components/_dash_sidebar_head.html' %}
 {% endblock %}
 
+{% block main_class %}app-main--with-sidebar{% endblock %}
+
 {% block content %}
+{% from 'components/_dash_sidebar.html' import dash_sidebar %}
+{% set sidebar_tabs = [
+    {'id': 'api-keys', 'label': 'API Key Management', 'icon': 'fa-key'},
+    {'id': 'endpoints', 'label': 'Endpoints', 'icon': 'fa-plug'},
+    {'id': 'models', 'label': 'Models', 'icon': 'fa-list'},
+    {'id': 'usage', 'label': 'Usage', 'icon': 'fa-chart-bar'},
+    {'id': 'quotas', 'label': 'Quotas', 'icon': 'fa-gauge-high'},
+    {'id': 'pool', 'label': 'Pool', 'icon': 'fa-users'},
+] %}
+<div class="dash-layout">
+{{ dash_sidebar(sidebar_tabs, 'api-keys', 'Dashboard sections') }}
+<div class="dash-content reveal-on-load">
 <div class="row">
     <div class="col-12">
         <div class="mb-4">
             <h1 id="welcomeMessage" class="h2 mb-1">Welcome back!</h1>
         </div>
     </div>
-</div>
-
-<!-- Tab Navigation -->
-<div class="tab-navigation mb-4">
-    <button class="tab-button active" onclick="showTab('api-keys')">
-        <i class="fas fa-key"></i> API Key Management
-    </button>
-    <button class="tab-button" onclick="showTab('endpoints')">
-        <i class="fas fa-plug"></i> Endpoints
-    </button>
-    <button class="tab-button" onclick="showTab('models')">
-        <i class="fas fa-list"></i> Models
-    </button>
-    <button class="tab-button" onclick="showTab('usage')">
-        <i class="fas fa-chart-bar"></i> Usage
-    </button>
-    <button class="tab-button" onclick="showTab('quotas')">
-        <i class="fas fa-gauge-high"></i> Quotas
-    </button>
-    <button class="tab-button" onclick="showTab('pool')">
-        <i class="fas fa-users"></i> Pool
-    </button>
 </div>
 
 <!-- ══════════════════════════════════════════════════════ API Keys -->
@@ -772,6 +765,8 @@
 
 <!-- Toast Container -->
 <div id="toast-container" class="toast-container"></div>
+</div><!-- /.dash-content -->
+</div><!-- /.dash-layout -->
 {% endblock %}
 
 {% block extra_js %}
@@ -797,4 +792,5 @@
 <script src="/static/js/features/dashboard/user-usage-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/quotas-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/pool-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/core/dash-sidebar.js?v={{ cache_version }}"></script>
 {% endblock %}

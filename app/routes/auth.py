@@ -583,7 +583,7 @@ async def get_my_quotas(
     profile's own limits. Admins are exempt and receive is_admin=True, sections=[].
     """
     from app.auth.database import list_model_groups
-    from app.profiles import DEFAULT_GROUP_ID
+    from app.profiles import DEFAULT_GROUP_ID, profile_registry
     from app.rate_limit import rate_limit_tracker
     from app.providers.provider_manager import provider_manager
 
