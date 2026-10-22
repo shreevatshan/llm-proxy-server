@@ -318,6 +318,7 @@ async def azure_chat_completions(
                 getattr(provider, "full_provider_name", None),
                 provider.chat_completion,
                 provider.chat_completion_stream,
+                user_id=get_owner_user_id(auth),
             )
             if request.stream:
                 current_context = otel_context.get_current()
@@ -815,6 +816,7 @@ async def azure_responses_create(
                 request,
                 getattr(provider, "full_provider_name", None),
                 lambda r: provider_manager.responses_create(r, user_id=owner_id),
+                user_id=owner_id,
             )
             if request.stream:
                 current_context = otel_context.get_current()

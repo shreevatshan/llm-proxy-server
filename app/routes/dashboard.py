@@ -9,7 +9,7 @@ from typing import Optional, List, Dict
 
 from app.auth.database import get_db, is_self_delete_allowed
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin, get_current_user_optional
-from app.auth.models import User
+from app.auth.models import FOURGET_WEB_SCRAPERS, User
 from app.auth.admin import AdminUser, get_admin_email
 from typing import Union
 
@@ -162,6 +162,8 @@ async def dashboard_home(
             "anthropic_endpoints_json": _safe_json(anthropic_endpoints),
             "azure_endpoints_json": _safe_json(azure_endpoints),
             "models_json": _safe_json(models_list),
+            # 4get has no discovery endpoint; the Web Search tab offers this list.
+            "fourget_scrapers": FOURGET_WEB_SCRAPERS,
         }
     )
 

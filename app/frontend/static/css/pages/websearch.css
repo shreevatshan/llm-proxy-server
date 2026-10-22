@@ -1,4 +1,4 @@
-/* LLM Proxy Server - Admin Web Search tab */
+/* LLM Proxy Server - Web Search: the admin tab and the user's preferences tab */
 /* Loaded after dark-flat-override.css so these scoped rules win without !important. */
 
 .ws-page {
@@ -390,6 +390,90 @@
 .ws-test__snippet {
     max-width: 80ch;
     color: var(--mono-text-secondary);
+}
+
+/* ================================
+   BACKENDS LIST + MODAL
+   ================================ */
+
+.ws-backends td {
+    vertical-align: middle;
+}
+
+.ws-backends__name {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    font-weight: var(--font-semibold);
+    color: var(--mono-text-primary);
+}
+
+.ws-backends__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-3);
+    margin-top: 2px;
+    font-size: var(--text-xs);
+    color: var(--mono-text-secondary);
+}
+
+.ws-backends__url {
+    overflow-wrap: anywhere;
+}
+
+.ws-backends__flag {
+    font-style: italic;
+}
+
+.ws-backends [aria-disabled="true"] {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.ws-subhead--first {
+    margin-top: 0;
+    padding-top: 0;
+    border-top: 0;
+}
+
+.ws-subhead--split {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+}
+
+/* ================================
+   NOTICES + INHERITED VALUES
+   ================================ */
+
+.ws-callout {
+    margin: 0 0 var(--space-4);
+    padding: var(--space-3) var(--space-4);
+    border: 1px dashed var(--mono-5);
+    border-radius: var(--radius-md);
+    font-size: var(--text-sm);
+    line-height: 1.6;
+    color: var(--mono-text-primary);
+}
+
+.ws-callout i {
+    margin-right: var(--space-2);
+    color: var(--mono-text-secondary);
+}
+
+.ws-intro {
+    max-width: 72ch;
+    margin-bottom: var(--space-5);
+    color: var(--mono-text-secondary);
+}
+
+.ws-actions {
+    display: flex;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-bottom: var(--ws-gap);
 }
 
 /* ================================

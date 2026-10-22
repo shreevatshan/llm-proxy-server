@@ -32,6 +32,8 @@ from app.auth.database import (
     set_group_members, get_model_group_limits, model_group_overview,
     reload_reference_caches, clear_model_group_members,
     get_websearch_settings, upsert_websearch_settings,
+    list_websearch_backends, get_websearch_backend, create_websearch_backend,
+    update_websearch_backend, delete_websearch_backend, count_backend_users,
     normalize_new_username, get_profile, get_profile_by_name, list_profiles, create_profile,
     update_profile, delete_profile, assign_users_profile, list_profile_member_ids, list_profile_members,
     upsert_profile_limits, upsert_profile_group_limit, set_group_limit_for_all_profiles,
@@ -54,7 +56,8 @@ from app.auth.models import (
     MODEL_ALIAS_API_SURFACES, validate_alias_pattern,
     AdminPoolResponse, AdminPoolLimitsUpdate, PoolSettingsResponse, PoolSettingsUpdate,
     WebSearchSettingsResponse, WebSearchSettingsUpdate, WebSearchTestRequest, WebSearchEnginesRequest,
-    FOURGET_WEB_SCRAPERS, WEBSEARCH_PROVIDER_LABELS,
+    WebSearchBackendCreate, WebSearchBackendUpdate, WebSearchBackendResponse,
+    FOURGET_WEB_SCRAPERS, WEBSEARCH_PROVIDER_LABELS, WEBSEARCH_PROVIDER_SEARXNG,
 )
 from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_admin_email
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
@@ -1588,23 +1591,22 @@ async def list_profile_members_endpoint(
 
 # ==================== Web Search Interception (SearXNG / 4get) ====================
 
-def _websearch_response(row) -> WebSearchSettingsResponse:
-    from app.websearch.settings import config_from_row
+async def _reload_websearch() -> None:
+    """Apply a change to requests now (other workers catch up on their refresh)."""
+    from app.websearch.settings import websearch_settings_cache
+    await websearch_settings_cache.load_from_database()
 
-    cfg = config_from_row(row)
+
+def _websearch_response(row, backends) -> WebSearchSettingsResponse:
+    from app.websearch.settings import settings_config
+
+    cfg = settings_config(row)
+    default_id = getattr(row, "default_backend_id", None)
+    default = next((b for b in backends if b.id == default_id), None)
     return WebSearchSettingsResponse(
         enabled=cfg.enabled,
-        provider=cfg.provider,
-        searxng_base_url=cfg.searxng_base_url,
-        engines=cfg.engines,
-        categories=cfg.categories,
-        language=cfg.language,
-        safesearch=cfg.safesearch,
-        time_range=cfg.time_range,
-        fourget_base_url=cfg.fourget_base_url,
-        fourget_scraper=cfg.fourget_scraper,
-        fourget_lang=cfg.fourget_lang,
-        fourget_country=cfg.fourget_country,
+        default_backend_id=default.id if default else None,
+        default_backend={"id": default.id, "name": default.name, "type": default.type} if default else None,
         max_results=cfg.max_results,
         max_snippet_chars=cfg.max_snippet_chars,
         timeout_seconds=cfg.timeout_seconds,
@@ -1621,13 +1623,64 @@ def _websearch_values(body: WebSearchSettingsUpdate) -> dict:
     return body.model_dump()
 
 
+def _backend_response(row, default_id: Optional[int], user_counts: dict) -> WebSearchBackendResponse:
+    return WebSearchBackendResponse(
+        id=row.id, name=row.name, type=row.type, base_url=row.base_url,
+        enabled=bool(row.enabled), user_selectable=bool(row.user_selectable),
+        engines=row.engines, categories=row.categories, language=row.language,
+        fourget_scraper=row.fourget_scraper, fourget_lang=row.fourget_lang,
+        fourget_country=row.fourget_country, safesearch=row.safesearch, time_range=row.time_range,
+        is_default=row.id == default_id,
+        user_count=user_counts.get(row.id, 0),
+        updated_at=row.updated_at, updated_by=row.updated_by,
+    )
+
+
+async def _backend_responses(db: AsyncSession) -> List[WebSearchBackendResponse]:
+    settings = await get_websearch_settings(db)
+    default_id = getattr(settings, "default_backend_id", None)
+    counts = await count_backend_users(db)
+    return [_backend_response(b, default_id, counts) for b in await list_websearch_backends(db)]
+
+
+async def _one_backend_response(db: AsyncSession, backend_id: int) -> WebSearchBackendResponse:
+    return next(b for b in await _backend_responses(db) if b.id == backend_id)
+
+
+async def _check_backend_name(db: AsyncSession, name: str, backend_id: Optional[int] = None) -> None:
+    """409 when another backend has the name, ignoring case."""
+    from sqlalchemy import func
+    from app.auth.models import WebSearchBackend
+    # lower() equality, like the unique index: ilike would read "_" as a wildcard.
+    q = select(WebSearchBackend.id).where(func.lower(WebSearchBackend.name) == name.lower())
+    if backend_id is not None:
+        q = q.where(WebSearchBackend.id != backend_id)
+    if (await db.execute(q.limit(1))).first():
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"A backend named '{name}' already exists")
+
+
+async def _require_backend(db: AsyncSession, backend_id: int):
+    row = await get_websearch_backend(db, backend_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Web search backend not found")
+    return row
+
+
+async def _is_default_backend(db: AsyncSession, backend_id: int) -> bool:
+    settings = await get_websearch_settings(db)
+    return getattr(settings, "default_backend_id", None) == backend_id
+
+
+_DEFAULT_BACKEND_LOCKED = "Choose another default backend first"
+
+
 @router.get("/websearch/settings", response_model=WebSearchSettingsResponse)
 async def get_websearch_settings_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get web search interception settings (API key masked)."""
-    return _websearch_response(await get_websearch_settings(db))
+    """Get web search interception settings and the defaults users inherit."""
+    return _websearch_response(await get_websearch_settings(db), await list_websearch_backends(db))
 
 
 @router.put("/websearch/settings", response_model=WebSearchSettingsResponse)
@@ -1637,10 +1690,101 @@ async def update_websearch_settings_endpoint(
     db: AsyncSession = Depends(get_db),
 ):
     """Replace web search interception settings and reload the request-time snapshot."""
+    if body.default_backend_id is not None:
+        backend = await get_websearch_backend(db, body.default_backend_id)
+        if backend is None or not backend.enabled:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="The default backend must be an existing, enabled backend",
+            )
     row = await upsert_websearch_settings(db, _websearch_values(body), current_admin.username)
-    from app.websearch.settings import config_from_row, websearch_settings_cache
-    websearch_settings_cache.set_config(config_from_row(row))
-    return _websearch_response(row)
+    await _reload_websearch()
+    return _websearch_response(row, await list_websearch_backends(db))
+
+
+@router.get("/websearch/backends", response_model=List[WebSearchBackendResponse])
+async def list_websearch_backends_endpoint(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every search backend, with whether it is the default and how many users picked it."""
+    return await _backend_responses(db)
+
+
+@router.post("/websearch/backends", response_model=WebSearchBackendResponse)
+async def create_websearch_backend_endpoint(
+    body: WebSearchBackendCreate,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Add a backend. The first one becomes the default."""
+    await _check_backend_name(db, body.name)
+    try:
+        row = await create_websearch_backend(db, body.column_values(), current_admin.username)
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="The name was taken by a concurrent edit; reload and retry")
+    await _reload_websearch()
+    return await _one_backend_response(db, row.id)
+
+
+@router.put("/websearch/backends", response_model=WebSearchBackendResponse)
+async def update_websearch_backend_endpoint(
+    body: WebSearchBackendUpdate,
+    backend_id: int = Query(..., description="Backend ID to update"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace a backend's definition. Its type is fixed: users' parameters for it
+    only make sense on that type."""
+    row = await _require_backend(db, backend_id)
+    if body.type != row.type:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="A backend's type cannot change; add a new backend instead")
+    if not body.enabled and await _is_default_backend(db, backend_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_DEFAULT_BACKEND_LOCKED)
+    await _check_backend_name(db, body.name, backend_id)
+    try:
+        await update_websearch_backend(db, backend_id, body.column_values(), current_admin.username)
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="The name was taken by a concurrent edit; reload and retry")
+    await _reload_websearch()
+    return await _one_backend_response(db, backend_id)
+
+
+@router.put("/websearch/backends/toggle", response_model=WebSearchBackendResponse)
+async def toggle_websearch_backend_endpoint(
+    toggle_data: ToggleRequest,
+    backend_id: int = Query(..., description="Backend ID to enable or disable"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Switch a backend on or off. While off, users who picked it use the default."""
+    await _require_backend(db, backend_id)
+    if not toggle_data.enabled and await _is_default_backend(db, backend_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_DEFAULT_BACKEND_LOCKED)
+    await update_websearch_backend(db, backend_id, {"enabled": toggle_data.enabled}, current_admin.username)
+    await _reload_websearch()
+    return await _one_backend_response(db, backend_id)
+
+
+@router.delete("/websearch/backends")
+async def delete_websearch_backend_endpoint(
+    backend_id: int = Query(..., description="Backend ID to delete"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a backend. Users who picked it go back to the default, and their
+    parameters for it are removed."""
+    if await _is_default_backend(db, backend_id):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_DEFAULT_BACKEND_LOCKED)
+    if not await delete_websearch_backend(db, backend_id):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Web search backend not found")
+    await _reload_websearch()
+    return {"message": f"Web search backend {backend_id} deleted"}
 
 
 @router.post("/websearch/test")
@@ -1649,21 +1793,31 @@ async def test_websearch_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Run one live query against the selected backend, with stored or unsaved settings."""
+    """Run one live query against an unsaved backend, a stored one, or the default."""
     import time as _time
     from app.websearch.backends import search
-    from app.websearch.settings import config_from_row
+    from app.websearch.settings import BackendSpec, apply_backend, load_snapshot
 
-    stored = config_from_row(await get_websearch_settings(db))
-    cfg = stored
+    snapshot = await load_snapshot(db)
+    cfg = snapshot.default
     if body.settings is not None:
-        values = _websearch_values(body.settings)
+        values = body.settings.model_dump(exclude={"enabled", "default_backend_id"})
         values["apply_to"] = frozenset(values["apply_to"])
         values["enabled_providers"] = frozenset(values["enabled_providers"])
-        cfg = stored.with_overrides(**values)
+        cfg = cfg.with_overrides(**values)
+    if body.backend is not None:
+        params = body.backend.params_for(body.backend.type)
+        cfg = apply_backend(cfg, BackendSpec(
+            id=body.backend_id, name=body.backend.name, type=body.backend.type, base_url=body.backend.base_url,
+            params={k: v for k, v in params.items() if v is not None},
+        ))
+    elif body.backend_id is not None:
+        backend = snapshot.backends.get(body.backend_id)
+        if backend is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Web search backend not found")
+        cfg = apply_backend(cfg, backend)
     if not cfg.base_url:
-        label = WEBSEARCH_PROVIDER_LABELS.get(cfg.provider, cfg.provider)
-        raise HTTPException(status_code=400, detail=f"{label} base URL is not configured")
+        raise HTTPException(status_code=400, detail="No backend to test: add one, or set the default backend")
 
     started = _time.monotonic()
     outcome = await search(body.query, cfg)
@@ -1687,16 +1841,33 @@ async def list_websearch_engines(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Engines and categories loaded on the SearXNG instance (from its /config)."""
+    """Engines and categories loaded on a SearXNG instance (from its /config)."""
     from app.websearch.searxng import SearxngConfigError, fetch_engines
-    from app.websearch.settings import config_from_row
+    from app.websearch.settings import load_snapshot
 
-    stored = config_from_row(await get_websearch_settings(db))
-    base_url = body.searxng_base_url or stored.searxng_base_url
+    snapshot = await load_snapshot(db)
+    base_url = body.base_url
+    if base_url is None and body.backend_id is not None:
+        backend = snapshot.backends.get(body.backend_id)
+        if backend is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Web search backend not found")
+        if backend.type != WEBSEARCH_PROVIDER_SEARXNG:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                detail=f"{backend.name} is not a SearXNG backend")
+        base_url = backend.base_url
+    if base_url is None:
+        # The default when it is SearXNG, else the first enabled SearXNG backend:
+        # before multiple backends, the stored SearXNG URL answered here even while
+        # 4get was the provider.
+        base_url = snapshot.default.searxng_base_url or next(
+            (b.base_url for b in sorted(snapshot.backends.values(), key=lambda b: b.id)
+             if b.enabled and b.type == WEBSEARCH_PROVIDER_SEARXNG),
+            None,
+        )
     if not base_url:
         raise HTTPException(status_code=400, detail="SearXNG base URL is not configured")
     try:
-        return await fetch_engines(base_url, stored.timeout_seconds)
+        return await fetch_engines(base_url, snapshot.default.timeout_seconds)
     except SearxngConfigError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

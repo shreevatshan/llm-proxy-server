@@ -26,7 +26,7 @@ from app.providers.provider_manager import provider_manager
 from app.providers.custom_providers import CustomProvider
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
 from app.conversion.token_estimate import estimate_anthropic_input_tokens
-from app.auth.middleware import authenticate_anthropic_request
+from app.auth.middleware import authenticate_anthropic_request, get_owner_user_id
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from app.tracing import (
@@ -254,12 +254,17 @@ async def create_message(
             # replaced by the plain "web_search_proxy" function tool, which
             # adapters forward like any other client tool.
             try:
-                websearch_loop = maybe_intercept_anthropic(request, provider, anthropic_beta)
+                websearch_loop = maybe_intercept_anthropic(
+                    request, provider, anthropic_beta, user_id=get_owner_user_id(auth),
+                )
             except WebSearchRequestError as e:
                 return _anthropic_error(400, "invalid_request_error", str(e))
             if websearch_loop is not None:
                 request = websearch_loop.request
-                add_span_attributes(span, {"anthropic.websearch_interception": True})
+                add_span_attributes(span, {
+                    "anthropic.websearch_interception": True,
+                    "anthropic.websearch_backend": websearch_loop.cfg.backend_name or "",
+                })
 
             request_metadata = _get_anthropic_request_metadata(provider, request, anthropic_beta)
             if request_metadata.mode == "unsupported":

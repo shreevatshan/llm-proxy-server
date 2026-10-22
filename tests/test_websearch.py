@@ -915,6 +915,20 @@ class AnthropicRouteTests(_ConfigMixin, unittest.TestCase):
         self.assertIn("web_search_tool_result", body)
         self.assertEqual(self._searches, [["weather"]])
 
+    def test_route_runs_with_the_callers_config(self):
+        seen = []
+        real = websearch_settings_cache.resolve_config
+
+        def spy(user_id):
+            seen.append(user_id)
+            return real(user_id)
+
+        provider = _ScriptedCustomProvider(responses=[_msg([{"type": "text", "text": "hi"}], "end_turn")])
+        with patch.object(websearch_settings_cache, "resolve_config", spy), \
+                patch("app.routes.anthropic_messages.get_owner_user_id", return_value=42):
+            self._invoke_create_message(self._payload(stream=False), provider)
+        self.assertEqual(seen, [42])
+
     def test_disabled_passes_through(self):
         websearch_settings_cache.set_config(CFG.with_overrides(enabled=False))
         provider = _ScriptedCustomProvider(responses=[_msg([{"type": "text", "text": "hi"}], "end_turn")])
@@ -931,97 +945,149 @@ class AdminSettingsTests(unittest.TestCase):
         from app.auth.models import WebSearchSettingsUpdate
 
         with self.assertRaises(ValidationError):
-            WebSearchSettingsUpdate(enabled=True)  # URL required when enabled
-        with self.assertRaises(ValidationError):
-            WebSearchSettingsUpdate(searxng_base_url="ftp://x")
+            WebSearchSettingsUpdate(enabled=True)  # a default backend is required when enabled
         with self.assertRaises(ValidationError):
             WebSearchSettingsUpdate(apply_to=["embeddings"])
         with self.assertRaises(ValidationError):
             WebSearchSettingsUpdate(max_agentic_loops=0)
-        ok = WebSearchSettingsUpdate(enabled=True, searxng_base_url=" http://s:8080/ ", engines="  ")
-        self.assertEqual(ok.searxng_base_url, "http://s:8080")
-        self.assertIsNone(ok.engines)
+        with self.assertRaises(ValidationError):
+            WebSearchSettingsUpdate(max_results=21)
+        with self.assertRaises(ValidationError):   # the pre-multiple-backends shape
+            WebSearchSettingsUpdate(provider="searxng", searxng_base_url="http://s")
+        ok =WebSearchSettingsUpdate(enabled=True, default_backend_id=3, enabled_providers=[" a ", "a", ""])
+        self.assertEqual(ok.default_backend_id, 3)
+        self.assertEqual(ok.enabled_providers, ["a"])
 
     def test_backend_validation(self):
         from pydantic import ValidationError
-        from app.auth.models import WebSearchSettingsUpdate
+        from app.auth.models import WebSearchBackendCreate
+
+        def backend(**kw):
+            return WebSearchBackendCreate(**{"name": "S", "type": "searxng", "base_url": "http://s", **kw})
 
         with self.assertRaises(ValidationError):
-            WebSearchSettingsUpdate(provider="bing")
+            backend(type="bing")
         with self.assertRaises(ValidationError):
-            WebSearchSettingsUpdate(fourget_scraper="not_a_scraper")
+            backend(base_url="ftp://x")
         with self.assertRaises(ValidationError):
-            WebSearchSettingsUpdate(fourget_base_url="ftp://x")
+            backend(base_url="  ")
         with self.assertRaises(ValidationError):
-            WebSearchSettingsUpdate(fourget_country="a bad value")
-        # The *selected* backend's URL is the one that is required.
+            backend(name="bad/name")
         with self.assertRaises(ValidationError):
-            WebSearchSettingsUpdate(enabled=True, provider="fourget", searxng_base_url="http://s")
-        ok = WebSearchSettingsUpdate(
-            enabled=True, provider="fourget", fourget_base_url=" http://fourget/ ",
-            fourget_scraper="ddg", fourget_lang="en", fourget_country="us-en",
+            backend(type="fourget", fourget_scraper="not_a_scraper")
+        with self.assertRaises(ValidationError):
+            backend(type="fourget", fourget_country="a bad value")
+        with self.assertRaises(ValidationError):
+            backend(safesearch=3)
+        ok = backend(base_url=" http://s:8080/ ", engines="  ", categories="news")
+        self.assertEqual(ok.base_url, "http://s:8080")
+        self.assertIsNone(ok.engines)
+        # The other type's parameters are never read, so they are not kept.
+        fourget = backend(
+            type="fourget", base_url="http://fourget", engines="bing", language="en",
+            fourget_scraper="ddg", fourget_lang="en", fourget_country="us-en", time_range="week",
         )
-        self.assertEqual(ok.fourget_base_url, "http://fourget")
-        self.assertIsNone(ok.searxng_base_url)
+        self.assertIsNone(fourget.engines)
+        self.assertIsNone(fourget.language)
+        self.assertEqual(fourget.fourget_scraper, "ddg")
+        self.assertEqual(fourget.time_range, "week")
+        self.assertEqual(set(fourget.params_for("fourget")),
+                         {"fourget_scraper", "fourget_lang", "fourget_country", "safesearch", "time_range"})
 
-    def test_row_round_trip(self):
+    def test_user_update_validation(self):
+        from pydantic import ValidationError
+        from app.auth.models import UserWebSearchUpdate, WebSearchEnginesRequest
+
+        # Admin-only knobs are refused, not ignored.
+        for field, value in (("enabled", False), ("timeout_seconds", 60), ("max_agentic_loops", 10)):
+            with self.assertRaises(ValidationError):
+                UserWebSearchUpdate(**{field: value})
+        with self.assertRaises(ValidationError):
+            UserWebSearchUpdate(max_results=0)
+        with self.assertRaises(ValidationError):
+            UserWebSearchUpdate(max_snippet_chars=5001)
+        self.assertIsNone(UserWebSearchUpdate(language=" ").language)
+        # The pre-multiple-backends field name still works.
+        self.assertEqual(WebSearchEnginesRequest(searxng_base_url="http://s/").base_url, "http://s")
+
+    @staticmethod
+    def _settings_row(**kw):
         from types import SimpleNamespace
-        from app.auth.models import FOURGET_WEB_SCRAPERS, WebSearchSettingsUpdate
-        from app.routes.admin import _websearch_response, _websearch_values
-        from app.websearch.settings import config_from_row
-
-        self.assertEqual(_websearch_values(WebSearchSettingsUpdate(searxng_base_url="http://s"))["searxng_base_url"], "http://s")
-
-        row = SimpleNamespace(
-            enabled=True, searxng_base_url="http://s", engines=None,
-            categories=None, language=None, safesearch=None, time_range=None, max_results=None,
-            max_snippet_chars=None, timeout_seconds=None, max_agentic_loops=4, max_queries_per_turn=None,
+        values = dict(
+            enabled=True, default_backend_id=1, max_results=None, max_snippet_chars=None,
+            timeout_seconds=None, max_agentic_loops=4, max_queries_per_turn=None,
             apply_to=json.dumps(["chat_completions"]), enabled_providers=json.dumps(["*"]),
-            provider=None, fourget_base_url=None, fourget_scraper=None, fourget_lang=None, fourget_country=None,
             updated_at=None, updated_by="admin",
         )
-        cfg = config_from_row(row)
+        values.update(kw)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def _backend_row(**kw):
+        from types import SimpleNamespace
+        values = dict(
+            id=1, name="S", type="searxng", base_url="http://s", enabled=True, user_selectable=True,
+            engines=None, categories=None, language=None, safesearch=None, time_range=None,
+            fourget_scraper=None, fourget_lang=None, fourget_country=None,
+        )
+        values.update(kw)
+        return SimpleNamespace(**values)
+
+    def test_settings_and_backend_round_trip(self):
+        from app.auth.models import WebSearchSettingsUpdate
+        from app.routes.admin import _websearch_response, _websearch_values
+        from app.websearch.settings import WebSearchSnapshot, settings_config
+
+        # Every key must be a column name and a WebSearchConfig field: the admin
+        # test endpoint hands the same dict to with_overrides.
+        for key in _websearch_values(WebSearchSettingsUpdate()):
+            self.assertTrue(hasattr(CFG, key) or key == "default_backend_id", key)
+
+        settings = self._settings_row()
+        cfg = settings_config(settings)
         self.assertEqual(cfg.max_agentic_loops, 4)
         self.assertEqual(cfg.max_results, 5)
         self.assertEqual(cfg.apply_to, frozenset({"chat_completions"}))
-        # A row predating the backend columns (NULL after the migration) defaults to SearXNG.
-        self.assertEqual(cfg.provider, "searxng")
-        self.assertIsNone(cfg.fourget_base_url)
-        self.assertEqual(cfg.fourget_scraper, FOURGET_WEB_SCRAPERS[0])
-        self.assertEqual(cfg.base_url, "http://s")
-        response = _websearch_response(row)
-        self.assertEqual(response.searxng_base_url, "http://s")
-        self.assertIsNone(config_from_row(None).searxng_base_url)
+        self.assertIsNone(cfg.base_url)  # no backend applied
 
-    def test_fourget_row_round_trip(self):
-        from types import SimpleNamespace
-        from app.auth.models import WebSearchSettingsUpdate
-        from app.routes.admin import _websearch_response, _websearch_values
-        from app.websearch.settings import config_from_row
+        snapshot = WebSearchSnapshot.from_rows(settings, [self._backend_row()], [], [])
+        self.assertEqual(snapshot.default.base_url, "http://s")
+        self.assertEqual(snapshot.default.provider, "searxng")
+        self.assertEqual(snapshot.default.categories, "general")  # NULL column -> default
+        self.assertEqual(snapshot.default.backend_name, "S")
+        response = _websearch_response(settings, [self._backend_row()])
+        self.assertEqual(response.default_backend, {"id": 1, "name": "S", "type": "searxng"})
+        self.assertIsNone(WebSearchSnapshot.from_rows(None, [], [], []).default.base_url)
 
-        values = _websearch_values(WebSearchSettingsUpdate(
-            enabled=True, provider="fourget", fourget_base_url="http://fourget",
-            fourget_scraper="brave", fourget_lang="en", fourget_country="us",
-        ))
-        # Every key must be both a column name and a WebSearchConfig field: the
-        # same dict is handed to upsert_websearch_settings and to with_overrides.
-        for key in ("provider", "fourget_base_url", "fourget_scraper", "fourget_lang", "fourget_country"):
-            self.assertIn(key, values)
+    def test_fourget_backend_applies(self):
+        from app.auth.models import FOURGET_WEB_SCRAPERS
+        from app.websearch.settings import WebSearchSnapshot
 
-        row = SimpleNamespace(
-            enabled=True, provider="fourget", searxng_base_url=None, engines=None,
-            categories=None, language=None, safesearch=None, time_range=None,
-            fourget_base_url="http://fourget", fourget_scraper="brave",
-            fourget_lang="en", fourget_country="us",
-            max_results=None, max_snippet_chars=None, timeout_seconds=None,
-            max_agentic_loops=None, max_queries_per_turn=None,
-            apply_to=None, enabled_providers=json.dumps(["*"]),
-            updated_at=None, updated_by="admin",
+        backend = self._backend_row(
+            type="fourget", base_url="http://fourget", fourget_lang="en", fourget_country="us",
+            engines="stale",  # another type's column is never read
         )
-        cfg = config_from_row(row)
+        cfg = WebSearchSnapshot.from_rows(self._settings_row(), [backend], [], []).default
+        self.assertEqual(cfg.provider, "fourget")
         self.assertEqual(cfg.base_url, "http://fourget")
-        self.assertEqual(cfg.fourget_scraper, "brave")
-        self.assertEqual(_websearch_response(row).provider, "fourget")
+        self.assertIsNone(cfg.searxng_base_url)
+        self.assertEqual(cfg.fourget_scraper, FOURGET_WEB_SCRAPERS[0])
+        self.assertEqual(cfg.fourget_country, "us")
+        self.assertIsNone(cfg.engines)
+
+    def test_disabled_or_missing_default_backend_turns_interception_off(self):
+        from app.websearch.settings import WebSearchSettingsCache, WebSearchSnapshot
+
+        cache = WebSearchSettingsCache()
+        for backends, settings in (
+            ([self._backend_row(enabled=False)], self._settings_row()),
+            ([self._backend_row()], self._settings_row(default_backend_id=9)),
+            ([self._backend_row()], self._settings_row(default_backend_id=None)),
+        ):
+            cache._snapshot = WebSearchSnapshot.from_rows(settings, backends, [], [])
+            self.assertFalse(cache.is_active("chat_completions", "custom:test"))
+        cache._snapshot = WebSearchSnapshot.from_rows(self._settings_row(), [self._backend_row()], [], [])
+        self.assertTrue(cache.is_active("chat_completions", "custom:test"))
 
     def test_is_active(self):
         from app.websearch.settings import WebSearchSettingsCache

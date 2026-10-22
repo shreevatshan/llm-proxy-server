@@ -1,142 +1,6 @@
-function wsEscape(text) {
-    return window.UIUtils?.escapeHtml ? window.UIUtils.escapeHtml(String(text ?? '')) : String(text ?? '');
-}
-
-// Searchable multi-select built on a Bootstrap dropdown. Items are
-// {value, label, hint?, group?, hidden?}; a hidden item is listed only while selected.
-class WsPicker {
-    constructor(root, opts = {}) {
-        this.root = root;
-        this.opts = opts;
-        this.items = [];
-        this.selected = new Set();
-        const id = root.id;
-        const labelledBy = root.dataset.labelledby || '';
-        const clearBtn = '<button type="button" class="btn btn-outline-secondary btn-sm ws-picker__clear">Clear all</button>';
-        root.innerHTML = `
-            <button class="form-select ws-picker__toggle" type="button" data-bs-toggle="dropdown"
-                    data-bs-auto-close="outside" aria-expanded="false" aria-labelledby="${labelledBy} ${id}-summary">
-                <span class="ws-picker__summary" id="${id}-summary"></span>
-            </button>
-            <div class="dropdown-menu ws-picker__menu">
-                ${opts.searchable === false ? '' : `
-                <div class="ws-picker__search">
-                    <div class="ws-picker__search-field">
-                        <i class="fas fa-magnifying-glass"></i>
-                        <input type="search" class="form-control form-control-sm" aria-label="${wsEscape(opts.searchPlaceholder || 'Search')}"
-                               placeholder="${wsEscape(opts.searchPlaceholder || 'Search')}">
-                    </div>
-                    ${clearBtn}
-                </div>`}
-                ${opts.extraHtml ? `<div class="ws-picker__extra">${opts.extraHtml}</div>` : ''}
-                <div class="ws-picker__list" role="group" aria-labelledby="${labelledBy}"></div>
-                <div class="ws-picker__foot">
-                    <span class="ws-picker__count"></span>
-                    ${opts.searchable === false ? clearBtn : ''}
-                </div>
-            </div>`;
-        this._summary = root.querySelector('.ws-picker__summary');
-        this._list = root.querySelector('.ws-picker__list');
-        this._search = root.querySelector('.ws-picker__search input');
-        this._count = root.querySelector('.ws-picker__count');
-        this._clear = root.querySelector('.ws-picker__clear');
-
-        this._search?.addEventListener('input', () => this.renderList());
-        this._list.addEventListener('change', e => {
-            const cb = e.target.closest('input[type="checkbox"]');
-            if (!cb) return;
-            if (cb.checked) this.selected.add(cb.value); else this.selected.delete(cb.value);
-            this._emit();
-        });
-        this._clear.addEventListener('click', () => {
-            this.selected = new Set();
-            this.renderList();
-            this._emit();
-        });
-        root.addEventListener('shown.bs.dropdown', () => this._search?.focus());
-        root.addEventListener('hidden.bs.dropdown', () => {
-            if (this._search && this._search.value) {
-                this._search.value = '';
-                this.renderList();
-            }
-        });
-    }
-
-    set(items, selected) {
-        this.items = items;
-        this.selected = new Set(selected);
-        this.render();
-    }
-
-    render() {
-        this.renderSummary();
-        this.renderList();
-    }
-
-    _disabled() {
-        return !!this.opts.isDisabled?.();
-    }
-
-    // In selection order, so a comma-separated value reads back as stored.
-    _selectedItems() {
-        const byValue = new Map(this.items.map(it => [it.value, it]));
-        return [...this.selected].map(v => byValue.get(v)).filter(Boolean);
-    }
-
-    renderSummary() {
-        const picked = this._selectedItems();
-        const custom = this.opts.summarize?.(picked, this);
-        let text = custom;
-        if (text == null) {
-            const labels = picked.map(it => it.label);
-            text = labels.length === 0 ? null
-                : labels.length <= 3 ? labels.join(', ')
-                : `${labels.slice(0, 2).join(', ')} and ${labels.length - 2} more`;
-        }
-        this._summary.textContent = text ?? (this.opts.placeholder || 'None selected');
-        this._summary.classList.toggle('is-placeholder', text == null);
-    }
-
-    renderList() {
-        const q = (this._search?.value || '').trim().toLowerCase();
-        const disabled = this._disabled();
-        const visible = this.items.filter(it =>
-            (!it.hidden || this.selected.has(it.value))
-            && (!q || `${it.label} ${it.hint || ''}`.toLowerCase().includes(q)));
-        let html = '';
-        let group;
-        visible.forEach(it => {
-            if (it.group && it.group !== group) {
-                html += `<div class="ws-picker__group">${wsEscape(it.group)}</div>`;
-            }
-            group = it.group;
-            html += `
-                <label class="ws-picker__item${disabled ? ' is-disabled' : ''}">
-                    <input class="form-check-input" type="checkbox" value="${wsEscape(it.value)}"
-                           ${this.selected.has(it.value) ? 'checked' : ''} ${disabled ? 'disabled' : ''}>
-                    <span class="ws-picker__label">${wsEscape(it.label)}</span>
-                    ${it.hint ? `<span class="ws-picker__hint">${wsEscape(it.hint)}</span>` : ''}
-                </label>`;
-        });
-        if (!visible.length) {
-            html = `<div class="ws-picker__empty">${q
-                ? `Nothing matches “${wsEscape(q)}”.`
-                : wsEscape(this.opts.emptyText || 'Nothing to pick.')}</div>`;
-        }
-        this._list.innerHTML = html;
-        this._list.classList.toggle('is-disabled', disabled);
-        const n = this.selected.size;
-        this._count.textContent = disabled ? '' : (n ? `${n} selected` : (this.opts.noneText || 'None selected'));
-        this._clear.disabled = disabled || n === 0;
-    }
-
-    _emit() {
-        this.renderSummary();
-        this._count.textContent = this.selected.size ? `${this.selected.size} selected` : (this.opts.noneText || 'None selected');
-        this._clear.disabled = this.selected.size === 0;
-        this.opts.onChange?.(new Set(this.selected));
-    }
-}
+// Admin Web Search tab: interception settings, the defaults users inherit, and
+// the list of backends. WsPicker, WsParamsForm and the WS_* constants come from
+// features/shared/websearch-params.js.
 
 const WS_SURFACES = [
     { value: 'anthropic_messages', label: 'Anthropic Messages', hint: '/messages' },
@@ -144,33 +8,38 @@ const WS_SURFACES = [
     { value: 'responses', label: 'Responses', hint: '/responses' },
 ];
 
-// Same check as the server's base URL validator.
-const WS_URL_RE = /^https?:\/\/[^\s/]+/;
+const WS_URL_HELP = {
+    searxng: 'Every query the model writes is sent here. The instance must list <code>json</code> under <code>search.formats</code> in its <code>settings.yml</code>.',
+    fourget: 'Queried at <code>/api/v1/web</code>. The instance must have its API enabled and bot protection off.',
+};
+const WS_URL_PLACEHOLDER = { searxng: 'http://searxng:8080', fourget: 'http://fourget' };
 
 class WebSearchManager {
     constructor() {
         this._settings = null;
         this._providers = [];
-        this._engines = null;  // [{name, categories, enabled, shortcut}] from SearXNG /config
-        this._categories = null;  // category names from SearXNG /config
+        this._backends = [];
         this._pickers = null;
-        this._connOpened = false;
-        this._source = 'categories';  // 'all' | 'categories' | 'engines'
-        this._sourceFromSaved = true;  // re-derive once the catalog loads
-        this._activeProvider = null;  // backend the form currently shows
+        this._params = null;       // WsParamsForm in the backend modal
+        this._editing = null;      // backend the modal edits; null = adding one
+        this._modalType = 'searxng';
+        this._returnFocus = null;
+        this._testRun = 0;
     }
 
     async load() {
-        this._initPickers();
-        await Promise.all([this._loadSettings(), this._loadProviders()]);
+        this._init();
+        await Promise.all([this._loadSettings(), this._loadProviders(), this._loadBackends()]);
+        if (this._settings) this._fill(this._settings);
         this._renderProviders();
-        // Populate the category and engine pickers automatically once a URL is saved.
-        if (this._settings?.provider !== 'fourget' && this._settings?.searxng_base_url && this._engines === null) {
-            this.fetchEngines({ quiet: true });
-        }
+        this._renderBackends();
     }
 
-    _initPickers() {
+    _el(id) {
+        return document.getElementById(id);
+    }
+
+    _init() {
         if (this._pickers) return;
         const allProviders = () => this._el('ws-all-providers')?.checked;
         this._pickers = {
@@ -178,7 +47,6 @@ class WebSearchManager {
                 searchable: false,
                 placeholder: 'None, interception never runs',
                 summarize: picked => picked.length === WS_SURFACES.length ? 'All' : null,
-                onChange: () => this._changed(),
             }),
             providers: new WsPicker(this._el('ws-providers-picker'), {
                 searchPlaceholder: 'Search providers',
@@ -191,302 +59,118 @@ class WebSearchManager {
                         <input class="form-check-input" type="checkbox" role="switch" id="ws-all-providers">
                         <label class="form-check-label" for="ws-all-providers">All providers, including ones added later</label>
                     </div>`,
-                onChange: () => this._changed(),
-            }),
-            categories: new WsPicker(this._el('ws-categories-picker'), {
-                searchPlaceholder: 'Search categories',
-                placeholder: 'None selected, uses general',
-                onChange: names => {
-                    this._setCsv('ws-categories', names);
-                    this.renderCategories();
-                    this._changed();
-                },
-            }),
-            engines: new WsPicker(this._el('ws-engines-picker'), {
-                searchPlaceholder: 'Search engines or categories',
-                placeholder: 'None selected',
-                emptyText: 'The instance has no engines.',
-                onChange: names => {
-                    this._setCsv('ws-engines', names);
-                    this._changed();
-                },
             }),
         };
-        this._el('ws-all-providers').addEventListener('change', () => {
-            this._pickers.providers.render();
-            this._changed();
+        this._el('ws-all-providers').addEventListener('change', () => this._pickers.providers.render());
+
+        const body = this._el('ws-backends-body');
+        body.addEventListener('click', e => this._onRowClick(e));
+
+        let scrapers = [];
+        try { scrapers = JSON.parse(this._el('ws-fourget-scrapers').textContent); } catch (e) { /* none */ }
+        this._params = new WsParamsForm(this._el('wsb-params'), {
+            idPrefix: 'wsb',
+            scrapers,
+            // The modal body would clip the pickers' menus otherwise.
+            fixedMenus: true,
+            fetchEngines: () => this._fetchEngines(),
         });
-        this._el('ws-engines').addEventListener('input', () => this.renderEngines());
-        this._el('ws-fourget-scraper').addEventListener('change', () => this._changed());
-        document.querySelectorAll('input[name="ws-provider"]').forEach(radio => {
-            radio.addEventListener('change', () => {
-                this._setProvider(radio.value);
-                // load() only fetches the catalog when SearXNG was the saved backend.
-                if (radio.value === 'searxng' && this._engines === null) this.fetchEngines({ quiet: true });
-            });
+        document.querySelectorAll('input[name="wsb-type"]').forEach(radio => {
+            radio.addEventListener('change', () => this._setModalType(radio.value));
         });
-        document.querySelectorAll('input[name="ws-source"]').forEach(radio => {
-            radio.addEventListener('change', () => {
-                this._sourceFromSaved = false;
-                this._setSource(radio.value);
-            });
-        });
-        // Any plain field edit refreshes the collapsed section summaries.
-        const tab = this._el('websearch-tab');
-        tab.addEventListener('input', () => this._changed());
-        tab.addEventListener('change', () => this._changed());
-    }
-
-    _provider() {
-        return document.querySelector('input[name="ws-provider"]:checked')?.value || 'searxng';
-    }
-
-    // Display name, from the backend's radio label.
-    _label(provider) {
-        return document.querySelector(`label[for="ws-provider-${provider}"]`)?.textContent.trim() || provider;
-    }
-
-    // The base URL input of a backend, the selected one by default.
-    _urlEl(provider = this._provider()) {
-        return this._el(`ws-${provider}-url`);
-    }
-
-    // The hidden backend's URL field can't be fixed from view, so an invalid
-    // value there keeps the saved URL rather than failing the save.
-    _urlValue(provider) {
-        const value = this._urlEl(provider).value.trim() || null;
-        if (provider === this._provider() || value === null || WS_URL_RE.test(value)) return value;
-        return this._settings?.[`${provider}_base_url`] ?? null;
-    }
-
-    _setProvider(provider) {
-        const isFourget = provider === 'fourget';
-        if (provider !== this._activeProvider) {
-            this._activeProvider = provider;
-            // A test result belongs to the backend it ran against; don't leave it under the other one.
-            this._testRun = (this._testRun || 0) + 1;
-            this._el('ws-test-result').innerHTML = '';
-        }
-        this._el('ws-provider-searxng').checked = !isFourget;
-        this._el('ws-provider-fourget').checked = isFourget;
-        this._el('ws-conn-searxng').hidden = isFourget;
-        this._el('ws-conn-fourget').hidden = !isFourget;
-        this._el('ws-params-searxng').hidden = isFourget;
-        this._el('ws-params-fourget').hidden = !isFourget;
-        // Engine/category discovery is a SearXNG endpoint.
-        this._el('ws-engines-fetch-btn').hidden = isFourget;
-        this._el('ws-safesearch-help').innerHTML = isFourget
-            ? "Sent as 4get's <code>nsfw</code> filter: off \u2192 yes, moderate \u2192 maybe, strict \u2192 no."
-            : "Sent as SearXNG's <code>safesearch</code>.";
-        this.updateParamsVisibility();
-        this._changed();
-    }
-
-    updateParamsVisibility() {
-        const hasUrl = WS_URL_RE.test(this._urlEl().value.trim());
-        this._el('ws-params-card').style.display = hasUrl ? '' : 'none';
-    }
-
-    _csv(id) {
-        return this._el(id).value.split(',').map(e => e.trim()).filter(Boolean);
-    }
-
-    _setCsv(id, names) {
-        // Keep the user's order, append new picks at the end.
-        const kept = this._csv(id).filter(n => names.has(n));
-        const added = [...names].filter(n => !kept.includes(n));
-        this._el(id).value = [...kept, ...added].join(',');
-    }
-
-    // Categories and engines are exclusive: SearXNG would union them.
-    _deriveSource() {
-        if (this._csv('ws-engines').length) return 'engines';
-        const picked = new Set(this._csv('ws-categories'));
-        if (this._categories?.length && this._categories.every(c => picked.has(c))) return 'all';
-        return 'categories';
-    }
-
-    _setSource(source) {
-        // "All" needs the instance's category list.
-        if (source === 'all' && !this._categories?.length) source = 'categories';
-        this._source = source;
-        ['all', 'categories', 'engines'].forEach(name => {
-            this._el(`ws-source-${name}`).checked = name === source;
-            this._el(`ws-source-${name}-field`).hidden = name !== source;
-        });
-        const allRadio = this._el('ws-source-all');
-        allRadio.disabled = !this._categories?.length;
-        allRadio.nextElementSibling.title = allRadio.disabled ? 'Reload from SearXNG to list its categories' : '';
-        if (this._categories?.length) {
-            this._el('ws-source-all-note').textContent =
-                `All ${this._categories.length} categories (${this._categories.join(', ')}), each with the engines the instance turns on for it.`;
-        }
-        this._changed();
-    }
-
-    // Once SearXNG's catalog is loaded, the pickers replace the comma-separated inputs.
-    _showCatalogPickers(on) {
-        ['categories', 'engines'].forEach(name => {
-            this._el(`ws-${name}`).hidden = on;
-            this._el(`ws-${name}-picker`).hidden = !on;
+        const modal = this._el('wsBackendModal');
+        modal.addEventListener('hidden.bs.modal', () => {
+            this._returnFocus?.focus();
+            this._returnFocus = null;
         });
     }
 
-    renderCategories() {
-        if (!this._pickers || !this._categories) return;
-        const counts = {};
-        (this._engines || []).forEach(e => {
-            if (!e.enabled) return;
-            e.categories.forEach(c => { counts[c] = (counts[c] || 0) + 1; });
-        });
-        // Most useful first: categories with more default-on engines.
-        const ordered = [...this._categories].sort((a, b) => (counts[b] || 0) - (counts[a] || 0) || a.localeCompare(b));
-        const unknown = this._csv('ws-categories').filter(c => !this._categories.includes(c));
-        const plural = n => `${n} engine${n === 1 ? '' : 's'} on by default`;
-        const items = [
-            ...unknown.map(c => ({ value: c, label: c, group: 'Not on this instance' })),
-            ...ordered.map(c => ({ value: c, label: c, hint: plural(counts[c] || 0), group: unknown.length ? 'On this instance' : undefined })),
-        ];
-        this._pickers.categories.set(items, this._csv('ws-categories'));
-    }
+    // ---- loading -------------------------------------------------------
 
-    async fetchEngines({ quiet = false } = {}) {
-        const btn = this._el('ws-engines-fetch-btn');
-        const baseUrl = this._el('ws-searxng-url').value.trim();
-        if (!baseUrl) {
-            if (!quiet) window.UIUtils?.showToast('Enter the SearXNG base URL first.', 'error');
-            return;
-        }
-        btn.disabled = true;
+    async _get(url, failure) {
         try {
-            const resp = await fetch('/admin/websearch/engines', {
-                method: 'POST',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ searxng_base_url: baseUrl }),
-            });
-            const data = await resp.json().catch(() => ({}));
-            if (!resp.ok) {
-                if (!quiet) window.UIUtils?.showToast(this._errorMessage(data, 'Failed to load engines.'), 'error');
-                return;
-            }
-            this._engines = data.engines || [];
-            this._categories = data.categories || [];
-            this._showCatalogPickers(true);
-            this.renderCategories();
-            this.renderEngines();
-            this._setSource(this._sourceFromSaved ? this._deriveSource() : this._source);
-            if (!quiet) {
-                window.UIUtils?.showToast(
-                    `Loaded ${this._categories.length} categories and ${this._engines.length} engines from SearXNG.`, 'success');
-            }
+            const resp = await fetch(url, { credentials: 'include' });
+            if (resp.ok) return await resp.json();
+            if (failure) window.UIUtils?.showToast(failure, 'error');
         } catch (e) {
-            if (!quiet) window.UIUtils?.showToast('Network error loading engines.', 'error');
-        } finally {
-            btn.disabled = false;
+            console.error('WebSearchManager:', url, e);
+            if (failure) window.UIUtils?.showToast(failure, 'error');
         }
-    }
-
-    renderEngines() {
-        if (!this._pickers || !this._engines) return;
-        const known = new Set(this._engines.map(e => e.name));
-        const unknown = this._csv('ws-engines').filter(n => !known.has(n));
-        // One alphabetical list: "on by default" only matters when SearXNG picks engines for a category.
-        const items = [
-            ...unknown.map(n => ({ value: n, label: n, group: 'Not on this instance' })),
-            ...[...this._engines].sort((a, b) => a.name.localeCompare(b.name)).map(e => ({
-                value: e.name,
-                label: e.name,
-                hint: e.categories.join(', '),
-                group: unknown.length ? 'On this instance' : undefined,
-            })),
-        ];
-        this._pickers.engines.set(items, this._csv('ws-engines'));
-        this._renderSummaries();
-    }
-
-    _el(id) {
-        return document.getElementById(id);
-    }
-
-    _escape(text) {
-        return wsEscape(text);
+        return null;
     }
 
     async _loadSettings() {
-        try {
-            const resp = await fetch('/admin/websearch/settings', { credentials: 'include' });
-            if (!resp.ok) {
-                window.UIUtils?.showToast('Failed to load web search settings.', 'error');
-                return;
-            }
-            this._settings = await resp.json();
-            this._fill(this._settings);
-        } catch (e) {
-            console.error('WebSearchManager: failed to load settings', e);
-        }
+        const data = await this._get('/admin/websearch/settings', 'Could not load the web search settings.');
+        if (data) this._settings = data;
     }
 
     async _loadProviders() {
+        const data = await this._get('/admin/websearch/providers');
+        this._providers = data?.providers || [];
+    }
+
+    async _loadBackends() {
+        const data = await this._get('/admin/websearch/backends', 'Could not load the web search backends.');
+        if (data) this._backends = data;
+    }
+
+    // Write requests: a toast on failure, the parsed body on success, else null.
+    async _send(url, method, body, failure) {
         try {
-            const resp = await fetch('/admin/websearch/providers', { credentials: 'include' });
-            if (!resp.ok) return;
-            const data = await resp.json();
-            this._providers = data.providers || [];
+            const resp = await fetch(url, {
+                method,
+                credentials: 'include',
+                headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+                body: body === undefined ? undefined : JSON.stringify(body),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok) return data;
+            window.UIUtils?.showToast(wsErrorMessage(data, failure), 'error');
         } catch (e) {
-            console.error('WebSearchManager: failed to load providers', e);
+            window.UIUtils?.showToast(`${failure} Check your connection and try again.`, 'error');
         }
+        return null;
+    }
+
+    // ---- settings ------------------------------------------------------
+
+    _enabledBackends() {
+        return this._backends.filter(b => b.enabled);
+    }
+
+    _defaultBackend() {
+        return this._backends.find(b => b.is_default) || null;
     }
 
     _fill(s) {
         this._el('ws-enabled').checked = !!s.enabled;
-        this._el('ws-searxng-url').value = s.searxng_base_url || '';
-        this._el('ws-fourget-url').value = s.fourget_base_url || '';
-        this._el('ws-fourget-lang').value = s.fourget_lang || '';
-        this._el('ws-fourget-country').value = s.fourget_country || '';
-        this._setScraper(s.fourget_scraper);
-        // Must come after both URLs are set: it decides which one to test.
-        this._setProvider(s.provider || 'searxng');
-        this._el('ws-timeout').value = s.timeout_seconds;
-        this._el('ws-engines').value = s.engines || '';
-        this._el('ws-categories').value = s.categories || '';
-        this.renderCategories();
-        this.renderEngines();
-        this._sourceFromSaved = true;
-        this._setSource(this._deriveSource());
-        this._el('ws-language').value = s.language || '';
-        this._el('ws-safesearch').value = String(s.safesearch);
-        this._el('ws-time-range').value = s.time_range || '';
-        this._el('ws-max-results').value = s.max_results;
-        this._el('ws-snippet-chars').value = s.max_snippet_chars;
         this._el('ws-max-loops').value = s.max_agentic_loops;
         this._el('ws-max-queries').value = s.max_queries_per_turn;
+        this._el('ws-timeout').value = s.timeout_seconds;
+        this._el('ws-max-results').value = s.max_results;
+        this._el('ws-snippet-chars').value = s.max_snippet_chars;
         this._pickers.surfaces.set(WS_SURFACES, s.apply_to || []);
         this._el('ws-all-providers').checked = (s.enabled_providers || []).includes('*');
-        // With nothing to connect to yet, start with the connection section open.
-        const savedUrl = s.provider === 'fourget' ? s.fourget_base_url : s.searxng_base_url;
-        if (!this._connOpened && !savedUrl && window.bootstrap) {
-            bootstrap.Collapse.getOrCreateInstance(this._el('ws-conn-body'), { toggle: false }).show();
-        }
-        this._connOpened = true;
+        this._renderDefaultSelect();
         const updated = this._el('ws-updated');
         updated.textContent = s.updated_at
-            ? `Last saved ${new Date(s.updated_at + (s.updated_at.endsWith('Z') ? '' : 'Z')).toLocaleString()}${s.updated_by ? ' by ' + s.updated_by : ''}.`
-            : 'Not saved yet.';
+            ? `Settings last saved ${new Date(s.updated_at + (s.updated_at.endsWith('Z') ? '' : 'Z')).toLocaleString()}${s.updated_by ? ' by ' + s.updated_by : ''}.`
+            : 'Settings not saved yet.';
     }
 
-    // A stored scraper the list no longer offers stays selected and visible (the
-    // server then rejects it on save) instead of the select going blank and
-    // silently saving the default.
-    _setScraper(name) {
-        const select = this._el('ws-fourget-scraper');
-        select.querySelectorAll('option[data-unsupported]').forEach(o => o.remove());
-        if (name && ![...select.options].some(o => o.value === name)) {
-            const option = new Option(`${name} (not supported)`, name);
-            option.dataset.unsupported = '';
-            select.add(option);
-        }
-        select.value = name || select.options[0]?.value || '';
+    _renderDefaultSelect() {
+        const select = this._el('ws-default-backend');
+        const enabled = this._enabledBackends();
+        const current = this._settings?.default_backend_id ?? null;
+        select.innerHTML = enabled.length
+            ? enabled.map(b => `<option value="${b.id}">${wsEscape(b.name)} (${WS_TYPE_LABELS[b.type] || b.type})</option>`).join('')
+            : '<option value="">Add a backend first</option>';
+        select.disabled = !enabled.length;
+        if (enabled.some(b => b.id === current)) select.value = String(current);
+        // Without a backend, interception has nowhere to send searches.
+        const toggle = this._el('ws-enabled');
+        toggle.disabled = !enabled.length && !toggle.checked;
+        this._el('ws-enabled-help').hidden = enabled.length > 0;
     }
 
     _renderProviders() {
@@ -504,7 +188,6 @@ class WebSearchManager {
             })),
         ];
         this._pickers.providers.set(items, selected);
-        this._renderSummaries();
     }
 
     _int(id) {
@@ -513,22 +196,10 @@ class WebSearchManager {
     }
 
     _collect() {
+        const defaultId = this._el('ws-default-backend').value;
         const body = {
             enabled: this._el('ws-enabled').checked,
-            provider: this._provider(),
-            // Both are always sent, so switching backends never drops the other's setup.
-            searxng_base_url: this._urlValue('searxng'),
-            fourget_base_url: this._urlValue('fourget'),
-            fourget_scraper: this._el('ws-fourget-scraper').value,
-            fourget_lang: this._el('ws-fourget-lang').value.trim() || null,
-            fourget_country: this._el('ws-fourget-country').value.trim() || null,
-            engines: this._source === 'engines' ? this._el('ws-engines').value.trim() || null : null,
-            categories: this._source === 'all' ? this._categories.join(',')
-                : this._source === 'categories' ? this._el('ws-categories').value.trim() || null
-                : null,
-            language: this._el('ws-language').value.trim() || null,
-            safesearch: parseInt(this._el('ws-safesearch').value, 10),
-            time_range: this._el('ws-time-range').value || null,
+            default_backend_id: defaultId ? parseInt(defaultId, 10) : null,
             timeout_seconds: this._int('ws-timeout'),
             max_results: this._int('ws-max-results'),
             max_snippet_chars: this._int('ws-snippet-chars'),
@@ -543,76 +214,251 @@ class WebSearchManager {
         return body;
     }
 
-    // Keeps the collapsed section headers in step with the fields.
-    _changed() {
-        if (!this._pickers) return;
-        this._renderSummaries();
-    }
-
-    _host(url) {
-        try { return new URL(url).host; } catch (e) { return url; }
-    }
-
-    _renderSummaries() {
-        if (!this._pickers) return;
-        const s = this._collect();
-        const isFourget = s.provider === 'fourget';
-        const url = isFourget ? s.fourget_base_url : s.searxng_base_url;
-        this._el('ws-conn-summary').textContent =
-            `${this._label(s.provider)} \u00b7 ${url ? this._host(url) : 'Not set'}`;
-        if (isFourget) {
-            this._el('ws-params-summary').textContent = `Scraper: ${s.fourget_scraper}`;
-            return;
-        }
-        const engines = (s.engines || '').split(',').filter(Boolean);
-        this._el('ws-params-summary').textContent =
-            this._source === 'all' ? 'All categories'
-            : this._source === 'engines'
-                ? (engines.length ? `${engines.length} engine${engines.length === 1 ? '' : 's'}` : 'No engines, general category')
-            : (s.categories || 'general').split(',').join(', ');
-    }
-
-    _errorMessage(err, fallback) {
-        if (Array.isArray(err.detail)) {
-            return err.detail.map(d => (d.msg || '').replace(/^Value error, /, '')).filter(Boolean).join('; ') || fallback;
-        }
-        return err.detail || fallback;
-    }
-
     async save() {
         const btn = this._el('ws-save-btn');
         btn.disabled = true;
         try {
-            const resp = await fetch('/admin/websearch/settings', {
-                method: 'PUT',
-                credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(this._collect()),
-            });
-            if (resp.ok) {
-                this._settings = await resp.json();
-                this._fill(this._settings);
-                this._renderProviders();
-                window.UIUtils?.showToast('Web search settings saved.', 'success');
-            } else {
-                const err = await resp.json().catch(() => ({}));
-                window.UIUtils?.showToast(this._errorMessage(err, 'Failed to save web search settings.'), 'error');
-            }
-        } catch (e) {
-            window.UIUtils?.showToast('Network error saving web search settings.', 'error');
+            const data = await this._send('/admin/websearch/settings', 'PUT', this._collect(), 'Settings were not saved.');
+            if (!data) return;
+            this._settings = data;
+            await this._loadBackends();   // the default marker may have moved
+            this._fill(data);
+            this._renderProviders();
+            this._renderBackends();
+            window.UIUtils?.showToast('Settings saved.', 'success');
         } finally {
             btn.disabled = false;
         }
     }
 
-    async test() {
-        const btn = this._el('ws-test-btn');
-        const out = this._el('ws-test-result');
-        const settings = this._collect();
-        const label = this._label(settings.provider);
-        const run = this._testRun = (this._testRun || 0) + 1;
-        // The test should not fail validation just because interception is off.
-        settings.enabled = false;
+    // ---- backends list -------------------------------------------------
+
+    _renderBackends() {
+        const rows = this._backends;
+        this._el('ws-backends-table').hidden = !rows.length;
+        this._el('ws-backends-empty').hidden = rows.length > 0;
+        this._el('ws-backends-body').innerHTML = rows.map(b => {
+            const name = wsEscape(b.name);
+            const locked = b.is_default ? ' aria-disabled="true" title="Choose another default backend first"' : '';
+            return `
+                <tr data-id="${b.id}">
+                    <td>
+                        <div class="ws-backends__name">${name}</div>
+                        <div class="ws-backends__meta">
+                            <span class="ws-backends__url">${wsEscape(b.base_url)}</span>
+                            ${b.user_selectable ? '' : '<span class="ws-backends__flag">Hidden from users</span>'}
+                        </div>
+                    </td>
+                    <td class="d-none d-md-table-cell">${WS_TYPE_LABELS[b.type] || wsEscape(b.type)}</td>
+                    <td class="text-end">${b.user_count}</td>
+                    <td>
+                        <div class="form-check form-switch mb-0">
+                            <input class="form-check-input" type="checkbox" role="switch" data-action="toggle"
+                                   aria-label="Enable ${name}" ${b.enabled ? 'checked' : ''}${locked}>
+                        </div>
+                    </td>
+                    <td class="text-end text-nowrap">
+                        <button type="button" class="btn btn-sm btn-outline-secondary" data-action="edit"
+                                aria-label="Edit ${name}" title="Edit"><i class="fas fa-pen"></i></button>
+                        <button type="button" class="btn btn-sm btn-outline-danger" data-action="delete"
+                                aria-label="Delete ${name}"${locked || ' title="Delete"'}><i class="fas fa-trash"></i></button>
+                    </td>
+                </tr>`;
+        }).join('');
+    }
+
+    _onRowClick(e) {
+        const control = e.target.closest('[data-action]');
+        if (!control) return;
+        const backend = this._backends.find(b => String(b.id) === control.closest('tr').dataset.id);
+        if (!backend) return;
+        if (control.getAttribute('aria-disabled') === 'true') {
+            // Reachable by keyboard so the reason can be given; the action itself is refused.
+            e.preventDefault();
+            window.UIUtils?.showToast('Choose another default backend first.', 'info');
+            return;
+        }
+        const action = control.dataset.action;
+        if (action === 'toggle') this.toggleBackend(backend, control);
+        else if (action === 'edit') this.openBackend(backend, control);
+        else if (action === 'delete') this.deleteBackend(backend);
+    }
+
+    _usersSentence(backend) {
+        const n = backend.user_count;
+        return `${n} user${n === 1 ? '' : 's'} picked ${backend.name}`;
+    }
+
+    async toggleBackend(backend, input) {
+        const enabled = input.checked;
+        if (!enabled && backend.user_count > 0) {
+            const fallback = this._defaultBackend()?.name || 'the default';
+            const ok = await window.UIUtils.showConfirmModal(
+                `Turn off ${backend.name}?`,
+                `${this._usersSentence(backend)}. Until you turn it back on they'll use the default, ${fallback}.`,
+                'warning',
+            );
+            if (!ok) {
+                input.checked = true;
+                return;
+            }
+        }
+        input.disabled = true;
+        const data = await this._send(
+            `/admin/websearch/backends/toggle?backend_id=${backend.id}`, 'PUT', { enabled },
+            `${backend.name} was not ${enabled ? 'turned on' : 'turned off'}.`,
+        );
+        input.disabled = false;
+        if (!data) {
+            input.checked = !enabled;
+            return;
+        }
+        window.UIUtils?.showToast(`${backend.name} turned ${enabled ? 'on' : 'off'}.`, 'success');
+        await this._refreshBackends();
+    }
+
+    async deleteBackend(backend) {
+        const fallback = this._defaultBackend()?.name || 'the default';
+        const users = backend.user_count > 0
+            ? ` ${this._usersSentence(backend)}. They'll use the default, ${fallback}, and their settings for this backend are removed.`
+            : '';
+        const ok = await window.UIUtils.showConfirmModal(`Delete ${backend.name}?`, `This can't be undone.${users}`, 'danger');
+        if (!ok) return;
+        const data = await this._send(`/admin/websearch/backends?backend_id=${backend.id}`, 'DELETE', undefined,
+            `${backend.name} was not deleted.`);
+        if (!data) return;
+        window.UIUtils?.showToast(`${backend.name} deleted.`, 'success');
+        await this._refreshBackends();
+    }
+
+    // Backends and the default select change together.
+    async _refreshBackends() {
+        await Promise.all([this._loadBackends(), this._loadSettings()]);
+        this._renderBackends();
+        this._renderDefaultSelect();
+    }
+
+    // ---- backend modal -------------------------------------------------
+
+    openBackend(backend = null, trigger = null) {
+        this._editing = backend;
+        this._returnFocus = trigger || document.activeElement;
+        const editing = backend !== null;
+        const type = backend?.type || 'searxng';
+        this._el('wsBackendModalTitle').textContent = editing ? `Edit ${backend.name}` : 'Add backend';
+        this._el('wsb-name').value = backend?.name || '';
+        this._el('wsb-url').value = backend?.base_url || '';
+        this._el('wsb-enabled').checked = backend ? backend.enabled : true;
+        this._el('wsb-selectable').checked = backend ? backend.user_selectable : true;
+        // A backend's type is fixed: users' parameters for it only fit that type.
+        this._el('wsb-type-choice').hidden = editing;
+        const fixed = this._el('wsb-type-fixed');
+        fixed.hidden = !editing;
+        fixed.textContent = WS_TYPE_LABELS[type] || type;
+        this._el('wsb-type-help').textContent = editing ? 'To use a different type, add a new backend.' : '';
+        // The default must stay on: it is what everyone falls back to.
+        const enabledSwitch = this._el('wsb-enabled');
+        enabledSwitch.disabled = !!backend?.is_default;
+        enabledSwitch.title = backend?.is_default ? 'The default backend stays on' : '';
+        document.querySelectorAll('input[name="wsb-type"]').forEach(r => { r.checked = r.value === type; });
+        this._setModalType(type);
+        this._params.resetCatalog();
+        this._params.fill(backend || {});
+        bootstrap.Modal.getOrCreateInstance(this._el('wsBackendModal')).show();
+        if (type === 'searxng' && backend?.base_url) this._params.loadCatalog({ quiet: true });
+    }
+
+    _setModalType(type) {
+        this._modalType = type;
+        this._params.setType(type);
+        this._el('wsb-url').placeholder = WS_URL_PLACEHOLDER[type];
+        this._el('wsb-url-help').innerHTML = WS_URL_HELP[type];
+        this._el('wsb-engines-fetch-btn').hidden = type !== 'searxng';
+        // A test result belongs to the backend it ran against.
+        this._testRun += 1;
+        this._el('wsb-test-result').innerHTML = '';
+    }
+
+    async _fetchEngines() {
+        const url = this._el('wsb-url').value.trim();
+        if (!WS_URL_RE.test(url)) throw new Error('Enter the base URL first.');
+        const resp = await fetch('/admin/websearch/engines', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ base_url: url }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(wsErrorMessage(data, 'Could not load the engine list.'));
+        return data;
+    }
+
+    async reloadCatalog() {
+        const btn = this._el('wsb-engines-fetch-btn');
+        btn.disabled = true;
+        try {
+            await this._params.loadCatalog();
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    _backendBody() {
+        return {
+            name: this._el('wsb-name').value.trim(),
+            type: this._modalType,
+            base_url: this._el('wsb-url').value.trim(),
+            enabled: this._el('wsb-enabled').checked,
+            user_selectable: this._el('wsb-selectable').checked,
+            ...this._params.collect(),
+        };
+    }
+
+    _checkBackendBody(body) {
+        if (!body.name) {
+            this._el('wsb-name').focus();
+            window.UIUtils?.showToast('Give the backend a name.', 'error');
+            return false;
+        }
+        if (!WS_URL_RE.test(body.base_url)) {
+            this._el('wsb-url').focus();
+            window.UIUtils?.showToast('Enter a base URL that starts with http:// or https://.', 'error');
+            return false;
+        }
+        return true;
+    }
+
+    async saveBackend() {
+        const body = this._backendBody();
+        if (!this._checkBackendBody(body)) return;
+        const btn = this._el('wsb-save-btn');
+        btn.disabled = true;
+        try {
+            const data = this._editing
+                ? await this._send(`/admin/websearch/backends?backend_id=${this._editing.id}`, 'PUT', body, 'Backend was not saved.')
+                : await this._send('/admin/websearch/backends', 'POST', body, 'Backend was not saved.');
+            if (!data) return;
+            bootstrap.Modal.getInstance(this._el('wsBackendModal'))?.hide();
+            window.UIUtils?.showToast('Backend saved.', 'success');
+            await this._refreshBackends();
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async testBackend() {
+        const body = this._backendBody();
+        if (!WS_URL_RE.test(body.base_url)) {
+            this._el('wsb-url').focus();
+            window.UIUtils?.showToast('Enter a base URL that starts with http:// or https://.', 'error');
+            return;
+        }
+        // The test needs a valid backend, not a finished one.
+        body.name = body.name || 'Unsaved backend';
+        const label = wsEscape(body.name);
+        const btn = this._el('wsb-test-btn');
+        const out = this._el('wsb-test-result');
+        const run = this._testRun += 1;
         btn.disabled = true;
         out.innerHTML = '<p class="ws-test__status"><i class="fas fa-spinner fa-spin me-1"></i>Searching…</p>';
         try {
@@ -620,30 +466,34 @@ class WebSearchManager {
                 method: 'POST',
                 credentials: 'include',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query: this._el('ws-test-query').value.trim() || 'web search', settings }),
+                body: JSON.stringify({
+                    query: this._el('wsb-test-query').value.trim() || 'web search',
+                    backend: body,
+                    backend_id: this._editing?.id ?? null,
+                }),
             });
             const data = await resp.json().catch(() => ({}));
-            // The backend was switched (or another test started) while this one ran.
+            // The type was switched (or another test started) while this one ran.
             if (run !== this._testRun) return;
             if (!resp.ok) {
-                out.innerHTML = `<p class="ws-test__status is-error"><i class="fas fa-circle-xmark me-1"></i>${this._escape(this._errorMessage(data, 'Test failed.'))}</p>`;
+                out.innerHTML = `<p class="ws-test__status is-error"><i class="fas fa-circle-xmark me-1"></i>${wsEscape(wsErrorMessage(data, 'Test failed.'))}</p>`;
                 return;
             }
             if (!data.ok) {
-                out.innerHTML = `<p class="ws-test__status is-error"><i class="fas fa-circle-xmark me-1"></i>${label} \u00b7 <strong>${this._escape(data.error_code)}</strong>: ${this._escape(data.error)} (${data.latency_ms} ms)</p>`;
+                out.innerHTML = `<p class="ws-test__status is-error"><i class="fas fa-circle-xmark me-1"></i>${label}: <strong>${wsEscape(data.error_code)}</strong>, ${wsEscape(data.error)} (${data.latency_ms} ms)</p>`;
                 return;
             }
             const items = (data.results || []).map(r => `
                 <li>
-                    <a href="${this._escape(r.url)}" target="_blank" rel="noopener noreferrer">${this._escape(r.title)}</a>
-                    <div class="ws-test__snippet">${this._escape(r.snippet)}</div>
+                    <a href="${wsEscape(r.url)}" target="_blank" rel="noopener noreferrer">${wsEscape(r.title)}</a>
+                    <div class="ws-test__snippet">${wsEscape(r.snippet)}</div>
                 </li>`).join('');
             out.innerHTML = `
                 <p class="ws-test__status is-ok"><i class="fas fa-circle-check me-1"></i>Connected to ${label}: ${data.result_count} result${data.result_count === 1 ? '' : 's'} in ${data.latency_ms} ms.</p>
                 ${items ? `<ol class="ws-test__results">${items}</ol>` : ''}`;
         } catch (e) {
             if (run !== this._testRun) return;
-            out.innerHTML = '<p class="ws-test__status is-error"><i class="fas fa-circle-xmark me-1"></i>Network error running the test.</p>';
+            out.innerHTML = '<p class="ws-test__status is-error"><i class="fas fa-circle-xmark me-1"></i>The test could not reach the server. Check your connection and try again.</p>';
         } finally {
             btn.disabled = false;
         }

@@ -1195,7 +1195,7 @@
     <div class="ws-head">
         <h4 class="mb-0"><i class="fas fa-magnifying-glass me-2"></i>Web Search Interception</h4>
         <button class="btn btn-primary" id="ws-save-btn" onclick="window.WebSearchManager?.save()">
-            <i class="fas fa-save me-1"></i>Save
+            <i class="fas fa-save me-1"></i>Save settings
         </button>
     </div>
 
@@ -1204,11 +1204,12 @@
         <div class="card-header ws-card__head">
             <h5 class="mb-0"><i class="fas fa-shuffle me-2"></i>Interception</h5>
             <div class="form-check form-switch mb-0">
-                <input class="form-check-input" type="checkbox" role="switch" id="ws-enabled">
+                <input class="form-check-input" type="checkbox" role="switch" id="ws-enabled" aria-describedby="ws-enabled-help">
                 <label class="form-check-label" for="ws-enabled">Enabled</label>
             </div>
         </div>
         <div class="card-body">
+            <p class="ws-callout" id="ws-enabled-help" hidden>Add a backend below before turning web search on.</p>
             <div class="row g-3">
                 <div class="col-lg-4 col-md-6">
                     <label class="form-label" id="ws-surfaces-label">API surfaces</label>
@@ -1218,198 +1219,165 @@
                     <label class="form-label" id="ws-providers-label">Providers</label>
                     <div class="dropdown ws-picker" id="ws-providers-picker" data-labelledby="ws-providers-label"></div>
                 </div>
-                <div class="col-lg-2 col-6">
+                <div class="col-lg col-4">
                     <label class="form-label" for="ws-max-loops">Search rounds</label>
                     <input type="number" id="ws-max-loops" class="form-control" min="1" max="10">
                     <div class="form-text">Per request, 1–10.</div>
                 </div>
-                <div class="col-lg-2 col-6">
+                <div class="col-lg col-4">
                     <label class="form-label" for="ws-max-queries">Queries per round</label>
                     <input type="number" id="ws-max-queries" class="form-control" min="1" max="10">
                     <div class="form-text">Run in parallel.</div>
                 </div>
+                <div class="col-lg col-4">
+                    <label class="form-label" for="ws-timeout">Timeout (s)</label>
+                    <input type="number" id="ws-timeout" class="form-control" min="1" max="60">
+                    <div class="form-text">Per search.</div>
+                </div>
             </div>
         </div>
     </div>
 
-    <!-- Search backend connection -->
+    <!-- Defaults users inherit -->
     <div class="card ws-card">
         <div class="card-header ws-card__head">
-            <button class="ws-card__toggle collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#ws-conn-body"
-                    aria-expanded="false" aria-controls="ws-conn-body">
-                <i class="fas fa-chevron-right ws-chevron"></i>
-                <h5 class="mb-0"><i class="fas fa-plug me-2"></i>Search backend</h5>
-                <span class="ws-card__summary" id="ws-conn-summary"></span>
-            </button>
+            <h5 class="mb-0"><i class="fas fa-sliders me-2"></i>Defaults</h5>
         </div>
-        <div class="collapse" id="ws-conn-body">
-            <div class="card-body">
-                <div class="row g-3">
-                    <div class="col-lg-4 col-md-5">
-                        <label class="form-label" id="ws-provider-label">Backend</label>
-                        <div class="btn-group ws-segmented" role="radiogroup" aria-labelledby="ws-provider-label">
-                            {% for value, label in websearch_provider_labels.items() %}
-                            <input type="radio" class="btn-check" name="ws-provider" id="ws-provider-{{ value }}" value="{{ value }}" autocomplete="off">
-                            <label class="btn btn-outline-secondary" for="ws-provider-{{ value }}">{{ label }}</label>
-                            {% endfor %}
-                        </div>
-                        <div class="form-text">Each backend keeps its own settings, so switching loses nothing.</div>
-                    </div>
-                    <div class="col-lg-5 col-md-4">
-                        <div id="ws-conn-searxng">
-                            <label class="form-label" for="ws-searxng-url">SearXNG base URL</label>
-                            <input type="url" id="ws-searxng-url" class="form-control" placeholder="http://searxng:8080"
-                                   oninput="window.WebSearchManager?.updateParamsVisibility()">
-                            <div class="form-text">
-                                Every query the model writes is sent here. The instance must list <code>json</code>
-                                under <code>search.formats</code> in its <code>settings.yml</code>.
-                            </div>
-                        </div>
-                        <div id="ws-conn-fourget">
-                            <label class="form-label" for="ws-fourget-url">4get base URL</label>
-                            <input type="url" id="ws-fourget-url" class="form-control" placeholder="http://fourget"
-                                   oninput="window.WebSearchManager?.updateParamsVisibility()">
-                            <div class="form-text">
-                                Queried at <code>/api/v1/web</code>. The instance must have its API enabled
-                                and bot protection off.
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-lg-3 col-md-3">
-                        <label class="form-label" for="ws-timeout">Timeout (s)</label>
-                        <input type="number" id="ws-timeout" class="form-control" min="1" max="60">
-                    </div>
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-lg-6 col-md-12">
+                    <label class="form-label" for="ws-default-backend">Default backend</label>
+                    <select id="ws-default-backend" class="form-select"></select>
                 </div>
-                <div class="ws-test">
-                    <label class="form-label" for="ws-test-query">Test with a query</label>
-                    <div class="ws-test__row">
-                        <input type="text" id="ws-test-query" class="form-control" value="web search">
-                        <button class="btn btn-outline-secondary" id="ws-test-btn" onclick="window.WebSearchManager?.test()">
-                            <i class="fas fa-vial me-1"></i>Run test
-                        </button>
-                    </div>
-                    <div class="form-text">Uses the values on this page, saved or not.</div>
-                    <div id="ws-test-result"></div>
+                <div class="col-lg-3 col-6">
+                    <label class="form-label" for="ws-max-results">Results per query</label>
+                    <input type="number" id="ws-max-results" class="form-control" min="1" max="20">
+                    <div class="form-text">1–20.</div>
+                </div>
+                <div class="col-lg-3 col-6">
+                    <label class="form-label" for="ws-snippet-chars">Snippet length</label>
+                    <input type="number" id="ws-snippet-chars" class="form-control" min="50" max="5000">
+                    <div class="form-text">Characters, 50–5000.</div>
                 </div>
             </div>
+            <p class="form-text mb-0 mt-3">
+                Search parameters are set on each backend. Users who don't pick their own
+                backend or limits get the ones here.
+            </p>
         </div>
     </div>
 
-    <!-- Search parameters (shown once a base URL is entered) -->
-    <div class="card ws-card" id="ws-params-card" style="display: none;">
+    <!-- Backends -->
+    <div class="card ws-card">
         <div class="card-header ws-card__head">
-            <button class="ws-card__toggle" type="button" data-bs-toggle="collapse" data-bs-target="#ws-params-body"
-                    aria-expanded="true" aria-controls="ws-params-body">
-                <i class="fas fa-chevron-right ws-chevron"></i>
-                <h5 class="mb-0"><i class="fas fa-sliders me-2"></i>Search parameters</h5>
-                <span class="ws-card__summary" id="ws-params-summary"></span>
-            </button>
-            <button class="btn btn-outline-secondary btn-sm" type="button" id="ws-engines-fetch-btn"
-                    onclick="window.WebSearchManager?.fetchEngines()" title="Reload categories and engines from SearXNG">
-                <i class="fas fa-rotate me-1"></i>Reload from SearXNG
+            <h5 class="mb-0"><i class="fas fa-plug me-2"></i>Backends</h5>
+            <button class="btn btn-outline-secondary btn-sm" type="button" onclick="window.WebSearchManager?.openBackend()">
+                <i class="fas fa-plus me-1"></i>Add backend
             </button>
         </div>
-        <div class="collapse show" id="ws-params-body">
-            <div class="card-body">
-                <div id="ws-params-searxng">
-                    <div class="row g-3">
-                        <div class="col-lg-4 col-md-5">
-                            <label class="form-label" id="ws-source-label">Search with</label>
-                            <div class="btn-group ws-segmented" role="radiogroup" aria-labelledby="ws-source-label">
-                                <input type="radio" class="btn-check" name="ws-source" id="ws-source-all" value="all" autocomplete="off">
-                                <label class="btn btn-outline-secondary" for="ws-source-all">All</label>
-                                <input type="radio" class="btn-check" name="ws-source" id="ws-source-categories" value="categories" autocomplete="off">
-                                <label class="btn btn-outline-secondary" for="ws-source-categories">Categories</label>
-                                <input type="radio" class="btn-check" name="ws-source" id="ws-source-engines" value="engines" autocomplete="off">
-                                <label class="btn btn-outline-secondary" for="ws-source-engines">Engines</label>
-                            </div>
-                        </div>
-                        <div class="col-lg-8 col-md-7">
-                            <div id="ws-source-all-field">
-                                <label class="form-label">Covers</label>
-                                <p class="ws-source-note" id="ws-source-all-note">Every category on the instance, using the engines it turns on by default.</p>
-                            </div>
-                            <div id="ws-source-categories-field">
-                                <label class="form-label" id="ws-categories-label" for="ws-categories">Categories</label>
-                                <input type="text" id="ws-categories" class="form-control" placeholder="general (comma-separated)"
-                                       oninput="window.WebSearchManager?.renderCategories()">
-                                <div class="dropdown ws-picker" id="ws-categories-picker" data-labelledby="ws-categories-label" hidden></div>
-                                <div class="form-text">Each category searches the engines the instance turns on for it.</div>
-                            </div>
-                            <div id="ws-source-engines-field">
-                                <label class="form-label" id="ws-engines-label" for="ws-engines">Engines</label>
-                                <input type="text" id="ws-engines" class="form-control" placeholder="Comma-separated, e.g. bing,duckduckgo">
-                                <div class="dropdown ws-picker" id="ws-engines-picker" data-labelledby="ws-engines-label" hidden></div>
-                                <div class="form-text">Only these engines are searched. With none picked, searches use the general category.</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="row g-3 mt-0">
-                        <div class="col-lg-4 col-md-5 col-6">
-                            <label class="form-label" for="ws-language">Language</label>
-                            <input type="text" id="ws-language" class="form-control" placeholder="auto">
-                            <div class="form-text">SearXNG codes, e.g. <code>auto</code> or <code>en-US</code>.</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div id="ws-params-fourget">
-                    <div class="row g-3">
-                        <div class="col-lg-4 col-md-6">
-                            <label class="form-label" for="ws-fourget-scraper">Scraper</label>
-                            <select id="ws-fourget-scraper" class="form-select">
-                                {% for name in fourget_scrapers %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
-                            </select>
-                            <div class="form-text">The upstream engine 4get scrapes for each query. Some need credentials or are blocked from a datacenter IP &mdash; run a test before saving.</div>
-                        </div>
-                        <div class="col-lg-4 col-md-3 col-6">
-                            <label class="form-label" for="ws-fourget-lang">Language</label>
-                            <input type="text" id="ws-fourget-lang" class="form-control" placeholder="any">
-                        </div>
-                        <div class="col-lg-4 col-md-3 col-6">
-                            <label class="form-label" for="ws-fourget-country">Country</label>
-                            <input type="text" id="ws-fourget-country" class="form-control" placeholder="any">
-                            <div class="form-text">Scraper-specific; ddg uses locales like <code>us-en</code>.</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="ws-subhead">Results</div>
-                <div class="row g-3">
-                    <div class="col-lg col-md-4 col-6">
-                        <label class="form-label" for="ws-safesearch">Safe search</label>
-                        <select id="ws-safesearch" class="form-select">
-                            <option value="0">Off</option>
-                            <option value="1">Moderate</option>
-                            <option value="2">Strict</option>
-                        </select>
-                        <div class="form-text" id="ws-safesearch-help">Sent as SearXNG's <code>safesearch</code>.</div>
-                    </div>
-                    <div class="col-lg col-md-4 col-6">
-                        <label class="form-label" for="ws-time-range">Time range</label>
-                        <select id="ws-time-range" class="form-select">
-                            <option value="">Any time</option>
-                            <option value="day">Past day</option>
-                            <option value="week">Past week</option>
-                            <option value="month">Past month</option>
-                            <option value="year">Past year</option>
-                        </select>
-                    </div>
-                    <div class="col-lg col-md-6 col-6">
-                        <label class="form-label" for="ws-max-results">Results per query</label>
-                        <input type="number" id="ws-max-results" class="form-control" min="1" max="20">
-                    </div>
-                    <div class="col-lg col-md-6 col-12">
-                        <label class="form-label" for="ws-snippet-chars">Snippet length</label>
-                        <input type="number" id="ws-snippet-chars" class="form-control" min="50" max="5000">
-                        <div class="form-text">Characters, 50–5000.</div>
-                    </div>
-                </div>
+        <div class="card-body p-0">
+            <div class="table-responsive" id="ws-backends-table" hidden>
+                <table class="table table-hover mb-0 ws-backends">
+                    <thead>
+                        <tr>
+                            <th scope="col">Backend</th>
+                            <th scope="col" class="d-none d-md-table-cell">Type</th>
+                            <th scope="col" class="text-end" title="Users who picked this backend">Users</th>
+                            <th scope="col">Enabled</th>
+                            <th scope="col" class="text-end"><span class="visually-hidden">Actions</span></th>
+                        </tr>
+                    </thead>
+                    <tbody id="ws-backends-body"></tbody>
+                </table>
+            </div>
+            <div class="empty-state" id="ws-backends-empty" hidden>
+                <div class="empty-state-icon"><i class="fas fa-plug"></i></div>
+                <p>No backends yet. Add a SearXNG or 4get instance so models can search the web.</p>
+                <button class="btn btn-primary" type="button" onclick="window.WebSearchManager?.openBackend()">
+                    <i class="fas fa-plus me-1"></i>Add backend
+                </button>
             </div>
         </div>
     </div>
     <div class="ws-updated" id="ws-updated"></div>
 </div>
+
+<!-- Add / edit a web search backend -->
+<div class="modal fade ws-page" id="wsBackendModal" tabindex="-1" aria-labelledby="wsBackendModalTitle" aria-hidden="true">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="wsBackendModalTitle">Add backend</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="ws-subhead ws-subhead--first">Connection</div>
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label class="form-label" for="wsb-name">Name</label>
+                        <input type="text" id="wsb-name" class="form-control" maxlength="64" placeholder="e.g. SearXNG EU">
+                        <div class="form-text">Users see this name, never the URL.</div>
+                    </div>
+                    <div class="col-md-6">
+                        <label class="form-label" id="wsb-type-label">Type</label>
+                        <div class="btn-group ws-segmented" role="radiogroup" aria-labelledby="wsb-type-label" id="wsb-type-choice">
+                            {% for value, label in websearch_provider_labels.items() %}
+                            <input type="radio" class="btn-check" name="wsb-type" id="wsb-type-{{ value }}" value="{{ value }}" autocomplete="off">
+                            <label class="btn btn-outline-secondary" for="wsb-type-{{ value }}">{{ label }}</label>
+                            {% endfor %}
+                        </div>
+                        <p class="ws-source-note" id="wsb-type-fixed" hidden></p>
+                        <div class="form-text" id="wsb-type-help"></div>
+                    </div>
+                    <div class="col-12">
+                        <label class="form-label" for="wsb-url">Base URL</label>
+                        <input type="url" id="wsb-url" class="form-control" placeholder="http://searxng:8080">
+                        <div class="form-text" id="wsb-url-help"></div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" role="switch" id="wsb-enabled">
+                            <label class="form-check-label" for="wsb-enabled">Enabled</label>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" role="switch" id="wsb-selectable">
+                            <label class="form-check-label" for="wsb-selectable">Users can pick this backend</label>
+                        </div>
+                    </div>
+                </div>
+                <div class="ws-test">
+                    <label class="form-label" for="wsb-test-query">Test with a query</label>
+                    <div class="ws-test__row">
+                        <input type="text" id="wsb-test-query" class="form-control" value="web search">
+                        <button class="btn btn-outline-secondary" type="button" id="wsb-test-btn" onclick="window.WebSearchManager?.testBackend()">
+                            <i class="fas fa-vial me-1"></i>Run test
+                        </button>
+                    </div>
+                    <div class="form-text">Uses the values in this form, saved or not.</div>
+                    <div id="wsb-test-result" aria-live="polite"></div>
+                </div>
+
+                <div class="ws-subhead ws-subhead--split">
+                    <span>Search parameters</span>
+                    <button class="btn btn-outline-secondary btn-sm" type="button" id="wsb-engines-fetch-btn"
+                            onclick="window.WebSearchManager?.reloadCatalog()">
+                        <i class="fas fa-rotate me-1"></i>Reload from SearXNG
+                    </button>
+                </div>
+                <div id="wsb-params"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" id="wsb-save-btn" onclick="window.WebSearchManager?.saveBackend()">
+                    <i class="fas fa-save me-1"></i>Save backend
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+<script type="application/json" id="ws-fourget-scrapers">{{ fourget_scrapers | list | tojson }}</script>
 </div><!-- /.dash-content -->
 </div><!-- /.dash-layout -->
 {% endblock %}
@@ -1433,6 +1401,7 @@
 <script src="/static/js/features/admin/model-group-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-access-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-alias-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/shared/websearch-params.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/websearch-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/admin-dashboard.js?v={{ cache_version }}"></script>
 <script src="/static/js/core/dash-sidebar.js?v={{ cache_version }}"></script>

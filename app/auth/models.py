@@ -8,7 +8,7 @@ import re
 import json
 import math
 from re import _constants as _sre, _parser as _sre_parse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List, Literal
 
 VALID_AZURE_BACKENDS = {"openai", "foundry"}
@@ -366,29 +366,20 @@ class PoolSettings(Base):
 class WebSearchSettings(Base):
     """Web search interception settings. Single row (id=1).
 
-    Each backend keeps its own connection and parameters, so switching
-    `provider` never discards the other one's configuration.
+    Holds the admin-only knobs and the defaults every user inherits: the default
+    backend and the result limits. Search parameters live on each backend
+    (WebSearchBackend). Databases from before multiple backends still carry the
+    old per-backend columns; only _migrate_websearch_backends reads them.
     """
     __tablename__ = "websearch_settings"
 
     id = Column(Integer, primary_key=True)  # always 1
     enabled = Column(Boolean, default=False, nullable=False)
-    provider = Column(String(20), nullable=True)      # "searxng" | "fourget"
-    # SearXNG backend
-    searxng_base_url = Column(String(500), nullable=True)
-    engines = Column(String(500), nullable=True)
-    categories = Column(String(200), nullable=True)
-    language = Column(String(20), nullable=True)
-    safesearch = Column(Integer, nullable=True)
-    time_range = Column(String(10), nullable=True)
-    # 4get backend
-    fourget_base_url = Column(String(500), nullable=True)
-    fourget_scraper = Column(String(50), nullable=True)   # NULL -> ddg
-    fourget_lang = Column(String(20), nullable=True)
-    fourget_country = Column(String(32), nullable=True)
-    # Shared
+    default_backend_id = Column(Integer, nullable=True)  # NULL -> interception inactive
+    # Defaults users may override
     max_results = Column(Integer, nullable=True)
     max_snippet_chars = Column(Integer, nullable=True)
+    # Admin only
     timeout_seconds = Column(Integer, nullable=True)
     max_agentic_loops = Column(Integer, nullable=True)
     max_queries_per_turn = Column(Integer, nullable=True)
@@ -396,6 +387,85 @@ class WebSearchSettings(Base):
     enabled_providers = Column(Text, nullable=True)  # JSON array of provider keys; "*" = all
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     updated_by = Column(String(50), nullable=True)
+
+
+class WebSearchBackend(Base):
+    """A SearXNG or 4get instance that searches can be sent to.
+
+    Parameter columns are named after WebSearchConfig's fields, and only the
+    type's own ones (WEBSEARCH_BACKEND_PARAMS) are read. NULL uses
+    WEBSEARCH_DEFAULTS.
+    """
+    __tablename__ = "websearch_backends"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(64), unique=True, nullable=False)
+    type = Column(String(20), nullable=False)        # "searxng" | "fourget"
+    base_url = Column(String(500), nullable=False)
+    # Off = no request uses it; users who picked it fall back to the default.
+    enabled = Column(Boolean, default=True, nullable=False, server_default="1")
+    # Off = users can no longer pick it (it can still be the default).
+    user_selectable = Column(Boolean, default=True, nullable=False, server_default="1")
+    # SearXNG
+    engines = Column(String(500), nullable=True)
+    categories = Column(String(200), nullable=True)
+    language = Column(String(20), nullable=True)
+    # 4get
+    fourget_scraper = Column(String(50), nullable=True)
+    fourget_lang = Column(String(20), nullable=True)
+    fourget_country = Column(String(32), nullable=True)
+    # Both
+    safesearch = Column(Integer, nullable=True)
+    time_range = Column(String(10), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_by = Column(String(50), nullable=True)
+
+    __table_args__ = (
+        # Same reason as uq_request_pools_name_lower: the routes reject names that
+        # differ only by case, and this makes a concurrent create lose with a 409.
+        Index("uq_websearch_backends_name_lower", func.lower(name), unique=True),
+    )
+
+
+class UserWebSearchSettings(Base):
+    """A user's web search choices. NULL inherits the admin default.
+
+    Search parameters are kept per backend (UserWebSearchBackendParams), since
+    engines or a scraper only mean something on one instance.
+    """
+    __tablename__ = "user_websearch_settings"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    # NULL = the admin default. A backend that is later disabled, deleted or made
+    # unselectable is ignored at request time rather than cleared here, so the
+    # choice comes back if the admin restores it (deleting does clear it).
+    backend_id = Column(Integer, ForeignKey("websearch_backends.id", ondelete="SET NULL"), nullable=True)
+    max_results = Column(Integer, nullable=True)
+    max_snippet_chars = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserWebSearchBackendParams(Base):
+    """A user's search parameters for one backend. NULL inherits the backend's own."""
+    __tablename__ = "user_websearch_backend_params"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    backend_id = Column(Integer, ForeignKey("websearch_backends.id", ondelete="CASCADE"), nullable=False)
+    engines = Column(String(500), nullable=True)
+    categories = Column(String(200), nullable=True)
+    language = Column(String(20), nullable=True)
+    fourget_scraper = Column(String(50), nullable=True)
+    fourget_lang = Column(String(20), nullable=True)
+    fourget_country = Column(String(32), nullable=True)
+    safesearch = Column(Integer, nullable=True)
+    time_range = Column(String(10), nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "backend_id", name="uq_user_websearch_backend_params"),
+    )
 
 
 # The config-based admin is not a row in `users`, so its usage is recorded under this
@@ -1132,17 +1202,32 @@ FOURGET_WEB_SCRAPERS = (
     "naver", "baidu", "coccoc", "solofield", "purili", "wiby",
 )
 
-# Effective values used when a websearch_settings column is NULL.
+# Search parameters each backend type reads, named like WebSearchConfig's fields
+# and the websearch_backends columns. 4get maps safesearch and time_range too.
+WEBSEARCH_BACKEND_PARAMS = {
+    WEBSEARCH_PROVIDER_SEARXNG: ("engines", "categories", "language", "safesearch", "time_range"),
+    WEBSEARCH_PROVIDER_FOURGET: ("fourget_scraper", "fourget_lang", "fourget_country", "safesearch", "time_range"),
+}
+WEBSEARCH_PARAM_FIELDS = tuple(dict.fromkeys(f for fields in WEBSEARCH_BACKEND_PARAMS.values() for f in fields))
+# Parameters a user overrides together: setting any one of a group takes the whole
+# group from the user. SearXNG ignores categories whenever engines is sent, and
+# 4get's lang/country codes are specific to the scraper.
+WEBSEARCH_PARAM_GROUPS = (
+    ("engines", "categories"),
+    ("fourget_scraper", "fourget_lang", "fourget_country"),
+)
+# Bounds of the limits users may override, shared with the admin form.
+WEBSEARCH_LIMITS = {"max_results": (1, 20), "max_snippet_chars": (50, 5000)}
+
+# Effective values used when a websearch_settings or websearch_backends column is NULL.
 WEBSEARCH_DEFAULTS = {
     "enabled": False,
     "provider": WEBSEARCH_PROVIDER_SEARXNG,
-    "searxng_base_url": None,
     "engines": None,
     "categories": "general",
     "language": "auto",
     "safesearch": 1,
     "time_range": None,
-    "fourget_base_url": None,
     "fourget_scraper": FOURGET_WEB_SCRAPERS[0],
     "fourget_lang": None,
     "fourget_country": None,
@@ -1156,55 +1241,35 @@ WEBSEARCH_DEFAULTS = {
 }
 
 
-class WebSearchSettingsResponse(BaseModel):
-    enabled: bool = False
-    provider: str = WEBSEARCH_PROVIDER_SEARXNG
-    searxng_base_url: Optional[str] = None
+def _check_url(v: Optional[str], field_name: str) -> Optional[str]:
+    """Trimmed http(s) URL without a trailing slash; blank -> None."""
+    if isinstance(v, str):
+        v = v.strip() or None
+    if v is None:
+        return v
+    if not re.match(r"^https?://[^\s/]+", v):
+        raise ValueError(f"{field_name} must start with http:// or https://")
+    return v.rstrip("/")
+
+
+class WebSearchParamsMixin(BaseModel):
+    """Search parameters of a backend, shared by the admin and user forms.
+
+    None means "not set": the backend's own value for a user, WEBSEARCH_DEFAULTS
+    for a backend.
+    """
     engines: Optional[str] = None
     categories: Optional[str] = None
     language: Optional[str] = None
-    safesearch: int = 1
-    time_range: Optional[str] = None
-    fourget_base_url: Optional[str] = None
     fourget_scraper: Optional[str] = None
     fourget_lang: Optional[str] = None
     fourget_country: Optional[str] = None
-    max_results: int = 5
-    max_snippet_chars: int = 500
-    timeout_seconds: int = 10
-    max_agentic_loops: int = 3
-    max_queries_per_turn: int = 5
-    apply_to: List[str] = Field(default_factory=lambda: list(WEBSEARCH_API_SURFACES))
-    enabled_providers: List[str] = Field(default_factory=list)
-    updated_at: Optional[datetime] = None
-    updated_by: Optional[str] = None
-
-
-class WebSearchSettingsUpdate(BaseModel):
-    """Full replacement of the web search settings."""
-    enabled: bool = False
-    provider: str = WEBSEARCH_PROVIDER_SEARXNG
-    searxng_base_url: Optional[str] = None
-    engines: Optional[str] = None
-    categories: Optional[str] = None
-    language: Optional[str] = None
-    safesearch: int = 1
+    safesearch: Optional[int] = None
     time_range: Optional[str] = None
-    fourget_base_url: Optional[str] = None
-    fourget_scraper: Optional[str] = None
-    fourget_lang: Optional[str] = None
-    fourget_country: Optional[str] = None
-    max_results: int = Field(default=5, ge=1, le=20)
-    max_snippet_chars: int = Field(default=500, ge=50, le=5000)
-    timeout_seconds: int = Field(default=10, ge=1, le=60)
-    max_agentic_loops: int = Field(default=3, ge=1, le=10)
-    max_queries_per_turn: int = Field(default=5, ge=1, le=10)
-    apply_to: List[str] = Field(default_factory=lambda: list(WEBSEARCH_API_SURFACES))
-    enabled_providers: List[str] = Field(default_factory=list)
 
     @field_validator(
-        "searxng_base_url", "engines", "categories", "language", "time_range",
-        "fourget_base_url", "fourget_scraper", "fourget_lang", "fourget_country",
+        "engines", "categories", "language", "time_range",
+        "fourget_scraper", "fourget_lang", "fourget_country",
         mode="before",
     )
     @classmethod
@@ -1212,22 +1277,6 @@ class WebSearchSettingsUpdate(BaseModel):
         if isinstance(v, str):
             v = v.strip()
             return v or None
-        return v
-
-    @field_validator("searxng_base_url", "fourget_base_url")
-    @classmethod
-    def _validate_url(cls, v, info):
-        if v is None:
-            return v
-        if not re.match(r"^https?://[^\s/]+", v):
-            raise ValueError(f"{info.field_name} must start with http:// or https://")
-        return v.rstrip("/")
-
-    @field_validator("provider")
-    @classmethod
-    def _validate_provider(cls, v):
-        if v not in WEBSEARCH_PROVIDERS:
-            raise ValueError(f"provider must be one of {', '.join(WEBSEARCH_PROVIDERS)}")
         return v
 
     @field_validator("fourget_scraper")
@@ -1249,7 +1298,7 @@ class WebSearchSettingsUpdate(BaseModel):
     @field_validator("safesearch")
     @classmethod
     def _validate_safesearch(cls, v):
-        if v not in WEBSEARCH_SAFESEARCH_VALUES:
+        if v is not None and v not in WEBSEARCH_SAFESEARCH_VALUES:
             raise ValueError("safesearch must be 0, 1 or 2")
         return v
 
@@ -1259,6 +1308,113 @@ class WebSearchSettingsUpdate(BaseModel):
         if v is not None and v not in WEBSEARCH_TIME_RANGES:
             raise ValueError(f"time_range must be one of {', '.join(WEBSEARCH_TIME_RANGES)}")
         return v
+
+    def params_for(self, backend_type: str) -> dict:
+        """The parameters a backend of this type reads; the others are dropped."""
+        return {f: getattr(self, f) for f in WEBSEARCH_BACKEND_PARAMS.get(backend_type, ())}
+
+
+class WebSearchBackendCreate(WebSearchParamsMixin):
+    """A backend's full definition (create, or full replacement on update)."""
+    name: str
+    type: str
+    base_url: str
+    enabled: bool = True
+    user_selectable: bool = True
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v):
+        return _clean_name(v)
+
+    @field_validator("type")
+    @classmethod
+    def _validate_type(cls, v):
+        if v not in WEBSEARCH_PROVIDERS:
+            raise ValueError(f"type must be one of {', '.join(WEBSEARCH_PROVIDERS)}")
+        return v
+
+    @field_validator("base_url", mode="before")
+    @classmethod
+    def _validate_url(cls, v):
+        v = _check_url(v, "base_url")
+        if v is None:
+            raise ValueError("base_url is required")
+        return v
+
+    @model_validator(mode="after")
+    def _drop_other_type_params(self):
+        # A type switch in the form leaves the other type's fields filled in; they
+        # would never be read, so they are not stored either.
+        keep = WEBSEARCH_BACKEND_PARAMS[self.type]
+        for f in WEBSEARCH_PARAM_FIELDS:
+            if f not in keep:
+                setattr(self, f, None)
+        return self
+
+    def column_values(self) -> dict:
+        return self.model_dump()
+
+
+class WebSearchBackendUpdate(WebSearchBackendCreate):
+    pass
+
+
+class WebSearchBackendResponse(BaseModel):
+    id: int
+    name: str
+    type: str
+    base_url: str
+    enabled: bool = True
+    user_selectable: bool = True
+    engines: Optional[str] = None
+    categories: Optional[str] = None
+    language: Optional[str] = None
+    fourget_scraper: Optional[str] = None
+    fourget_lang: Optional[str] = None
+    fourget_country: Optional[str] = None
+    safesearch: Optional[int] = None
+    time_range: Optional[str] = None
+    is_default: bool = False
+    user_count: int = 0                   # users who picked it
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+
+class WebSearchSettingsResponse(BaseModel):
+    enabled: bool = False
+    default_backend_id: Optional[int] = None
+    default_backend: Optional[dict] = None  # {id, name, type}
+    max_results: int = 5
+    max_snippet_chars: int = 500
+    timeout_seconds: int = 10
+    max_agentic_loops: int = 3
+    max_queries_per_turn: int = 5
+    apply_to: List[str] = Field(default_factory=lambda: list(WEBSEARCH_API_SURFACES))
+    enabled_providers: List[str] = Field(default_factory=list)
+    updated_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+
+
+class WebSearchSettingsUpdate(BaseModel):
+    """Full replacement of the web search settings (backends are edited separately).
+
+    Unknown fields are refused: a pre-multiple-backends payload (provider,
+    searxng_base_url...) would otherwise pass and clear the default backend.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    default_backend_id: Optional[int] = None
+    max_results: int = Field(default=5, ge=WEBSEARCH_LIMITS["max_results"][0], le=WEBSEARCH_LIMITS["max_results"][1])
+    max_snippet_chars: int = Field(
+        default=500, ge=WEBSEARCH_LIMITS["max_snippet_chars"][0], le=WEBSEARCH_LIMITS["max_snippet_chars"][1],
+    )
+    timeout_seconds: int = Field(default=10, ge=1, le=60)
+    max_agentic_loops: int = Field(default=3, ge=1, le=10)
+    max_queries_per_turn: int = Field(default=5, ge=1, le=10)
+    apply_to: List[str] = Field(default_factory=lambda: list(WEBSEARCH_API_SURFACES))
+    enabled_providers: List[str] = Field(default_factory=list)
 
     @field_validator("apply_to")
     @classmethod
@@ -1274,36 +1430,50 @@ class WebSearchSettingsUpdate(BaseModel):
         return list(dict.fromkeys(p.strip() for p in v if isinstance(p, str) and p.strip()))
 
     @model_validator(mode="after")
-    def _require_url_when_enabled(self):
-        if not self.enabled:
-            return self
-        field = (
-            "fourget_base_url"
-            if self.provider == WEBSEARCH_PROVIDER_FOURGET
-            else "searxng_base_url"
-        )
-        if not getattr(self, field):
-            raise ValueError(f"{field} is required when web search is enabled")
+    def _require_backend_when_enabled(self):
+        if self.enabled and self.default_backend_id is None:
+            raise ValueError("default_backend_id is required when web search is enabled")
         return self
 
 
-class WebSearchEnginesRequest(BaseModel):
-    # Unsaved base URL to query; omitted -> stored settings.
-    searxng_base_url: Optional[str] = None
+class UserWebSearchUpdate(WebSearchParamsMixin):
+    """A user's full web search choices; None inherits the admin default.
 
-    @field_validator("searxng_base_url", mode="before")
+    The parameters are for `backend_id`'s backend, or the default backend when
+    it is None. Unknown fields are refused, so a user cannot reach the admin-only
+    knobs (enabled, timeout, loops...) by sending them.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    backend_id: Optional[int] = None
+    max_results: Optional[int] = Field(
+        default=None, ge=WEBSEARCH_LIMITS["max_results"][0], le=WEBSEARCH_LIMITS["max_results"][1],
+    )
+    max_snippet_chars: Optional[int] = Field(
+        default=None, ge=WEBSEARCH_LIMITS["max_snippet_chars"][0], le=WEBSEARCH_LIMITS["max_snippet_chars"][1],
+    )
+
+
+class WebSearchEnginesRequest(BaseModel):
+    # An unsaved URL (the backend form), else a stored SearXNG backend, else the
+    # default backend (or the first SearXNG one when the default is 4get).
+    # searxng_base_url is the pre-multiple-backends name.
+    base_url: Optional[str] = Field(default=None, validation_alias=AliasChoices("base_url", "searxng_base_url"))
+    backend_id: Optional[int] = None
+
+    @field_validator("base_url", mode="before")
     @classmethod
     def _validate_url(cls, v):
-        if isinstance(v, str):
-            v = v.strip() or None
-        if v is not None and not re.match(r"^https?://[^\s/]+", v):
-            raise ValueError("searxng_base_url must start with http:// or https://")
-        return v.rstrip("/") if v else v
+        return _check_url(v, "base_url")
 
 
 class WebSearchTestRequest(BaseModel):
-    query: str = Field(default="SearXNG", min_length=1, max_length=500)
-    # Optional unsaved settings to test before saving; omitted -> stored settings.
+    query: str = Field(default="web search", min_length=1, max_length=500)
+    # What to test: an unsaved backend (the backend form), else a stored one, else
+    # the default backend.
+    backend: Optional[WebSearchBackendCreate] = None
+    backend_id: Optional[int] = None
+    # Optional unsaved settings (limits, timeout); omitted -> stored settings.
     settings: Optional[WebSearchSettingsUpdate] = None
 
 

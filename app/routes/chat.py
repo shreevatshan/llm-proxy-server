@@ -10,7 +10,7 @@ from app.openai_models import ChatCompletionRequest, ChatCompletionResponse
 from app.providers.provider_manager import provider_manager
 from app.providers.base import ProviderHTTPError
 from app.routes._errors import openai_provider_error_response
-from app.auth.middleware import authenticate_jwt_or_api_key
+from app.auth.middleware import authenticate_jwt_or_api_key, get_owner_user_id
 from app.auth.models import APIKey, User
 from app.auth.admin import AdminUser
 from typing import Union
@@ -94,9 +94,13 @@ async def chat_completions(
                 provider_key_for_model(request.model),
                 provider_manager.chat_completion,
                 provider_manager.chat_completion_stream,
+                user_id=get_owner_user_id(auth),
             )
             if websearch_loop is not None:
-                add_span_attributes(span, {"chat.websearch_interception": True})
+                add_span_attributes(span, {
+                    "chat.websearch_interception": True,
+                    "chat.websearch_backend": websearch_loop.cfg.backend_name or "",
+                })
 
             if request.stream:
                 # Validate the model up front so a bad/unknown model name yields

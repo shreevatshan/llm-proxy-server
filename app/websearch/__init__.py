@@ -1,4 +1,4 @@
-"""Server-side web search interception (SearXNG or 4get).
+"""Server-side web search interception (SearXNG or 4get backends).
 
 Routes call the ``maybe_intercept_*`` helpers; each returns None when the
 feature is off for that surface/provider or the request carries no web search
@@ -45,9 +45,12 @@ def _anthropic_messages_dicts(messages) -> list:
     return [m.model_dump(exclude_none=True) if hasattr(m, "model_dump") else dict(m) for m in messages or []]
 
 
-def maybe_intercept_anthropic(request, provider, anthropic_beta: Optional[str] = None) -> Optional[AnthropicWebSearchLoop]:
+def maybe_intercept_anthropic(
+    request, provider, anthropic_beta: Optional[str] = None, *, user_id: Optional[int] = None,
+) -> Optional[AnthropicWebSearchLoop]:
     """Rewrite an Anthropic Messages request for interception, or return None.
 
+    `user_id` selects that user's backend and parameters (None -> the defaults).
     Raises WebSearchRequestError (HTTP 400) for an invalid web_search tool.
     """
     if not websearch_settings_cache.is_active(SURFACE_ANTHROPIC_MESSAGES, _provider_key(provider)):
@@ -58,7 +61,7 @@ def maybe_intercept_anthropic(request, provider, anthropic_beta: Optional[str] =
     if not found and not replayed:
         return None
 
-    cfg = websearch_settings_cache.config
+    cfg = websearch_settings_cache.resolve_config(user_id)
     overrides = _tools.native_tool_options(request.tools)
     if overrides:
         cfg = cfg.with_overrides(**overrides)
@@ -113,6 +116,8 @@ def maybe_intercept_chat(
     provider_key: Optional[str],
     call: Callable[[Any], Awaitable[Any]],
     call_stream: Callable[[Any], AsyncGenerator[str, None]],
+    *,
+    user_id: Optional[int] = None,
 ) -> Optional[ChatWebSearchLoop]:
     """Rewrite a ChatCompletionRequest for interception, or return None."""
     if not websearch_settings_cache.is_active(SURFACE_CHAT_COMPLETIONS, provider_key):
@@ -122,7 +127,7 @@ def maybe_intercept_chat(
         return None
     return ChatWebSearchLoop(
         _tools.rewrite_chat_request(request_dict),
-        websearch_settings_cache.config,
+        websearch_settings_cache.resolve_config(user_id),
         call,
         call_stream,
     )
@@ -148,6 +153,8 @@ def maybe_intercept_responses(
     request,
     provider_key: Optional[str],
     call: Callable[[Any], Awaitable[Any]],
+    *,
+    user_id: Optional[int] = None,
 ) -> Optional[ResponsesWebSearchLoop]:
     """Rewrite a ResponsesCreateRequest for interception, or return None."""
     if not websearch_settings_cache.is_active(SURFACE_RESPONSES, provider_key):
@@ -157,7 +164,7 @@ def maybe_intercept_responses(
         return None
     return ResponsesWebSearchLoop(
         _tools.rewrite_responses_request(request_dict),
-        websearch_settings_cache.config,
+        websearch_settings_cache.resolve_config(user_id),
         call,
         original_tools=request_dict.get("tools"),
     )

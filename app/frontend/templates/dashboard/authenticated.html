@@ -299,6 +299,7 @@
     {'id': 'usage', 'label': 'Usage', 'icon': 'fa-chart-bar'},
     {'id': 'quotas', 'label': 'Quotas', 'icon': 'fa-gauge-high'},
     {'id': 'pool', 'label': 'Pool', 'icon': 'fa-users'},
+    {'id': 'websearch', 'label': 'Web Search', 'icon': 'fa-magnifying-glass'},
 ] %}
 <div class="dash-layout">
 {{ dash_sidebar(sidebar_tabs, 'api-keys', 'Dashboard sections') }}
@@ -686,6 +687,63 @@
     </div>
 </div>
 
+<!-- ══════════════════════════════════════════════════════ Web Search -->
+<div class="section tab-content ws-page" id="websearch-tab">
+    <h4 class="mb-2"><i class="fas fa-magnifying-glass me-2"></i>Web Search</h4>
+    <p class="ws-intro">
+        When a model you call searches the web, the proxy runs the search for it.
+        Choose where searches go and how results come back.
+    </p>
+    <div class="skeleton-stack" id="wsu-loading" aria-busy="true" aria-label="Loading your web search settings">
+        <div class="skeleton skeleton-row"></div>
+        <div class="skeleton skeleton-row"></div>
+        <div class="skeleton skeleton-row"></div>
+    </div>
+    <p class="ws-callout" id="wsu-unavailable" hidden></p>
+    <div id="wsu-form" hidden>
+        <p class="ws-callout" id="wsu-callout" hidden></p>
+
+        <div class="card ws-card">
+            <div class="card-header ws-card__head">
+                <h5 class="mb-0"><i class="fas fa-plug me-2"></i>Backend</h5>
+            </div>
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-lg-6 col-12">
+                        <label class="form-label" for="wsu-backend">Send searches to</label>
+                        <select id="wsu-backend" class="form-select"></select>
+                    </div>
+                    <div class="col-lg-3 col-6">
+                        <label class="form-label" for="wsu-max-results">Results per query</label>
+                        <input type="number" id="wsu-max-results" class="form-control" aria-describedby="wsu-max-results-help">
+                        <div class="form-text ws-inherit" id="wsu-max-results-help"></div>
+                    </div>
+                    <div class="col-lg-3 col-6">
+                        <label class="form-label" for="wsu-snippet-chars">Snippet length</label>
+                        <input type="number" id="wsu-snippet-chars" class="form-control" aria-describedby="wsu-snippet-chars-help">
+                        <div class="form-text ws-inherit" id="wsu-snippet-chars-help"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card ws-card" id="wsu-params-card">
+            <div class="card-header ws-card__head">
+                <h5 class="mb-0"><i class="fas fa-sliders me-2"></i><span id="wsu-params-title">Search parameters</span></h5>
+            </div>
+            <div class="card-body">
+                <div id="wsu-params"></div>
+            </div>
+        </div>
+
+        <div class="ws-actions">
+            <button type="button" class="btn btn-outline-secondary" id="wsu-reset-btn">Reset to defaults</button>
+            <button type="button" class="btn btn-primary" id="wsu-save-btn"><i class="fas fa-save me-1"></i>Save settings</button>
+        </div>
+    </div>
+    <script type="application/json" id="wsu-fourget-scrapers">{{ fourget_scrapers | list | tojson }}</script>
+</div>
+
 <!-- Leaving is the one decision that needs real numbers, and showConfirmModal is
      textContent-only. This dialog renders if_i_leave_now: a real settlement run,
      computed and rolled back, never numbers the frontend derives for itself. -->
@@ -792,5 +850,7 @@
 <script src="/static/js/features/dashboard/user-usage-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/quotas-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/pool-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/shared/websearch-params.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/dashboard/websearch-prefs-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/core/dash-sidebar.js?v={{ cache_version }}"></script>
 {% endblock %}

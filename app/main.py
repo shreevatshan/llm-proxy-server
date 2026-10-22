@@ -893,13 +893,14 @@ def create_management_app(
     templates = Jinja2Templates(directory="app/frontend/templates")
     mgmt_app.mount("/static", StaticFiles(directory="app/frontend/static"), name="static")
 
-    from app.routes import auth, dashboard, admin, pools
+    from app.routes import auth, dashboard, admin, pools, user_websearch
     mgmt_app.include_router(auth.router)
     mgmt_app.include_router(dashboard.router)
     mgmt_app.include_router(admin.router)
-    # Prefixed /auth/pools, so it inherits the CSRF protection the /auth/ prefix
-    # already has — no middleware change needed.
+    # Prefixed /auth/pools and /auth/websearch, so they inherit the CSRF protection
+    # the /auth/ prefix already has — no middleware change needed.
     mgmt_app.include_router(pools.router)
+    mgmt_app.include_router(user_websearch.router)
 
     # Unified entry point: expose every provider API under this port too.
     # MountedApp hands each sub-app the same scope it gets on its own port.

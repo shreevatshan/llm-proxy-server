@@ -14,7 +14,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Sequence, Tuple
-from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, ModelGroupInstanceMember, UserModelGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, ModelGroupInstanceMember, UserModelGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, WebSearchBackend, UserWebSearchSettings, UserWebSearchBackendParams, WEBSEARCH_BACKEND_PARAMS, WEBSEARCH_PARAM_FIELDS, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -713,6 +713,159 @@ async def upsert_websearch_settings(
     return row
 
 
+async def list_websearch_backends(db: AsyncSession) -> List[WebSearchBackend]:
+    """Every web search backend, by name."""
+    from sqlalchemy import func
+    result = await db.execute(select(WebSearchBackend).order_by(func.lower(WebSearchBackend.name)))
+    return list(result.scalars().all())
+
+
+async def get_websearch_backend(db: AsyncSession, backend_id: int) -> Optional[WebSearchBackend]:
+    result = await db.execute(select(WebSearchBackend).where(WebSearchBackend.id == backend_id))
+    return result.scalar_one_or_none()
+
+
+async def create_websearch_backend(db: AsyncSession, values: dict, admin_username: str) -> WebSearchBackend:
+    """Create a backend. With no default backend yet, it becomes the default."""
+    row = WebSearchBackend(**values, updated_by=admin_username)
+    db.add(row)
+    await db.flush()
+    settings = await get_websearch_settings(db)
+    if settings is None:
+        settings = WebSearchSettings(id=1, updated_by=admin_username)
+        db.add(settings)
+    if settings.default_backend_id is None:
+        settings.default_backend_id = row.id
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def update_websearch_backend(
+    db: AsyncSession, backend_id: int, values: dict, admin_username: str,
+) -> Optional[WebSearchBackend]:
+    row = await get_websearch_backend(db, backend_id)
+    if row is None:
+        return None
+    for key, value in values.items():
+        setattr(row, key, value)
+    row.updated_by = admin_username
+    row.updated_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def delete_websearch_backend(db: AsyncSession, backend_id: int) -> bool:
+    """Delete a backend with its users' parameters for it; users who picked it
+    go back to the default. SQLite does not enforce the foreign keys, so the
+    dependent rows are handled here, in the same commit."""
+    from sqlalchemy import delete as _sql_delete, update as _sql_update
+    row = await get_websearch_backend(db, backend_id)
+    if row is None:
+        return False
+    await db.execute(_sql_delete(UserWebSearchBackendParams).where(
+        UserWebSearchBackendParams.backend_id == backend_id
+    ))
+    await db.execute(_sql_update(UserWebSearchSettings).where(
+        UserWebSearchSettings.backend_id == backend_id
+    ).values(backend_id=None))
+    await db.delete(row)
+    await db.commit()
+    return True
+
+
+async def count_backend_users(db: AsyncSession) -> Dict[int, int]:
+    """{backend_id: number of users who picked it}."""
+    from sqlalchemy import func
+    result = await db.execute(
+        select(UserWebSearchSettings.backend_id, func.count())
+        .where(UserWebSearchSettings.backend_id.is_not(None))
+        .group_by(UserWebSearchSettings.backend_id)
+    )
+    return dict(result.all())
+
+
+async def get_user_websearch(
+    db: AsyncSession, user_id: int,
+) -> Tuple[Optional[UserWebSearchSettings], Dict[int, UserWebSearchBackendParams]]:
+    """A user's web search row (or None) and their parameter rows by backend id."""
+    row = (await db.execute(
+        select(UserWebSearchSettings).where(UserWebSearchSettings.user_id == user_id)
+    )).scalar_one_or_none()
+    params = (await db.execute(
+        select(UserWebSearchBackendParams).where(UserWebSearchBackendParams.user_id == user_id)
+    )).scalars().all()
+    return row, {p.backend_id: p for p in params}
+
+
+async def put_user_websearch(
+    db: AsyncSession, user_id: int, backend_id: Optional[int], limits: dict,
+    params_backend_id: Optional[int], params: dict,
+) -> None:
+    """Replace a user's backend choice and limits, and their parameters for one
+    backend (the others are kept). Rows left with nothing set are removed."""
+    from sqlalchemy.exc import IntegrityError
+    try:
+        await _put_user_websearch(db, user_id, backend_id, limits, params_backend_id, params)
+    except IntegrityError:
+        # A concurrent save (another tab) inserted the same row first. Once more
+        # finds it and updates it: the last save wins, as for any PUT.
+        await db.rollback()
+        await _put_user_websearch(db, user_id, backend_id, limits, params_backend_id, params)
+
+
+async def _put_user_websearch(
+    db: AsyncSession, user_id: int, backend_id: Optional[int], limits: dict,
+    params_backend_id: Optional[int], params: dict,
+) -> None:
+    row, by_backend = await get_user_websearch(db, user_id)
+    if params_backend_id is not None:
+        params_row = by_backend.get(params_backend_id)
+        if any(v is not None for v in params.values()):
+            if params_row is None:
+                params_row = UserWebSearchBackendParams(user_id=user_id, backend_id=params_backend_id)
+                db.add(params_row)
+                by_backend[params_backend_id] = params_row
+            for field in WEBSEARCH_PARAM_FIELDS:
+                setattr(params_row, field, params.get(field))
+            params_row.updated_at = datetime.utcnow()
+        elif params_row is not None:
+            await db.delete(params_row)
+            del by_backend[params_backend_id]
+
+    if backend_id is None and all(v is None for v in limits.values()) and not by_backend:
+        if row is not None:
+            await db.delete(row)
+    else:
+        if row is None:
+            row = UserWebSearchSettings(user_id=user_id)
+            db.add(row)
+        row.backend_id = backend_id
+        for key, value in limits.items():
+            setattr(row, key, value)
+        row.updated_at = datetime.utcnow()
+    await db.commit()
+
+
+async def delete_user_websearch(db: AsyncSession, user_id: int) -> None:
+    """Drop all of a user's web search choices (back to the admin defaults)."""
+    from sqlalchemy import delete as _sql_delete
+    for model in (UserWebSearchBackendParams, UserWebSearchSettings):
+        await db.execute(_sql_delete(model).where(model.user_id == user_id))
+    await db.commit()
+
+
+async def load_websearch_snapshot_rows(db: AsyncSession):
+    """(settings row or None, backends, user rows, user parameter rows), for the
+    request-time snapshot in app.websearch.settings."""
+    settings = await get_websearch_settings(db)
+    backends = await list_websearch_backends(db)
+    users = (await db.execute(select(UserWebSearchSettings))).scalars().all()
+    params = (await db.execute(select(UserWebSearchBackendParams))).scalars().all()
+    return settings, backends, list(users), list(params)
+
+
 async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
     """Permanently delete a user and all associated data from the database.
 
@@ -753,6 +906,8 @@ async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
             UserModelGroupRateLimit,
             UserModelAccessPolicy,
             UserModelAccessException,
+            UserWebSearchSettings,
+            UserWebSearchBackendParams,
         ):
             await db.execute(_sql_delete(_model).where(_model.user_id == user_id))
 
@@ -2992,6 +3147,18 @@ async def _run_auto_migrations():
             )
         logger.info("Auto-migration: database backed up to %s", backup)
 
+    # Moving web search onto backend rows deletes nothing (the old columns stay),
+    # so a failed backup only warns.
+    async with engine.connect() as conn:
+        websearch_backends_pending = await _websearch_backends_pending(conn)
+    if websearch_backends_pending:
+        try:
+            backup = await asyncio.to_thread(_backup_sqlite_file, "pre-websearch-backends")
+            if backup:
+                logger.info("Auto-migration: database backed up to %s", backup)
+        except Exception as e:
+            logger.warning("Auto-migration: pre-websearch-backends backup failed: %s", e)
+
     async with engine.begin() as conn:
         # Check if is_pending_approval column exists on users table
         try:
@@ -3125,26 +3292,11 @@ async def _run_auto_migrations():
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add azure_backend column: {e}")
 
-        # Add the backend-selection columns to websearch_settings. NULL means
-        # "use the default" (provider -> searxng), so existing rows keep working.
-        # On a fresh database create_tables_async() has already made these and
-        # this is a no-op.
-        try:
-            result = await conn.execute(text("PRAGMA table_info(websearch_settings)"))
-            columns = [row[1] for row in result.fetchall()]
-            if columns:
-                for name, ddl in (
-                    ('provider', "ALTER TABLE websearch_settings ADD COLUMN provider TEXT"),
-                    ('fourget_base_url', "ALTER TABLE websearch_settings ADD COLUMN fourget_base_url TEXT"),
-                    ('fourget_scraper', "ALTER TABLE websearch_settings ADD COLUMN fourget_scraper TEXT"),
-                    ('fourget_lang', "ALTER TABLE websearch_settings ADD COLUMN fourget_lang TEXT"),
-                    ('fourget_country', "ALTER TABLE websearch_settings ADD COLUMN fourget_country TEXT"),
-                ):
-                    if name not in columns:
-                        logger.info(f"Auto-migration: Adding '{name}' column to websearch_settings")
-                        await conn.execute(text(ddl))
-        except Exception as e:
-            logger.warning(f"Auto-migration: Could not add websearch backend columns: {e}")
+        # Move the single SearXNG / 4get configuration onto websearch_backends rows.
+        # Not wrapped in a swallow-all try: a half-done move would leave web search
+        # pointing at nothing, so a failure aborts startup with the transaction
+        # rolled back.
+        await _migrate_websearch_backends(conn, websearch_backends_pending)
 
         # Per-pool admin overrides of PoolSettings. NULL inherits the global value, so
         # existing pools keep today's behaviour.
@@ -3435,6 +3587,90 @@ async def _run_auto_migrations():
             await _seed_pool_id_high_water(conn)
         except Exception as e:
             logger.warning(f"Auto-migration: could not seed the pool id high-water mark: {e}")
+
+
+async def _websearch_backends_pending(conn) -> bool:
+    """True when websearch_settings predates multiple backends.
+
+    A fresh database gets default_backend_id from create_all, so only a table
+    created before it lacks the column.
+    """
+    from sqlalchemy import text
+
+    columns = [r[1] for r in (await conn.execute(text("PRAGMA table_info(websearch_settings)"))).fetchall()]
+    return bool(columns) and "default_backend_id" not in columns
+
+
+# The single-backend columns of websearch_settings, read once by the migration.
+# Older databases may lack the 4get ones (added in a later release).
+_LEGACY_WEBSEARCH_COLUMNS = (
+    "provider", "searxng_base_url", "engines", "categories", "language", "safesearch",
+    "time_range", "fourget_base_url", "fourget_scraper", "fourget_lang", "fourget_country",
+)
+
+
+async def _migrate_websearch_backends(conn, pending: bool) -> None:
+    """Turn the stored SearXNG and 4get configurations into backend rows.
+
+    Each configured URL becomes a backend with its parameters, and the backend of
+    the old `provider` becomes the default. Adding default_backend_id happens in
+    the same transaction, which is what makes this run once. The old columns are
+    left in place, so the previous release still finds its settings.
+    """
+    from sqlalchemy import text
+
+    if not pending:
+        return
+    await conn.execute(text("ALTER TABLE websearch_settings ADD COLUMN default_backend_id INTEGER"))
+    columns = {r[1] for r in (await conn.execute(text("PRAGMA table_info(websearch_settings)"))).fetchall()}
+    legacy = [c for c in _LEGACY_WEBSEARCH_COLUMNS if c in columns]
+    row = (await conn.execute(text(
+        f"SELECT {', '.join(['enabled'] + legacy)} FROM websearch_settings WHERE id = 1"
+    ))).mappings().first()
+    if row is None:
+        logger.info("Auto-migration: web search was never configured; no backends to create")
+        return
+    row = dict(row)
+
+    created = {}
+    if not (await conn.execute(text("SELECT 1 FROM websearch_backends LIMIT 1"))).first():
+        for backend_type, name, url_column in (
+            ("searxng", "SearXNG", "searxng_base_url"),
+            ("fourget", "4get", "fourget_base_url"),
+        ):
+            url = (row.get(url_column) or "").strip().rstrip("/")
+            if not url:
+                continue
+            params = {p: row.get(p) for p in WEBSEARCH_BACKEND_PARAMS[backend_type]}
+            names = ", ".join(params)
+            await conn.execute(text(
+                "INSERT INTO websearch_backends (name, type, base_url, enabled, user_selectable, "
+                f"{names}, created_at, updated_at, updated_by) VALUES (:name, :type, :url, 1, 1, "
+                f"{', '.join(':' + p for p in params)}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 'migration')"
+            ), {"name": name, "type": backend_type, "url": url, **params})
+            created[backend_type] = (await conn.execute(
+                text("SELECT id FROM websearch_backends WHERE name = :name"), {"name": name}
+            )).scalar_one()
+
+    # Backends already there (an old settings table restored next to them) are
+    # not duplicated, but one of them is still the default rather than none.
+    by_type = dict(created)
+    for backend_type, backend_id in (await conn.execute(
+        text("SELECT type, id FROM websearch_backends WHERE enabled = 1 ORDER BY id")
+    )).fetchall():
+        by_type.setdefault(backend_type, backend_id)
+    default_id = by_type.get(row.get("provider") or "searxng") or next(iter(by_type.values()), None)
+    if default_id is not None:
+        await conn.execute(text("UPDATE websearch_settings SET default_backend_id = :d WHERE id = 1"), {"d": default_id})
+    elif row.get("enabled"):
+        # Unreachable with the old form's validation (enabled needed a URL), but an
+        # enabled feature with nowhere to send searches must not stay on.
+        await conn.execute(text("UPDATE websearch_settings SET enabled = 0 WHERE id = 1"))
+        logger.warning("Auto-migration: web search was enabled without a backend URL; turned it off")
+    logger.info(
+        "Auto-migration: web search backends created: %s; default backend id %s",
+        ", ".join(sorted(created)) or "none", default_id,
+    )
 
 
 async def _users_need_profile_column(conn) -> bool:

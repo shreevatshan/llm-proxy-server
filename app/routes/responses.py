@@ -160,9 +160,13 @@ async def responses_create(
                 request,
                 provider_key_for_model(request.model),
                 lambda r: provider_manager.responses_create(r, user_id=owner_id),
+                user_id=owner_id,
             )
             if websearch_loop is not None:
-                add_span_attributes(span, {"responses.websearch_interception": True})
+                add_span_attributes(span, {
+                    "responses.websearch_interception": True,
+                    "responses.websearch_backend": websearch_loop.cfg.backend_name or "",
+                })
 
             if request.stream:
                 # Validate the model up front so a bad/unknown model name yields

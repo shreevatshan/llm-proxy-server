@@ -285,9 +285,10 @@ Examples:
 
 When a client sends a web search tool, the proxy can strip it, run the searches
 itself against a self-hosted metasearch engine, and feed the results back to the
-model. Two backends are supported and either can be selected at runtime:
+model. Two backend types are supported, and the admin can register any number of
+instances of each:
 
-| Backend | Compose service | Base URL to configure |
+| Backend type | Compose service | Base URL to configure |
 |---------|-----------------|-----------------------|
 | SearXNG | `searxng` | `http://searxng:8080` |
 | 4get | `fourget` | `http://fourget` |
@@ -312,7 +313,7 @@ as a compose `config`, which needs Docker Compose 2.23 or newer.
 2. The proxy replaces it with an internal `web_search_proxy` function tool and
    calls the upstream model.
 3. When the model calls that tool, the proxy runs the queries concurrently on
-   the configured backend and feeds the results back, repeating until the model
+   the caller's backend and feeds the results back, repeating until the model
    answers or the round limit is reached. Duplicate queries are skipped.
 4. The client sees one request and one response. On the Anthropic and
    Responses surfaces, searches come back as native `server_tool_use` /
@@ -326,27 +327,82 @@ header.
 ### Configuration
 
 **These settings are not environment variables.** Everything is configured in
-the admin dashboard under **Web Search**: pick the backend, enter its base URL,
-press *Run test* to confirm connectivity, then enable interception and choose
-which API surfaces and providers it applies to. Each backend stores its own URL
-and parameters, so switching between them keeps both configurations. Changes
-take effect immediately, without a restart.
+the admin dashboard under **Web Search**, and changes take effect immediately,
+without a restart:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| Apply to | all surfaces | Anthropic Messages, Chat Completions, Responses |
-| Providers | none | Provider instances interception applies to (`*` for all) |
-| Max results | 5 | Results returned per query |
-| Max snippet chars | 500 | Snippet length per result |
-| Timeout | 10s | Per-search timeout |
-| Max agentic loops | 3 | Search rounds before the model must answer |
-| Max queries per turn | 5 | Queries accepted from a single model turn |
-| SearXNG: categories / language / safesearch / time range / engines | `general` / `auto` / moderate / any / default | Passed through to SearXNG |
-| 4get: scraper / language / country | `ddg` / — / — | Upstream engine 4get scrapes, plus locale |
+1. Under **Backends**, press *Add backend*: give it a name, pick its type, enter
+   its base URL and press *Run test*. Each backend keeps its own search
+   parameters. The first backend becomes the default.
+2. Under **Defaults**, choose the default backend and the result limits.
+3. Under **Interception**, turn it on and choose which API surfaces and
+   providers it applies to.
 
-Interception only runs when it is enabled, a base URL is set for the selected
-backend, and both the request's API surface and its provider are selected.
-Otherwise the web search tool is passed to the upstream provider unchanged.
+| Setting | Default | Who sets it | Description |
+|---------|---------|-------------|-------------|
+| Enabled | off | admin | Master switch |
+| Apply to | all surfaces | admin | Anthropic Messages, Chat Completions, Responses |
+| Providers | none | admin | Provider instances interception applies to (`*` for all) |
+| Timeout | 10s | admin | Per-search timeout |
+| Max agentic loops | 3 | admin | Search rounds before the model must answer |
+| Max queries per turn | 5 | admin | Queries accepted from a single model turn |
+| Default backend | first added | admin | Where searches go for users who did not pick one |
+| Max results | 5 | admin default, user | Results returned per query (1–20) |
+| Max snippet chars | 500 | admin default, user | Snippet length per result (50–5000) |
+| SearXNG: categories / language / safesearch / time range / engines | `general` / `auto` / moderate / any / default | per backend, user | Passed through to SearXNG |
+| 4get: scraper / language / country / safesearch / time range | `ddg` / — / — / moderate / any | per backend, user | Upstream engine 4get scrapes, its locale and filters |
+
+Interception only runs when it is enabled, the default backend is enabled, and
+both the request's API surface and its provider are selected. Otherwise the web
+search tool is passed to the upstream provider unchanged.
+
+#### Backends
+
+- **Enabled:** a disabled backend is never used. The default backend cannot be
+  disabled or deleted; choose another default first.
+- **Users can pick this backend:** when off, the backend disappears from the
+  users' list. It can still be the default.
+- A backend's type cannot change after it is created; add a new backend instead.
+- Deleting a backend returns the users who picked it to the default and removes
+  their parameters for it. Turning it off or hiding it only moves them to the
+  default while it stays that way; their choice comes back with the backend.
+
+#### User preferences
+
+Each user has a **Web Search** tab in their dashboard where they can:
+
+- pick another backend among the enabled, user-selectable ones (the URL is
+  never shown to them),
+- override the backend's search parameters, and the result limits.
+
+Anything a user leaves empty follows the admin default: the default backend,
+that backend's parameters, and the default limits. Parameters are saved per
+backend, so switching backends and back keeps them. Engines and categories are
+one choice, as are 4get's scraper with its language and country: a user who sets
+either takes the whole group, so it never mixes with the backend's own. Users
+cannot turn interception off or change the admin-only settings above.
+
+Endpoints, all under the management server:
+
+| Endpoint | Who | Purpose |
+|----------|-----|---------|
+| `GET` / `PUT /admin/websearch/settings` | admin | Interception settings, default backend and limits |
+| `GET` / `POST` / `PUT` / `DELETE /admin/websearch/backends[?backend_id=]` | admin | List, add, replace, delete backends |
+| `PUT /admin/websearch/backends/toggle?backend_id=` | admin | Turn a backend on or off |
+| `POST /admin/websearch/test` | admin | Run one query on an unsaved backend, a stored one, or the default |
+| `POST /admin/websearch/engines` | admin | A SearXNG instance's engines and categories |
+| `GET` / `PUT` / `DELETE /auth/websearch` | user | The caller's choices, available backends and effective settings; reset |
+| `GET /auth/websearch/engines?backend_id=` | user | Engines and categories of a pickable SearXNG backend (cached 10 minutes) |
+
+#### Upgrading from a single backend
+
+Before multiple backends, `PUT /admin/websearch/settings` took the backend's URL
+and parameters directly. On the first start after upgrading, the stored SearXNG
+and 4get configurations each become a backend (named `SearXNG` and `4get`) with
+their parameters, and the one that was selected becomes the default. The
+database is backed up first to `llm_proxy.db.pre-websearch-backends-<time>.bak`.
+The old columns are left in place, so the previous release still finds its
+settings if you roll back. The settings endpoint now takes `default_backend_id`
+instead; backends are edited through `/admin/websearch/backends`.
 
 ## API Documentation
 
