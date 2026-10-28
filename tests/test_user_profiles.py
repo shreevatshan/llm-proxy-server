@@ -19,7 +19,8 @@ from sqlalchemy.exc import IntegrityError
 from app.auth.admin import AdminUser
 from app.auth.models import (
     DEFAULT_PROFILE_ID, AdminUserCreate, BulkUserActionRequest, ModelAlias, ModelConfiguration,
-    ProfileCreate, ProfileLimitsUpdate, ProviderCredentials, User, UserProfile,
+    ProfileCreate, ProfileLimitsUpdate, ProfileOverallLimitsUpdate, ProviderCredentials, User,
+    UserProfile,
 )
 from app.model_alias import (
     alias_input_name, alias_resolved_name, alias_resolved_scope, alias_seen_names,
@@ -108,17 +109,23 @@ def test_models_with_access_shows_profile_disabled_models(registry):
 
 @pytest.fixture
 def aliases():
-    saved = (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots)
+    saved = (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots,
+             model_alias_resolver._fallback_snapshot, model_alias_resolver._fallback_profile_snapshots)
     tokens = [(v, v.set(d)) for v, d in (
         (original_model_name, None), (current_api_surface, "openai"), (alias_resolved_name, None),
         (alias_input_name, None), (alias_resolved_scope, None), (alias_seen_names, frozenset()),
         (current_profile_id, None),
     )]
     model_alias_resolver._profile_snapshots = {}
-    model_alias_resolver.set_rules([build_rule("gpt", "p/default", rule_id=1)])
-    model_alias_resolver.set_rules([build_rule("gpt", "p/team", rule_id=2)], profile_id=7)
+    model_alias_resolver._fallback_profile_snapshots = {}
+    # "gpt" is no model, so requests for it are mapped by the fallback lists; the
+    # same rules sit in both lists so apply_alias's default (regular) list sees them too.
+    for kind in ("alias", "fallback"):
+        model_alias_resolver.set_rules([build_rule("gpt", "p/default", rule_id=1)], kind=kind)
+        model_alias_resolver.set_rules([build_rule("gpt", "p/team", rule_id=2)], profile_id=7, kind=kind)
     yield model_alias_resolver
-    (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots) = saved
+    (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots,
+     model_alias_resolver._fallback_snapshot, model_alias_resolver._fallback_profile_snapshots) = saved
     for var, token in reversed(tokens):
         var.reset(token)
 
@@ -163,11 +170,20 @@ def test_profile_mapping_applies_directly_after_auth(aliases):
 def test_bind_profile_context_retags_the_request(aliases, registry):
     from unittest.mock import AsyncMock, patch
     from app.auth.middleware import _bind_profile_context
+    from app.cache import ModelCache
+    from app.openai_models import ModelInfo
+    from app.providers.provider_manager import provider_manager
 
+    # After auth a fallback is only taken when its target can be served.
+    cache = ModelCache()
+    cache.update_models([ModelInfo(id="p/team", created=0, owned_by="t", provider="t")])
+    stub = SimpleNamespace(supports_api_for_model=lambda model, api: True)
     registry.install({5: 7}, [ProfileSnapshot(7, "team")])
-    assert apply_alias("gpt") == "p/default"    # what the middleware did
+    assert apply_alias("gpt", kind="fallback") == "p/default"    # what the middleware did
     request = SimpleNamespace(state=SimpleNamespace(model="p/default", tracking_request_id="r1"))
-    with patch("app.request_tracker.request_tracker.update_model", new_callable=AsyncMock) as upd:
+    with patch.object(provider_manager, "model_cache", cache), \
+         patch.object(provider_manager, "providers", {"p": stub}), \
+         patch("app.request_tracker.request_tracker.update_model", new_callable=AsyncMock) as upd:
         asyncio.run(_bind_profile_context(request, SimpleNamespace(user_id=5, id=1)))
     assert request.state.model == "p/team", "the overall-limit check sees the final model"
     upd.assert_awaited_once_with("r1", "p/team")
@@ -178,12 +194,40 @@ def test_bind_profile_context_restores_the_name_for_a_profile_without_mappings(a
     from app.auth.middleware import _bind_profile_context
 
     registry.install({6: 8}, [ProfileSnapshot(8, "empty")])
-    assert apply_alias("gpt") == "p/default"
+    assert apply_alias("gpt", kind="fallback") == "p/default"
     request = SimpleNamespace(state=SimpleNamespace(model="p/default", tracking_request_id="r1"))
     with patch("app.request_tracker.request_tracker.update_model", new_callable=AsyncMock) as upd:
         asyncio.run(_bind_profile_context(request, SimpleNamespace(user_id=6, id=1)))
     assert request.state.model == "gpt"
     upd.assert_awaited_once_with("r1", "gpt")
+
+
+def test_bind_profile_context_rejudges_default_members_by_their_access(aliases, registry):
+    """Before auth only the global gate is known; a Default member whose access denies
+    the model gets the fallback list, so the pre-auth regular mapping is undone."""
+    from unittest.mock import AsyncMock, patch
+    from app.auth.middleware import _bind_profile_context
+    from app.cache import ModelCache
+    from app.openai_models import ModelInfo
+    from app.providers.provider_manager import provider_manager
+
+    cache = ModelCache()
+    cache.update_models([ModelInfo(id=m, created=0, owned_by="t", provider="t")
+                         for m in ("p/gpt", "p/fallback")])
+    stub = SimpleNamespace(supports_api_for_model=lambda model, api: True)
+    model_alias_resolver.set_rules([build_rule("gpt", "p/mapped", rule_id=3)])            # regular
+    model_alias_resolver.set_rules([build_rule("gpt", "p/fallback", rule_id=4)], kind="fallback")
+    registry.install({5: DEFAULT}, [ProfileSnapshot(DEFAULT, "Default", access_mode="custom",
+                                                    access_exceptions={"p/gpt": False})])
+    with patch.object(provider_manager, "model_cache", cache), \
+         patch.object(provider_manager, "providers", {"p": stub}):
+        from app.model_resolution import map_model_name
+        assert map_model_name("gpt") == "p/mapped", "pre-auth: globally available"
+        request = SimpleNamespace(state=SimpleNamespace(model="p/mapped", tracking_request_id="r1"))
+        with patch("app.request_tracker.request_tracker.update_model", new_callable=AsyncMock) as upd:
+            asyncio.run(_bind_profile_context(request, SimpleNamespace(user_id=5, id=1)))
+    assert request.state.model == "p/fallback"
+    upd.assert_awaited_once_with("r1", "p/fallback")
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +298,7 @@ class ProfileRateLimitTests(PoolTestCase):
         self.assertEqual(ctx.exception.status_code, 409, "names are case-insensitive")
 
         await admin_routes.update_profile_limits_endpoint(
-            ProfileLimitsUpdate(rpm_limit=4), created.id, ADMIN, self.db)
+            ProfileOverallLimitsUpdate(rpm_limit=4), created.id, ADMIN, self.db)
         listed = {p.id: p for p in await admin_routes.list_profiles_endpoint(ADMIN, self.db)}
         self.assertEqual(listed[created.id].rpm_limit, 4)
         self.assertTrue(listed[DEFAULT_PROFILE_ID].is_default)
@@ -425,8 +469,10 @@ def test_migration_seeds_default_from_global_values_and_is_idempotent(monkeypatc
         assert conn.execute("SELECT DISTINCT profile_id FROM users").fetchall() == [(1,)]
         assert conn.execute(
             "SELECT profile_id, group_id, rpd_limit FROM profile_model_group_limits").fetchall() == [(1, 1, 100)]
-        assert conn.execute("SELECT profile_id, alias FROM model_aliases").fetchall() == [(1, "gpt")], \
-            "mappings from before profiles become Default's"
+        assert conn.execute(
+            "SELECT profile_id, alias, kind FROM model_aliases ORDER BY kind").fetchall() == [
+                (1, "gpt", "alias"), (1, "gpt", "fallback")], \
+            "mappings from before profiles become Default's, in both lists"
         conn.execute("INSERT INTO user_profiles (id, name, model_access_mode) VALUES (2, 'Team', 'default')")
         conn.execute("INSERT INTO model_aliases (alias, target_model_id, enabled, profile_id) "
                      "VALUES ('gpt', 'p/team', 1, 2)")

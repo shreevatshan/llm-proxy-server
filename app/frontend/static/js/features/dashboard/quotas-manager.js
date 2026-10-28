@@ -59,6 +59,7 @@ class QuotasManager {
 
         if (data.is_admin) {
             this._renderPoolChip(null);
+            this._renderConcurrencyChip(null, 0);
             container.innerHTML = `
                 <div class="alert alert-info mb-0">
                     <i class="fas fa-shield-alt me-2"></i>
@@ -69,6 +70,7 @@ class QuotasManager {
         }
 
         this._renderPoolChip(data.pool);
+        this._renderConcurrencyChip(data.max_concurrent_requests, data.in_flight);
 
         const sections = data.sections || [];
         if (sections.length === 0) {
@@ -167,6 +169,23 @@ class QuotasManager {
                 <i class="fas fa-users me-1" style="font-size:0.62rem"></i>
                 <span class="c-name">${this._escapeHtml(pool.name)}</span>
                 <span class="c-prefix"> · ${n} ${n === 1 ? 'member' : 'members'}</span>
+            </span>
+        `;
+    }
+
+    // Profile-wide, not per section, so it sits in the header beside the pool chip.
+    // Nothing is shown when the profile leaves concurrency unlimited.
+    _renderConcurrencyChip(limit, inFlight) {
+        const chip = document.getElementById('quotaConcurrencyChip');
+        if (!chip) return;
+        if (limit === null || limit === undefined) { chip.innerHTML = ''; return; }
+        const now = Number(inFlight || 0);
+        const title = `At most ${limit} request${limit === 1 ? '' : 's'} in progress at once across all your keys (${now} now)`;
+        chip.innerHTML = `
+            <span class="quota-chip ms-2" style="vertical-align:middle" title="${this._escapeHtml(title)}">
+                <i class="fas fa-layer-group me-1" style="font-size:0.62rem"></i>
+                <span class="c-name">${this._fmt(limit)}</span>
+                <span class="c-prefix"> concurrent</span>
             </span>
         `;
     }

@@ -592,8 +592,9 @@
                 <i class="fas fa-gauge-high me-2"></i>Usage &amp; Quotas
                 <i class="fas fa-info-circle text-muted ms-1 quota-info" style="font-size:0.8rem;cursor:help;"
                    data-bs-toggle="tooltip" data-bs-placement="top"
-                   title="Each section is a quota bucket shared by the models listed under it. The header shows today's requests used, the daily limit (RPD), and how many remain; RPM is your per-minute limit. Models are grouped so that any group sharing one quota is shown together; models not in any other group appear under 'Default'. ∞ means unlimited."></i>
+                   title="Each section is a quota bucket shared by the models listed under it. The header shows today's requests used, the daily limit (RPD), and how many remain; RPM is your per-minute limit. Models are grouped so that any group sharing one quota is shown together; models not in any other group appear under 'Default'. ∞ means unlimited. If your profile caps concurrent requests, the header also shows how many may be in progress at once across all your keys."></i>
             <span id="quotaPoolChip"></span>
+            <span id="quotaConcurrencyChip"></span>
             </h5>
         </div>
         <div class="card-body">

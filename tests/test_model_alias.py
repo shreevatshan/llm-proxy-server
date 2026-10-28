@@ -5,6 +5,7 @@ import pytest
 
 from app.model_alias import (
     alias_input_name,
+    alias_source_name,
     alias_resolved_name,
     alias_resolved_scope,
     alias_seen_names,
@@ -24,7 +25,8 @@ from app.model_alias import (
 @pytest.fixture(autouse=True)
 def _isolated_resolver():
     """Restore the live snapshot and per-request context after every test."""
-    previous = (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots)
+    previous = (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots,
+                model_alias_resolver._fallback_snapshot, model_alias_resolver._fallback_profile_snapshots)
     tokens = [
         (original_model_name, original_model_name.set(None)),
         (current_api_surface, current_api_surface.set(None)),
@@ -37,7 +39,8 @@ def _isolated_resolver():
     try:
         yield
     finally:
-        (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots) = previous
+        (model_alias_resolver._snapshot, model_alias_resolver._profile_snapshots,
+         model_alias_resolver._fallback_snapshot, model_alias_resolver._fallback_profile_snapshots) = previous
         for var, token in reversed(tokens):
             var.reset(token)
 
@@ -317,3 +320,64 @@ def test_load_from_database_skips_disabled_and_invalid_rows(monkeypatch):
     assert [r.id for r in model_alias_resolver._snapshot.rules] == [4]
     assert model_alias_resolver.resolve("claude-opus-4", "anthropic") == "p/on"
     assert model_alias_resolver.resolve("claude-opus-4", "openai") == "claude-opus-4"
+
+
+# ---------------------------------------------------------------------------
+# Regular and fallback lists
+# ---------------------------------------------------------------------------
+
+def test_load_from_database_splits_rows_by_kind(monkeypatch):
+    import app.model_alias as model_alias_module
+
+    rows = [
+        SimpleNamespace(id=1, alias="gpt", target_model_id="p/regular", enabled=True, apis=None,
+                        match_type="exact", priority=0),                      # legacy row: no kind
+        SimpleNamespace(id=2, alias="gpt", target_model_id="p/fallback", enabled=True, apis=None,
+                        match_type="exact", priority=0, kind="fallback"),
+        SimpleNamespace(id=3, alias="gpt", target_model_id="p/team", enabled=True, apis=None,
+                        match_type="exact", priority=0, kind="fallback", profile_id=7),
+        SimpleNamespace(id=4, alias="x", target_model_id="p/odd", enabled=True, apis=None,
+                        match_type="exact", priority=0, kind="bogus"),
+    ]
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def _fake_get_all(db, **_scope):
+        return rows
+
+    monkeypatch.setattr(model_alias_module, "AsyncSessionLocal", lambda: _Session())
+    monkeypatch.setattr(model_alias_module, "get_all_model_aliases", _fake_get_all)
+
+    asyncio.run(model_alias_resolver.load_from_database())
+    assert model_alias_resolver.resolve("gpt", "openai") == "p/regular"
+    assert model_alias_resolver.resolve("gpt", "openai", kind="fallback") == "p/fallback"
+    assert model_alias_resolver.resolve("gpt", "openai", 7, kind="fallback") == "p/team"
+    assert model_alias_resolver.resolve("gpt", "openai", 7) == "gpt", "profile 7 has no regular list"
+    assert model_alias_resolver.resolve("x", "openai") == "x", "unknown kinds never load"
+
+
+def test_switching_list_re_resolves_the_clients_name():
+    """Before auth the fallback list may apply; once the caller's access shows the
+    model is available, the regular list replaces that mapping (and vice versa)."""
+    model_alias_resolver.set_rules([build_rule("gpt", "p/regular", rule_id=1)])
+    model_alias_resolver.set_rules([build_rule("gpt", "p/fallback", rule_id=2)], kind="fallback")
+    assert apply_alias("gpt", kind="fallback") == "p/fallback"
+    assert apply_alias("p/fallback", kind="fallback") == "p/fallback", "no chaining within a list"
+    assert apply_alias("p/fallback", kind="alias") == "p/regular"
+    assert apply_alias("p/regular", kind="fallback") == "p/fallback"
+    assert original_model_name.get() == "gpt"
+
+
+def test_alias_source_name_recovers_the_clients_name():
+    model_alias_resolver.set_rules([build_rule("gpt", "p/x", rule_id=1)], kind="fallback")
+    assert alias_source_name("gpt") == "gpt", "nothing mapped yet"
+    apply_alias("gpt", kind="fallback")
+    assert alias_source_name("p/x") == "gpt"
+    assert alias_source_name("gpt") == "gpt"
+    assert alias_source_name("other") == "other"
+    assert alias_source_name(None) is None

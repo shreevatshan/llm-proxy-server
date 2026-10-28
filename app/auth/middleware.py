@@ -97,8 +97,10 @@ async def _enforce_rate_limit(
     endpoint = request.scope.get("endpoint") if hasattr(request, "scope") else None
     if getattr(endpoint, ROUTE_ENFORCES_LIMITS, False) is True:
         return
-    decision = await rate_limit_tracker.check_and_increment(user_id, username)
-    if not decision.allowed:
+    from app.concurrency_slots import charge_with_slot
+    decision = await charge_with_slot(
+        request, user_id, lambda: rate_limit_tracker.check_and_increment(user_id, username))
+    if decision is not None:
         envelope = envelope_for(request.url.path, envelope_override)
         if envelope == "anthropic":
             raise RateLimitExceeded.anthropic(decision)
@@ -133,25 +135,24 @@ def _resolve_identity(auth_result) -> tuple[Optional[str], Optional[str], Option
 async def _bind_profile_context(request: Request, auth_result) -> None:
     """Bind the caller's profile for alias resolution, and re-map the request's model.
 
-    The tracking middleware applied Default's mappings before auth (the profile was
-    not known yet) and recorded the result in request.state.model. For a caller in any
-    other profile the model is re-resolved here against that profile's own list --
-    before _enforce_rate_limit reads it to decide whether the overall limit applies --
-    and the in-flight usage entry is retagged so usage is recorded under the model
-    actually served.
+    The tracking middleware mapped the model before auth with Default's lists, choosing
+    the regular or fallback list from the global gate alone, and recorded the result
+    in request.state.model. Now the caller is known it is re-mapped: with the caller's
+    own profile lists, and with the list the caller's access picks (an admin, or a
+    profile in allow/deny mode, can see a model differently from the global gate). The
+    in-flight usage entry is retagged so usage is recorded under the model actually
+    served.
     """
-    from app.model_alias import apply_alias, current_profile_id
-    from app.profiles import DEFAULT_PROFILE_ID, profile_id_for_auth
+    from app.model_alias import current_profile_id
+    from app.model_resolution import map_model_name
+    from app.profiles import profile_id_for_auth
 
-    profile_id = profile_id_for_auth(auth_result)
-    current_profile_id.set(profile_id)
-    if profile_id is None or profile_id == DEFAULT_PROFILE_ID:
-        return
+    current_profile_id.set(profile_id_for_auth(auth_result))
     state = getattr(request, "state", None)
     model = getattr(state, "model", None) if state is not None else None
     if not isinstance(model, str) or not model:
         return
-    remapped = apply_alias(model)
+    remapped = map_model_name(model, auth_result)
     if remapped == model:
         return
     state.model = remapped

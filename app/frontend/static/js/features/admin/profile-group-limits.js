@@ -68,11 +68,11 @@ class ProfileGroupLimits {
                     </td>
                     <td>
                         <input type="number" min="0" class="form-control form-control-sm mg-pl-rpm"
-                            data-group-id="${g.group_id}" placeholder="Unlimited" value="${rpm}" style="width:120px;">
+                            data-group-id="${g.group_id}" placeholder="Unlimited" value="${rpm}">
                     </td>
                     <td>
                         <input type="number" min="0" class="form-control form-control-sm mg-pl-rpd"
-                            data-group-id="${g.group_id}" placeholder="Unlimited" value="${rpd}" style="width:120px;">
+                            data-group-id="${g.group_id}" placeholder="Unlimited" value="${rpd}">
                     </td>
                     <td class="text-nowrap">
                         <button class="btn btn-primary btn-sm me-1" onclick="${mgr}?.saveProfileGroupLimit(${g.group_id})">

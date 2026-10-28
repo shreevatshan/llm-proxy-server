@@ -59,8 +59,7 @@ from app.routes.stream_utils import (
     STREAM_TIMEOUT_SECONDS,
 )
 from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
-from app.model_alias import apply_alias
-from app.model_resolution import canonicalize_provider_prefix
+from app.model_resolution import canonicalize_provider_prefix, map_model_name
 from fastapi.encoders import jsonable_encoder
 from app.websearch import (
     HEADER_NAME as WEBSEARCH_HEADER,
@@ -294,7 +293,7 @@ async def azure_chat_completions(
     # a clean 400 before the StreamingResponse wrapper is returned.  (Foundry
     # ignores both ContextVars; see _deployment_call_guard.)
     model_name = await canonicalize_provider_prefix(
-        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
+        request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -389,7 +388,7 @@ async def azure_completions(
     provider = _get_azure_provider(provider_name)
 
     model_name = await canonicalize_provider_prefix(
-        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
+        request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -465,7 +464,7 @@ async def azure_embeddings(
     provider = _get_azure_provider(provider_name)
 
     model_name = await canonicalize_provider_prefix(
-        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
+        request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -516,7 +515,7 @@ async def azure_image_generation(
     provider = _get_azure_provider(provider_name)
 
     model_name = await canonicalize_provider_prefix(
-        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
+        request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -567,7 +566,7 @@ async def azure_audio_speech(
     provider = _get_azure_provider(provider_name)
 
     model_name = await canonicalize_provider_prefix(
-        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
+        request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -644,7 +643,7 @@ async def azure_audio_transcription(
     provider = _get_azure_provider(provider_name)
 
     model_name = await canonicalize_provider_prefix(
-        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
+        request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -714,7 +713,7 @@ async def azure_audio_translation(
     provider = _get_azure_provider(provider_name)
 
     model_name = await canonicalize_provider_prefix(
-        request_obj, apply_alias(_build_model_name(provider_name, deployment)))
+        request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
     # Validate after the alias resolves (it can rewrite the URL's deployment) and
     # before signalling the deployment call style.
     guard_error = _deployment_call_guard(provider, model_name, api_version)
@@ -779,12 +778,16 @@ async def azure_responses_create(
     # For Responses API, model is in the request body — prefix it with provider
     if request.model and "/" not in request.model:
         request.model = _build_model_name(provider_name, request.model)
-    elif request.model:
-        # Already prefixed: provider_manager routes by the model prefix, so a
-        # body model naming a DIFFERENT provider would silently execute there
-        # despite the URL scoping this call to `provider_name`. The URL
-        # provider is authoritative (matching the deployment-style siblings,
-        # where the URL fully determines the model) — reject mismatches.
+    # Map for this caller before checking the provider: the tracking middleware rewrote
+    # the body before auth, picking the regular or fallback list from the global gate
+    # alone (an admin may still call a disabled model it mapped away from).
+    request.model = map_model_name(request.model, auth)
+    if request.model:
+        # provider_manager routes by the model prefix, so a body model naming a
+        # DIFFERENT provider would silently execute there despite the URL scoping
+        # this call to `provider_name`. The URL provider is authoritative (matching
+        # the deployment-style siblings, where the URL fully determines the model)
+        # — reject mismatches.
         model_prefix = request.model.split("/", 1)[0]
         try:
             resolved_provider = provider_manager._get_provider(model_prefix)
@@ -798,7 +801,7 @@ async def azure_responses_create(
                 f"'{provider_name}' named in the URL",
             )
 
-    request.model = await canonicalize_provider_prefix(request_obj, apply_alias(request.model))
+    request.model = await canonicalize_provider_prefix(request_obj, request.model)
 
     # Enforce per-user model access + the group rate limit, mirroring the sibling
     # azure_chat_completions handler.

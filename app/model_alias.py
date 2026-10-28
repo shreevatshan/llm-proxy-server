@@ -5,6 +5,11 @@ case-insensitive regex (re.search), evaluated in admin-defined priority order.
 The first enabled rule that matches and is scoped to the request's API surface
 wins. Results are memoised per immutable rules snapshot, so after the first
 request for a name the lookup is a dict hit regardless of the rule types.
+
+Every profile has two lists: the regular one ("alias"), applied when the
+requested model is available to the caller, and the fallback one ("fallback"),
+applied when it is not. Which list applies is decided by app.model_resolution
+(map_model_name / resolve_model_for_request); this module only matches.
 """
 
 import asyncio
@@ -17,7 +22,9 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 from app.auth.database import AsyncSessionLocal, get_all_model_aliases
-from app.auth.models import DEFAULT_PROFILE_ID, MODEL_ALIAS_API_SURFACES, validate_alias_pattern
+from app.auth.models import (
+    DEFAULT_PROFILE_ID, MODEL_ALIAS_API_SURFACES, MODEL_ALIAS_KINDS, validate_alias_pattern,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,16 +55,17 @@ current_profile_id: ContextVar[Optional[int]] = ContextVar(
 )
 
 # Bookkeeping that corrects a mapping applied before auth. The tracking middleware
-# maps the client's name with Default's list (the profile is not known yet) and
-# rewrites the body, so handlers re-read Default's target. Once the profile is known,
-# apply_alias recognises any name this request already produced and re-resolves the
-# client's original input against that profile's own list -- which gives the input
-# back unchanged when nothing in that list matches it.
+# maps the client's name with Default's list (the profile is not known yet), picking
+# the regular or fallback list from the global gate alone, and rewrites the body, so
+# handlers re-read that target. Once the caller is known, apply_alias recognises any
+# name this request already produced and, if the scope -- the profile, or the list --
+# differs, re-resolves the client's original input against the new scope's rules,
+# which gives the input back unchanged when nothing there matches it.
 #   alias_input_name     -- the name the current mapping was computed from
-#   alias_resolved_scope -- the profile whose list that mapping used
+#   alias_resolved_scope -- the (profile, kind) whose list that mapping used
 #   alias_seen_names     -- every name apply_alias has produced in this request
 alias_input_name: ContextVar[Optional[str]] = ContextVar("alias_input_name", default=None)
-alias_resolved_scope: ContextVar[Optional[int]] = ContextVar("alias_resolved_scope", default=None)
+alias_resolved_scope: ContextVar[Optional[tuple]] = ContextVar("alias_resolved_scope", default=None)
 alias_seen_names: ContextVar[frozenset] = ContextVar("alias_seen_names", default=frozenset())
 
 
@@ -173,15 +181,17 @@ _NO_RULES = _RuleSnapshot()
 class ModelAliasResolver:
     """Immutable-snapshot alias resolver; reads never touch the database.
 
-    One snapshot per profile; a profile maps with its own list alone. Default's is
-    also the list requests map with before authentication. Other profiles' snapshots
-    are only consulted after authentication, so unauthenticated clients cannot fill
-    their match caches.
+    One snapshot per profile and list; a profile maps with its own lists alone.
+    Default's are also the lists requests map with before authentication. Other
+    profiles' snapshots are only consulted after authentication, so unauthenticated
+    clients cannot fill their match caches.
     """
 
     def __init__(self) -> None:
-        self._snapshot = _RuleSnapshot()        # Default's
-        self._profile_snapshots: dict = {}      # every other profile with rules
+        self._snapshot = _RuleSnapshot()                # Default's regular list
+        self._profile_snapshots: dict = {}              # every other profile's
+        self._fallback_snapshot = _RuleSnapshot()       # Default's fallback list
+        self._fallback_profile_snapshots: dict = {}     # every other profile's
         # Serialises reloads. Each admin edit commits and then reloads; without
         # this, an earlier reload whose SELECT predates a later commit could
         # install its snapshot last and leave stale rules live.
@@ -190,8 +200,8 @@ class ModelAliasResolver:
     async def load_from_database(self) -> None:
         async with self._reload_lock:
             async with AsyncSessionLocal() as db:
-                aliases = await get_all_model_aliases(db, all_profiles=True)
-            profile_rules = {}
+                aliases = await get_all_model_aliases(db, all_profiles=True, kind=None)
+            rules_by_kind = {kind: {} for kind in MODEL_ALIAS_KINDS}
             for row in aliases:
                 if not row.enabled:
                     continue
@@ -204,37 +214,61 @@ class ModelAliasResolver:
                     # Never fail startup over one bad row; it simply never matches.
                     logger.warning("Skipping model alias %r: %s", row.alias, e)
                     continue
-                # NULL reads as Default, as for users.profile_id.
+                # NULL reads as Default, as for users.profile_id; a missing kind as regular.
                 pid = getattr(row, "profile_id", None) or DEFAULT_PROFILE_ID
-                profile_rules.setdefault(pid, []).append(rule)
-            self._snapshot = _RuleSnapshot(profile_rules.pop(DEFAULT_PROFILE_ID, ()))
-            self._profile_snapshots = {pid: _RuleSnapshot(rules) for pid, rules in profile_rules.items()}
+                kind = getattr(row, "kind", None) or "alias"
+                if kind not in rules_by_kind:
+                    logger.warning("Skipping model alias %r: unknown kind %r", row.alias, kind)
+                    continue
+                rules_by_kind[kind].setdefault(pid, []).append(rule)
+            regular, fallback = rules_by_kind["alias"], rules_by_kind["fallback"]
+            self._snapshot = _RuleSnapshot(regular.pop(DEFAULT_PROFILE_ID, ()))
+            self._profile_snapshots = {pid: _RuleSnapshot(rules) for pid, rules in regular.items()}
+            self._fallback_snapshot = _RuleSnapshot(fallback.pop(DEFAULT_PROFILE_ID, ()))
+            self._fallback_profile_snapshots = {
+                pid: _RuleSnapshot(rules) for pid, rules in fallback.items()
+            }
 
-    def set_rules(self, rules: Iterable[AliasRule], profile_id: int = DEFAULT_PROFILE_ID) -> None:
-        """Replace one profile's rules, Default's unless given (tests and helpers)."""
-        if profile_id == DEFAULT_PROFILE_ID:
+    def set_rules(
+        self, rules: Iterable[AliasRule], profile_id: int = DEFAULT_PROFILE_ID, kind: str = "alias",
+    ) -> None:
+        """Replace one list of one profile, Default's regular list unless given (tests and helpers)."""
+        if kind == "fallback":
+            if profile_id == DEFAULT_PROFILE_ID:
+                self._fallback_snapshot = _RuleSnapshot(rules)
+            else:
+                self._fallback_profile_snapshots = {
+                    **self._fallback_profile_snapshots, profile_id: _RuleSnapshot(rules),
+                }
+        elif profile_id == DEFAULT_PROFILE_ID:
             self._snapshot = _RuleSnapshot(rules)
         else:
             self._profile_snapshots = {**self._profile_snapshots, profile_id: _RuleSnapshot(rules)}
 
-    def _snapshot_for(self, profile_id: Optional[int]) -> _RuleSnapshot:
+    def _snapshot_for(self, profile_id: Optional[int], kind: str = "alias") -> _RuleSnapshot:
+        if kind == "fallback":
+            default, others = self._fallback_snapshot, self._fallback_profile_snapshots
+        else:
+            default, others = self._snapshot, self._profile_snapshots
         if profile_id is None or profile_id == DEFAULT_PROFILE_ID:
-            return self._snapshot
-        return self._profile_snapshots.get(profile_id, _NO_RULES)
+            return default
+        return others.get(profile_id, _NO_RULES)
 
     def match(
         self, name: Optional[str], api: Optional[str] = None, profile_id: Optional[int] = None,
+        kind: str = "alias",
     ) -> Optional[AliasRule]:
-        """The rule *name* hits on *api* (None = unscoped) in *profile_id*'s list
+        """The rule *name* hits on *api* (None = unscoped) in *profile_id*'s *kind* list
         (None = Default's), or None."""
         if name is None:
             return None
-        return self._snapshot_for(profile_id).match(name, api)
+        return self._snapshot_for(profile_id, kind).match(name, api)
 
     def resolve(
         self, name: Optional[str], api: Optional[str] = None, profile_id: Optional[int] = None,
+        kind: str = "alias",
     ) -> Optional[str]:
-        rule = self.match(name, api, profile_id)
+        rule = self.match(name, api, profile_id, kind)
         return name if rule is None else rule.target
 
 
@@ -247,30 +281,47 @@ def _alias_scope() -> int:
     return DEFAULT_PROFILE_ID if pid is None else pid
 
 
-def apply_alias(name: Optional[str], api: Optional[str] = None) -> Optional[str]:
-    """Resolve *name* and retain its client-facing value when it changes.
+def _produced_by_this_request(name: str) -> bool:
+    """True if *name* is the input or an output of a mapping this request applied."""
+    return alias_resolved_name.get() is not None and (
+        name == alias_resolved_name.get() or name in alias_seen_names.get()
+        or name == alias_input_name.get()
+    )
+
+
+def alias_source_name(name: Optional[str]) -> Optional[str]:
+    """The client's name behind *name*: the mapping's input if this request produced
+    *name* by mapping, else *name* itself. Availability is judged on this name."""
+    if name is not None and _produced_by_this_request(name):
+        return alias_input_name.get()
+    return name
+
+
+def apply_alias(name: Optional[str], api: Optional[str] = None, kind: str = "alias") -> Optional[str]:
+    """Resolve *name* with the *kind* list and retain its client-facing value when it changes.
 
     Never chains: a name this request already produced comes back unchanged -- unless
-    the caller's profile became known since it was produced, in which case the
-    client's original name is re-resolved against the profile's own list.
+    the scope changed since it was produced (the caller's profile became known, or
+    the other list now applies), in which case the client's original name is
+    re-resolved against the new scope's rules.
     """
     if name is None:
         return name
     if api is None:
         api = current_api_surface.get()
-    scope = _alias_scope()
-    resolved = alias_resolved_name.get()
-    if resolved is not None and (name == resolved or name in alias_seen_names.get()
-                                 or name == alias_input_name.get()):
+    profile_id = _alias_scope()
+    scope = (profile_id, kind)
+    if _produced_by_this_request(name):
+        resolved = alias_resolved_name.get()
         if alias_resolved_scope.get() == scope:
             return resolved
         source = alias_input_name.get()
-        mapped = model_alias_resolver.resolve(source, api, scope)
+        mapped = model_alias_resolver.resolve(source, api, profile_id, kind)
         alias_resolved_name.set(mapped)
         alias_resolved_scope.set(scope)
         alias_seen_names.set(alias_seen_names.get() | {mapped})
         return mapped
-    mapped = model_alias_resolver.resolve(name, api, scope)
+    mapped = model_alias_resolver.resolve(name, api, profile_id, kind)
     if mapped != name:
         original_model_name.set(name)
         alias_input_name.set(name)

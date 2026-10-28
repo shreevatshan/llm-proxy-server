@@ -46,6 +46,8 @@ class UserProfile(Base):
     description = Column(String(256), nullable=True)
     rpm_limit = Column(Integer, nullable=True)  # null = unlimited
     rpd_limit = Column(Integer, nullable=True)  # null = unlimited
+    # Requests a member may have in progress at once, across all their keys; null = unlimited.
+    max_concurrent_requests = Column(Integer, nullable=True)
     # One of MODEL_ACCESS_MODES; same semantics as the per-user policy it replaced.
     model_access_mode = Column(String(16), nullable=False, default="default", server_default="default")
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -166,6 +168,11 @@ MODEL_ALIAS_API_SURFACES = ("openai", "anthropic", "azure_openai")
 # How a model alias's `alias` text is compared with the requested model name.
 # exact is case-sensitive; contains and regex (re.search) are case-insensitive.
 MODEL_ALIAS_MATCH_TYPES = ("exact", "contains", "regex")
+
+# Which list a mapping belongs to. "alias" mappings apply when the requested model
+# is available to the caller; "fallback" mappings apply only when it is not (an
+# unknown name, a disabled model/provider/group, or one the profile does not allow).
+MODEL_ALIAS_KINDS = ("alias", "fallback")
 
 # Python's re has no timeout and regex aliases run on the event loop against
 # client-supplied model names (up to 256 characters, see app.model_alias), so
@@ -288,12 +295,14 @@ class ModelAlias(Base):
     # Evaluation order: lowest first, ties broken by id. Not contiguous (deletes
     # leave gaps); the admin UI shows row position instead.
     priority = Column(Integer, nullable=False, default=0, server_default="0")
+    # One of MODEL_ALIAS_KINDS. Each kind is its own list with its own priority order.
+    kind = Column(String(16), nullable=False, default="alias", server_default="alias")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     __table_args__ = (
-        # One alias text per profile.
-        Index("uq_model_aliases_scope_alias", profile_id, alias, unique=True),
+        # One alias text per list of a profile.
+        Index("uq_model_aliases_scope_kind_alias", profile_id, kind, alias, unique=True),
     )
 
 
@@ -1110,6 +1119,19 @@ class ProfileLimitsUpdate(BaseModel):
         return self
 
 
+class ProfileOverallLimitsUpdate(ProfileLimitsUpdate):
+    """A profile's own limits: Default-group RPM/RPD plus the profile-wide concurrency
+    cap, which has no per-group form. Same null/omitted rules."""
+    max_concurrent_requests: Optional[int] = None
+
+    @model_validator(mode="after")
+    def validate_concurrency(self):
+        # 0 would refuse every request a member sends; leave the field empty for unlimited.
+        if self.max_concurrent_requests is not None and self.max_concurrent_requests < 1:
+            raise ValueError("max_concurrent_requests must be >= 1")
+        return self
+
+
 class ProfileResponse(BaseModel):
     id: int
     name: str
@@ -1118,6 +1140,7 @@ class ProfileResponse(BaseModel):
     member_count: int = 0
     rpm_limit: Optional[int] = None
     rpd_limit: Optional[int] = None
+    max_concurrent_requests: Optional[int] = None
     model_access_mode: str = "default"
     exception_count: int = 0
     alias_count: int = 0
@@ -1808,6 +1831,8 @@ class MyQuotasResponse(BaseModel):
     sections: List[QuotaSectionResponse] = []  # unified list; empty when is_admin
     pool: Optional[PoolSummary] = None         # null when the user is not in a pool
     profile_name: Optional[str] = None         # the profile the limits come from
+    max_concurrent_requests: Optional[int] = None  # requests in progress at once; null = unlimited
+    in_flight: int = 0                         # the caller's requests in progress right now
 
 
 class ModelAliasUpsert(BaseModel):
@@ -1822,6 +1847,9 @@ class ModelAliasUpsert(BaseModel):
     match_type: Optional[Literal[MODEL_ALIAS_MATCH_TYPES]] = None
     # The profile this mapping belongs to.
     profile_id: int = DEFAULT_PROFILE_ID
+    # The list it belongs to. None keeps an existing row's list ("alias" for a new row);
+    # with `id`, a different kind moves the row to that list.
+    kind: Optional[Literal[MODEL_ALIAS_KINDS]] = None
 
     @model_validator(mode="after")
     def validate_fields(self):
@@ -1853,6 +1881,11 @@ class ModelAliasResponse(BaseModel):
     match_type: str
     priority: int
     profile_id: int = DEFAULT_PROFILE_ID
+    kind: str = "alias"
+    # For exact "alias" rows only: whether the alias names a model the profile's
+    # members can use. False means the rule never applies (it belongs in the
+    # fallback list); None means not computed.
+    source_available: Optional[bool] = None
     created_at: datetime
     updated_at: datetime
 
@@ -1878,9 +1911,10 @@ class ModelAliasResponse(BaseModel):
 
 
 class ModelAliasReorder(BaseModel):
-    """Every alias id of one profile, in the desired evaluation order (highest priority first)."""
+    """Every alias id of one list of a profile, in the desired evaluation order (highest priority first)."""
     ids: List[int]
     profile_id: int = DEFAULT_PROFILE_ID
+    kind: Literal[MODEL_ALIAS_KINDS] = "alias"
 
     @model_validator(mode="after")
     def validate_ids(self):
@@ -1894,6 +1928,10 @@ class ModelAliasReorder(BaseModel):
 class ModelAliasTestMatch(BaseModel):
     """Which mapping (if any) a model name hits on one API surface."""
     api: str
+    # Whether the name is available to the profile's members; picks the list below.
+    available: bool = True
+    # The list that was tried: "alias" when available, "fallback" otherwise.
+    kind: str = "alias"
     matched: bool
     resolved_model: str
     id: Optional[int] = None

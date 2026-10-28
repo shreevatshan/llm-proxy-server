@@ -10,9 +10,18 @@ class ModelAliasManager {
     };
     static ORDER_NOTE = ' Mappings are checked top to bottom and the first match wins.';
     static PATTERN_NOTE = ModelAliasManager.ORDER_NOTE + ' Patterns apply to every endpoint on the selected APIs, including audio and images; on Azure deployment routes the name is "provider/deployment".';
+    static KINDS = ['alias', 'fallback'];
+    static KIND_STORE_KEY = 'model-mapping-kind';
 
     constructor() {
-        this.aliases = [];
+        // Both lists of the shown profile; this.aliases is the one on screen.
+        this.lists = { alias: [], fallback: [] };
+        this.aliases = this.lists.alias;
+        this._kind = 'alias';
+        try {
+            const stored = window.localStorage.getItem(ModelAliasManager.KIND_STORE_KEY);
+            if (ModelAliasManager.KINDS.includes(stored)) this._kind = stored;
+        } catch (_) { /* storage unavailable: start on the regular list */ }
         this.models = [];
         this._comboInit = false;
         this._dndInit = false;
@@ -29,10 +38,10 @@ class ModelAliasManager {
         this._switcher = new window.ProfileSwitcher(document.getElementById('model-alias-switcher'), {
             label: 'Model mappings for',
             hint: 'Mappings for members of this profile only. Other profiles have their own lists.',
-            // The list shown is fresher than the profile's alias_count once a mapping is saved.
+            // The lists shown are fresher than the profile's alias_count once a mapping is saved.
             stats: p => [
                 [p.member_count, 'member'],
-                [p.id === this._aliasesFor ? this.aliases.length : p.alias_count, 'mapping'],
+                [p.id === this._aliasesFor ? this.lists.alias.length + this.lists.fallback.length : p.alias_count, 'mapping'],
             ],
             onSelect: id => this.setScope(id),
         });
@@ -52,6 +61,7 @@ class ModelAliasManager {
         this._initSelects();
         this._initCombobox();
         this._initDragAndDrop();
+        this._renderKind();
         this.updateMatchHelp();
         this._profileId = window.ProfileStore.selected('model-mapping', window.ProfileStore.DEFAULT_ID);
         await this._fillScope();
@@ -67,18 +77,60 @@ class ModelAliasManager {
         this._switcher.value = this._profileId;
         this._switcher.refresh();
         window.ProfileStore.select('model-mapping', this._profileId);
+        this._clearView();
+        await this._loadAliases();
+    }
+
+    /** Show the regular ('alias') or fallback list of the shown profile. */
+    setKind(kind) {
+        if (!ModelAliasManager.KINDS.includes(kind) || kind === this._kind) return;
+        this._kind = kind;
+        try {
+            window.localStorage.setItem(ModelAliasManager.KIND_STORE_KEY, kind);
+        } catch (_) { /* not remembered; harmless */ }
+        this.aliases = this.lists[kind];
+        this._clearView();
+        this._renderKind();
+        this._render();
+    }
+
+    _clearView() {
         this._resetForm();
         this._search = '';
         const search = document.getElementById('model-alias-search');
         if (search) search.value = '';
         const out = document.getElementById('model-alias-test-result');
         if (out) out.innerHTML = '';
-        await this._loadAliases();
     }
 
-    /** Query string selecting the shown profile's list. */
-    _scopeQuery(prefix = '?') {
-        return `${prefix}profile_id=${this._profileId}`;
+    _isFallback() {
+        return this._kind === 'fallback';
+    }
+
+    /** "mapping" or "fallback mapping", for messages. */
+    _noun() {
+        return this._isFallback() ? 'fallback mapping' : 'mapping';
+    }
+
+    // The list toggle, its counts and the list title.
+    _renderKind() {
+        for (const kind of ModelAliasManager.KINDS) {
+            const btn = document.getElementById(`model-alias-kind-${kind}`);
+            if (btn) {
+                btn.classList.toggle('active', kind === this._kind);
+                btn.setAttribute('aria-pressed', String(kind === this._kind));
+            }
+            const count = document.getElementById(`model-alias-count-${kind}`);
+            if (count) count.textContent = this._aliasesFor === null ? '' : String(this.lists[kind].length);
+        }
+        const title = document.getElementById('model-alias-list-title');
+        if (title) title.innerHTML = `<i class="fas fa-list me-2"></i>Configured ${this._isFallback() ? 'Fallback ' : ''}Mappings`;
+        if (this._editingId === null) this._setEditing(null);
+    }
+
+    /** Query string selecting the shown profile's list of *kind* (the shown list unless given). */
+    _scopeQuery(prefix = '?', kind = this._kind) {
+        return `${prefix}profile_id=${this._profileId}&kind=${kind}`;
     }
 
     async _loadAliases() {
@@ -86,11 +138,18 @@ class ModelAliasManager {
         if (!tbody) return;
         const profileId = this._profileId;
         try {
-            const response = await fetch(`/admin/model-aliases${this._scopeQuery()}`, { credentials: 'include' });
-            if (!response.ok) throw new Error('load failed');
-            this.aliases = await response.json();
+            // Both lists: the other one's size shows on the toggle, and moving a row
+            // between them changes both.
+            const lists = await Promise.all(ModelAliasManager.KINDS.map(async kind => {
+                const response = await fetch(`/admin/model-aliases${this._scopeQuery('?', kind)}`, { credentials: 'include' });
+                if (!response.ok) throw new Error('load failed');
+                return response.json();
+            }));
+            ModelAliasManager.KINDS.forEach((kind, i) => { this.lists[kind] = lists[i]; });
+            this.aliases = this.lists[this._kind];
             this._aliasesFor = profileId;
             this._switcher.refresh();
+            this._renderKind();
             this._render();
         } catch (_) {
             tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Failed to load mappings.</td></tr>';
@@ -125,7 +184,7 @@ class ModelAliasManager {
         const hint = document.getElementById('model-alias-reorder-hint');
         if (hint) hint.style.display = this._search.trim() && this.aliases.length > 1 ? '' : 'none';
         if (!this.aliases.length) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">No mappings configured.</td></tr>';
+            tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-4">No ${this._noun()}s configured.</td></tr>`;
             return;
         }
         const q = this._search.trim().toLowerCase();
@@ -141,9 +200,15 @@ class ModelAliasManager {
         }
         const reorder = this._canReorder();
         const last = this.aliases.length - 1;
+        const other = this._isFallback() ? 'mappings' : 'fallback mappings';
         tbody.innerHTML = rows.map(({ row, index }) => {
             const type = row.match_type || 'exact';
-            const name = esc(row.alias);
+            // A regular mapping only applies to an available model, so one whose
+            // name is no model the profile can use never fires.
+            const neverApplies = row.kind !== 'fallback' && row.source_available === false;
+            const name = esc(row.alias) + (neverApplies
+                ? ` <span class="alias-warn" title="'${esc(row.alias)}' is not a model available to this profile, and mappings only apply to available models. Move it to the fallback mappings to apply it to unavailable names."><i class="fas fa-exclamation-triangle"></i>Never applies</span>`
+                : '');
             return `
             <tr data-id="${row.id}">
             <td class="alias-order-cell">
@@ -163,6 +228,7 @@ class ModelAliasManager {
                     <span class="ma-slider"></span>
                 </label>
                 <button class="btn btn-outline-secondary btn-sm" title="Edit mapping" onclick="window.ModelAliasManager?.edit(${index})"><i class="fas fa-pencil-alt"></i></button>
+                <button class="btn btn-outline-secondary btn-sm" title="Move to ${other}" aria-label="Move to ${other}" onclick="window.ModelAliasManager?.moveToOtherList(${index})"><i class="fas fa-exchange-alt"></i></button>
                 <button class="btn btn-outline-danger btn-sm" onclick="window.ModelAliasManager?.remove(${index})"><i class="fas fa-trash"></i></button>
             </div></td></tr>`;
         }).join('');
@@ -274,12 +340,12 @@ class ModelAliasManager {
                 this._orderDirty = false;
                 const response = await fetch('/admin/model-aliases/order', {
                     method: 'PUT', credentials: 'include', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ ids: this.aliases.map(row => row.id), profile_id: this._profileId }),
+                    body: JSON.stringify({ ids: this.aliases.map(row => row.id), profile_id: this._profileId, kind: this._kind }),
                 });
                 const result = await response.json().catch(() => ({}));
                 if (!response.ok) throw new Error(this._errorMessage(result, 'Failed to save mapping order.'));
                 if (!this._orderDirty) {
-                    this.aliases = result;
+                    this.aliases = this.lists[this._kind] = result;
                     this._render();
                     window.UIUtils?.showToast('Mapping order saved.', 'success');
                 }
@@ -424,9 +490,10 @@ class ModelAliasManager {
         if (saveBtn) saveBtn.innerHTML = row ? '<i class="fas fa-save me-1"></i>Update' : '<i class="fas fa-save me-1"></i>Save';
         if (title) {
             const esc = window.UIUtils?.escapeHtml || (value => value);
+            const noun = this._isFallback() ? 'Fallback Mapping' : 'Mapping';
             title.innerHTML = row
-                ? `<i class="fas fa-pencil-alt me-2"></i>Edit Mapping <code>${esc(row.alias)}</code>`
-                : '<i class="fas fa-plus me-2"></i>Add or Update Mapping';
+                ? `<i class="fas fa-pencil-alt me-2"></i>Edit ${noun} <code>${esc(row.alias)}</code>`
+                : `<i class="fas fa-plus me-2"></i>Add or Update ${noun}`;
         }
     }
 
@@ -479,7 +546,7 @@ class ModelAliasManager {
             if (!confirmed) return;
         }
         const enabled = existing ? existing.enabled : true;
-        const payload = { alias, target_model_id, enabled, apis, match_type, profile_id: this._profileId };
+        const payload = { alias, target_model_id, enabled, apis, match_type, profile_id: this._profileId, kind: this._kind };
         if (this._editingId !== null) payload.id = this._editingId;
         try {
             const response = await fetch('/admin/model-aliases', {
@@ -487,12 +554,45 @@ class ModelAliasManager {
                 body: JSON.stringify(payload),
             });
             const result = await response.json().catch(() => ({}));
-            if (!response.ok) throw new Error(this._errorMessage(result, 'Failed to save mapping.'));
-            window.UIUtils?.showToast(`Mapping '${alias}' saved.`, 'success');
+            if (!response.ok) throw new Error(this._errorMessage(result, `Failed to save ${this._noun()}.`));
+            if (result.source_available === false) {
+                window.UIUtils?.showToast(`Mapping '${alias}' saved, but '${alias}' is not an available model, so it will never apply. Move it to the fallback mappings to map unavailable names.`, 'warning');
+            } else {
+                window.UIUtils?.showToast(`${this._isFallback() ? 'Fallback mapping' : 'Mapping'} '${alias}' saved.`, 'success');
+            }
             this._resetForm();
             await this._loadAliases();
         } catch (error) {
-            window.UIUtils?.showToast(error.message || 'Failed to save mapping.', 'error');
+            window.UIUtils?.showToast(error.message || `Failed to save ${this._noun()}.`, 'error');
+        }
+    }
+
+    /** Move a row to the other list, at the bottom of it. */
+    async moveToOtherList(index) {
+        const row = this.aliases[index];
+        if (!row) return;
+        const target = this._isFallback() ? 'alias' : 'fallback';
+        const targetLabel = target === 'fallback' ? 'fallback mappings' : 'mappings';
+        if (this.lists[target].some(other => other.alias === row.alias)) {
+            window.UIUtils?.showToast(`The ${targetLabel} already have an entry for '${row.alias}'.`, 'error');
+            return;
+        }
+        try {
+            const response = await fetch('/admin/model-aliases', {
+                method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: row.id, alias: row.alias, target_model_id: row.target_model_id,
+                    enabled: row.enabled, apis: row.apis, match_type: row.match_type || 'exact',
+                    profile_id: this._profileId, kind: target,
+                }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(this._errorMessage(result, 'Failed to move mapping.'));
+            window.UIUtils?.showToast(`'${row.alias}' moved to the ${targetLabel}.`, 'success');
+            if (this._editingId === row.id) this._resetForm();
+            await this._loadAliases();
+        } catch (error) {
+            window.UIUtils?.showToast(error.message || 'Failed to move mapping.', 'error');
         }
     }
 
@@ -519,7 +619,7 @@ class ModelAliasManager {
                 body: JSON.stringify({
                     id: row.id, alias: row.alias, target_model_id: row.target_model_id,
                     enabled: !row.enabled, apis: row.apis, match_type: row.match_type || 'exact',
-                    profile_id: this._profileId,
+                    profile_id: this._profileId, kind: this._kind,
                 }),
             });
             const result = await response.json().catch(() => ({}));
@@ -536,7 +636,8 @@ class ModelAliasManager {
         const row = this.aliases[index];
         if (!row) return;
         const { alias } = row;
-        const confirmed = await window.UIUtils?.showConfirmModal('Delete Model Mapping', `Delete mapping '${alias}'?`, 'danger');
+        const confirmed = await window.UIUtils?.showConfirmModal(
+            this._isFallback() ? 'Delete Fallback Mapping' : 'Delete Model Mapping', `Delete ${this._noun()} '${alias}'?`, 'danger');
         if (!confirmed) return;
         try {
             const response = await fetch(`/admin/model-aliases/${encodeURIComponent(alias)}${this._scopeQuery()}`, { method: 'DELETE', credentials: 'include' });
@@ -565,13 +666,19 @@ class ModelAliasManager {
             if (!response.ok) throw new Error(this._errorMessage(result, 'Test failed.'));
             out.innerHTML = result.map(item => {
                 const label = esc(ModelAliasManager.API_LABELS[item.api] || item.api);
+                const fallback = item.kind === 'fallback';
+                const state = item.available
+                    ? '<span class="alias-match alias-match-exact">Available</span> → mappings:'
+                    : '<span class="alias-warn">Unavailable</span> → fallback mappings:';
                 if (!item.matched) {
-                    return `<li><strong>${label}:</strong> <span class="text-muted">no mapping — passed through unchanged</span></li>`;
+                    const outcome = fallback ? 'no match — the request fails as unavailable' : 'no match — passed through unchanged';
+                    return `<li><strong>${label}:</strong> ${state} <span class="text-muted">${outcome}</span></li>`;
                 }
-                const position = this.aliases.findIndex(row => row.id === item.id) + 1;
-                const which = position > 0 ? `Mapping #${position}` : 'Mapping';
+                const position = (this.lists[item.kind] || []).findIndex(row => row.id === item.id) + 1;
+                const noun = fallback ? 'Fallback' : 'Mapping';
+                const which = position > 0 ? `${noun} #${position}` : noun;
                 const type = esc(ModelAliasManager.MATCH_LABELS[item.match_type] || item.match_type);
-                return `<li><strong>${label}:</strong> ${which} <code>${esc(item.alias)}</code> (${type}) → <code>${esc(item.target_model_id)}</code></li>`;
+                return `<li><strong>${label}:</strong> ${state} ${which} <code>${esc(item.alias)}</code> (${type}) → <code>${esc(item.target_model_id)}</code></li>`;
             }).join('');
         } catch (error) {
             out.innerHTML = `<li class="text-danger">${esc(error.message || 'Test failed.')}</li>`;

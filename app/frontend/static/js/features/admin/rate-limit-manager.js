@@ -1,8 +1,12 @@
 /**
  * Rate Limits tab. Every limit belongs to a user profile: the profile switcher at the
- * top picks whose limits the table edits -- one row per model group, Default first.
+ * top picks whose limits the tab edits -- the profile-wide concurrency cap, then the
+ * table with one row per model group, Default first.
  * Groups themselves are managed in the Model Groups tab.
  */
+const CONCURRENCY_INVALID_MSG =
+    'Max concurrent requests must be a whole number of at least 1, or empty for unlimited.';
+
 class RateLimitManager {
     constructor() {
         this._profileId = null;
@@ -11,6 +15,14 @@ class RateLimitManager {
             hint: 'Limits apply to every member of this profile.',
             stats: p => [[p.member_count, 'member']],
             onSelect: id => this.onProfileChange(id),
+        });
+        this._concInput = document.getElementById('rl-max-concurrent');
+        this._concSave = document.getElementById('rl-max-concurrent-save');
+        this._concClear = document.getElementById('rl-max-concurrent-clear');
+        this._concSave?.addEventListener('click', () => this._saveTypedConcurrency());
+        this._concClear?.addEventListener('click', () => this._saveConcurrency(''));
+        this._concInput?.addEventListener('keydown', e => {
+            if (e.key === 'Enter') this._saveTypedConcurrency();
         });
         document.addEventListener('profiles:changed', () => this._onProfilesChanged());
     }
@@ -42,7 +54,61 @@ class RateLimitManager {
     async _loadProfile() {
         // On failure the table falls back to fetching for itself.
         const limits = await this._fetchLimits();
+        this._renderConcurrency(limits?.profile);
         await window.ModelGroupManager?.setProfile(this._profileId, limits);
+    }
+
+    /** *profile* is a ProfileResponse, or null when there is none to edit. */
+    _renderConcurrency(profile) {
+        if (!this._concInput) return;
+        const value = profile?.max_concurrent_requests ?? null;
+        this._concInput.value = value ?? '';
+        this._concInput.disabled = !profile;
+        this._concSave.disabled = !profile;
+        this._concClear.disabled = !profile || value === null;
+    }
+
+    /** Save what is typed. A number input reports text it cannot parse ('-', '1e') as
+     *  an empty value, which must be refused rather than read as Clear. */
+    _saveTypedConcurrency() {
+        if (this._concInput.validity.badInput) {
+            window.UIUtils?.showToast(CONCURRENCY_INVALID_MSG, 'error');
+            return;
+        }
+        this._saveConcurrency(this._concInput.value.trim());
+    }
+
+    async _saveConcurrency(raw) {
+        const profileId = this._profileId;
+        if (!profileId) return;
+        let value = null;
+        if (raw !== '') {
+            value = Number(raw);
+            if (!Number.isInteger(value) || value < 1) {
+                window.UIUtils?.showToast(CONCURRENCY_INVALID_MSG, 'error');
+                return;
+            }
+        }
+        try {
+            const resp = await fetch(`/admin/profiles/limits?profile_id=${profileId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ max_concurrent_requests: value }),
+            });
+            if (resp.ok) {
+                const profile = await resp.json();
+                // The admin may have switched profiles while this was in flight.
+                if (this._profileId === profileId) this._renderConcurrency(profile);
+                window.UIUtils?.showToast(value === null
+                    ? 'Concurrency limit cleared (unlimited).' : 'Concurrency limit saved.', 'success');
+            } else {
+                const e = await resp.json().catch(() => ({}));
+                window.UIUtils?.showToast(typeof e.detail === 'string' ? e.detail : 'Failed to save concurrency limit.', 'error');
+            }
+        } catch (e) {
+            window.UIUtils?.showToast('Network error.', 'error');
+        }
     }
 
     async _fetchLimits() {

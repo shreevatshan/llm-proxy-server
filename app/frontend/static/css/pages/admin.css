@@ -1399,6 +1399,55 @@ input:checked + .model-toggle-slider:before {
     margin-top: 0.25rem;
 }
 
+/* Regular / fallback list toggle on the Model Mapping tab */
+.alias-kind-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+/* dark-flat-override pins .btn-secondary.active's background, border and color with
+   !important; the more specific selector wins them back. */
+.alias-kind-toggle .btn.active {
+    background-color: var(--mono-text-primary) !important;
+    border-color: var(--mono-text-primary) !important;
+    color: var(--mono-text-inverse) !important;
+}
+
+.alias-kind-count {
+    font-family: var(--font-family-mono);
+    font-size: 0.7rem;
+    opacity: 0.75;
+    margin-left: 0.25rem;
+}
+
+.alias-kind-count:empty {
+    display: none;
+}
+
+/* A regular mapping whose name is not an available model, or an unavailable test result */
+.alias-warn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    margin-left: 0.4rem;
+    font-family: var(--font-family-mono);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+    white-space: nowrap;
+    color: var(--warning-color);
+    border: 1px dashed var(--warning-color);
+    cursor: help;
+}
+
+.alias-test-result .alias-warn {
+    margin-left: 0;
+    cursor: default;
+}
+
 /* ================================
    USER MANAGEMENT — BULK SELECTION
    ================================ */
@@ -1765,6 +1814,26 @@ input:checked + .model-toggle-slider:before {
         padding-left: 0;
         border-left: none;
     }
+}
+
+/* Rate Limits tab: the Concurrency card and the per-group table share fixed columns,
+   so the concurrency input and buttons sit in line with the RPM and Actions columns. */
+.rl-limits-table {
+    table-layout: fixed;
+    min-width: 40rem;
+}
+
+.rl-limits-table .rl-col-limit {
+    width: 12rem;
+}
+
+.rl-limits-table .rl-col-actions {
+    width: 15rem;
+}
+
+.rl-limits-table input[type="number"] {
+    width: 100%;
+    max-width: 9rem;
 }
 
 .profile-switcher-menu {

@@ -631,18 +631,50 @@
     <!-- Profile switcher: the table below edits this profile's limits -->
     <div class="profile-switcher" id="rl-profile-switcher"></div>
 
-    <div class="card">
+    <!-- Profile-wide, so it sits outside the per-group table below. Both tables share
+         rl-limits-table's columns, so the input and buttons line up with the rows below. -->
+    <div class="card mb-3">
         <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
-            <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Limits for <span id="mg-profile-name"></span></h5>
-            <span class="text-muted small">
-                One limit per model group. Every model is in exactly one group; models no group
-                claims are in <strong>Default</strong>. Empty means unlimited.
-                <a href="#" onclick="showTab('model-groups'); return false;">Manage groups</a>
-            </span>
+            <h5 class="mb-0"><i class="fas fa-layer-group me-2"></i>Concurrency</h5>
         </div>
         <div class="card-body p-0">
             <div class="table-responsive">
-                <table class="table table-hover mb-0">
+                <table class="table table-hover mb-0 rl-limits-table">
+                    <colgroup><col><col class="rl-col-limit"><col class="rl-col-limit"><col class="rl-col-actions"></colgroup>
+                    <tbody>
+                        <tr>
+                            <td>
+                                <label for="rl-max-concurrent" class="fw-semibold mb-0">Max concurrent requests</label>
+                                <div class="text-muted small">In flight at once, per member, across all models</div>
+                            </td>
+                            <td>
+                                <input type="number" min="1" step="1" id="rl-max-concurrent" class="form-control form-control-sm"
+                                       placeholder="Unlimited" disabled>
+                            </td>
+                            <td></td>
+                            <td class="text-nowrap">
+                                <button class="btn btn-primary btn-sm me-1" id="rl-max-concurrent-save" disabled>
+                                    <i class="fas fa-save me-1"></i>Save
+                                </button>
+                                <button class="btn btn-outline-danger btn-sm" id="rl-max-concurrent-clear" disabled>
+                                    <i class="fas fa-times me-1"></i>Clear
+                                </button>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <h5 class="mb-0"><i class="fas fa-id-badge me-2"></i>Limits for <span id="mg-profile-name"></span></h5>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover mb-0 rl-limits-table">
+                    <colgroup><col><col class="rl-col-limit"><col class="rl-col-limit"><col class="rl-col-actions"></colgroup>
                     <thead>
                         <tr>
                             <th>Group</th>
@@ -820,6 +852,12 @@
 <div class="section tab-content" id="model-mapping-tab" style="display: none;">
     <!-- Profile switcher: each profile has its own mapping list -->
     <div class="profile-switcher" id="model-alias-switcher"></div>
+    <!-- Two lists per profile: regular mappings apply to available models, fallback mappings to unavailable ones -->
+    <div class="alias-kind-bar mb-4">
+        <div id="model-alias-kind-toggle" class="btn-group alias-kind-toggle" role="group" aria-label="Mapping list">
+            <button type="button" class="btn btn-secondary btn-sm active" id="model-alias-kind-alias" aria-pressed="true" onclick="window.ModelAliasManager?.setKind('alias')"><i class="fas fa-map-signs me-1"></i>Mappings <span class="alias-kind-count" id="model-alias-count-alias"></span></button>
+            <button type="button" class="btn btn-secondary btn-sm" id="model-alias-kind-fallback" aria-pressed="false" onclick="window.ModelAliasManager?.setKind('fallback')"><i class="fas fa-life-ring me-1"></i>Fallback mappings <span class="alias-kind-count" id="model-alias-count-fallback"></span></button>
+        </div>    </div>
     <div class="card mb-4">
         <div class="card-header"><h5 class="mb-0" id="model-alias-form-title"><i class="fas fa-plus me-2"></i>Add or Update Mapping</h5></div>
         <div class="card-body">
@@ -872,7 +910,7 @@
             <form onsubmit="window.ModelAliasManager?.test(event); return false;">
                 <div class="row g-3 align-items-end">
                     <div class="col-md-5">
-                        <label class="form-label" for="model-alias-test-name">Requested model</label>
+                        <label class="form-label" for="model-alias-test-name">Requested model <span class="alias-help">(checks availability, then the matching list)</span></label>
                         <input id="model-alias-test-name" class="form-control" placeholder="e.g. claude-opus-4-1" required maxlength="512">
                     </div>
                     <div class="col-md-4">
@@ -890,7 +928,7 @@
     <div class="card">
         <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
             <div class="d-flex align-items-center gap-2">
-                <h5 class="mb-0 me-4"><i class="fas fa-list me-2"></i>Configured Mappings</h5>
+                <h5 class="mb-0 me-4" id="model-alias-list-title"><i class="fas fa-list me-2"></i>Configured Mappings</h5>
                 <div class="position-relative flex-shrink-0" style="width: 240px;">
                     <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
                     <input type="text" id="model-alias-search" class="form-control form-control-sm ps-5"

@@ -981,22 +981,30 @@ async def get_all_model_configurations(db: AsyncSession) -> List[ModelConfigurat
 
 async def get_all_model_aliases(
     db: AsyncSession, profile_id: int = DEFAULT_PROFILE_ID, all_profiles: bool = False,
+    kind: Optional[str] = "alias",
 ) -> List[ModelAlias]:
-    """Return one profile's model aliases (Default's unless given) in evaluation order.
+    """Return one list of one profile (Default's regular list unless given) in evaluation order.
 
-    all_profiles=True returns every profile's rows, for the resolver.
+    all_profiles=True returns every profile's rows, and kind=None every list's, so
+    the resolver can load everything in one query.
     """
     q = select(ModelAlias)
     if not all_profiles:
         q = q.where(ModelAlias.profile_id == profile_id)
+    if kind is not None:
+        q = q.where(ModelAlias.kind == kind)
     result = await db.execute(q.order_by(ModelAlias.priority, ModelAlias.id))
     return list(result.scalars().all())
 
 
-async def get_model_alias(db: AsyncSession, alias: str, profile_id: int = DEFAULT_PROFILE_ID) -> Optional[ModelAlias]:
-    """Return an alias by its exact client-facing name within one profile's list."""
+async def get_model_alias(
+    db: AsyncSession, alias: str, profile_id: int = DEFAULT_PROFILE_ID, kind: str = "alias",
+) -> Optional[ModelAlias]:
+    """Return an alias by its exact client-facing name within one list of a profile."""
     result = await db.execute(
-        select(ModelAlias).where(ModelAlias.alias == alias, ModelAlias.profile_id == profile_id)
+        select(ModelAlias).where(
+            ModelAlias.alias == alias, ModelAlias.profile_id == profile_id, ModelAlias.kind == kind,
+        )
     )
     return result.scalar_one_or_none()
 
@@ -1009,32 +1017,42 @@ async def get_model_alias_by_id(db: AsyncSession, alias_id: int) -> Optional[Mod
 async def upsert_model_alias(
     db: AsyncSession, alias: str, target_model_id: str, enabled: bool, apis,
     match_type: Optional[str] = None, alias_id: Optional[int] = None,
-    profile_id: int = DEFAULT_PROFILE_ID,
+    profile_id: int = DEFAULT_PROFILE_ID, kind: str = "alias",
 ) -> Optional[ModelAlias]:
-    """Create or update a model alias in *profile_id*'s list.
+    """Create or update a model alias in *profile_id*'s *kind* list.
 
-    With *alias_id*, that row is updated (and may be renamed); returns None if it
-    does not exist in this profile. Otherwise the row is looked up by *alias*. New rows
-    go to the bottom of their profile's priority order. A *match_type* of None keeps an
-    existing row's type. Two concurrent creates may share a priority; ties break by id.
+    With *alias_id*, that row is updated (and may be renamed, or moved to the other
+    list); returns None if it does not exist in this profile. Otherwise the row is
+    looked up by *alias* within the list. New and moved rows go to the bottom of
+    their list's priority order. A *match_type* of None keeps an existing row's
+    type. Two concurrent creates may share a priority; ties break by id.
     """
     from sqlalchemy import func
+
+    async def bottom_priority() -> int:
+        max_priority = (await db.execute(
+            select(func.max(ModelAlias.priority))
+            .where(ModelAlias.profile_id == profile_id, ModelAlias.kind == kind)
+        )).scalar()
+        return (max_priority if max_priority is not None else -1) + 1
+
     if alias_id is not None:
         row = await get_model_alias_by_id(db, alias_id)
         if row is None or row.profile_id != profile_id:
             return None
         row.alias = alias
+        if (row.kind or "alias") != kind:
+            row.priority = await bottom_priority()
+            row.kind = kind
     else:
-        row = await get_model_alias(db, alias, profile_id)
+        row = await get_model_alias(db, alias, profile_id, kind)
     if row is None:
-        max_priority = (await db.execute(
-            select(func.max(ModelAlias.priority)).where(ModelAlias.profile_id == profile_id)
-        )).scalar()
         row = ModelAlias(
             alias=alias,
             profile_id=profile_id,
+            kind=kind,
             match_type=match_type or "exact",
-            priority=(max_priority if max_priority is not None else -1) + 1,
+            priority=await bottom_priority(),
         )
         db.add(row)
     elif match_type is not None:
@@ -1048,14 +1066,16 @@ async def upsert_model_alias(
     return row
 
 
-async def reorder_model_aliases(db: AsyncSession, ids: List[int], profile_id: int = DEFAULT_PROFILE_ID) -> bool:
-    """Set priorities to the order of *ids*, which must name every alias of the profile once.
+async def reorder_model_aliases(
+    db: AsyncSession, ids: List[int], profile_id: int = DEFAULT_PROFILE_ID, kind: str = "alias",
+) -> bool:
+    """Set priorities to the order of *ids*, which must name every alias of the list once.
 
     Returns False (writing nothing) when *ids* does not match the stored rows, so a
     client working from a stale list cannot silently drop rows from the order.
     """
     rows = list((await db.execute(
-        select(ModelAlias).where(ModelAlias.profile_id == profile_id)
+        select(ModelAlias).where(ModelAlias.profile_id == profile_id, ModelAlias.kind == kind)
     )).scalars().all())
     by_id = {row.id: row for row in rows}
     if len(ids) != len(rows) or set(ids) != set(by_id):
@@ -1066,9 +1086,11 @@ async def reorder_model_aliases(db: AsyncSession, ids: List[int], profile_id: in
     return True
 
 
-async def delete_model_alias(db: AsyncSession, alias: str, profile_id: int = DEFAULT_PROFILE_ID) -> bool:
-    """Delete a model alias by name from one profile's list."""
-    row = await get_model_alias(db, alias, profile_id)
+async def delete_model_alias(
+    db: AsyncSession, alias: str, profile_id: int = DEFAULT_PROFILE_ID, kind: str = "alias",
+) -> bool:
+    """Delete a model alias by name from one list of a profile."""
+    row = await get_model_alias(db, alias, profile_id, kind)
     if row is None:
         return False
     await db.delete(row)
@@ -3682,23 +3704,32 @@ async def _users_need_profile_column(conn) -> bool:
 
 
 _MODEL_ALIAS_COLUMNS = (
-    "id, alias, target_model_id, enabled, apis, match_type, priority, created_at, updated_at"
+    "id, alias, target_model_id, enabled, apis, match_type, priority, kind, created_at, updated_at"
 )
 
 
 async def _make_aliases_profile_scoped(conn) -> None:
-    """Add model_aliases.profile_id and move alias uniqueness to (profile, alias).
+    """Add model_aliases.profile_id and .kind, and move alias uniqueness to (profile, kind, alias).
 
     Safe to run on every start. The mappings that predate profiles were the one list
-    every user had, so they become Default's. Deployments carry the old uniqueness as a
-    separate UNIQUE index, which is simply dropped. A column-level UNIQUE (very old DDL)
-    cannot be dropped in SQLite, so that table is rebuilt from the current model.
+    every user had, so they become Default's. The mappings that predate fallback lists
+    applied whether or not the requested model was available, so each is kept in both
+    lists. Deployments carry the old uniqueness as a separate UNIQUE
+    index, which is simply dropped. A column-level UNIQUE (very old DDL) cannot be
+    dropped in SQLite, so that table is rebuilt from the current model.
     """
     from sqlalchemy import text
 
     columns = [r[1] for r in (await conn.execute(text("PRAGMA table_info(model_aliases)"))).fetchall()]
     if not columns:
         return
+    # Before any rebuild: the rebuild copies _MODEL_ALIAS_COLUMNS, which include it.
+    kind_added = "kind" not in columns
+    if kind_added:
+        logger.info("Auto-migration: Adding 'kind' column to model_aliases (all mappings -> regular)")
+        await conn.execute(text(
+            "ALTER TABLE model_aliases ADD COLUMN kind VARCHAR(16) NOT NULL DEFAULT 'alias'"
+        ))
     if "profile_id" not in columns:
         logger.info("Auto-migration: Adding 'profile_id' column to model_aliases (all mappings -> Default)")
         # SQLite cannot ADD a NOT NULL REFERENCES column; the UPDATE below fills it.
@@ -3739,10 +3770,23 @@ async def _make_aliases_profile_scoped(conn) -> None:
         await conn.execute(text("DROP TABLE model_aliases_mig"))
 
     await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_model_aliases_alias ON model_aliases (alias)"))
+    # The same text may sit once in each list, so (profile, alias) uniqueness gives way
+    # to (profile, kind, alias). Dropped first, or every start would bring it back.
+    await conn.execute(text("DROP INDEX IF EXISTS uq_model_aliases_scope_alias"))
     await conn.execute(text(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_aliases_scope_alias "
-        "ON model_aliases (profile_id, alias)"
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_model_aliases_scope_kind_alias "
+        "ON model_aliases (profile_id, kind, alias)"
     ))
+    # After the index swap, which lets the same text sit in both lists. Without the
+    # copy, a mapping for a name no provider serves (the common nickname case) would
+    # stop applying on upgrade; the admin UI flags the copies that never apply.
+    if kind_added:
+        logger.info("Auto-migration: Copying every model alias into the fallback list too")
+        copied = "alias, target_model_id, enabled, apis, match_type, priority, created_at, updated_at, profile_id"
+        await conn.execute(text(
+            f"INSERT INTO model_aliases ({copied}, kind) "
+            f"SELECT {copied}, 'fallback' FROM model_aliases WHERE kind = 'alias'"
+        ))
 
 
 # Set when this start folded instance groups into model groups. The precedence flip
@@ -3930,6 +3974,11 @@ async def _migrate_profiles(conn, profiles_pending: bool) -> None:
     await conn.execute(text(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_user_profiles_name_lower ON user_profiles (lower(name))"
     ))
+
+    columns = [row[1] for row in (await conn.execute(text("PRAGMA table_info(user_profiles)"))).fetchall()]
+    if "max_concurrent_requests" not in columns:
+        logger.info("Auto-migration: Adding 'max_concurrent_requests' column to user_profiles")
+        await conn.execute(text("ALTER TABLE user_profiles ADD COLUMN max_concurrent_requests INTEGER"))
 
     await _make_aliases_profile_scoped(conn)
 
@@ -4213,6 +4262,7 @@ async def list_profiles(db: AsyncSession, profile_id: Optional[int] = None) -> L
             "is_default": p.id == DEFAULT_PROFILE_ID,
             "member_count": members.get(p.id, 0),
             "rpm_limit": p.rpm_limit, "rpd_limit": p.rpd_limit,
+            "max_concurrent_requests": p.max_concurrent_requests,
             "model_access_mode": p.model_access_mode or "default",
             "exception_count": exceptions.get(p.id, 0),
             "alias_count": aliases.get(p.id, 0),
@@ -4238,6 +4288,7 @@ async def create_profile(
         src = await get_profile(db, clone_from_id)
         if src is not None:
             row.rpm_limit, row.rpd_limit = src.rpm_limit, src.rpd_limit
+            row.max_concurrent_requests = src.max_concurrent_requests
             row.model_access_mode = src.model_access_mode
             for lim in (await db.execute(select(ProfileModelGroupLimit)
                                          .where(ProfileModelGroupLimit.profile_id == src.id))).scalars():
@@ -4247,10 +4298,10 @@ async def create_profile(
                                         .where(ProfileModelAccessException.profile_id == src.id))).scalars():
                 db.add(ProfileModelAccessException(profile_id=row.id, model_id=ex.model_id,
                                                    is_allowed=ex.is_allowed, updated_by=admin_username))
-            for al in await get_all_model_aliases(db, profile_id=src.id):
+            for al in await get_all_model_aliases(db, profile_id=src.id, kind=None):
                 db.add(ModelAlias(profile_id=row.id, alias=al.alias, target_model_id=al.target_model_id,
                                   enabled=al.enabled, apis=al.apis, match_type=al.match_type,
-                                  priority=al.priority))
+                                  priority=al.priority, kind=al.kind or "alias"))
     await db.commit()
     await db.refresh(row)
     return row
@@ -4319,14 +4370,17 @@ async def list_profile_members(db: AsyncSession, profile_id: int) -> List[User]:
 
 async def upsert_profile_limits(
     db: AsyncSession, profile_id: int, rpm: Optional[int], rpd: Optional[int],
-    admin_username: str, fields_set: set,
+    admin_username: str, fields_set: set, max_concurrent: Optional[int] = None,
 ) -> Optional[UserProfile]:
-    """Set a profile's Default-group limits; only fields in fields_set change."""
+    """Set a profile's Default-group limits and concurrency cap; only fields in
+    fields_set change."""
     fields = {}
     if "rpm_limit" in fields_set:
         fields["rpm_limit"] = rpm
     if "rpd_limit" in fields_set:
         fields["rpd_limit"] = rpd
+    if "max_concurrent_requests" in fields_set:
+        fields["max_concurrent_requests"] = max_concurrent
     return await update_profile(db, profile_id, fields, admin_username)
 
 

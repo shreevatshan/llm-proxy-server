@@ -12,7 +12,6 @@ from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
 from app.model_access_dep import ModelAccessDenied
 from app.model_resolution import resolve_model_for_request, ModelUnavailable
 from app.rate_limit import RateLimitExceeded
-from app.model_alias import apply_alias
 from typing import Union
 from app.tracing import create_span, add_span_attributes, set_span_error
 import logging
@@ -115,7 +114,6 @@ async def edit_image(
 
     with create_span("image_edit_request") as span:
         try:
-            model = apply_alias(model)
             model = await resolve_model_for_request(request_obj, auth, model)
             # Access first, so a 403 spends no quota; then the model's group limit.
             await enforce_access_and_limits(request_obj, auth, model)
@@ -224,7 +222,6 @@ async def create_image_variation(
 
     with create_span("image_variation_request") as span:
         try:
-            model = apply_alias(model)
             model = await resolve_model_for_request(request_obj, auth, model)
             # Access first, so a 403 spends no quota; then the model's group limit.
             await enforce_access_and_limits(request_obj, auth, model)

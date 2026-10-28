@@ -15,7 +15,7 @@ partition: regrouping a model moves rows between scopes, which is a real delta o
 """
 
 from app.auth.admin import AdminUser
-from app.auth.models import ProfileLimitsUpdate, UserProfileAssign
+from app.auth.models import ProfileOverallLimitsUpdate, UserProfileAssign
 from app.routes import admin as admin_routes
 from app.routes.pools import resettle_pools
 from tests.pool_test_base import PoolTestCase
@@ -47,7 +47,7 @@ class AdminResettleTests(PoolTestCase):
         await self.tracker.get_user_status(alice.id, "alice")   # warm the RPD cache
 
         await admin_routes.update_profile_limits_endpoint(
-            ProfileLimitsUpdate(rpd_limit=30), own.id, ADMIN, self.db,
+            ProfileOverallLimitsUpdate(rpd_limit=30), own.id, ADMIN, self.db,
         )
 
         status = await self.tracker.get_user_status(bob.id, "bob")

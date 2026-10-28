@@ -17,6 +17,7 @@ from fastapi import Request
 from app.api_envelope import envelope_for
 from app.auth.admin import AdminUser
 from app.auth.models import APIKey, User
+from app.concurrency_slots import charge_with_slot
 from app.model_access_dep import enforce_model_access
 from app.profiles import DEFAULT_GROUP_ID
 from app.rate_limit import RateLimitExceeded, rate_limit_tracker
@@ -71,11 +72,12 @@ async def enforce_group_rate_limit(
         return
 
     if rate_limit_tracker.group_for(model_id) == DEFAULT_GROUP_ID:
-        decision = await rate_limit_tracker.check_and_increment(user_id, username)
+        charge = lambda: rate_limit_tracker.check_and_increment(user_id, username)
     else:
-        decision = await rate_limit_tracker.check_group_limit(user_id, username, model_id)
+        charge = lambda: rate_limit_tracker.check_group_limit(user_id, username, model_id)
 
-    if decision is not None and not decision.allowed:
+    decision = await charge_with_slot(request, user_id, charge)
+    if decision is not None:
         _raise(request, decision, envelope_override)
 
 

@@ -69,6 +69,20 @@ def _message(model_id: str) -> str:
     )
 
 
+def caller_may_use(auth, model_id: str) -> bool:
+    """The per-user access decision for `model_id`.
+
+    AdminUser and identity-less principals bypass it; everyone else gets their
+    profile's rules (app/cache.py:is_model_allowed_for_user).
+    """
+    if isinstance(auth, AdminUser):
+        return True
+    user_id = getattr(auth, "user_id", None) or getattr(auth, "id", None)
+    if user_id is None:
+        return True
+    return provider_manager.model_cache.is_model_allowed_for_user(user_id, model_id)
+
+
 async def enforce_model_access(
     request: Request,
     auth: Union[User, AdminUser, APIKey],
@@ -79,16 +93,7 @@ async def enforce_model_access(
 
     Raises ModelAccessDenied (403) in the format matching the API envelope.
     """
-    if isinstance(auth, AdminUser):
-        return
-    if not model_id:
-        return
-
-    user_id = getattr(auth, "user_id", None) or getattr(auth, "id", None)
-    if user_id is None:
-        return
-
-    if provider_manager.model_cache.is_model_allowed_for_user(user_id, model_id):
+    if not model_id or caller_may_use(auth, model_id):
         return
 
     envelope = envelope_for(request.url.path, envelope_override)

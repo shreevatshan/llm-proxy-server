@@ -1,9 +1,10 @@
-"""Per-user request rate limiting (RPM and RPD).
+"""Per-user request rate limiting (RPM and RPD) and concurrency (requests in flight).
 
 Single-process only: counters live in-memory. RPM buckets reset on restart
-(60s window — acceptable). RPD survives via the RequestUsage table.
+(60s window — acceptable). RPD survives via the RequestUsage table. In-flight counts
+start at zero, which is exact: a restart ends every request.
 
-If the app is ever scaled to multiple workers, swap _minute_buckets for
+If the app is ever scaled to multiple workers, swap _minute_buckets and _inflight for
 a shared Redis counter.
 
 Request pools share one daily quota across several users: a pooled user's RPD limit is
@@ -80,7 +81,8 @@ class RateLimitDecision:
     rpd_limit: Optional[int]
     rpd_remaining: Optional[int]
     retry_after_seconds: int
-    limited_by: Optional[str]  # "rpm"|"rpd" (Default group)|"group_rpm"|"group_rpd"|None
+    # "rpm"|"rpd" (Default group)|"group_rpm"|"group_rpd"|"concurrency"|None
+    limited_by: Optional[str]
     # Group context (set when limited_by is group_rpm or group_rpd, or for headers)
     group_id: Optional[int] = None
     group_name: Optional[str] = None
@@ -96,6 +98,8 @@ class RateLimitDecision:
     # pool's own total: the cap that was hit and the percent it came from.
     pool_share_cap: Optional[int] = None
     pool_share_pct: Optional[int] = None
+    # Set when limited_by is "concurrency": the profile's cap on requests in flight.
+    concurrency_limit: Optional[int] = None
 
 
 @dataclass
@@ -223,6 +227,13 @@ def _share_message(d: RateLimitDecision, scope: str, pool_limit: Optional[int]) 
 
 
 def _limit_message(d: RateLimitDecision) -> str:
+    if d.limited_by == "concurrency":
+        n = d.concurrency_limit
+        return (
+            f"Concurrency limit exceeded: at most {n} request{'s' if n != 1 else ''} "
+            f"may be in progress at once. Retry when an earlier request finishes. "
+            f"View your allowed quota in the console."
+        )
     if d.pool_share_cap is not None:
         if d.limited_by == "group_rpd":
             return _share_message(d, f" for model group '{d.group_name}'", d.group_rpd_limit)
@@ -255,6 +266,14 @@ def _limit_message(d: RateLimitDecision) -> str:
 
 
 def _rl_headers(d: RateLimitDecision) -> dict:
+    if d.limited_by == "concurrency":
+        # Not the -Requests headers: those describe the per-minute window, and this
+        # denial says nothing about it.
+        return {
+            "Retry-After": str(d.retry_after_seconds),
+            "X-RateLimit-Limit-Concurrent-Requests": str(d.concurrency_limit),
+            "X-RateLimit-Remaining-Concurrent-Requests": "0",
+        }
     if d.pool_share_cap is not None:
         # The member's own ceiling is the limit they actually ran into.
         limit = d.pool_share_cap
@@ -330,6 +349,11 @@ class RateLimitTracker:
         # snapshot still falls back to the default. None = uncapped.
         self._pool_share_default: Optional[int] = None
         self._pool_share_override: Dict[int, int] = {}             # pool_id → pct
+        # Requests each user has in progress (user_id → count), whether or not their
+        # profile caps it. Taken and released through app.concurrency_slots, which ties
+        # each slot to one ASGI call. Keys are dropped at zero, so this never grows
+        # past the users with something in flight.
+        self._inflight: Dict[int, int] = {}
 
     def set_db_session_factory(self, factory: Callable) -> None:
         self._db_session_factory = factory
@@ -652,6 +676,44 @@ class RateLimitTracker:
         DEFAULT_GROUP_ID resolves to the profile's own rpm/rpd.
         """
         return profile_registry.for_user(user_id).model_group_limit(group_id)
+
+    # -- concurrency --------------------------------------------------------
+    #
+    # Synchronous on purpose: with no await between the check and the increment, the
+    # pair is atomic on the one event loop every port shares.
+
+    def concurrency_limit_for(self, user_id: int) -> Optional[int]:
+        """Requests this user's profile lets them have in progress at once; None = unlimited."""
+        return profile_registry.for_user(user_id).max_concurrent
+
+    def inflight_for(self, user_id: int) -> int:
+        return self._inflight.get(user_id, 0)
+
+    def try_acquire_slot(self, user_id: int) -> Optional[RateLimitDecision]:
+        """Take an in-flight slot, or return the denial if the user is at their cap.
+
+        Unlimited users are counted too, so a cap set while they have requests open
+        applies to them at once rather than only after those finish.
+        """
+        limit = self.concurrency_limit_for(user_id)
+        current = self._inflight.get(user_id, 0)
+        if limit is not None and current >= limit:
+            return RateLimitDecision(
+                allowed=False,
+                rpm_limit=None, rpm_remaining=None, rpd_limit=None, rpd_remaining=None,
+                retry_after_seconds=1,
+                limited_by="concurrency",
+                concurrency_limit=limit,
+            )
+        self._inflight[user_id] = current + 1
+        return None
+
+    def release_slot(self, user_id: int) -> None:
+        current = self._inflight.get(user_id, 0)
+        if current <= 1:
+            self._inflight.pop(user_id, None)
+        else:
+            self._inflight[user_id] = current - 1
 
     # -- request pooling ---------------------------------------------------
     #

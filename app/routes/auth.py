@@ -676,6 +676,8 @@ async def get_my_quotas(
     return MyQuotasResponse(
         is_admin=False, sections=sections, pool=pool_summary,
         profile_name=profile_registry.for_user(current_user.id).name,
+        max_concurrent_requests=rate_limit_tracker.concurrency_limit_for(current_user.id),
+        in_flight=rate_limit_tracker.inflight_for(current_user.id),
     )
 
 

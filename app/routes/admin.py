@@ -44,7 +44,8 @@ from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
 from app.auth.models import (
     User, AdminUserCreate, UserResponse, DEFAULT_PROFILE_ID,
-    ProfileCreate, ProfileUpdate, ProfileResponse, ProfileLimitsUpdate, ProfileLimitsResponse,
+    ProfileCreate, ProfileUpdate, ProfileResponse, ProfileLimitsUpdate, ProfileOverallLimitsUpdate,
+    ProfileLimitsResponse,
     ProfileMemberResponse, UserProfileAssign, ProviderConfigurationResponse, ModelConfigurationResponse,
     ModelManagementTree, ToggleRequest, BulkToggleRequest, BulkUserActionRequest, ModelSearchResponse,
     ProviderCredentialsCreate, ProviderCredentialsUpdate, ProviderCredentialsResponse,
@@ -1506,19 +1507,29 @@ async def get_profile_limits_endpoint(
 
 @router.put("/profiles/limits", response_model=ProfileResponse)
 async def update_profile_limits_endpoint(
-    body: ProfileLimitsUpdate,
+    body: ProfileOverallLimitsUpdate,
     profile_id: int = Query(...),
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set a profile's Default-group RPM/RPD (null = unlimited; omitted = unchanged).
+    """Set a profile's Default-group RPM/RPD and its max concurrent requests
+    (null = unlimited; omitted = unchanged).
 
-    The same as PUT /profiles/model-group-limits with group_id=0.
+    For RPM/RPD, the same as PUT /profiles/model-group-limits with group_id=0. The
+    concurrency cap is profile-wide and has no per-group form.
     """
     await _require_profile(db, profile_id)
+    fields_set = body.model_fields_set
     await upsert_profile_limits(db, profile_id, body.rpm_limit, body.rpd_limit,
-                                current_admin.username, body.model_fields_set)
-    await _resettle_profile(db, profile_id)
+                                current_admin.username, fields_set,
+                                max_concurrent=body.max_concurrent_requests)
+    if fields_set & {"rpm_limit", "rpd_limit"}:
+        await _resettle_profile(db, profile_id)
+    else:
+        # Only the concurrency cap changed: no count depends on it, so there is
+        # nothing to re-apportion -- the snapshot just has to pick it up.
+        from app.rate_limit import rate_limit_tracker
+        await rate_limit_tracker.reload_config()
     return await _profile_response(db, profile_id)
 
 
@@ -1902,15 +1913,44 @@ async def get_all_models(
 # Every mapping belongs to a profile, and a profile's members are mapped with its
 # list alone. `profile_id` defaults to Default throughout.
 
+#
+# Each profile has two lists, selected by `kind`: the regular mappings ("alias"),
+# applied when the requested model is available to the caller, and the fallback
+# mappings ("fallback"), applied when it is not.
+
+_KindQuery = Query("alias", pattern="^(alias|fallback)$", description="Which list: alias or fallback")
+
+
+def _alias_responses(rows, profile_id: int) -> List[ModelAliasResponse]:
+    """Serialise rows; exact regular rows also report whether their source is available.
+
+    A regular mapping only applies to an available model, so one whose alias names
+    no model the profile's members can use never fires (it belongs in the fallback
+    list). Only exact rows name a single model; patterns are left unflagged.
+    """
+    from app.model_resolution import is_model_available, may_use_for_profile
+    may_use = may_use_for_profile(profile_id)
+    out = []
+    for row in rows:
+        resp = ModelAliasResponse.model_validate(row)
+        if resp.kind == "alias" and resp.match_type == "exact":
+            resp.source_available = any(
+                is_model_available(resp.alias, may_use, surface) for surface in resp.apis
+            )
+        out.append(resp)
+    return out
+
+
 @router.get("/model-aliases", response_model=List[ModelAliasResponse])
 async def list_model_aliases_endpoint(
     profile_id: int = Query(DEFAULT_PROFILE_ID, description="Profile whose mappings to list"),
+    kind: str = _KindQuery,
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """List one profile's aliases, including disabled aliases."""
+    """List one list of a profile, including disabled aliases."""
     await _require_profile(db, profile_id)
-    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db, profile_id)]
+    return _alias_responses(await get_all_model_aliases(db, profile_id, kind=kind), profile_id)
 
 
 @router.post("/model-aliases", response_model=ModelAliasResponse)
@@ -1921,8 +1961,9 @@ async def upsert_model_alias_endpoint(
 ):
     """Create or update an alias after validating its pattern and canonical target.
 
-    With `id`, that row is updated in place (and may be renamed); otherwise the
-    row is matched by its alias text within the profile's list.
+    With `id`, that row is updated in place (and may be renamed, or moved to the
+    other list by a different `kind`); otherwise the row is matched by its alias
+    text within the profile's `kind` list.
     """
     from sqlalchemy.exc import IntegrityError
     await _require_profile(db, body.profile_id)
@@ -1931,7 +1972,9 @@ async def upsert_model_alias_endpoint(
         if existing is None or existing.profile_id != body.profile_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
     else:
-        existing = await get_model_alias(db, body.alias, body.profile_id)
+        existing = await get_model_alias(db, body.alias, body.profile_id, body.kind or "alias")
+    # Like match_type, an omitted kind keeps the row where it is.
+    kind = body.kind or (existing.kind if existing else None) or "alias"
 
     # The schema only validates the pattern when match_type is sent; re-check it
     # against the type the row will actually have.
@@ -1952,19 +1995,20 @@ async def upsert_model_alias_endpoint(
         row = await upsert_model_alias(
             db, body.alias, body.target_model_id, body.enabled, body.apis,
             match_type=body.match_type, alias_id=existing.id if existing else None,
-            profile_id=body.profile_id,
+            profile_id=body.profile_id, kind=kind,
         )
     except IntegrityError:
         await db.rollback()
+        list_name = "fallback mapping" if kind == "fallback" else "mapping"
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"A mapping for '{body.alias}' already exists",
+            detail=f"A {list_name} for '{body.alias}' already exists",
         )
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
     from app.model_alias import model_alias_resolver
     await model_alias_resolver.load_from_database()
-    return ModelAliasResponse.model_validate(row)
+    return _alias_responses([row], body.profile_id)[0]
 
 
 @router.put("/model-aliases/order", response_model=List[ModelAliasResponse])
@@ -1973,16 +2017,18 @@ async def reorder_model_aliases_endpoint(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Set one profile's evaluation order; `ids` must list every alias of it exactly once."""
+    """Set one list's evaluation order; `ids` must list every alias of it exactly once."""
     await _require_profile(db, body.profile_id)
-    if not await reorder_model_aliases(db, body.ids, body.profile_id):
+    if not await reorder_model_aliases(db, body.ids, body.profile_id, body.kind):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Mapping list changed — refresh and retry",
         )
     from app.model_alias import model_alias_resolver
     await model_alias_resolver.load_from_database()
-    return [ModelAliasResponse.model_validate(row) for row in await get_all_model_aliases(db, body.profile_id)]
+    return _alias_responses(
+        await get_all_model_aliases(db, body.profile_id, kind=body.kind), body.profile_id,
+    )
 
 
 @router.get("/model-aliases/test", response_model=List[ModelAliasTestMatch])
@@ -1995,24 +2041,31 @@ async def match_model_alias_endpoint(
 ):
     """Report which enabled mapping *model* would hit, per API surface.
 
-    Uses the live resolver, so the answer is exactly what requests get. Without
-    `api`, every surface is reported (rather than an unscoped match, which
-    ignores API scoping and so never happens for a real request). Only
-    `profile_id`'s own mappings are tried, as for its members.
+    Uses the live resolver and model availability, so the answer is what a member
+    of `profile_id` gets: the regular list when the name is available to them, the
+    fallback list when it is not. Without `api`, every surface is reported (rather
+    than an unscoped match, which ignores API scoping and so never happens for a
+    real request). Only `profile_id`'s own mappings are tried, as for its members.
     """
     if api is not None and api not in MODEL_ALIAS_API_SURFACES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown API surface: {api}")
     await _require_profile(db, profile_id)
     from app.model_alias import model_alias_resolver
+    from app.model_resolution import is_model_available, may_use_for_profile
+    may_use = may_use_for_profile(profile_id)
     results = []
     for surface in ([api] if api else MODEL_ALIAS_API_SURFACES):
-        rule = model_alias_resolver.match(model, surface, profile_id)
+        available = is_model_available(model, may_use, surface)
+        kind = "alias" if available else "fallback"
+        rule = model_alias_resolver.match(model, surface, profile_id, kind)
         if rule is None:
-            results.append(ModelAliasTestMatch(api=surface, matched=False, resolved_model=model))
+            results.append(ModelAliasTestMatch(
+                api=surface, available=available, kind=kind, matched=False, resolved_model=model,
+            ))
         else:
             results.append(ModelAliasTestMatch(
-                api=surface, matched=True, resolved_model=rule.target, id=rule.id,
-                alias=rule.pattern, match_type=rule.match_type, target_model_id=rule.target,
+                api=surface, available=available, kind=kind, matched=True, resolved_model=rule.target,
+                id=rule.id, alias=rule.pattern, match_type=rule.match_type, target_model_id=rule.target,
             ))
     return results
 
@@ -2021,11 +2074,12 @@ async def match_model_alias_endpoint(
 async def delete_model_alias_endpoint(
     alias: str,
     profile_id: int = Query(DEFAULT_PROFILE_ID, description="Profile whose list holds the alias"),
+    kind: str = _KindQuery,
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db),
 ):
     """Delete an alias and reload the in-memory resolver immediately."""
-    if not await delete_model_alias(db, alias, profile_id):
+    if not await delete_model_alias(db, alias, profile_id, kind):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model alias not found")
     from app.model_alias import model_alias_resolver
     await model_alias_resolver.load_from_database()

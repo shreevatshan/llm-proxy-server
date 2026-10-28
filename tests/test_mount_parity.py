@@ -32,20 +32,47 @@ def mount(sub_app, prefix):
 
 
 class _AliasSnapshot:
-    """Swap in alias rules for the duration of a test.
+    """Swap in Default's rules of one list (regular unless *kind* says) for a test.
 
-    Accepts exact mappings as {alias: (target, apis)} or a list of AliasRule.
+    Accepts exact mappings as {alias: (target, apis)} or a list of AliasRule. A
+    name no provider serves is unavailable, so only the fallback list applies to it.
     """
 
-    def __init__(self, aliases):
+    def __init__(self, aliases, kind="alias"):
         self.rules = rules_from_mapping(aliases) if isinstance(aliases, dict) else list(aliases)
+        self.kind = kind
 
     def __enter__(self):
-        self.saved = model_alias_resolver._snapshot
-        model_alias_resolver.set_rules(self.rules)
+        self.saved = (model_alias_resolver._snapshot, model_alias_resolver._fallback_snapshot)
+        model_alias_resolver.set_rules(self.rules, kind=self.kind)
 
     def __exit__(self, *exc):
-        model_alias_resolver._snapshot = self.saved
+        model_alias_resolver._snapshot, model_alias_resolver._fallback_snapshot = self.saved
+
+
+class _ServedModels:
+    """Make *model_ids* available: a model cache and providers that serve them."""
+
+    def __init__(self, *model_ids):
+        self.model_ids = model_ids
+
+    def __enter__(self):
+        from types import SimpleNamespace
+        from app.cache import ModelCache
+        from app.openai_models import ModelInfo
+        from app.providers.provider_manager import provider_manager
+        cache = ModelCache()
+        cache.update_models([ModelInfo(id=m, created=0, owned_by="t", provider="t") for m in self.model_ids])
+        stub = SimpleNamespace(supports_api_for_model=lambda model, api: True)
+        providers = {m.split("/", 1)[0]: stub for m in self.model_ids}
+        self.patches = [patch.object(provider_manager, "model_cache", cache),
+                        patch.object(provider_manager, "providers", providers)]
+        for p in self.patches:
+            p.start()
+
+    def __exit__(self, *exc):
+        for p in reversed(self.patches):
+            p.stop()
 
 
 def build_openai_sub():
@@ -148,8 +175,9 @@ class TrackingParityTests(unittest.TestCase):
             self.assertEqual(payload["state_model"], "gpt-4o")
 
     def test_alias_mapping_applies(self):
+        # "friendly" is no model, so it is mapped by the fallback list.
         aliases = {"friendly": ("prov/real-model", ALL_SURFACES)}
-        with _AliasSnapshot(aliases):
+        with _AliasSnapshot(aliases, kind="fallback"):
             (direct, direct_call), (mounted, mounted_call) = self._both(
                 json={"model": "friendly", "stream": False}
             )
@@ -160,9 +188,33 @@ class TrackingParityTests(unittest.TestCase):
         self.assertEqual(mounted_call["model"], direct_call["model"])
         self.assertEqual(mounted_call["model"], "prov/real-model")
 
+    def test_regular_mapping_applies_to_an_available_model(self):
+        aliases = {"gpt-4o": ("prov/gpt-4.1", ALL_SURFACES)}
+        with _ServedModels("prov/gpt-4o", "prov/gpt-4.1"), _AliasSnapshot(aliases):
+            (direct, direct_call), (mounted, mounted_call) = self._both(json={"model": "gpt-4o"})
+        for payload in (direct.json(), mounted.json()):
+            self.assertEqual(payload["model_seen"], "prov/gpt-4.1")
+        self.assertEqual(mounted_call["model"], direct_call["model"])
+        self.assertEqual(direct_call["model"], "prov/gpt-4.1")
+
+    def test_regular_mapping_does_not_apply_to_an_unavailable_model(self):
+        aliases = {"friendly": ("prov/real-model", ALL_SURFACES)}
+        with _AliasSnapshot(aliases):
+            (direct, direct_call), (mounted, mounted_call) = self._both(json={"model": "friendly"})
+        for payload in (direct.json(), mounted.json()):
+            self.assertEqual(payload["model_seen"], "friendly")
+        self.assertEqual(direct_call["model"], "friendly")
+
+    def test_fallback_mapping_does_not_apply_to_an_available_model(self):
+        aliases = {"gpt-4o": ("prov/gpt-4.1", ALL_SURFACES)}
+        with _ServedModels("prov/gpt-4o", "prov/gpt-4.1"), _AliasSnapshot(aliases, kind="fallback"):
+            (direct, _), (mounted, _) = self._both(json={"model": "gpt-4o"})
+        for payload in (direct.json(), mounted.json()):
+            self.assertEqual(payload["model_seen"], "gpt-4o")
+
     def test_contains_mapping_rewrites_body_model(self):
         rules = [build_rule("opus", "prov/opus-target", match_type="contains")]
-        with _AliasSnapshot(rules):
+        with _AliasSnapshot(rules, kind="fallback"):
             (direct, direct_call), (mounted, mounted_call) = self._both(
                 json={"model": "Claude-Opus-4", "stream": False}
             )
@@ -187,7 +239,7 @@ class TrackingParityTests(unittest.TestCase):
             seen["echoed"] = original_model_name.get()
             return {}
 
-        with _AliasSnapshot(aliases):
+        with _AliasSnapshot(aliases, kind="fallback"):
             post(mount(sub, "/openai"), "/openai/v1/chat/completions",
                  json={"model": "friendly"})
 
@@ -381,7 +433,7 @@ class AzureParityTests(unittest.TestCase):
         """The bare model in a deployment-scoped Responses body gets provider-qualified."""
         aliases = {"prov/friendly": ("prov/real-model", ALL_SURFACES)}
         path = "/openai/deployments/prov/responses"
-        with _AliasSnapshot(aliases):
+        with _AliasSnapshot(aliases, kind="fallback"):
             _, direct_call = post(build_azure_sub(), path, json={"model": "friendly"})
             _, mounted_call = post(mount(build_azure_sub(), "/azure-openai"),
                                    "/azure-openai" + path, json={"model": "friendly"})
@@ -389,12 +441,13 @@ class AzureParityTests(unittest.TestCase):
         self.assertEqual(mounted_call["model"], direct_call["model"])
 
     def test_responses_pattern_rules_do_not_chain(self):
-        """The route re-applies aliases (azure_openai.py) after the middleware did.
+        """The route re-maps (azure_openai.py) after the middleware did.
 
         With pattern rules a second pass would chain mini -> gpt-4o -> gpt-4.1 and
         overwrite the echoed name; it must be a no-op instead.
         """
-        from app.model_alias import apply_alias, original_model_name
+        from app.model_alias import original_model_name
+        from app.model_resolution import map_model_name
 
         def build():
             sub = FastAPI()
@@ -402,7 +455,7 @@ class AzureParityTests(unittest.TestCase):
 
             @sub.post("/openai/deployments/{provider}/responses")
             async def responses(provider: str, body: dict):
-                return {"routed": apply_alias(body.get("model")), "echo": original_model_name.get()}
+                return {"routed": map_model_name(body.get("model")), "echo": original_model_name.get()}
 
             return sub
 
@@ -411,7 +464,7 @@ class AzureParityTests(unittest.TestCase):
             build_rule("gpt-4o", "prov/gpt-4.1", match_type="contains", priority=1, rule_id=2),
         ]
         path = "/openai/deployments/prov/responses"
-        with _AliasSnapshot(rules):
+        with _AliasSnapshot(rules, kind="fallback"):
             direct, direct_call = post(build(), path, json={"model": "gpt-4o-mini"})
             mounted, mounted_call = post(mount(build(), "/azure-openai"),
                                          "/azure-openai" + path, json={"model": "gpt-4o-mini"})

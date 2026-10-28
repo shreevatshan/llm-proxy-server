@@ -55,6 +55,8 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         self._saved_aliases = (
             model_alias_module.model_alias_resolver._snapshot,
             model_alias_module.model_alias_resolver._profile_snapshots,
+            model_alias_module.model_alias_resolver._fallback_snapshot,
+            model_alias_module.model_alias_resolver._fallback_profile_snapshots,
         )
 
         from app.rate_limit import rate_limit_tracker
@@ -82,7 +84,9 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         import app.model_alias as model_alias_module
         model_alias_module.AsyncSessionLocal = self._real_alias_session
         (model_alias_module.model_alias_resolver._snapshot,
-         model_alias_module.model_alias_resolver._profile_snapshots) = self._saved_aliases
+         model_alias_module.model_alias_resolver._profile_snapshots,
+         model_alias_module.model_alias_resolver._fallback_snapshot,
+         model_alias_module.model_alias_resolver._fallback_profile_snapshots) = self._saved_aliases
         time_utils.local_today = self._real_local_today
         self.tracker.set_db_session_factory(self._saved_factory)
         self.tracker._user_to_pool = {}
@@ -104,6 +108,7 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
         # User ids repeat across tests, so per-minute counts must not carry over.
         self.tracker._minute_buckets = {}
         self.tracker._group_minute_buckets = {}
+        self.tracker._inflight = {}
         self.tracker._rpd_cache = {}
         self.tracker._group_rpd_cache = {}
         self.request_tracker._usage_buffer.clear()

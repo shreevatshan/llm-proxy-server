@@ -33,6 +33,7 @@ class ProfileSnapshot:
     access_mode: str = "default"  # default | allow | deny | custom
     access_exceptions: Mapping[str, bool] = field(
         default_factory=lambda: MappingProxyType({}))
+    max_concurrent: Optional[int] = None  # requests in progress at once; None = unlimited
 
     def model_group_limit(self, group_id: int) -> Tuple[Optional[int], Optional[int]]:
         if group_id == DEFAULT_GROUP_ID:
@@ -115,6 +116,7 @@ class ProfileRegistry:
                 model_group_limits=MappingProxyType(mg.get(p.id, {})),
                 access_mode=p.model_access_mode or "default",
                 access_exceptions=MappingProxyType(ex.get(p.id, {})),
+                max_concurrent=p.max_concurrent_requests,
             )
             for p in profile_rows
         ]

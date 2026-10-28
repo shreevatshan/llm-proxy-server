@@ -351,7 +351,14 @@ def _model_from_multipart(body: bytes, content_type: str) -> Optional[str]:
 
 def _add_request_tracking(app: FastAPI, server_name: str):
     """Add request tracking middleware to an API server."""
+    from app.concurrency_slots import ConcurrencySlotMiddleware
     from app.request_tracker import request_tracker
+
+    # Registered first so it sits just inside track_requests, which must stay the
+    # outermost user middleware (tests/test_user_id_span_attribute.py). It wraps every
+    # route on the app, so whatever a route charges, it holds a concurrency slot for
+    # until the ASGI call returns.
+    app.add_middleware(ConcurrencySlotMiddleware)
 
     @app.middleware("http")
     async def track_requests(request: Request, call_next):
@@ -446,7 +453,9 @@ def _add_request_tracking(app: FastAPI, server_name: str):
             #   RuntimeError: Unexpected message received: http.request
 
         if isinstance(model, str) and model:
-            from app.model_alias import apply_alias
+            # Before auth only the global gate is known, so the regular-or-fallback
+            # choice here is provisional; auth and the route re-judge it per caller.
+            from app.model_resolution import map_model_name
             azure_responses_model = (
                 path.startswith("/openai/deployments/")
                 and path.endswith("/responses")
@@ -456,7 +465,7 @@ def _add_request_tracking(app: FastAPI, server_name: str):
             client_model = model
             if azure_responses_model:
                 model = f"{path.split('/')[3]}/{model}"
-            mapped = apply_alias(model)
+            mapped = map_model_name(model)
             if mapped != model:
                 if azure_responses_model:
                     original_model_name.set(client_model)

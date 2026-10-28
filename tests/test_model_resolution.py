@@ -20,6 +20,7 @@ from app.cache import ModelCache
 from app.model_access_dep import ModelAccessDenied
 from app.model_alias import current_api_surface, original_model_name
 from app.model_resolution import (
+    PRE_AUTH,
     ModelUnavailable,
     candidate_ids,
     resolve_model_for_request,
@@ -505,6 +506,190 @@ class SideEffectTests(unittest.TestCase):
         with _Env(["azure:foundry/gpt-5.4"]):
             self.assertEqual(_resolve(object(), None, "gpt-5.4"),
                              "azure:foundry/gpt-5.4")
+
+
+# ======================================================================
+# Regular vs fallback mappings: the client's name picks the list
+# ======================================================================
+
+class _Rules:
+    """Install one profile's (Default's unless given) regular and fallback rules
+    ({alias: target}) for one test. _grant puts its user in profile 9."""
+
+    def __init__(self, regular=None, fallback=None, apis=frozenset({"openai", "anthropic", "azure_openai"}),
+                 profile_id=1):
+        self.lists = {"alias": regular or {}, "fallback": fallback or {}}
+        self.apis = apis
+        self.profile_id = profile_id
+
+    def __enter__(self):
+        from app.model_alias import build_rule, model_alias_resolver as r
+        self.saved = (r._snapshot, r._profile_snapshots, r._fallback_snapshot, r._fallback_profile_snapshots)
+        for kind, mapping in self.lists.items():
+            r.set_rules([build_rule(a, t, self.apis, rule_id=i) for i, (a, t) in enumerate(mapping.items(), 1)],
+                        profile_id=self.profile_id, kind=kind)
+        return self
+
+    def __exit__(self, *exc):
+        from app.model_alias import model_alias_resolver as r
+        (r._snapshot, r._profile_snapshots, r._fallback_snapshot, r._fallback_profile_snapshots) = self.saved
+
+
+def _fresh_alias_context():
+    """Inside asyncio.run: start from a request with nothing mapped, as the middleware does."""
+    from app.model_alias import reset_alias_context
+    reset_alias_context()
+    original_model_name.set(None)
+
+
+def _resolve_fresh(request_obj, auth, model, **kw):
+    async def run():
+        _fresh_alias_context()
+        chosen = await resolve_model_for_request(request_obj, auth, model, **kw)
+        return chosen, original_model_name.get()
+    return asyncio.run(run())
+
+
+MODELS = ["p:a/gpt-5.4", "p:a/gpt-5.5"]
+
+
+class FallbackMappingTests(unittest.TestCase):
+
+    def test_available_name_uses_the_regular_list(self):
+        with _Env(MODELS), _Rules(regular={"gpt-5.4": "p:a/gpt-5.5"}, fallback={"gpt-5.4": "nope"}):
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "gpt-5.4"), ("p:a/gpt-5.5", "gpt-5.4"))
+
+    def test_fallback_list_is_ignored_for_an_available_name(self):
+        with _Env(MODELS), _Rules(fallback={"gpt-5.4": "p:a/gpt-5.5"}):
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "gpt-5.4")[0], "p:a/gpt-5.4")
+
+    def test_unknown_name_uses_the_fallback_list(self):
+        with _Env(MODELS), _Rules(fallback={"gpt-9": "p:a/gpt-5.5"}):
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "gpt-9"), ("p:a/gpt-5.5", "gpt-9"))
+
+    def test_regular_list_never_applies_to_an_unknown_name(self):
+        with _Env(MODELS), _Rules(regular={"gpt-9": "p:a/gpt-5.5"}):
+            with self.assertRaises(ModelUnavailable) as ctx:
+                _resolve_fresh(_request(), _User(7), "gpt-9")
+        self.assertIn("'gpt-9'", ctx.exception.body["error"]["message"])
+
+    def test_pattern_fallback_rules_work(self):
+        from app.model_alias import build_rule, model_alias_resolver as r
+        with _Env(MODELS), _Rules():
+            r.set_rules([build_rule(".", "p:a/gpt-5.5", match_type="regex", rule_id=1)], kind="fallback")
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "anything-at-all")[0], "p:a/gpt-5.5")
+
+    def test_globally_disabled_model_uses_the_fallback_list(self):
+        with _Env(MODELS, disabled_models=["p:a/gpt-5.4"]), \
+             _Rules(fallback={"gpt-5.4": "p:a/gpt-5.5", "p:a/gpt-5.4": "p:a/gpt-5.5"}):
+            for name in ("gpt-5.4", "p:a/gpt-5.4"):
+                with self.subTest(name=name):
+                    self.assertEqual(_resolve_fresh(_request(), _User(7), name), ("p:a/gpt-5.5", name))
+
+    def test_disabled_provider_uses_the_fallback_list(self):
+        with _Env(["p:a/gpt-5.4", "q:b/gpt-5.5"], disabled_providers=["p:a"]), \
+             _Rules(fallback={"gpt-5.4": "q:b/gpt-5.5"}):
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "gpt-5.4")[0], "q:b/gpt-5.5")
+
+    def test_model_the_profile_denies_uses_the_fallback_list(self):
+        with _Env(MODELS), _Rules(fallback={"gpt-5.4": "p:a/gpt-5.5", "p:a/gpt-5.4": "p:a/gpt-5.5"},
+                                  profile_id=9):
+            _grant(self, 7, "custom", {"p:a/gpt-5.4": False})
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "gpt-5.4")[0], "p:a/gpt-5.5")
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "p:a/gpt-5.4")[0], "p:a/gpt-5.5")
+
+    def test_denied_fallback_target_keeps_the_original_403(self):
+        with _Env(MODELS), _Rules(fallback={"gpt-5.4": "p:a/gpt-5.5"}, profile_id=9):
+            _grant(self, 7, "deny")
+            with self.assertRaises(ModelAccessDenied) as ctx:
+                _resolve_fresh(_request(), _User(7), "gpt-5.4")
+        self.assertIn("'gpt-5.4'", ctx.exception.body["error"]["message"])
+
+    def test_unavailable_fallback_target_keeps_the_original_404(self):
+        # (A target under a live provider prefix would pass through as an uncached
+        # deployment, so this one names no provider.)
+        with _Env(MODELS), _Rules(fallback={"gpt-9": "gone:x/gone"}):
+            with self.assertRaises(ModelUnavailable) as ctx:
+                _resolve_fresh(_request(), _User(7), "gpt-9")
+        self.assertIn("'gpt-9'", ctx.exception.body["error"]["message"])
+
+    def test_unavailable_regular_target_is_reported_not_rescued(self):
+        with _Env(MODELS), _Rules(regular={"gpt-5.4": "gone:x/gone"}, fallback={"gpt-5.4": "p:a/gpt-5.5"}):
+            with self.assertRaises(ModelUnavailable) as ctx:
+                _resolve_fresh(_request(), _User(7), "gpt-5.4")
+        self.assertIn("'gone:x/gone'", ctx.exception.body["error"]["message"])
+
+    def test_admin_may_call_a_disabled_model_by_id_so_no_fallback(self):
+        admin = AdminUser("root", "root@example.com")
+        with _Env(MODELS, disabled_models=["p:a/gpt-5.4"]), \
+             _Rules(fallback={"p:a/gpt-5.4": "p:a/gpt-5.5"}):
+            self.assertEqual(_resolve_fresh(_request(), admin, "p:a/gpt-5.4")[0], "p:a/gpt-5.4")
+
+    def test_fallback_rules_respect_their_api_surfaces(self):
+        with _Env(MODELS, api="openai"), _Rules(fallback={"gpt-9": "p:a/gpt-5.5"}, apis={"anthropic"}):
+            with self.assertRaises(ModelUnavailable):
+                _resolve_fresh(_request(), _User(7), "gpt-9")
+
+    def test_denied_deployment_behind_a_provider_prefix_uses_the_fallback_list(self):
+        providers = {"azure:primary": _StubProvider("azure:primary"), "p:a": _StubProvider("p:a")}
+        with _Env(MODELS, providers=providers), \
+             _Rules(fallback={"azure:primary/dep": "p:a/gpt-5.5"}, profile_id=9):
+            _grant(self, 7, "custom", {"azure:primary/dep": False})
+            self.assertEqual(_resolve_fresh(_request(), _User(7), "azure:primary/dep")[0], "p:a/gpt-5.5")
+
+    def test_caller_access_overrides_the_pre_auth_choice_and_retags(self):
+        """Before auth a disabled model looks unavailable and the fallback is applied;
+        an allow-mode caller may use it, so it is served after all and usage follows."""
+        from unittest.mock import AsyncMock
+        from app.model_resolution import map_model_name
+        request = SimpleNamespace(url=SimpleNamespace(path="/v1/chat/completions"),
+                                  state=SimpleNamespace(tracking_request_id="r1"))
+
+        async def run():
+            _fresh_alias_context()
+            request.state.model = map_model_name("p:a/gpt-5.4")      # tracking middleware
+            pre_auth = request.state.model
+            chosen = await resolve_model_for_request(request, _User(7), request.state.model)
+            return pre_auth, chosen
+
+        with _Env(MODELS, disabled_models=["p:a/gpt-5.4"]), \
+             _Rules(fallback={"p:a/gpt-5.4": "p:a/gpt-5.5"}), \
+             _Rules(profile_id=9), \
+             patch("app.request_tracker.request_tracker.update_model", new_callable=AsyncMock) as upd:
+            _grant(self, 7, "allow")
+            pre_auth, chosen = asyncio.run(run())
+        self.assertEqual(pre_auth, "p:a/gpt-5.5")
+        self.assertEqual(chosen, "p:a/gpt-5.4")
+        self.assertEqual(request.state.model, "p:a/gpt-5.4")
+        upd.assert_awaited_once_with("r1", "p:a/gpt-5.4")
+
+    def test_map_model_name_picks_the_list_without_raising(self):
+        from app.model_resolution import map_model_name
+
+        async def run(name):
+            _fresh_alias_context()
+            return map_model_name(name, _User(7))
+
+        with _Env(MODELS), _Rules(regular={"gpt-5.4": "p:a/gpt-5.5"}, fallback={"gpt-9": "p:a/gpt-5.4"}):
+            self.assertEqual(asyncio.run(run("gpt-5.4")), "p:a/gpt-5.5")
+            self.assertEqual(asyncio.run(run("gpt-9")), "p:a/gpt-5.4")
+            self.assertEqual(asyncio.run(run("gpt-10")), "gpt-10")
+
+    def test_map_model_name_keeps_the_clients_name_when_the_fallback_target_fails_too(self):
+        """As resolve_model_for_request does, so the Azure deployment routes report the
+        failure against the name the client sent, not a target it never asked for."""
+        from app.model_resolution import map_model_name
+
+        async def run(name, auth):
+            _fresh_alias_context()
+            return map_model_name(name, auth), original_model_name.get()
+
+        with _Env(MODELS, disabled_models=["p:a/gpt-5.5"]), \
+             _Rules(fallback={"gpt-9": "p:a/gpt-5.5", "gpt-10": "gone:x/gone"}):
+            self.assertEqual(asyncio.run(run("gpt-9", _User(7))), ("gpt-9", None))
+            self.assertEqual(asyncio.run(run("gpt-10", _User(7))), ("gpt-10", None))
+            # Before auth the choice is provisional: the route re-judges it.
+            self.assertEqual(asyncio.run(run("gpt-9", PRE_AUTH)), ("p:a/gpt-5.5", "gpt-9"))
 
 
 # ======================================================================

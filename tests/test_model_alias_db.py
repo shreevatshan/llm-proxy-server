@@ -19,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.auth import database
 from app.auth.database import (
+    delete_model_alias,
     get_all_model_aliases,
     reorder_model_aliases,
     upsert_model_alias,
@@ -107,6 +108,69 @@ class ModelAliasDataAccessTests(_TempDb):
             self.assertEqual([r.id for r in await get_all_model_aliases(db)], [a.id, b.id])
 
 
+class ModelAliasKindTests(_TempDb):
+    """Regular and fallback mappings are two lists: own texts, own order, own reorder."""
+
+    async def _upsert(self, alias, target="p/t", **kw):
+        async with self._factory() as db:
+            return await upsert_model_alias(db, alias, target, True, ALL, **kw)
+
+    async def _list(self, kind):
+        async with self._factory() as db:
+            return [(r.alias, r.priority) for r in await get_all_model_aliases(db, kind=kind)]
+
+    async def test_same_text_once_per_list(self):
+        from sqlalchemy.exc import IntegrityError
+        from app.auth.models import ModelAlias
+        regular = await self._upsert("gpt")
+        fallback = await self._upsert("gpt", kind="fallback")
+        self.assertNotEqual(regular.id, fallback.id)
+        self.assertEqual(fallback.kind, "fallback")
+        async with self._factory() as db:
+            db.add(ModelAlias(alias="gpt", target_model_id="p/x", enabled=True, kind="fallback"))
+            with self.assertRaises(IntegrityError):
+                await db.commit()
+
+    async def test_priorities_are_per_list(self):
+        await self._upsert("a")
+        await self._upsert("b")
+        await self._upsert("x", kind="fallback")
+        self.assertEqual(await self._list("alias"), [("a", 0), ("b", 1)])
+        self.assertEqual(await self._list("fallback"), [("x", 0)])
+
+    async def test_reorder_and_delete_stay_in_their_list(self):
+        a = await self._upsert("a")
+        b = await self._upsert("b")
+        x = await self._upsert("a", kind="fallback")
+        async with self._factory() as db:
+            self.assertFalse(await reorder_model_aliases(db, [b.id, a.id, x.id]),
+                             "another list's id makes the set stale")
+            self.assertTrue(await reorder_model_aliases(db, [b.id, a.id]))
+            self.assertTrue(await reorder_model_aliases(db, [x.id], kind="fallback"))
+        self.assertEqual(await self._list("alias"), [("b", 0), ("a", 1)])
+        async with self._factory() as db:
+            self.assertTrue(await delete_model_alias(db, "a", kind="fallback"))
+        self.assertEqual(await self._list("fallback"), [])
+        self.assertEqual([r[0] for r in await self._list("alias")], ["b", "a"])
+
+    async def test_moving_a_row_puts_it_at_the_bottom_of_the_other_list(self):
+        await self._upsert("f1", kind="fallback")
+        await self._upsert("f2", kind="fallback")
+        moved = await self._upsert("a")
+        await self._upsert("b")
+        again = await self._upsert("a", alias_id=moved.id, kind="fallback")
+        self.assertEqual(again.id, moved.id)
+        self.assertEqual(await self._list("fallback"), [("f1", 0), ("f2", 1), ("a", 2)])
+        self.assertEqual(await self._list("alias"), [("b", 1)])
+
+    async def test_all_lists_are_returned_for_the_resolver(self):
+        await self._upsert("a")
+        await self._upsert("x", kind="fallback")
+        async with self._factory() as db:
+            rows = await get_all_model_aliases(db, all_profiles=True, kind=None)
+        self.assertEqual(sorted((r.alias, r.kind) for r in rows), [("a", "alias"), ("x", "fallback")])
+
+
 class ModelAliasSchemaValidationTests(unittest.TestCase):
 
     def test_invalid_regex_rejected(self):
@@ -159,13 +223,13 @@ class ModelAliasEndpointTests(_TempDb):
             ))
             db.add(ModelConfiguration(model_id="p/t", provider_key="p", model_name="t"))
             await db.commit()
-        self._saved_snapshot = model_alias_resolver._snapshot
+        self._saved_snapshot = (model_alias_resolver._snapshot, model_alias_resolver._fallback_snapshot)
         self._patch = patch("app.model_alias.AsyncSessionLocal", self._factory)
         self._patch.start()
 
     async def asyncTearDown(self):
         self._patch.stop()
-        model_alias_resolver._snapshot = self._saved_snapshot
+        model_alias_resolver._snapshot, model_alias_resolver._fallback_snapshot = self._saved_snapshot
         await super().asyncTearDown()
 
     async def _post(self, **body):
@@ -194,6 +258,48 @@ class ModelAliasEndpointTests(_TempDb):
     async def test_save_reloads_resolver_in_priority_order(self):
         await self._post(alias="opus", target_model_id="p/t", match_type="contains")
         self.assertEqual(model_alias_resolver.resolve("Claude-Opus-4", "openai"), "p/t")
+
+    async def test_fallback_rows_load_into_the_fallback_list(self):
+        row = await self._post(alias="opus", target_model_id="p/t", match_type="contains", kind="fallback")
+        self.assertEqual(row.kind, "fallback")
+        self.assertIsNone(row.source_available, "only regular exact rows are checked")
+        self.assertEqual(model_alias_resolver.resolve("Claude-Opus-4", "openai", kind="fallback"), "p/t")
+        self.assertEqual(model_alias_resolver.resolve("Claude-Opus-4", "openai"), "Claude-Opus-4")
+
+    async def test_omitted_kind_keeps_the_row_in_its_list(self):
+        row = await self._post(alias="opus", target_model_id="p/t", kind="fallback")
+        by_id = await self._post(id=row.id, alias="opus", target_model_id="p/t", enabled=False)
+        self.assertEqual((by_id.kind, by_id.priority), ("fallback", row.priority))
+
+    async def test_omitted_kind_without_id_means_the_regular_list(self):
+        fallback = await self._post(alias="opus", target_model_id="p/t", kind="fallback")
+        regular = await self._post(alias="opus", target_model_id="p/t")
+        self.assertEqual(regular.kind, "alias")
+        self.assertNotEqual(regular.id, fallback.id)
+
+    async def test_conflict_names_the_list(self):
+        await self._post(alias="one", target_model_id="p/t", kind="fallback")
+        two = await self._post(alias="two", target_model_id="p/t", kind="fallback")
+        with self.assertRaises(HTTPException) as ctx:
+            await self._post(id=two.id, alias="one", target_model_id="p/t", kind="fallback")
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("fallback mapping", ctx.exception.detail)
+
+    async def test_regular_exact_row_reports_whether_its_source_is_available(self):
+        from types import SimpleNamespace
+        from app.cache import ModelCache
+        from app.openai_models import ModelInfo
+        from app.providers.provider_manager import provider_manager
+        cache = ModelCache()
+        cache.update_models([ModelInfo(id="p/t", created=0, owned_by="t", provider="t"),
+                             ModelInfo(id="p/real", created=0, owned_by="t", provider="t")])
+        stub = SimpleNamespace(supports_api_for_model=lambda model, api: True)
+        with patch.object(provider_manager, "model_cache", cache), \
+             patch.object(provider_manager, "providers", {"p": stub}):
+            served = await self._post(alias="real", target_model_id="p/t")
+            missing = await self._post(alias="no-such-model", target_model_id="p/t")
+        self.assertTrue(served.source_available)
+        self.assertFalse(missing.source_available)
 
 
 class ModelAliasMigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -240,11 +346,12 @@ class ModelAliasMigrationTests(unittest.IsolatedAsyncioTestCase):
             if full.startswith(self.path):
                 os.unlink(full)
 
-    async def _rows(self):
+    async def _rows(self, kind="alias"):
         async with self.engine.connect() as conn:
             result = await conn.execute(text(
-                "SELECT alias, match_type, priority FROM model_aliases ORDER BY priority, id"
-            ))
+                "SELECT alias, match_type, priority FROM model_aliases WHERE kind = :kind "
+                "ORDER BY priority, id"
+            ), {"kind": kind})
             return [tuple(r) for r in result]
 
     async def test_adds_columns_and_backfills_alphabetical_priority(self):
@@ -252,6 +359,21 @@ class ModelAliasMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._rows(), [
             ("alpha", "exact", 0), ("mid", "exact", 1), ("zeta", "exact", 2),
         ])
+
+    async def test_existing_rows_land_in_both_lists_and_uniqueness_is_per_list(self):
+        await database._run_auto_migrations()
+        await database._run_auto_migrations()
+        async with self.engine.connect() as conn:
+            indexes = {r[1]: r[2] for r in await conn.execute(text("PRAGMA index_list(model_aliases)"))}
+            cols = [r[2] for r in await conn.execute(
+                text("PRAGMA index_info('uq_model_aliases_scope_kind_alias')"))]
+        # They applied whether or not the model was available; the copy is made once.
+        expected = [("alpha", "exact", 0), ("mid", "exact", 1), ("zeta", "exact", 2)]
+        self.assertEqual(await self._rows("alias"), expected)
+        self.assertEqual(await self._rows("fallback"), expected)
+        self.assertNotIn("uq_model_aliases_scope_alias", indexes)
+        self.assertEqual(indexes.get("uq_model_aliases_scope_kind_alias"), 1)
+        self.assertEqual(cols, ["profile_id", "kind", "alias"])
 
     async def test_second_run_changes_nothing(self):
         await database._run_auto_migrations()
