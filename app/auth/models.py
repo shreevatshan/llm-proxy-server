@@ -174,6 +174,11 @@ MODEL_ALIAS_MATCH_TYPES = ("exact", "contains", "regex")
 # unknown name, a disabled model/provider/group, or one the profile does not allow).
 MODEL_ALIAS_KINDS = ("alias", "fallback")
 
+# What an outage covers: a whole provider instance (target = provider_key, live:
+# models synced later are covered too) or one model (target = canonical model_id).
+OUTAGE_SCOPES = ("provider", "model")
+OUTAGE_DESCRIPTION_MAX_LENGTH = 200
+
 # Python's re has no timeout and regex aliases run on the event loop against
 # client-supplied model names (up to 256 characters, see app.model_alias), so
 # patterns whose worst-case backtracking could stall the server are refused.
@@ -654,6 +659,28 @@ class ModelGroupInstanceMember(Base):
 
     __table_args__ = (
         Index("ix_model_group_instance_members_group_id", "group_id"),
+    )
+
+
+class ModelOutage(Base):
+    """An admin-declared outage of a provider instance or one model.
+
+    While a row exists its models are unavailable to every caller, admins included
+    (app.model_resolution), so requests go to the fallback mappings. Resolving an
+    outage deletes the row. Targets are plain strings, like group members, and are
+    kept in step by _rename_provider_references / _remove_model_references.
+    """
+    __tablename__ = "model_outages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scope = Column(String(16), nullable=False)    # see OUTAGE_SCOPES
+    target = Column(String(200), nullable=False)  # provider_key or model_id
+    description = Column(String(OUTAGE_DESCRIPTION_MAX_LENGTH), nullable=False)
+    created_by = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("scope", "target", name="uq_model_outages_scope_target"),
     )
 
 
@@ -1951,6 +1978,65 @@ class ModelAliasTestMatch(BaseModel):
     alias: Optional[str] = None
     match_type: Optional[str] = None
     target_model_id: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Outage Pydantic models
+# ---------------------------------------------------------------------------
+
+def _clean_outage_description(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        raise ValueError("A short description of the outage is required")
+    if len(value) > OUTAGE_DESCRIPTION_MAX_LENGTH:
+        raise ValueError(f"The description must be at most {OUTAGE_DESCRIPTION_MAX_LENGTH} characters")
+    return value
+
+
+class OutageCreate(BaseModel):
+    """Puts provider instances and/or single models in outage, one row per target."""
+    description: str
+    provider_keys: List[str] = []
+    model_ids: List[str] = []
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        self.description = _clean_outage_description(self.description)
+        self.provider_keys = _clean_keys(self.provider_keys, "provider_key", 100)
+        self.model_ids = _clean_keys(self.model_ids, "model_id", 200)
+        if not self.provider_keys and not self.model_ids:
+            raise ValueError("Select at least one provider instance or model")
+        return self
+
+
+class OutageUpdate(BaseModel):
+    description: str
+
+    @model_validator(mode="after")
+    def validate_fields(self):
+        self.description = _clean_outage_description(self.description)
+        return self
+
+
+class OutageBulkResolve(BaseModel):
+    ids: List[int]
+
+    @model_validator(mode="after")
+    def validate_ids(self):
+        if not self.ids:
+            raise ValueError("ids must not be empty")
+        return self
+
+
+class OutageResponse(BaseModel):
+    id: int
+    scope: str                     # provider | model
+    target: str                    # provider_key or model_id
+    description: str
+    created_by: Optional[str] = None
+    created_at: Optional[float] = None  # epoch seconds, so the browser renders it in local time
+    affected_models: int = 0       # models the outage takes out of service right now
+    target_exists: bool = True     # false once the instance or model is gone
 
 
 # Model Management Pydantic models (updated to use ProviderCredentials)

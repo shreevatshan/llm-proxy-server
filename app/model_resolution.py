@@ -23,15 +23,20 @@ Step 4 precedes step 5 because a bare name may itself contain '/': an
 OpenAI-compatible backend reporting ``meta-llama/Llama-3.1-8B`` produces the id
 ``lmstudio:box/meta-llama/Llama-3.1-8B``.
 
+Admin-declared outages (app.outages) apply after the access check, to every
+caller including admins: an id in outage evaluates as "outage", and a bare name
+keeps only its candidates that are not in outage ("outage" when none is left).
+
 Admin mappings come in two lists per profile, and the evaluation of the
 *client's* name picks one (map_model_name, resolve_model_for_request):
 
     available to the caller   -> the regular list; its target is evaluated in
                                  turn, and its failures are reported against it
-    unavailable or denied     -> the fallback list; if nothing matches, or the
-                                 target cannot be served either, the client's
-                                 name fails: ModelUnavailable (404) or
-                                 ModelAccessDenied (403)
+                                 (except an outage, which tries the fallback list)
+    unavailable, denied or    -> the fallback list; if nothing matches, or the
+    in outage                    target cannot be served either, the client's
+                                 name fails: ModelUnavailable (404, or 503 for
+                                 an outage) or ModelAccessDenied (403)
 
 Resolution happens in the route rather than in middleware so the candidate pool
 can be narrowed by the caller's per-user access *before* a provider is picked --
@@ -55,6 +60,7 @@ from app.model_alias import (
     alias_source_name, apply_alias, current_api_surface, current_profile_id, model_alias_resolver,
     original_model_name,
 )
+from app.outages import Outage, describe, outage_registry
 from app.profiles import profile_id_for_auth, profile_registry
 from app.providers.provider_manager import provider_manager
 
@@ -100,8 +106,50 @@ class ModelUnavailable(Exception):
         }})
 
 
+    # An admin-declared outage (app.outages): 503, quoting the admin's description.
+    @classmethod
+    def outage_openai(cls, model_id: str, description: str) -> "ModelUnavailable":
+        return cls(status_code=503, body={"error": {
+            "message": _outage_message(model_id, description),
+            "type": "service_unavailable",
+            "code": "model_outage",
+            "param": "model",
+        }})
+
+    @classmethod
+    def outage_azure(cls, model_id: str, description: str) -> "ModelUnavailable":
+        # Azure uses the OpenAI error envelope.
+        return cls.outage_openai(model_id, description)
+
+    @classmethod
+    def outage_anthropic(cls, model_id: str, description: str) -> "ModelUnavailable":
+        return cls(status_code=503, body={"type": "error", "error": {
+            "type": "api_error",
+            "message": _outage_message(model_id, description),
+        }})
+
+    @property
+    def is_outage(self) -> bool:
+        return self.status_code == 503
+
+
 def _message(model_id: str) -> str:
     return f"The model '{model_id}' does not exist or you do not have access to it."
+
+
+def _outage_message(model_id: str, description: str) -> str:
+    return f"The model '{model_id}' is temporarily unavailable due to an outage: {description}"
+
+
+def raise_outage(request_obj, model: str, outages, envelope_override: Optional[str] = None):
+    """Raise the 503 for `model`, whose outage(s) are `outages`."""
+    description = describe(outages)
+    envelope = envelope_for(_path_of(request_obj), envelope_override)
+    if envelope == "anthropic":
+        raise ModelUnavailable.outage_anthropic(model, description)
+    if envelope == "azure":
+        raise ModelUnavailable.outage_azure(model, description)
+    raise ModelUnavailable.outage_openai(model, description)
 
 
 class _RoundRobin:
@@ -168,7 +216,7 @@ def candidate_ids(
     pool = _filter_pool(cache.bare_model_candidates(name), api)
     if not pool and allow_prefix_strip and rest:
         pool = _filter_pool(cache.bare_model_candidates(rest), api)
-    return pool
+    return [model_id for model_id in pool if not outage_registry.is_in_outage(model_id)]
 
 
 def _filter_pool(pool: List[str], api: Optional[str]) -> List[str]:
@@ -222,8 +270,9 @@ PRE_AUTH = object()
 
 @dataclass(frozen=True)
 class _Evaluation:
-    status: str                     # "ok" | "unavailable" | "denied"
+    status: str                     # "ok" | "unavailable" | "denied" | "outage"
     candidates: Tuple[str, ...] = ()  # canonical ids the caller may use (ok only)
+    outages: Tuple[Outage, ...] = ()  # what takes the name out of service (outage only)
 
 
 _UNAVAILABLE = _Evaluation("unavailable")
@@ -258,23 +307,37 @@ def _canonical_for_prefix(model: str) -> str:
     return f"{provider_key}/{rest}"
 
 
+def _single(model_id: str, may_use: Callable[[str], bool], check_outage: bool) -> _Evaluation:
+    """Evaluate one canonical id: access first, then outage."""
+    if not may_use(model_id):
+        return _DENIED
+    outage = outage_registry.outage_for(model_id) if check_outage else None
+    if outage is not None:
+        return _Evaluation("outage", outages=(outage,))
+    return _Evaluation("ok", (model_id,))
+
+
 def _evaluate(
     name: str,
     may_use: Callable[[str], bool],
     api: Optional[str],
     allow_prefix_strip: bool = True,
+    check_outage: bool = True,
 ) -> _Evaluation:
-    """Whether a caller with `may_use` can be served `name`, in the module's resolution order."""
+    """Whether a caller with `may_use` can be served `name`, in the module's resolution order.
+
+    Access is judged before outages, so a caller who may not use a model is told
+    so whether or not it is down; an outage then applies to every caller.
+    """
     cache = provider_manager.model_cache
     if cache.has_model_id(name):
         # A disabled model or provider fails may_use (the global gate) for everyone
         # but admins and allow-mode profiles, which may still call it by id.
-        return _Evaluation("ok", (name,)) if may_use(name) else _DENIED
+        return _single(name, may_use, check_outage)
 
     head, rest = name.split('/', 1) if '/' in name else ('', '')
     if rest and provider_manager.has_provider_prefix(head):
-        canonical = _canonical_for_prefix(name)
-        return _Evaluation("ok", (canonical,)) if may_use(canonical) else _DENIED
+        return _single(_canonical_for_prefix(name), may_use, check_outage)
 
     pool = _filter_pool(cache.bare_model_candidates(name), api)
     if not pool and allow_prefix_strip and rest:
@@ -282,12 +345,25 @@ def _evaluate(
     if not pool:
         return _UNAVAILABLE
     allowed = tuple(model_id for model_id in pool if may_use(model_id))
-    return _Evaluation("ok", allowed) if allowed else _DENIED
+    if not allowed:
+        return _DENIED
+    if not check_outage:
+        return _Evaluation("ok", allowed)
+    live = tuple(model_id for model_id in allowed if not outage_registry.is_in_outage(model_id))
+    if live:
+        return _Evaluation("ok", live)
+    return _Evaluation("outage", outages=tuple(outage_registry.outage_for(m) for m in allowed))
 
 
-def is_model_available(name: str, may_use: Callable[[str], bool], api: Optional[str]) -> bool:
-    """True if a caller with `may_use` can be served `name` on `api` (picks the regular list)."""
-    return bool(name) and _evaluate(name, may_use, api).status == "ok"
+def is_model_available(
+    name: str, may_use: Callable[[str], bool], api: Optional[str], *, ignore_outage: bool = False,
+) -> bool:
+    """True if a caller with `may_use` can be served `name` on `api` (picks the regular list).
+
+    ignore_outage judges the name as if no outage were declared: whether a regular
+    mapping can ever apply, rather than whether it applies right now.
+    """
+    return bool(name) and _evaluate(name, may_use, api, check_outage=not ignore_outage).status == "ok"
 
 
 def map_model_name(name: Optional[str], auth=PRE_AUTH, *, allow_prefix_strip: bool = True) -> Optional[str]:
@@ -373,9 +449,20 @@ async def resolve_model_for_request(
         target = apply_alias(source, kind="alias")
         if target != source:
             # A regular mapping is the admin's choice for an available model; when
-            # its target cannot be served, that is reported, not papered over.
+            # its target cannot be served, that is reported, not papered over --
+            # except an outage, which the fallback list exists for.
             ev = _evaluate(target, may_use, api, allow_prefix_strip)
             failed_name = target
+            if ev.status == "outage":
+                fallback_target = model_alias_resolver.resolve(source, api, current_profile_id.get(), "fallback")
+                if fallback_target != source:
+                    fallback = _evaluate(fallback_target, may_use, api, allow_prefix_strip)
+                    if fallback.status == "ok":
+                        logger.info(
+                            "Fallback mapping: %s -> %s (mapped target %s is in outage)",
+                            source, fallback_target, target,
+                        )
+                        ev = fallback
     else:
         target = apply_alias(source, kind="fallback")
         if target != source:
@@ -393,6 +480,8 @@ async def resolve_model_for_request(
         _raise_unavailable(request_obj, failed_name, envelope_override)
     if ev.status == "denied":
         _raise_access_denied(request_obj, failed_name, envelope_override)
+    if ev.status == "outage":
+        raise_outage(request_obj, failed_name, ev.outages, envelope_override)
 
     chosen = _round_robin.pick(list(ev.candidates))
 

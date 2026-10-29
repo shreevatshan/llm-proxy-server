@@ -19,6 +19,7 @@
     {'id': 'pools', 'label': 'Pools', 'icon': 'fa-users-rectangle'},
     {'id': 'rate-limits', 'label': 'Rate Limits', 'icon': 'fa-tachometer-alt'},
     {'id': 'model-mapping', 'label': 'Model Mapping', 'icon': 'fa-map-signs'},
+    {'id': 'outage', 'label': 'Outages', 'icon': 'fa-triangle-exclamation'},
     {'id': 'providers', 'label': 'Providers & Models', 'icon': 'fa-server'},
     {'id': 'models', 'label': 'Model Access', 'icon': 'fa-cubes'},
     {'id': 'model-groups', 'label': 'Model Groups', 'icon': 'fa-layer-group'},
@@ -843,6 +844,105 @@
     </div>
 </div>
 
+<!-- Outages Section -->
+<div class="section tab-content" id="outage-tab" style="display: none;">
+    <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <div class="d-flex align-items-center gap-2">
+                <h5 class="mb-0 me-4"><i class="fas fa-triangle-exclamation me-2"></i>Outages</h5>
+                <div class="position-relative flex-shrink-0" style="width: 240px;">
+                    <i class="fas fa-search search-icon" style="font-size: 0.8rem;"></i>
+                    <input type="text" id="outage-search" class="form-control form-control-sm ps-5"
+                        placeholder="Search outages" aria-label="Search outages"
+                        oninput="window.OutageManager?.filter(this.value)">
+                </div>
+            </div>
+            <div class="alias-list-actions ms-auto">
+                <div class="section-actions" id="outage-bulk" style="display:none;">
+                    <span class="bulk-selection-status" id="outage-bulk-count"></span>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="window.OutageManager?.clearSelection()">Clear</button>
+                    <button class="btn btn-success btn-sm" onclick="window.OutageManager?.bulkResolve()"><i class="fas fa-check me-1"></i>Resolve selected</button>
+                </div>
+                <button class="btn btn-outline-secondary btn-sm" onclick="window.OutageManager?.load()"><i class="fas fa-sync-alt me-1"></i>Refresh</button>
+                <button class="btn btn-warning btn-sm" onclick="window.OutageManager?.openCreateModal()"><i class="fas fa-plus me-1"></i>Report outage</button>
+            </div>
+        </div>
+        <div class="card-body p-0">
+            <p class="outage-help">
+                Models in outage are unavailable to every caller, admins included. Requests for them follow the
+                <strong>Fallback</strong> list in Model Mapping; with no fallback they fail with 503 and the description below.
+                Users see the description on their Models page.
+            </p>
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead><tr>
+                        <th class="col-select"><input type="checkbox" class="form-check-input" id="outage-select-all" aria-label="Select all shown outages" onchange="window.OutageManager?.toggleSelectAll(this.checked)"></th>
+                        <th>Target</th><th>Scope</th><th>Description</th><th>Models</th><th>Since</th><th>Reported by</th><th>Actions</th>
+                    </tr></thead>
+                    <tbody id="outages-tbody"><tr><td colspan="8" class="text-center text-muted py-4">Open this tab to load outages.</td></tr></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Outage Report/Edit Modal -->
+<div class="modal fade mg-modal" id="outageModal" tabindex="-1" aria-hidden="true" aria-labelledby="outageModalTitle">
+    <div class="modal-dialog modal-lg modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="outageModalTitle">Report outage</h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-4">
+                    <label class="form-label" for="og-description">Description <span class="text-danger">*</span></label>
+                    <textarea id="og-description" class="form-control" rows="2" maxlength="200" aria-required="true"
+                        placeholder="e.g. Upstream returning 5xx since 10:30; provider investigating"
+                        aria-describedby="og-description-hint" oninput="window.OutageManager?.updateCounter()"></textarea>
+                    <div class="form-text d-flex justify-content-between" id="og-description-hint">
+                        <span>Shown to users on hover in their Models page, and in the 503 error when there is no fallback.</span>
+                        <span id="og-description-count">0/200</span>
+                    </div>
+                </div>
+
+                <section class="mg-members" id="og-members" aria-labelledby="og-members-label">
+                    <div class="mg-members__head">
+                        <span class="form-label mb-0" id="og-members-label">Affected instances and models</span>
+                        <span class="mg-readout" id="og-readout" aria-live="polite"></span>
+                    </div>
+                    <div class="mg-toolbar">
+                        <div class="mg-search">
+                            <i class="fas fa-search"></i>
+                            <input type="search" id="og-member-search" class="form-control form-control-sm"
+                                placeholder="Find an instance or model" aria-label="Find an instance or model"
+                                oninput="window.OutageManager?.filterMembers(this.value)">
+                        </div>
+                        <button type="button" class="btn btn-outline-secondary btn-sm mg-filter" id="og-selected-only"
+                            aria-pressed="false" onclick="window.OutageManager?.toggleSelectedOnly()">
+                            Selected only
+                        </button>
+                    </div>
+                    <div class="mg-tree" id="og-member-tree">
+                        <div class="mg-empty">Loading…</div>
+                    </div>
+                    <p class="mg-legend">
+                        Check an instance to take every model it has out of service, including ones synced later.
+                        Open it to pick single models instead. Fallback rules match the name the client sends, so map
+                        the bare name (e.g. <code>gpt-5.4</code>) as well as the full id.
+                    </p>
+                </section>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-warning" id="og-save" onclick="window.OutageManager?.save()">
+                    Report outage
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Toast Notification Container -->
 <div id="toast-container" class="toast-container">
     <!-- Toast notifications will be inserted here -->
@@ -1444,6 +1544,7 @@
 <script src="/static/js/features/admin/rate-limit-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/profile-group-limits.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-group-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/admin/outage-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-access-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/admin/model-alias-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/shared/websearch-params.js?v={{ cache_version }}"></script>

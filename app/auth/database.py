@@ -14,7 +14,7 @@ from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Sequence, Tuple
-from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, ModelGroupInstanceMember, UserModelGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, WebSearchBackend, UserWebSearchSettings, UserWebSearchBackendParams, WEBSEARCH_BACKEND_PARAMS, WEBSEARCH_PARAM_FIELDS, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
+from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, ModelGroupInstanceMember, ModelOutage, UserModelGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, WebSearchBackend, UserWebSearchSettings, UserWebSearchBackendParams, WEBSEARCH_BACKEND_PARAMS, WEBSEARCH_PARAM_FIELDS, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
 from app.providers.azure_deployments import serialize_azure_deployments
 
 # Initialize logger
@@ -1116,6 +1116,72 @@ async def delete_model_aliases(
     return [row.id for row in rows]
 
 
+# ---------------------------------------------------------------------------
+# Outages
+# ---------------------------------------------------------------------------
+
+async def get_all_outages(db: AsyncSession) -> List[ModelOutage]:
+    """Every active outage, provider instances first, then by target."""
+    result = await db.execute(
+        select(ModelOutage).order_by(ModelOutage.scope.desc(), ModelOutage.target)
+    )
+    return list(result.scalars().all())
+
+
+async def get_outage(db: AsyncSession, outage_id: int) -> Optional[ModelOutage]:
+    return (await db.execute(select(ModelOutage).where(ModelOutage.id == outage_id))).scalar_one_or_none()
+
+
+async def create_outages(
+    db: AsyncSession,
+    provider_keys: Sequence[str],
+    model_ids: Sequence[str],
+    description: str,
+    created_by: Optional[str] = None,
+) -> List[ModelOutage]:
+    """Put each target in outage, in one commit. A target already in outage keeps its
+    row (and start time) and takes the new description."""
+    targets = [("provider", key) for key in provider_keys] + [("model", mid) for mid in model_ids]
+    existing = {
+        (row.scope, row.target): row
+        for row in (await db.execute(select(ModelOutage).where(
+            ModelOutage.target.in_([target for _, target in targets])
+        ))).scalars().all()
+    }
+    rows = []
+    for scope, target in targets:
+        row = existing.get((scope, target))
+        if row is None:
+            row = ModelOutage(scope=scope, target=target, description=description, created_by=created_by)
+            db.add(row)
+        else:
+            row.description = description
+        rows.append(row)
+    await db.commit()
+    for row in rows:
+        await db.refresh(row)
+    return rows
+
+
+async def update_outage_description(db: AsyncSession, outage_id: int, description: str) -> Optional[ModelOutage]:
+    row = await get_outage(db, outage_id)
+    if row is None:
+        return None
+    row.description = description
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
+async def delete_outages(db: AsyncSession, ids: List[int]) -> List[int]:
+    """Resolve the outages of *ids*, in one commit. Returns the ids actually deleted."""
+    rows = list((await db.execute(select(ModelOutage).where(ModelOutage.id.in_(ids)))).scalars().all())
+    for row in rows:
+        await db.delete(row)
+    await db.commit()
+    return [row.id for row in rows]
+
+
 async def get_models_by_provider(db: AsyncSession, provider_key: str) -> List[ModelConfiguration]:
     """Get all models for a specific provider."""
     result = await db.execute(
@@ -1735,6 +1801,16 @@ async def _rename_provider_references(db: AsyncSession, old_key: str, new_key: s
         sa_update(ModelGroupInstanceMember).where(ModelGroupInstanceMember.provider_key == old_key)
         .values(provider_key=new_key).execution_options(synchronize_session=False)
     )
+    await db.execute(
+        sa_update(ModelOutage)
+        .where(ModelOutage.scope == "model", _on_instance(ModelOutage.target, old_key))
+        .values(target=moved(ModelOutage.target)).execution_options(synchronize_session=False)
+    )
+    await db.execute(
+        sa_update(ModelOutage)
+        .where(ModelOutage.scope == "provider", ModelOutage.target == old_key)
+        .values(target=new_key).execution_options(synchronize_session=False)
+    )
     settings = (await db.execute(select(WebSearchSettings))).scalars().all()
     for row in settings:
         keys = json.loads(row.enabled_providers) if row.enabled_providers else None
@@ -1767,9 +1843,15 @@ async def _remove_model_references(
         sa_update(ModelAlias).where(matching(ModelAlias.target_model_id))
         .values(enabled=False).execution_options(synchronize_session=False)
     )
+    # Outages of removed models end with them. _on_instance matches 'key/' prefixes,
+    # so an instance's own outage row is matched by its key separately below.
+    await db.execute(sa_delete(ModelOutage).where(
+        ModelOutage.scope == "model", matching(ModelOutage.target)))
     if provider_keys:
         await db.execute(sa_delete(ModelGroupInstanceMember).where(
             ModelGroupInstanceMember.provider_key.in_(list(provider_keys))))
+        await db.execute(sa_delete(ModelOutage).where(
+            ModelOutage.scope == "provider", ModelOutage.target.in_(list(provider_keys))))
         for row in (await db.execute(select(WebSearchSettings))).scalars().all():
             keys = json.loads(row.enabled_providers) if row.enabled_providers else None
             if isinstance(keys, list) and any(k in provider_keys for k in keys):
@@ -1783,14 +1865,21 @@ async def clear_model_group_members(db: AsyncSession) -> None:
     await db.execute(sa_delete(ModelGroupInstanceMember))
 
 
+async def clear_outages(db: AsyncSession) -> None:
+    """End every outage (system reinit, which drops every provider). No commit."""
+    from sqlalchemy import delete as sa_delete
+    await db.execute(sa_delete(ModelOutage))
+
+
 async def reload_reference_caches() -> None:
     """Reload what the reference cleanups above can change: groups and access
-    exceptions (the rate-limit snapshot), aliases, and web-search settings."""
+    exceptions (the rate-limit snapshot), aliases, web-search settings and outages."""
     from app.rate_limit import rate_limit_tracker
     from app.model_alias import model_alias_resolver
     from app.websearch.settings import websearch_settings_cache
+    from app.outages import outage_registry
     for reload in (rate_limit_tracker.refresh_now, model_alias_resolver.load_from_database,
-                   websearch_settings_cache.load_from_database):
+                   websearch_settings_cache.load_from_database, outage_registry.load_from_database):
         try:
             await reload()
         except Exception as e:

@@ -59,6 +59,10 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
             model_alias_module.model_alias_resolver._fallback_profile_snapshots,
         )
 
+        # Provider renames and removals reload the outage registry from this database.
+        from app.outages import outage_registry
+        self._saved_outages = outage_registry._state
+
         from app.rate_limit import rate_limit_tracker
         from app.request_tracker import request_tracker
 
@@ -87,6 +91,8 @@ class PoolTestCase(unittest.IsolatedAsyncioTestCase):
          model_alias_module.model_alias_resolver._profile_snapshots,
          model_alias_module.model_alias_resolver._fallback_snapshot,
          model_alias_module.model_alias_resolver._fallback_profile_snapshots) = self._saved_aliases
+        from app.outages import outage_registry
+        outage_registry._state = self._saved_outages
         time_utils.local_today = self._real_local_today
         self.tracker.set_db_session_factory(self._saved_factory)
         self.tracker._user_to_pool = {}

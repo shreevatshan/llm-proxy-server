@@ -178,6 +178,10 @@ function showTab(tabName) {
     if (tabName === 'model-groups') {
         window.ModelGroupManager?.load();
     }
+
+    if (tabName === 'outage') {
+        window.OutageManager?.load();
+    }
 }
 
 // Utility Functions

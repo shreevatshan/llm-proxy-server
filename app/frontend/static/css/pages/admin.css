@@ -2178,3 +2178,18 @@ input:checked + .model-toggle-slider:before {
 @media (prefers-reduced-motion: reduce) {
     .mg-twisty i, .mg-box { transition: none; }
 }
+
+/* ── Outages tab ─────────────────────────────────────────────────── */
+.outage-help {
+    margin: 0; padding: 0.75rem 1rem;
+    font-size: var(--text-sm); color: var(--mono-text-muted);
+    border-bottom: 1px solid var(--mono-4);
+}
+.outage-row td:nth-child(2) { border-left: 2px solid var(--mono-text-name); }
+.outage-row.selected { background-color: var(--mono-3); }
+.outage-scope {
+    font-family: var(--font-family-mono); font-size: 0.7rem; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--mono-text-secondary);
+}
+.outage-description { max-width: 28rem; white-space: normal; overflow-wrap: anywhere; }
+.mg-tag.outage-tag { border-color: var(--mono-text-name); color: var(--mono-text-name); cursor: help; }

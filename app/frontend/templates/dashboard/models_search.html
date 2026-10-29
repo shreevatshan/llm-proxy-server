@@ -60,6 +60,23 @@
         border: 1px solid var(--mono-5);
         font-family: var(--font-family-mono);
     }
+    /* Outage: faded, struck through, dashed badge; the description is on hover. */
+    .model-list-item.outage .model-name,
+    .model-list-item.outage .api-badge:not(.model-outage-badge) {
+        opacity: 0.5;
+    }
+    .model-list-item.outage .model-name {
+        text-decoration: line-through;
+    }
+    .model-list-item.outage {
+        cursor: help;
+    }
+    .api-badge.model-outage-badge {
+        background: transparent;
+        color: var(--mono-text-secondary);
+        border: 1px dashed var(--mono-5);
+        font-family: var(--font-family-mono);
+    }
     .copy-button {
         padding: 6px 16px;
         background-color: transparent;
@@ -223,7 +240,8 @@
                     model_id: model.id,  // Use full ID
                     model_name: model.id,  // Full name is the ID
                     provider_key: '',  // Not needed for display
-                    is_enabled: true  // All models from v1/models are enabled
+                    is_enabled: true,  // All models from v1/models are enabled
+                    outage: model.outage ? model.outage.description : null
                 };
             });
             
@@ -293,8 +311,13 @@
                 badgesHtml += `<span class="api-badge ${escapeHtml(api)}">${escapeHtml(api)}</span>`;
             });
             
+            const outageTitle = model.outage ? escapeHtml(`Outage: ${model.outage}`) : '';
+            if (model.outage) {
+                badgesHtml += `<span class="api-badge model-outage-badge" title="${outageTitle}"><i class="fas fa-triangle-exclamation me-1"></i>outage</span>`;
+            }
+
             html += `
-                <div class="model-list-item">
+                <div class="model-list-item${model.outage ? ' outage' : ''}"${model.outage ? ` title="${outageTitle}"` : ''}>
                     <div class="model-info">
                         <div class="model-name">${escapeHtml(fullModelName)}</div>
                         <div class="api-badges">${badgesHtml}</div>

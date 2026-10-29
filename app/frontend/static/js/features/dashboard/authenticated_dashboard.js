@@ -308,10 +308,14 @@ function initModelsTab() {
         if (m.supported_apis) _modelApiSupport[m.id] = m.supported_apis;
     });
 
+    // Available first, then in outage, then disabled; each group by name.
+    const rank = m => (m.disabled ? 2 : m.outage ? 1 : 0);
     _allModels = modelsData
-        .map(m => ({ model_id: m.id, model_name: m.id, disabled: !!m.disabled }))
-        // Enabled first, then disabled; each group by name.
-        .sort((a, b) => (a.disabled - b.disabled)
+        .map(m => ({
+            model_id: m.id, model_name: m.id, disabled: !!m.disabled,
+            outage: m.outage ? m.outage.description : null,
+        }))
+        .sort((a, b) => (rank(a) - rank(b))
             || a.model_name.toLowerCase().localeCompare(b.model_name.toLowerCase()));
 
     _filteredModels = [..._allModels];
@@ -335,9 +339,11 @@ function _displayModels() {
     if (!listBody) return;
 
     const disabledCount = _filteredModels.filter(m => m.disabled).length;
+    const outageCount = _filteredModels.filter(m => m.outage && !m.disabled).length;
     const enabledCount = _filteredModels.length - disabledCount;
     if (stats) {
         stats.textContent = `Showing ${enabledCount} enabled model${enabledCount !== 1 ? 's' : ''}`
+            + (outageCount ? `, ${outageCount} in outage` : '')
             + (disabledCount ? `, ${disabledCount} disabled` : '');
     }
 
@@ -354,11 +360,16 @@ function _displayModels() {
         const disabledTag = model.disabled
             ? `<span class="api-badge model-disabled-badge" title="Disabled for your profile — contact an admin for access"><i class="fas fa-ban me-1"></i>disabled</span>`
             : '';
+        const outageTitle = model.outage ? escapeHtml(`Outage: ${model.outage}`) : '';
+        const outageTag = model.outage
+            ? `<span class="api-badge model-outage-badge" title="${outageTitle}"><i class="fas fa-triangle-exclamation me-1"></i>outage</span>`
+            : '';
+        const classes = (model.disabled ? ' disabled' : '') + (model.outage ? ' outage' : '');
         html += `
-            <div class="model-list-item${model.disabled ? ' disabled' : ''}">
+            <div class="model-list-item${classes}"${model.outage ? ` title="${outageTitle}"` : ''}>
                 <div class="model-info">
                     <div class="model-name">${escapeHtml(name)}</div>
-                    <div class="api-badges">${badges}${disabledTag}</div>
+                    <div class="api-badges">${badges}${outageTag}${disabledTag}</div>
                 </div>
                 <button class="copy-button" data-model-name="${escapeHtml(name)}" onclick="copyModelName(this)">
                     <i class="fas fa-copy"></i> Copy

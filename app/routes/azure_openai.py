@@ -59,7 +59,9 @@ from app.routes.stream_utils import (
     STREAM_TIMEOUT_SECONDS,
 )
 from app.rate_limit_dep import enforce_access_and_limits, enforces_limits
-from app.model_resolution import canonicalize_provider_prefix, map_model_name
+from app.model_resolution import canonicalize_provider_prefix, map_model_name, raise_outage
+from app.model_access_dep import caller_may_use
+from app.outages import outage_registry
 from fastapi.encoders import jsonable_encoder
 from app.websearch import (
     HEADER_NAME as WEBSEARCH_HEADER,
@@ -181,6 +183,26 @@ def _get_azure_provider(provider_name: str):
     return provider
 
 
+def _refuse_outage(request_obj, auth, provider, deployment: str, model_name: str) -> None:
+    """Refuse (503) a deployment call that would reach a model in outage.
+
+    The deployment routes dispatch to the URL's provider whatever the mapping says,
+    so a fallback to another instance cannot be honoured here. Judge the id that is
+    actually called and, when the mapping points elsewhere, the URL's own deployment.
+    A caller who may not use the model is left to enforce_access_and_limits (403).
+    """
+    if not caller_may_use(auth, model_name):
+        return
+    instance = provider.full_provider_name
+    dispatched = f"{instance}/{provider.get_model_id(model_name)}"
+    outage = outage_registry.outage_for(dispatched)
+    if outage is None and model_name.split("/", 1)[0] != instance:
+        dispatched = f"{instance}/{deployment}"
+        outage = outage_registry.outage_for(dispatched)
+    if outage is not None:
+        raise_outage(request_obj, dispatched, (outage,), envelope_override="azure")
+
+
 def _build_model_name(provider_name: str, deployment: str) -> str:
     """Construct the canonical model reference used by the provider manager."""
     return f"{provider_name}/{deployment}"
@@ -299,6 +321,7 @@ async def azure_chat_completions(
     guard_error = _deployment_call_guard(provider, model_name, api_version)
     if guard_error is not None:
         return guard_error
+    _refuse_outage(request_obj, auth, provider, deployment, model_name)
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
@@ -394,6 +417,7 @@ async def azure_completions(
     guard_error = _deployment_call_guard(provider, model_name, api_version)
     if guard_error is not None:
         return guard_error
+    _refuse_outage(request_obj, auth, provider, deployment, model_name)
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
@@ -470,6 +494,7 @@ async def azure_embeddings(
     guard_error = _deployment_call_guard(provider, model_name, api_version)
     if guard_error is not None:
         return guard_error
+    _refuse_outage(request_obj, auth, provider, deployment, model_name)
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
@@ -521,6 +546,7 @@ async def azure_image_generation(
     guard_error = _deployment_call_guard(provider, model_name, api_version)
     if guard_error is not None:
         return guard_error
+    _refuse_outage(request_obj, auth, provider, deployment, model_name)
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
@@ -572,6 +598,7 @@ async def azure_audio_speech(
     guard_error = _deployment_call_guard(provider, model_name, api_version)
     if guard_error is not None:
         return guard_error
+    _refuse_outage(request_obj, auth, provider, deployment, model_name)
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
@@ -649,6 +676,7 @@ async def azure_audio_transcription(
     guard_error = _deployment_call_guard(provider, model_name, api_version)
     if guard_error is not None:
         return guard_error
+    _refuse_outage(request_obj, auth, provider, deployment, model_name)
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
@@ -719,6 +747,7 @@ async def azure_audio_translation(
     guard_error = _deployment_call_guard(provider, model_name, api_version)
     if guard_error is not None:
         return guard_error
+    _refuse_outage(request_obj, auth, provider, deployment, model_name)
     azure_call_style.set("deployment")
     azure_api_version.set(api_version)
 
@@ -781,6 +810,7 @@ async def azure_responses_create(
     # Map for this caller before checking the provider: the tracking middleware rewrote
     # the body before auth, picking the regular or fallback list from the global gate
     # alone (an admin may still call a disabled model it mapped away from).
+    url_model = request.model
     request.model = map_model_name(request.model, auth)
     if request.model:
         # provider_manager routes by the model prefix, so a body model naming a
@@ -794,6 +824,14 @@ async def azure_responses_create(
         except Exception:
             resolved_provider = None
         if resolved_provider is not provider:
+            # A fallback away from a model in outage cannot leave the URL's
+            # provider, so report the outage rather than a provider mismatch.
+            head, _, bare = (url_model or "").partition("/")
+            if bare and head in (provider_name, provider.full_provider_name):
+                url_model_id = f"{provider.full_provider_name}/{bare}"
+                url_outage = outage_registry.outage_for(url_model_id)
+                if url_outage is not None and caller_may_use(auth, url_model_id):
+                    raise_outage(request_obj, url_model_id, (url_outage,), envelope_override="azure")
             return _azure_error(
                 400,
                 "InvalidRequest",

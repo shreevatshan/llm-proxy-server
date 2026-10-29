@@ -519,7 +519,12 @@ async def count_message_tokens(
                         request_obj, auth, model_name, envelope_override="anthropic"
                     )
                     payload["model"] = model_name
-                except (ModelUnavailable, ModelAccessDenied):
+                except ModelUnavailable as e:
+                    # A model in outage is refused like everywhere else: degrading
+                    # would send the count to the provider that is down.
+                    if e.is_outage:
+                        raise
+                except ModelAccessDenied:
                     pass
                 provider = await provider_manager.get_anthropic_provider_for_model(model_name)
 

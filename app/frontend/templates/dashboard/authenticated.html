@@ -228,6 +228,16 @@
         background: transparent; color: var(--mono-text-secondary);
         border: 1px dashed var(--mono-5);
     }
+    /* Outage: shown like disabled (faded, struck through, dashed badge); the
+       description is on hover. */
+    .model-list-item.outage .model-name,
+    .model-list-item.outage .api-badge:not(.model-outage-badge):not(.model-disabled-badge) { opacity: 0.5; }
+    .model-list-item.outage .model-name { text-decoration: line-through; }
+    .model-list-item.outage { cursor: help; }
+    .api-badge.model-outage-badge {
+        background: transparent; color: var(--mono-text-secondary);
+        border: 1px dashed var(--mono-5);
+    }
     .copy-button {
         padding: 6px 16px; background-color: transparent; color: var(--mono-text-primary);
         border: 1px solid var(--mono-5); border-radius: var(--radius-sm); cursor: pointer;

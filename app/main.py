@@ -136,6 +136,10 @@ async def shared_startup():
                 from app.websearch.settings import websearch_settings_cache
                 await websearch_settings_cache.start()
 
+            with create_span("app.startup.init_outages"):
+                from app.outages import outage_registry
+                await outage_registry.start()
+
         _startup_complete = True
 
 
@@ -151,6 +155,7 @@ async def shared_shutdown():
     from app.rate_limit import rate_limit_tracker
     from app.websearch.settings import websearch_settings_cache
     from app.websearch.client import close_client as close_search_client
+    from app.outages import outage_registry
     from app.usage_report import usage_report_scheduler
 
     # Phase 1: Stop background tasks and caches (may be using provider clients)
@@ -162,6 +167,7 @@ async def shared_shutdown():
         asyncio.create_task(request_tracker.stop()),
         asyncio.create_task(rate_limit_tracker.stop()),
         asyncio.create_task(websearch_settings_cache.stop()),
+        asyncio.create_task(outage_registry.stop()),
         asyncio.create_task(close_search_client()),
     ]
 

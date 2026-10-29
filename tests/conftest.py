@@ -25,6 +25,15 @@ os.environ.setdefault("JWT_SECRET_KEY", "test-secret-not-placeholder-abc123")
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _no_outages():
+    """Start every test with no outage declared; the registry is process-wide."""
+    from app.outages import outage_registry
+    outage_registry.reset()
+    yield
+    outage_registry.reset()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _dispose_db_engines():
     """Dispose the async + sync DB engines after the session ends."""

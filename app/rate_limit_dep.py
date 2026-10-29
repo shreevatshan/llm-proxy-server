@@ -5,7 +5,9 @@ explicit model member beats an instance member), or else the built-in Default gr
 whose limits are the profile's own rpm/rpd. See rate_limit_tracker.group_for.
 
 Routes call enforce_access_and_limits once the model is resolved. It checks access
-first, so a request denied with 403 never spends quota, then charges exactly one group.
+first, so a request denied with 403 never spends quota, then refuses a model in outage
+(503; resolve_model_for_request never picks one, but the Azure deployment routes
+map without resolving), then charges exactly one group.
 Endpoints that do this are marked @enforces_limits, and the auth middleware leaves them
 alone; anything unmarked is charged to the Default group in the middleware instead.
 """
@@ -19,6 +21,7 @@ from app.auth.admin import AdminUser
 from app.auth.models import APIKey, User
 from app.concurrency_slots import charge_with_slot
 from app.model_access_dep import enforce_model_access
+from app.outages import outage_registry
 from app.profiles import DEFAULT_GROUP_ID
 from app.rate_limit import RateLimitExceeded, rate_limit_tracker
 
@@ -81,6 +84,14 @@ async def enforce_group_rate_limit(
         _raise(request, decision, envelope_override)
 
 
+def enforce_not_in_outage(request: Request, model_id: Optional[str], envelope_override: Optional[str] = None) -> None:
+    """Refuse (503) a model in outage, quoting the admin's description."""
+    outage = outage_registry.outage_for(model_id)
+    if outage is not None:
+        from app.model_resolution import raise_outage  # local: model_resolution imports provider_manager
+        raise_outage(request, model_id, (outage,), envelope_override)
+
+
 async def enforce_access_and_limits(
     request: Request,
     auth: Union[User, AdminUser, APIKey],
@@ -88,11 +99,13 @@ async def enforce_access_and_limits(
     envelope_override: Optional[str] = None,
     consume_quota: bool = True,
 ) -> None:
-    """Deny (403) if the caller may not use the model, then charge its group (429).
+    """Deny (403) if the caller may not use the model, refuse (503) a model in
+    outage, then charge its group (429).
 
-    consume_quota=False checks access only, for endpoints that do no upstream work
-    worth metering (count_tokens).
+    consume_quota=False checks access and outage only, for endpoints that do no
+    upstream work worth metering (count_tokens).
     """
     await enforce_model_access(request, auth, model_id, envelope_override=envelope_override)
+    enforce_not_in_outage(request, model_id, envelope_override)
     if consume_quota:
         await enforce_group_rate_limit(request, auth, model_id, envelope_override=envelope_override)

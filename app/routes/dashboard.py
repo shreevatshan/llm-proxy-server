@@ -90,6 +90,13 @@ def _anthropic_mode(provider, model_id: str, supported_apis) -> Optional[str]:
         return None
 
 
+def _outage_info(model_id: str) -> Optional[Dict[str, str]]:
+    """{"description"} when the model is in outage (its own, or its instance's), else None."""
+    from app.outages import outage_registry
+    outage = outage_registry.outage_for(model_id)
+    return {"description": outage.description} if outage is not None else None
+
+
 @router.get("/", response_class=HTMLResponse)
 async def dashboard_home(
     request: Request,
@@ -143,6 +150,7 @@ async def dashboard_home(
             "supported_apis": supported_apis,
             "anthropic_mode": _anthropic_mode(provider, model.id, supported_apis),
             "disabled": not allowed,
+            "outage": _outage_info(model.id),
         })
 
     # Regular user - show normal dashboard
@@ -300,5 +308,6 @@ async def list_models_for_dashboard(
             "owned_by": model.owned_by,
             "supported_apis": supported_apis,
             "anthropic_mode": _anthropic_mode(provider, model.id, supported_apis),
+            "outage": _outage_info(model.id),
         })
     return {"data": result}

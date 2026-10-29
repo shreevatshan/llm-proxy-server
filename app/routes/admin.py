@@ -30,7 +30,8 @@ from app.auth.database import (
     load_pool_settings, upsert_pool_settings,
     list_model_groups, create_model_group, update_model_group, delete_model_group,
     set_group_members, get_model_group_limits, model_group_overview,
-    reload_reference_caches, clear_model_group_members,
+    reload_reference_caches, clear_model_group_members, clear_outages,
+    get_all_outages, get_outage, create_outages, update_outage_description, delete_outages,
     get_websearch_settings, upsert_websearch_settings,
     list_websearch_backends, get_websearch_backend, create_websearch_backend,
     update_websearch_backend, delete_websearch_backend, count_backend_users,
@@ -55,6 +56,7 @@ from app.auth.models import (
     ModelGroupMemberResponse, ProfileGroupLimitResponse,
     ModelAliasUpsert, ModelAliasResponse, ModelAliasReorder, ModelAliasBulkDelete, ModelAliasTestMatch,
     MODEL_ALIAS_API_SURFACES, validate_alias_pattern,
+    OutageCreate, OutageUpdate, OutageBulkResolve, OutageResponse,
     AdminPoolResponse, AdminPoolLimitsUpdate, PoolSettingsResponse, PoolSettingsUpdate,
     WebSearchSettingsResponse, WebSearchSettingsUpdate, WebSearchTestRequest, WebSearchEnginesRequest,
     WebSearchBackendCreate, WebSearchBackendUpdate, WebSearchBackendResponse,
@@ -515,6 +517,7 @@ async def reinit_system(
 
         # Nothing is left for a group to name; empty them rather than keep stale members.
         await clear_model_group_members(db)
+        await clear_outages(db)
         await db.commit()
 
         # Refresh provider manager from database (should now be empty)
@@ -1908,6 +1911,130 @@ async def get_all_models(
     return [ModelConfigurationResponse.from_orm(m) for m in models]
 
 
+# ==================== Outage Management API Endpoints ====================
+#
+# An outage takes a provider instance (every model on it, including ones synced
+# later) or one model out of service for every caller; requests go to the fallback
+# mappings, or fail with 503 quoting the description. Resolving deletes the row.
+
+def _outage_responses(rows, provider_keys, model_ids) -> List[OutageResponse]:
+    """Serialise outage rows with what each one takes out of service right now."""
+    from datetime import timezone
+    cached = [m.id for m in provider_manager.model_cache.get_models()]
+    out = []
+    for row in rows:
+        if row.scope == "provider":
+            prefix = f"{row.target}/"
+            affected = sum(1 for model_id in cached if model_id.startswith(prefix))
+            exists = row.target in provider_keys
+        else:
+            exists = row.target in model_ids or provider_manager.model_cache.has_model_id(row.target)
+            affected = 1 if exists else 0
+        out.append(OutageResponse(
+            id=row.id, scope=row.scope, target=row.target, description=row.description,
+            created_by=row.created_by,
+            created_at=row.created_at.replace(tzinfo=timezone.utc).timestamp() if row.created_at else None,
+            affected_models=affected, target_exists=exists,
+        ))
+    return out
+
+
+async def _outage_targets(db: AsyncSession):
+    """(provider keys, model ids) an outage may name."""
+    from app.auth.models import ModelConfiguration
+    provider_keys = {p.provider_key for p in await get_all_provider_credentials(db)}
+    model_ids = set((await db.execute(select(ModelConfiguration.model_id))).scalars().all())
+    return provider_keys, model_ids
+
+
+async def _reload_outages() -> None:
+    from app.outages import outage_registry
+    await outage_registry.load_from_database()
+
+
+@router.get("/outages", response_model=List[OutageResponse])
+async def list_outages_endpoint(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every active outage."""
+    return _outage_responses(await get_all_outages(db), *await _outage_targets(db))
+
+
+@router.post("/outages", response_model=List[OutageResponse])
+async def create_outages_endpoint(
+    body: OutageCreate,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Put provider instances and/or models in outage. A target already in outage
+    keeps its start time and takes the new description."""
+    provider_keys, model_ids = await _outage_targets(db)
+    unknown = [pk for pk in body.provider_keys if pk not in provider_keys]
+    unknown += [
+        m for m in body.model_ids
+        if m not in model_ids and not provider_manager.model_cache.has_model_id(m)
+    ]
+    if unknown:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown provider instance(s) or model(s): {unknown}")
+    rows = await create_outages(db, body.provider_keys, body.model_ids, body.description, current_admin.username)
+    await _reload_outages()
+    logger.info("Outage reported by %s for %s: %s", current_admin.username,
+                [r.target for r in rows], body.description)
+    return _outage_responses(rows, provider_keys, model_ids)
+
+
+@router.put("/outages", response_model=OutageResponse)
+async def update_outage_endpoint(
+    body: OutageUpdate,
+    outage_id: int = Query(..., description="Outage ID to update"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Change an outage's description."""
+    row = await update_outage_description(db, outage_id, body.description)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Outage not found")
+    await _reload_outages()
+    return _outage_responses([row], *await _outage_targets(db))[0]
+
+
+@router.delete("/outages")
+async def resolve_outage_endpoint(
+    outage_id: int = Query(..., description="Outage ID to resolve"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve an outage: its models are served again."""
+    row = await get_outage(db, outage_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Outage not found")
+    target = row.target
+    await delete_outages(db, [outage_id])
+    await _reload_outages()
+    logger.info("Outage of %s resolved by %s", target, current_admin.username)
+    return {"message": f"Outage of {target} resolved"}
+
+
+@router.post("/outages/bulk-resolve")
+async def bulk_resolve_outages_endpoint(
+    body: OutageBulkResolve,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve several outages at once; ids already resolved are reported in ``missing``."""
+    ids = list(dict.fromkeys(body.ids))
+    deleted = await delete_outages(db, ids)
+    if deleted:
+        await _reload_outages()
+    gone = set(deleted)
+    return {
+        "deleted": deleted,
+        "missing": [outage_id for outage_id in ids if outage_id not in gone],
+        "message": f"Resolved {len(deleted)} outage{'' if len(deleted) == 1 else 's'}",
+    }
+
+
 # ==================== Model Alias Management API Endpoints ====================
 #
 # Every mapping belongs to a profile, and a profile's members are mapped with its
@@ -1934,8 +2061,10 @@ def _alias_responses(rows, profile_id: int) -> List[ModelAliasResponse]:
     for row in rows:
         resp = ModelAliasResponse.model_validate(row)
         if resp.kind == "alias" and resp.match_type == "exact":
+            # Judged without outages: a mapping that applies once an outage is
+            # resolved is not misplaced, and must not be flagged to be moved.
             resp.source_available = any(
-                is_model_available(resp.alias, may_use, surface) for surface in resp.apis
+                is_model_available(resp.alias, may_use, surface, ignore_outage=True) for surface in resp.apis
             )
         out.append(resp)
     return out
