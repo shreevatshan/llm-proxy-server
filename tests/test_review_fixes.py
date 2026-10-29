@@ -111,6 +111,18 @@ class ProviderErrorResponseTests(unittest.TestCase):
         self.assertEqual(translated.status_code, 400)
         self.assertEqual(translated.body["error"], bare)
 
+    def test_openai_sdk_error_unwraps_gemini_list_body(self):
+        import httpx, openai
+        from app.providers.openai_compatible import _translate_openai_sdk_error
+
+        body = [{"error": {"code": 400, "message": "Function call is missing a thought_signature", "status": "INVALID_ARGUMENT"}}]
+        request = httpx.Request("POST", "https://example.test/v1beta/openai/chat/completions")
+        response = httpx.Response(400, json=body, request=request)
+        translated = _translate_openai_sdk_error(
+            openai.APIStatusError("400", response=response, body=body), "google"
+        )
+        self.assertEqual(translated.body["error"]["message"], "Function call is missing a thought_signature")
+
     def test_openai_sdk_error_falls_back_for_non_dict_body(self):
         import httpx, openai
         from app.providers.openai_compatible import _translate_openai_sdk_error

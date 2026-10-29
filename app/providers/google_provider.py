@@ -20,6 +20,8 @@ class GoogleProvider(OpenAICompatibleProvider):
     
     # Google's OpenAI-compatible endpoint rejects unknown body params (top_k).
     anthropic_adapter_supports_top_k = False
+    # Gemini 3+ rejects tool calls replayed without their thought signature.
+    anthropic_adapter_thought_signatures = True
 
     # Parameters not supported by Google's API
     UNSUPPORTED_PARAMS = {

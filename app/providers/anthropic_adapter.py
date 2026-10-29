@@ -172,6 +172,23 @@ def _to_dict(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _loaded_tool_names(value: Any, names: Optional[Set[str]] = None) -> Set[str]:
+    """Tools the history has loaded: tool-search references and tools already called."""
+    names = set() if names is None else names
+    if isinstance(value, list):
+        for item in value:
+            _loaded_tool_names(item, names)
+    elif isinstance(value, dict):
+        if value.get("type") == "tool_reference" and value.get("tool_name"):
+            names.add(value["tool_name"])
+        elif value.get("type") == "tool_use" and value.get("name"):
+            names.add(value["name"])
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                _loaded_tool_names(item, names)
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -448,6 +465,8 @@ def prepare_anthropic_adapter_request(
     """
     raw = request.model_dump(exclude_none=True)
     dropped_fields: List[str] = []
+    # Read before unsupported blocks (e.g. tool_search_tool_result) are dropped.
+    loaded_tools = _loaded_tool_names(raw.get("messages"))
 
     for key in list(raw.keys()):
         if key in _TOP_LEVEL_ADAPTER_ONLY_FIELDS:
@@ -559,9 +578,17 @@ def prepare_anthropic_adapter_request(
         normalized_messages.append(message_data)
     raw["messages"] = normalized_messages
 
+    # Emulate tool search: deferred tools are declared once the history loads
+    # them. Not when the client relies on the server-side search tool (the
+    # adapter can't run it) or defers everything, as nothing could load them.
+    raw_tools = [_to_dict(tool) for tool in raw.get("tools", []) or []]
+    defer_tools = not any(
+        str(t.get("type") or "").startswith("tool_search_tool") for t in raw_tools
+    ) and any(not t.get("defer_loading") and not _is_server_tool(t) for t in raw_tools)
+    withheld = 0
+
     normalized_tools = []
-    for index, tool in enumerate(raw.get("tools", []) or []):
-        tool_data = _to_dict(tool)
+    for index, tool_data in enumerate(raw_tools):
         tool_type = str(tool_data.get("type") or "")
         tool_name = str(tool_data.get("name") or "")
 
@@ -574,6 +601,11 @@ def prepare_anthropic_adapter_request(
             dropped_fields.append(f"tools.{tool_type or tool_name or index}")
             continue
 
+        # Withheld on purpose, so not reported as dropped.
+        if tool_data.pop("defer_loading", None) and defer_tools and tool_name not in loaded_tools:
+            withheld += 1
+            continue
+
         if not tool_name:
             tool_data["name"] = f"tool_{index + 1}"
 
@@ -583,6 +615,9 @@ def prepare_anthropic_adapter_request(
             dropped_fields.append("tools.input_schema.type")
 
         normalized_tools.append(tool_data)
+
+    if withheld:
+        logger.debug("Withholding %d deferred tool(s) not yet loaded by tool search", withheld)
 
     if normalized_tools:
         raw["tools"] = normalized_tools
@@ -627,6 +662,7 @@ def _input_converter(provider: Any, *, transport: str, echo_reasoning: bool) -> 
         echo_reasoning=echo_reasoning,
         supports_top_k=bool(getattr(provider, "anthropic_adapter_supports_top_k", True)),
         supports_file_parts=bool(getattr(provider, "anthropic_adapter_supports_file_parts", False)),
+        thought_signatures=bool(getattr(provider, "anthropic_adapter_thought_signatures", False)),
     )
 
 

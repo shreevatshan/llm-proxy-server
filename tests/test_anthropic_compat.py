@@ -18,6 +18,8 @@ from app.conversion.anthropic_helpers import (
     ToolNameMap,
     parse_tool_arguments,
     reasoning_effort_for,
+    restore_tool_id,
+    tool_id_signature,
 )
 from app.conversion.anthropic_openai import (
     AnthropicToOpenAIConverter,
@@ -115,6 +117,74 @@ class RequestConversionTests(unittest.TestCase):
         msgs = _messages_dump(AnthropicToOpenAIConverter().convert_request(sanitized, "m"))
         self.assertEqual(msgs[1]["tool_calls"][0]["id"], raw_id)
         self.assertEqual(msgs[2]["tool_call_id"], raw_id)
+
+    def _replay(self, tool_uses, converter):
+        req = _req(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": i, "name": "f", "input": {}} for i in tool_uses]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": i, "content": "ok"} for i in tool_uses]},
+        ])
+        sanitized, _ = prepare_anthropic_adapter_request(req, transport="chat")
+        return _messages_dump(converter.convert_request(sanitized, "m"))
+
+    def test_gemini_extra_content_thought_signature_round_trips(self):
+        # Gemini signs only the first of parallel calls, beside the id.
+        sig = "CiIBjz1rX+/sig=="
+        out = OpenAIToAnthropicConverter().convert_response({"choices": [{"finish_reason": "tool_calls", "message": {
+            "role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"},
+                 "extra_content": {"google": {"thought_signature": sig}}},
+                {"id": "c2", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+            ]}}]}, "m")
+        ids = [b["id"] for b in out["content"]]
+        self.assertRegex(ids[0], r"^[a-zA-Z0-9_-]+$")
+        self.assertEqual(ids[1], "c2")
+
+        msgs = self._replay(ids, AnthropicToOpenAIConverter(thought_signatures=True))
+        calls = msgs[1]["tool_calls"]
+        self.assertEqual([c["id"] for c in calls], ["c1", "c2"])
+        self.assertEqual(calls[0]["extra_content"], {"google": {"thought_signature": sig}})
+        self.assertNotIn("extra_content", calls[1])
+        self.assertEqual([m["tool_call_id"] for m in msgs[2:]], ["c1", "c2"])
+
+        # Other OpenAI-compatible upstreams get the bare id and no extension.
+        msgs = self._replay(ids, AnthropicToOpenAIConverter())
+        self.assertEqual(msgs[1]["tool_calls"][0]["id"], "c1")
+        self.assertNotIn("extra_content", msgs[1]["tool_calls"][0])
+
+    def test_unsigned_tool_calls_get_skip_signature_for_gemini(self):
+        msgs = self._replay(["toolu_a", "toolu_b"], AnthropicToOpenAIConverter(thought_signatures=True))
+        calls = msgs[1]["tool_calls"]
+        self.assertEqual(calls[0]["extra_content"], {"google": {"thought_signature": "skip_thought_signature_validator"}})
+        self.assertNotIn("extra_content", calls[1])
+
+    def _tool_search_result(self, content):
+        req = _req(messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {"query": "x"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": content}]},
+        ])
+        return _messages_dump(self.c.convert_request(req, "m"))[2]["content"]
+
+    def test_tool_reference_becomes_text(self):
+        with self.assertNoLogs("app.conversion.anthropic_openai", level="WARNING"):
+            text = self._tool_search_result([
+                {"type": "tool_reference", "tool_name": "a"},
+                {"type": "tool_reference", "tool_name": "b"},
+            ])
+        self.assertEqual(text, "Tool loaded: a\nTool loaded: b")
+
+    def test_tool_reference_uses_the_declared_tool_name(self):
+        long_name = "mcp__" + "x" * 80
+        text = self._tool_search_result([{"type": "tool_reference", "tool_name": long_name}])
+        self.assertEqual(text, f"Tool loaded: {ToolNameMap().to_openai(long_name)}")
+
+    def test_tool_reference_keeps_surrounding_text(self):
+        text = self._tool_search_result([
+            {"type": "text", "text": "Found 1 tool"},
+            {"type": "tool_reference", "tool_name": "a"},
+        ])
+        self.assertEqual(text, "Found 1 tool\nTool loaded: a")
 
     def test_responses_keeps_unpaired_server_tool_use(self):
         req = _req(messages=[
@@ -433,6 +503,88 @@ class StreamConversionTests(unittest.TestCase):
         self.assertEqual(self._tool_inputs(events), [("f", {"x": 1}), ("g", {"y": 2})])
         delta = [d for e, d in events if e == "message_delta"][0]
         self.assertEqual(delta["delta"]["stop_reason"], "tool_use")
+
+    def test_parallel_tool_calls_sharing_an_index_stay_separate(self):
+        # Gemini's OpenAI layer sends each parallel call whole, all at index 0
+        # (or with no index); only the id tells them apart.
+        for extra in ({"index": 0}, {}):
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{**extra, "id": "a", "function": {"name": "Bash", "arguments": '{"command": "git diff"}'}}]}}]},
+                {"choices": [{"delta": {"tool_calls": [{**extra, "id": "b", "function": {"name": "Read", "arguments": '{"file_path": "/x"}'}}]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            ]
+            events = self._run(chunks)
+            self._assert_well_formed(self, events)
+            self.assertEqual(self._tool_inputs(events), [("Bash", {"command": "git diff"}), ("Read", {"file_path": "/x"})])
+            ids = [d["content_block"]["id"] for e, d in events if e == "content_block_start"]
+            self.assertEqual(ids, ["a", "b"])
+
+    def test_streamed_thought_signature_rides_in_tool_id(self):
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "f", "arguments": "{}"},
+                                                    "extra_content": {"google": {"thought_signature": "sig/1+="}}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c2", "function": {"name": "f", "arguments": "{}"}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        events = self._run(chunks)
+        self._assert_well_formed(self, events)
+        ids = [d["content_block"]["id"] for e, d in events if e == "content_block_start"]
+        self.assertEqual([restore_tool_id(i) for i in ids], ["c1", "c2"])
+        self.assertEqual([tool_id_signature(i) for i in ids], ["sig/1+=", None])
+
+    def test_live_tool_call_then_second_call_at_same_index(self):
+        def tc(**kw):
+            return {"choices": [{"delta": {"tool_calls": [{"index": 0, **kw}]}}]}
+        chunks = [
+            tc(id="a", function={"name": "Bash", "arguments": '{"comm'}),
+            tc(function={"arguments": 'and": "ls"}'}),
+            tc(id="b", function={"name": "Read", "arguments": '{"file_path"'}),
+            tc(function={"arguments": ': "/x"}'}),
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        events = self._run(chunks)
+        self._assert_well_formed(self, events)
+        self.assertEqual(self._tool_inputs(events), [("Bash", {"command": "ls"}), ("Read", {"file_path": "/x"})])
+
+    def test_tool_call_ids_repeated_or_regenerated_per_chunk_do_not_split(self):
+        # Some upstreams repeat the id on every delta; others send a fresh id
+        # on each delta but the name only on the first.
+        for second_id in ("a", "a2"):
+            chunks = [
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "a", "function": {"name": "Bash", "arguments": '{"comm'}}]}}]},
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": second_id, "function": {"arguments": 'and": "ls"}'}}]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            ]
+            events = self._run(chunks)
+            self._assert_well_formed(self, events)
+            self.assertEqual(self._tool_inputs(events), [("Bash", {"command": "ls"})])
+            ids = [d["content_block"]["id"] for e, d in events if e == "content_block_start"]
+            self.assertEqual(ids, ["a"])
+
+    def test_resent_tool_call_id_reuses_its_call(self):
+        def tc(**kw):
+            return {"choices": [{"delta": {"tool_calls": [{"index": 0, **kw}]}}]}
+        chunks = [
+            tc(id="a", function={"name": "Bash", "arguments": '{"command"'}),
+            tc(id="b", function={"name": "Read", "arguments": '{"file_path": "/x"}'}),
+            tc(id="a", function={"arguments": ': "ls"}'}),
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        events = self._run(chunks)
+        self._assert_well_formed(self, events)
+        self.assertEqual(self._tool_inputs(events), [("Bash", {"command": "ls"}), ("Read", {"file_path": "/x"})])
+        ids = [d["content_block"]["id"] for e, d in events if e == "content_block_start"]
+        self.assertEqual(ids, ["a", "b"])
+
+    def test_null_and_missing_tool_call_index_are_the_same_call(self):
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": [{"index": None, "id": "a", "function": {"name": "Bash", "arguments": '{"comm'}}]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"function": {"arguments": 'and": "ls"}'}}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]
+        events = self._run(chunks)
+        self._assert_well_formed(self, events)
+        self.assertEqual(self._tool_inputs(events), [("Bash", {"command": "ls"})])
 
     def test_text_after_tool_call_is_deferred(self):
         chunks = [
@@ -894,6 +1046,89 @@ class TokenEstimateTests(unittest.TestCase):
             "tools": [{"name": "f", "description": "does things", "input_schema": {"type": "object"}}],
         })
         self.assertGreater(more, base)
+
+
+def _tool(name, deferred=False):
+    tool = {"name": name, "description": name, "input_schema": {"type": "object", "properties": {}}}
+    if deferred:
+        tool["defer_loading"] = True
+    return tool
+
+
+class DeferLoadingTests(unittest.TestCase):
+    """The adapter emulates tool search: deferred tools appear once loaded."""
+
+    def _prepare(self, tools, messages=None):
+        req = _req(tools=tools, messages=messages or [{"role": "user", "content": "hi"}])
+        sanitized, metadata = prepare_anthropic_adapter_request(req, transport="chat")
+        dumped = sanitized.model_dump(exclude_none=True)
+        return dumped.get("tools", []), metadata
+
+    def test_only_loaded_deferred_tools_are_declared(self):
+        tools, metadata = self._prepare(
+            [_tool("ToolSearch"), _tool("Bash"), _tool("A", True), _tool("B", True), _tool("C", True)],
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                    {"type": "tool_reference", "tool_name": "A"},
+                ]}]},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t2", "name": "C", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t2", "content": "ok"}]},
+            ],
+        )
+        self.assertEqual([t["name"] for t in tools], ["ToolSearch", "Bash", "A", "C"])
+        self.assertFalse(any("defer_loading" in t for t in tools))
+        self.assertFalse(any("B" in f for f in metadata.dropped_fields))
+
+    def test_server_tool_search_history_loads_its_references(self):
+        tools, _ = self._prepare(
+            [_tool("Bash"), _tool("D", True), _tool("E", True)],
+            [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [
+                    {"type": "server_tool_use", "id": "srvtoolu_1", "name": "tool_search_tool_regex", "input": {"query": "d"}},
+                    {"type": "tool_search_tool_result", "tool_use_id": "srvtoolu_1", "content": {
+                        "type": "tool_search_tool_search_result",
+                        "tool_references": [{"type": "tool_reference", "tool_name": "D"}],
+                    }},
+                    {"type": "text", "text": "found it"},
+                ]},
+                {"role": "user", "content": "use it"},
+            ],
+        )
+        self.assertEqual([t["name"] for t in tools], ["Bash", "D"])
+
+    def test_server_side_tool_search_sends_every_tool(self):
+        tools, _ = self._prepare([
+            {"type": "tool_search_tool_regex_20251119", "name": "tool_search_tool_regex"},
+            _tool("Bash"), _tool("A", True),
+        ])
+        self.assertEqual([t["name"] for t in tools], ["Bash", "A"])
+
+    def test_all_deferred_sends_every_tool(self):
+        tools, _ = self._prepare([_tool("A", True), _tool("B", True)])
+        self.assertEqual([t["name"] for t in tools], ["A", "B"])
+
+    def test_upstream_sees_only_loaded_tools(self):
+        provider = _custom_provider()
+        calls = []
+
+        async def chat_completion(request):
+            calls.append(request.model_dump(exclude_none=True))
+            return _chat_response({"content": "ok"})
+
+        provider.chat_completion = chat_completion
+        req = _req(tools=[_tool("ToolSearch"), _tool("A", True), _tool("B", True)], messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "tool_reference", "tool_name": "B"},
+            ]}]},
+        ])
+        run(anthropic_adapter_messages(provider, req, transport="chat"))
+        self.assertEqual([t["function"]["name"] for t in calls[0]["tools"]], ["ToolSearch", "B"])
+        self.assertEqual(calls[0]["messages"][-1]["content"], "Tool loaded: B")
 
 
 class ToolNameMapTests(unittest.TestCase):

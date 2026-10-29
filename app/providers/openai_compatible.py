@@ -79,7 +79,11 @@ def _translate_openai_sdk_error(e: Exception, provider_name: str) -> ProviderHTT
         # Forward the upstream's own JSON error body when available (it is the
         # provider's error message, not internal topology); otherwise synthesize
         # a generic envelope. Never embed str(e) (leaks the request URL).
-        body = e.body if isinstance(getattr(e, "body", None), dict) else None
+        body = getattr(e, "body", None)
+        if isinstance(body, list) and len(body) == 1:
+            # Gemini's OpenAI layer wraps its error envelope in a one-item list.
+            body = body[0]
+        body = body if isinstance(body, dict) else None
         if body is not None and "error" not in body and isinstance(body.get("message"), str):
             # Azure AI Foundry's /openai/v1/ surface returns the error object
             # *unwrapped* — {"message", "type", "param", "code"} with no top-level

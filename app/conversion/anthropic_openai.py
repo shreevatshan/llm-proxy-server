@@ -41,6 +41,8 @@ from app.conversion.anthropic_helpers import (
     sanitize_tool_id,
     split_think_tags,
     strip_billing_header,
+    tool_id_signature,
+    tool_id_with_signature,
 )
 from app.openai_models import ChatCompletionRequest, ResponsesCreateRequest
 from app.websearch.tools import INTERNAL_TOOL_NAMES
@@ -51,6 +53,10 @@ logger = logging.getLogger(__name__)
 SERVER_TOOL_NAMES = {"code_execution"}
 SERVER_TOOL_NAME_PREFIXES = ("web_search_", "web_fetch_")
 SERVER_TOOL_TYPE_PREFIXES = ("computer_",)
+
+# Google's documented stand-in for tool calls it did not sign itself (history
+# from another model, or ids minted before signatures were carried).
+SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 
 
 def _is_server_tool(tool_dict: Dict[str, Any]) -> bool:
@@ -96,6 +102,17 @@ def _block_dict(block: Any) -> Dict[str, Any]:
     if isinstance(block, dict):
         return block
     return {}
+
+
+def _thought_signature(tc: Dict[str, Any]) -> Optional[str]:
+    """Gemini's ``extra_content.google.thought_signature`` on a tool call."""
+    google = (tc.get("extra_content") or {}).get("google") or {}
+    signature = google.get("thought_signature") if isinstance(google, dict) else None
+    return signature if isinstance(signature, str) and signature else None
+
+
+def _signature_extra(signature: str) -> Dict[str, Any]:
+    return {"google": {"thought_signature": signature}}
 
 
 def _text_part(text: str) -> Dict[str, Any]:
@@ -184,6 +201,8 @@ class AnthropicToOpenAIConverter:
         supports_file_parts: send binary documents (PDF etc.) as OpenAI
             ``file`` content parts; otherwise they become a text placeholder
             (Gemini's OpenAI layer, vLLM, Ollama reject the part type).
+        thought_signatures: send Gemini thought signatures back on tool
+            calls as ``extra_content`` (Gemini rejects calls without one).
     """
 
     def __init__(
@@ -192,10 +211,12 @@ class AnthropicToOpenAIConverter:
         echo_reasoning: bool = False,
         supports_top_k: bool = True,
         supports_file_parts: bool = True,
+        thought_signatures: bool = False,
     ):
         self.echo_reasoning = echo_reasoning
         self.supports_top_k = supports_top_k
         self.supports_file_parts = supports_file_parts
+        self.thought_signatures = thought_signatures
         self.tool_names = ToolNameMap()
 
     def convert_request(
@@ -328,6 +349,10 @@ class AnthropicToOpenAIConverter:
             return [_text_part(text)] if text else []
         if block_type in ("thinking", "redacted_thinking"):
             return []
+        if block_type == "tool_reference":
+            # A tool-search hit: the adapter has already declared the tool.
+            name = block.get("tool_name") or block.get("name")
+            return [_text_part(f"Tool loaded: {self.tool_names.to_openai(name)}")] if name else []
         logger.warning("Dropping unsupported user content block type: %s", block_type)
         return []
 
@@ -452,14 +477,18 @@ class AnthropicToOpenAIConverter:
                     text_parts.append(block["text"])
 
             elif block_type == "tool_use":
-                tool_calls.append({
+                tool_call: Dict[str, Any] = {
                     "id": restore_tool_id(block.get("id", "")),
                     "type": "function",
                     "function": {
                         "name": self.tool_names.to_openai(block.get("name", "")),
                         "arguments": json.dumps(block.get("input") or {}),
                     },
-                })
+                }
+                signature = tool_id_signature(block.get("id", ""))
+                if self.thought_signatures and signature:
+                    tool_call["extra_content"] = _signature_extra(signature)
+                tool_calls.append(tool_call)
 
             elif block_type == "thinking":
                 if self.echo_reasoning and block.get("thinking"):
@@ -480,6 +509,11 @@ class AnthropicToOpenAIConverter:
 
         for use in server_uses.values():
             text_parts.append(_flatten_server_tool_turn(use, None))
+
+        # Gemini signs only the first call of a step; a step with none signed
+        # came from elsewhere and needs the stand-in to pass validation.
+        if self.thought_signatures and tool_calls and not any("extra_content" in tc for tc in tool_calls):
+            tool_calls[0]["extra_content"] = _signature_extra(SKIP_THOUGHT_SIGNATURE)
 
         if not text_parts and not tool_calls and not reasoning_parts:
             # An assistant turn with nothing left to send; several chat
@@ -567,12 +601,18 @@ class StreamConversionState:
     content_block_index: int = -1  # -1 means no block opened yet
     current_block_type: Optional[str] = None  # "text", "tool_use", "thinking"
     block_open: bool = False
-    tool_call_indices: Dict[int, int] = field(default_factory=dict)  # OpenAI tc index → our block index
-    # Buffers id/name/args per OpenAI tool-call index. Only the first tool call
-    # streams live; later ones are emitted whole at the end so argument deltas
-    # never target an already-closed block, however the upstream interleaves.
+    tool_call_indices: Dict[int, int] = field(default_factory=dict)  # tool-call key → our block index
+    # Buffers id/name/args per tool call, keyed 0, 1, ... in arrival order.
+    # Only the first tool call streams live; later ones are emitted whole at
+    # the end so argument deltas never target an already-closed block,
+    # however the upstream interleaves.
     pending_tool_calls: Dict[int, Dict[str, Any]] = field(default_factory=dict)
-    tool_order: List[int] = field(default_factory=list)
+    # Upstream id / upstream index → tool-call key. Calls are found by id
+    # first; id-less fragments go to the last call seen at their index.
+    # Gemini's OpenAI layer sends parallel calls under one index (or none),
+    # told apart only by a new id, so a new id with a name starts a new call.
+    tool_call_ids: Dict[str, int] = field(default_factory=dict)
+    tool_call_keys: Dict[int, int] = field(default_factory=dict)
     live_tool_index: Optional[int] = None
     # Text/thinking that arrived while a tool block was live; emitted after.
     deferred_content: List[Tuple[str, str]] = field(default_factory=list)
@@ -685,7 +725,7 @@ class OpenAIToAnthropicConverter:
                 continue
             content.append({
                 "type": "tool_use",
-                "id": sanitize_tool_id(tc.get("id")),
+                "id": tool_id_with_signature(tc.get("id"), _thought_signature(tc)),
                 "name": self.tool_names.to_anthropic(name),
                 "input": parse_tool_arguments(func.get("arguments")),
             })
@@ -795,10 +835,9 @@ class OpenAIToAnthropicConverter:
         if state.live_tool_index is not None:
             events.extend(self._close_block(state))
             state.live_tool_index = None
-        for tc_index in state.tool_order:
+        for tc_index, pending in state.pending_tool_calls.items():
             if tc_index in state.tool_call_indices:
                 continue
-            pending = state.pending_tool_calls[tc_index]
             if not pending.get("name"):
                 continue
             events.extend(self._open_tool_block(state, tc_index))
@@ -906,18 +945,36 @@ class OpenAIToAnthropicConverter:
 
     def _handle_tool_delta(self, state: StreamConversionState, tc: Dict[str, Any]) -> List[str]:
         events: List[str] = []
-        tc_index = tc.get("index", 0)
         func = tc.get("function") or {}
         args_chunk = func.get("arguments")
 
-        if tc_index not in state.pending_tool_calls:
-            state.pending_tool_calls[tc_index] = {"id": None, "name": None, "buffered_args": ""}
-            state.tool_order.append(tc_index)
+        upstream_index = tc.get("index")
+        if upstream_index is None:
+            upstream_index = 0
+        tc_id = tc.get("id")
+        tc_index = state.tool_call_ids.get(tc_id) if tc_id else None
+        if tc_index is None:
+            tc_index = state.tool_call_keys.get(upstream_index)
+            # An unseen id without a name is a continuation (some upstreams
+            # regenerate ids per delta); with a name it is a new call.
+            if tc_index is None or (
+                tc_id and func.get("name") and state.pending_tool_calls[tc_index]["id"]
+            ):
+                tc_index = len(state.pending_tool_calls)
+                state.pending_tool_calls[tc_index] = {
+                    "id": None, "name": None, "signature": None, "buffered_args": "",
+                }
+        state.tool_call_keys[upstream_index] = tc_index
         pending = state.pending_tool_calls[tc_index]
-        if tc.get("id"):
-            pending["id"] = tc["id"]
+        if tc_id:
+            state.tool_call_ids[tc_id] = tc_index
+            if not pending["id"]:
+                pending["id"] = tc_id
         if func.get("name"):
             pending["name"] = func["name"]
+        signature = _thought_signature(tc)
+        if signature:
+            pending["signature"] = signature
 
         if tc_index == state.live_tool_index:
             if args_chunk:
@@ -927,7 +984,7 @@ class OpenAIToAnthropicConverter:
         # Only the first tool call streams live. Open it once both id and
         # name are known (or once arguments start without an id).
         should_open = (
-            state.tool_order[0] == tc_index
+            tc_index == 0
             and state.live_tool_index is None
             and tc_index not in state.tool_call_indices
             and pending["name"]
@@ -954,7 +1011,7 @@ class OpenAIToAnthropicConverter:
         names = state.tool_names or self.tool_names
         events = self._open_block(state, "tool_use", {
             "type": "tool_use",
-            "id": sanitize_tool_id(pending.get("id")),
+            "id": tool_id_with_signature(pending.get("id"), pending.get("signature")),
             "name": names.to_anthropic(pending["name"]),
             "input": {},
         })

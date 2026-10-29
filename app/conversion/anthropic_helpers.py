@@ -90,6 +90,9 @@ class ToolNameMap:
 
 
 _ENCODED_ID_PREFIX = "toolu_enc_"
+# Splits an encoded id into upstream id and thought signature; never valid
+# in either, so ids encoded before signatures existed decode unchanged.
+_SIGNATURE_SEPARATOR = "\x1f"
 
 
 def sanitize_tool_id(raw_id: Any, prefix: str = "toolu_") -> str:
@@ -109,8 +112,22 @@ def sanitize_tool_id(raw_id: Any, prefix: str = "toolu_") -> str:
     return f"{_ENCODED_ID_PREFIX}{encoded}"
 
 
-def restore_tool_id(tool_id: Any) -> str:
-    """Invert :func:`sanitize_tool_id` for ids sent back upstream."""
+def tool_id_with_signature(raw_id: Any, signature: Optional[str]) -> str:
+    """:func:`sanitize_tool_id`, also carrying a Gemini thought signature.
+
+    Gemini's OpenAI layer returns the signature beside the call
+    (``extra_content.google.thought_signature``) and rejects the next
+    request without it; Anthropic clients echo only the id, so it rides
+    there. :func:`restore_tool_id` still yields the bare upstream id.
+    """
+    if not signature:
+        return sanitize_tool_id(raw_id)
+    text = sanitize_tool_id(raw_id) if raw_id is None or raw_id == "" else str(raw_id)
+    payload = f"{text}{_SIGNATURE_SEPARATOR}{signature}".encode("utf-8")
+    return f"{_ENCODED_ID_PREFIX}{base64.urlsafe_b64encode(payload).decode('ascii').rstrip('=')}"
+
+
+def _decode_tool_id(tool_id: Any) -> str:
     text = "" if tool_id is None else str(tool_id)
     if not text.startswith(_ENCODED_ID_PREFIX):
         return text
@@ -119,6 +136,17 @@ def restore_tool_id(tool_id: Any) -> str:
         return base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)).decode("utf-8")
     except (binascii.Error, ValueError):
         return text
+
+
+def restore_tool_id(tool_id: Any) -> str:
+    """Invert :func:`sanitize_tool_id` for ids sent back upstream."""
+    return _decode_tool_id(tool_id).split(_SIGNATURE_SEPARATOR, 1)[0]
+
+
+def tool_id_signature(tool_id: Any) -> Optional[str]:
+    """The thought signature :func:`tool_id_with_signature` put in ``tool_id``."""
+    _, sep, signature = _decode_tool_id(tool_id).partition(_SIGNATURE_SEPARATOR)
+    return signature if sep and signature else None
 
 
 # ---------------------------------------------------------------------------

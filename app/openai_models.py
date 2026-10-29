@@ -39,6 +39,8 @@ class ResponseFunction(BaseModel):
 
 
 class ToolCall(BaseModel):
+    # Keeps provider extensions such as Gemini's extra_content (thought signature).
+    model_config = ConfigDict(extra="allow")
     id: Optional[str] = None
     type: str = "function"
     function: ResponseFunction
