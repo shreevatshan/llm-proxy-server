@@ -18,7 +18,7 @@ from app.auth.database import (
     get_all_provider_configurations, get_all_model_configurations, get_models_by_provider,
     create_or_update_provider_configuration, create_or_update_model_configuration, get_model_configuration,
     get_all_model_aliases, get_model_alias, get_model_alias_by_id, upsert_model_alias,
-    delete_model_alias, reorder_model_aliases,
+    delete_model_alias, delete_model_aliases, reorder_model_aliases,
     toggle_provider_configuration, toggle_model_configuration, bulk_toggle_all_models,
     search_models_and_providers, get_all_provider_credentials, get_provider_credentials,
     create_provider_credentials, update_provider_credentials, delete_provider_credentials,
@@ -53,7 +53,7 @@ from app.auth.models import (
     UserManagementSettingsResponse, UserManagementSettingsUpdate,
     ModelGroupCreate, ModelGroupUpdate, ModelGroupMembersUpdate, ModelGroupResponse,
     ModelGroupMemberResponse, ProfileGroupLimitResponse,
-    ModelAliasUpsert, ModelAliasResponse, ModelAliasReorder, ModelAliasTestMatch,
+    ModelAliasUpsert, ModelAliasResponse, ModelAliasReorder, ModelAliasBulkDelete, ModelAliasTestMatch,
     MODEL_ALIAS_API_SURFACES, validate_alias_pattern,
     AdminPoolResponse, AdminPoolLimitsUpdate, PoolSettingsResponse, PoolSettingsUpdate,
     WebSearchSettingsResponse, WebSearchSettingsUpdate, WebSearchTestRequest, WebSearchEnginesRequest,
@@ -2029,6 +2029,31 @@ async def reorder_model_aliases_endpoint(
     return _alias_responses(
         await get_all_model_aliases(db, body.profile_id, kind=body.kind), body.profile_id,
     )
+
+
+@router.post("/model-aliases/bulk-delete")
+async def bulk_delete_model_aliases_endpoint(
+    body: ModelAliasBulkDelete,
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete several aliases of one list at once and reload the resolver.
+
+    Ids no longer in the list (already deleted, or another list's) are skipped and
+    reported in ``missing`` rather than failing the batch.
+    """
+    await _require_profile(db, body.profile_id)
+    ids = list(dict.fromkeys(body.ids))
+    deleted = await delete_model_aliases(db, ids, body.profile_id, body.kind)
+    if deleted:
+        from app.model_alias import model_alias_resolver
+        await model_alias_resolver.load_from_database()
+    gone = set(deleted)
+    return {
+        "deleted": deleted,
+        "missing": [alias_id for alias_id in ids if alias_id not in gone],
+        "message": f"Deleted {len(deleted)} mapping{'' if len(deleted) == 1 else 's'}",
+    }
 
 
 @router.get("/model-aliases/test", response_model=List[ModelAliasTestMatch])

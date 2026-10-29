@@ -1098,6 +1098,24 @@ async def delete_model_alias(
     return True
 
 
+async def delete_model_aliases(
+    db: AsyncSession, ids: List[int], profile_id: int = DEFAULT_PROFILE_ID, kind: str = "alias",
+) -> List[int]:
+    """Delete the aliases of *ids* that belong to one list of a profile, in one commit.
+
+    Returns the ids actually deleted; ids of other lists or profiles are left alone.
+    """
+    rows = list((await db.execute(
+        select(ModelAlias).where(
+            ModelAlias.profile_id == profile_id, ModelAlias.kind == kind, ModelAlias.id.in_(ids),
+        )
+    )).scalars().all())
+    for row in rows:
+        await db.delete(row)
+    await db.commit()
+    return [row.id for row in rows]
+
+
 async def get_models_by_provider(db: AsyncSession, provider_key: str) -> List[ModelConfiguration]:
     """Get all models for a specific provider."""
     result = await db.execute(

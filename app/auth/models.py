@@ -1925,6 +1925,19 @@ class ModelAliasReorder(BaseModel):
         return self
 
 
+class ModelAliasBulkDelete(BaseModel):
+    """Alias ids to delete from one list of a profile; ids not in that list are skipped."""
+    ids: List[int]
+    profile_id: int = DEFAULT_PROFILE_ID
+    kind: Literal[MODEL_ALIAS_KINDS] = "alias"
+
+    @model_validator(mode="after")
+    def validate_ids(self):
+        if not self.ids:
+            raise ValueError("ids must not be empty")
+        return self
+
+
 class ModelAliasTestMatch(BaseModel):
     """Which mapping (if any) a model name hits on one API surface."""
     api: str

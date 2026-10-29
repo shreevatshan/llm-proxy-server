@@ -937,9 +937,16 @@
                 </div>
                 <span id="model-alias-reorder-hint" class="alias-help" style="display: none;">Clear search to reorder</span>
             </div>
-            <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelAliasManager?.load()"><i class="fas fa-sync-alt me-1"></i>Refresh</button>
+            <div class="alias-list-actions ms-auto">
+                <div class="section-actions" id="model-alias-bulk" style="display:none;">
+                    <span class="bulk-selection-status" id="model-alias-bulk-count"></span>
+                    <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelAliasManager?.clearSelection()">Clear</button>
+                    <button class="btn btn-danger btn-sm" onclick="window.ModelAliasManager?.bulkRemove()"><i class="fas fa-trash me-1"></i>Delete selected</button>
+                </div>
+                <button class="btn btn-outline-secondary btn-sm" onclick="window.ModelAliasManager?.load()"><i class="fas fa-sync-alt me-1"></i>Refresh</button>
+            </div>
         </div>
-        <div class="card-body p-0"><div class="table-responsive" style="max-height:60vh;overflow-y:auto;"><table class="table table-hover mb-0"><thead><tr><th title="Mappings are checked top to bottom; the first match wins. Drag to reorder.">Priority</th><th>Model name / pattern</th><th>Match</th><th>Canonical target</th><th>APIs</th><th>Status</th><th>Actions</th></tr></thead><tbody id="model-aliases-tbody"><tr><td colspan="7" class="text-center text-muted py-4">Open this tab to load mappings.</td></tr></tbody></table></div></div>
+        <div class="card-body p-0"><div class="table-responsive" style="max-height:60vh;overflow-y:auto;"><table class="table table-hover mb-0"><thead><tr><th class="col-select"><input type="checkbox" class="form-check-input" id="model-alias-select-all" aria-label="Select all shown mappings" onchange="window.ModelAliasManager?.toggleSelectAll(this.checked)"></th><th title="Mappings are checked top to bottom; the first match wins. Drag to reorder.">Priority</th><th>Model name / pattern</th><th>Match</th><th>Canonical target</th><th>APIs</th><th>Status</th><th>Actions</th></tr></thead><tbody id="model-aliases-tbody"><tr><td colspan="8" class="text-center text-muted py-4">Open this tab to load mappings.</td></tr></tbody></table></div></div>
     </div>
 </div>
 

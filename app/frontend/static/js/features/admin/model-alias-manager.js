@@ -32,6 +32,8 @@ class ModelAliasManager {
         this._drop = null;
         this._orderSaving = false;
         this._orderDirty = false;
+        // Ids of the shown list ticked for bulk delete; cleared when the list changes.
+        this._selected = new Set();
         // The profile whose mappings are shown. Each profile has its own list; its
         // members are mapped with that list alone.
         this._profileId = window.ProfileStore.DEFAULT_ID;
@@ -96,6 +98,7 @@ class ModelAliasManager {
 
     _clearView() {
         this._resetForm();
+        this._selected.clear();
         this._search = '';
         const search = document.getElementById('model-alias-search');
         if (search) search.value = '';
@@ -148,11 +151,14 @@ class ModelAliasManager {
             ModelAliasManager.KINDS.forEach((kind, i) => { this.lists[kind] = lists[i]; });
             this.aliases = this.lists[this._kind];
             this._aliasesFor = profileId;
+            // Drop ticks on rows that no longer exist.
+            const ids = new Set(this.aliases.map(row => row.id));
+            this._selected.forEach(id => { if (!ids.has(id)) this._selected.delete(id); });
             this._switcher.refresh();
             this._renderKind();
             this._render();
         } catch (_) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-danger py-4">Failed to load mappings.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-danger py-4">Failed to load mappings.</td></tr>';
         }
     }
 
@@ -177,25 +183,31 @@ class ModelAliasManager {
         return !this._search.trim() && this.aliases.length > 1;
     }
 
+    /** Rows of the shown list that pass the search, with their list index. */
+    _shownRows() {
+        const q = this._search.trim().toLowerCase();
+        return this.aliases
+            .map((row, index) => ({ row, index }))
+            .filter(({ row }) => !q
+                || (row.alias || '').toLowerCase().includes(q)
+                || (row.target_model_id || '').toLowerCase().includes(q)
+                || (ModelAliasManager.MATCH_LABELS[row.match_type] || '').toLowerCase().includes(q));
+    }
+
     _render() {
         const tbody = document.getElementById('model-aliases-tbody');
         if (!tbody) return;
         const esc = window.UIUtils?.escapeHtml || (value => value);
         const hint = document.getElementById('model-alias-reorder-hint');
         if (hint) hint.style.display = this._search.trim() && this.aliases.length > 1 ? '' : 'none';
+        this._syncSelection();
         if (!this.aliases.length) {
-            tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted py-4">No ${this._noun()}s configured.</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="8" class="text-center text-muted py-4">No ${this._noun()}s configured.</td></tr>`;
             return;
         }
-        const q = this._search.trim().toLowerCase();
-        const rows = this.aliases
-            .map((row, index) => ({ row, index }))
-            .filter(({ row }) => !q
-                || (row.alias || '').toLowerCase().includes(q)
-                || (row.target_model_id || '').toLowerCase().includes(q)
-                || (ModelAliasManager.MATCH_LABELS[row.match_type] || '').toLowerCase().includes(q));
+        const rows = this._shownRows();
         if (!rows.length) {
-            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-4">No mappings match your search.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-4">No mappings match your search.</td></tr>';
             return;
         }
         const reorder = this._canReorder();
@@ -209,8 +221,11 @@ class ModelAliasManager {
             const name = esc(row.alias) + (neverApplies
                 ? ` <span class="alias-warn" title="'${esc(row.alias)}' is not a model available to this profile, and mappings only apply to available models. Move it to the fallback mappings to apply it to unavailable names."><i class="fas fa-exclamation-triangle"></i>Never applies</span>`
                 : '');
+            const selected = this._selected.has(row.id);
             return `
-            <tr data-id="${row.id}">
+            <tr data-id="${row.id}" class="alias-row${selected ? ' selected' : ''}">
+            <td class="col-select"><input type="checkbox" class="form-check-input" aria-label="Select ${esc(row.alias)}"
+                ${selected ? 'checked' : ''} onchange="window.ModelAliasManager?.toggleRow(${row.id}, this.checked)"></td>
             <td class="alias-order-cell">
                 <span class="alias-grip ${reorder ? '' : 'is-disabled'}" title="${reorder ? 'Drag to reorder' : 'Clear search to reorder'}"><i class="fas fa-grip-vertical"></i></span>
                 <span class="alias-position">${index + 1}</span>
@@ -232,6 +247,73 @@ class ModelAliasManager {
                 <button class="btn btn-outline-danger btn-sm" onclick="window.ModelAliasManager?.remove(${index})"><i class="fas fa-trash"></i></button>
             </div></td></tr>`;
         }).join('');
+    }
+
+    // ==================== Bulk selection ====================
+
+    toggleRow(id, checked) {
+        if (checked) this._selected.add(id);
+        else this._selected.delete(id);
+        document.querySelector(`#model-aliases-tbody tr[data-id="${id}"]`)?.classList.toggle('selected', checked);
+        this._syncSelection();
+    }
+
+    toggleSelectAll(checked) {
+        // Only the rows shown, so a filtered select-all never sweeps in hidden mappings.
+        this._shownRows().forEach(({ row }) => {
+            if (checked) this._selected.add(row.id);
+            else this._selected.delete(row.id);
+        });
+        this._render();
+    }
+
+    clearSelection() {
+        this._selected.clear();
+        this._render();
+    }
+
+    _syncSelection() {
+        const n = this._selected.size;
+        const bar = document.getElementById('model-alias-bulk');
+        if (bar) bar.style.display = n ? '' : 'none';
+        const count = document.getElementById('model-alias-bulk-count');
+        if (count) count.textContent = `${n} selected`;
+        const all = document.getElementById('model-alias-select-all');
+        if (all) {
+            const shown = this._shownRows();
+            const picked = shown.filter(({ row }) => this._selected.has(row.id)).length;
+            all.checked = shown.length > 0 && picked === shown.length;
+            all.indeterminate = picked > 0 && picked < shown.length;
+            all.disabled = !shown.length;
+        }
+    }
+
+    async bulkRemove() {
+        const ids = this.aliases.filter(row => this._selected.has(row.id)).map(row => row.id);
+        if (!ids.length) return;
+        const n = ids.length;
+        const noun = `${this._noun()}${n === 1 ? '' : 's'}`;
+        const confirmed = await window.UIUtils?.showConfirmModal(
+            this._isFallback() ? 'Delete Fallback Mappings' : 'Delete Model Mappings',
+            `Delete ${n} selected ${noun}? This cannot be undone.`, 'danger');
+        if (!confirmed) return;
+        try {
+            const response = await fetch('/admin/model-aliases/bulk-delete', {
+                method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ids, profile_id: this._profileId, kind: this._kind }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(this._errorMessage(result, `Failed to delete ${noun}.`));
+            const missing = (result.missing || []).length;
+            window.UIUtils?.showToast(
+                missing ? `${result.message}; ${missing} were already gone.` : `${result.message}.`,
+                missing ? 'warning' : 'success');
+            if (this._editingId !== null && (result.deleted || []).includes(this._editingId)) this._resetForm();
+            this._selected.clear();
+            await this._loadAliases();
+        } catch (error) {
+            window.UIUtils?.showToast(error.message || `Failed to delete ${noun}.`, 'error');
+        }
     }
 
     _initDragAndDrop() {

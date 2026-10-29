@@ -926,6 +926,15 @@ input:checked + .model-toggle-slider:before {
     row-gap: 0.5rem;
 }
 
+/* Model Mapping list header: bulk-delete bar and Refresh. Its own class for the
+   same reason as .ma-models-head above. */
+.alias-list-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+
 /* Model Access › Groups: one row per model group, expanding to its models. */
 .ma-group-row {
     padding-top: 0.7rem;
@@ -1476,14 +1485,16 @@ input:checked + .model-toggle-slider:before {
 /* tbody tr:hover already owns --dark-bg-secondary, so selection is marked with
    an inset edge instead of a background it would fight with. */
 .user-mgmt-row.selected td:first-child,
-.profile-member-row.selected td:first-child {
+.profile-member-row.selected td:first-child,
+.alias-row.selected td:first-child {
     box-shadow: inset 2px 0 0 var(--mono-text-primary);
 }
 
 /* Five actions plus the status line can outrun a narrow window before the
    mobile breakpoint, so the group wraps rather than pushing past the header. */
 #user-bulk-actions,
-#profile-members-bulk {
+#profile-members-bulk,
+#model-alias-bulk {
     flex-wrap: wrap;
     justify-content: flex-end;
     align-items: center;

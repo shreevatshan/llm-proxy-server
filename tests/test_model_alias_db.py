@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 from app.auth import database
 from app.auth.database import (
     delete_model_alias,
+    delete_model_aliases,
     get_all_model_aliases,
     reorder_model_aliases,
     upsert_model_alias,
@@ -152,6 +153,20 @@ class ModelAliasKindTests(_TempDb):
             self.assertTrue(await delete_model_alias(db, "a", kind="fallback"))
         self.assertEqual(await self._list("fallback"), [])
         self.assertEqual([r[0] for r in await self._list("alias")], ["b", "a"])
+
+    async def test_bulk_delete_only_touches_the_given_list(self):
+        a = await self._upsert("a")
+        b = await self._upsert("b")
+        c = await self._upsert("c")
+        x = await self._upsert("a", kind="fallback")
+        async with self._factory() as db:
+            deleted = await delete_model_aliases(db, [a.id, c.id, x.id, 999])
+        self.assertEqual(sorted(deleted), sorted([a.id, c.id]))
+        self.assertEqual([r[0] for r in await self._list("alias")], ["b"])
+        self.assertEqual([r[0] for r in await self._list("fallback")], ["a"])
+        async with self._factory() as db:
+            self.assertEqual(await delete_model_aliases(db, [b.id], profile_id=999), [])
+        self.assertEqual([r[0] for r in await self._list("alias")], ["b"])
 
     async def test_moving_a_row_puts_it_at_the_bottom_of_the_other_list(self):
         await self._upsert("f1", kind="fallback")
