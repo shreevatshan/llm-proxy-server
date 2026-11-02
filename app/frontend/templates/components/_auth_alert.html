@@ -1,0 +1,20 @@
+{# Shared auth alert slot. Server renders the one-time flash here; AuthUI (static/js/features/auth/auth-ui.js) renders the same markup client-side. #}
+{%- set _auth_alert_icons = {"success": "fa-check-circle", "info": "fa-info-circle", "warning": "fa-exclamation-circle", "danger": "fa-exclamation-triangle"} -%}
+<div id="authAlert" class="auth-alert" aria-live="polite">
+    {%- if flash %}
+    <div class="alert alert-{{ flash.level }}" role="{{ 'alert' if flash.level in ('danger', 'warning') else 'status' }}" data-source="{{ flash.source or '' }}">
+        <i class="fas {{ _auth_alert_icons.get(flash.level, 'fa-info-circle') }} auth-alert-icon" aria-hidden="true"></i>
+        <div class="auth-alert-body">
+            <span class="auth-alert-message">{{ flash.message }}</span>
+            {%- if flash.actions %}
+            <div class="auth-alert-actions">
+                {%- for a in flash.actions %}
+                <button type="button" class="btn btn-sm btn-outline-{{ 'danger' if a.key == 'withdraw_pending' else 'secondary' }} auth-alert-action" data-auth-action="{{ a.key }}">{{ a.label }}</button>
+                {%- endfor %}
+            </div>
+            {%- endif %}
+        </div>
+        <button type="button" class="btn-close auth-alert-close" aria-label="Close"></button>
+    </div>
+    {%- endif -%}
+</div>

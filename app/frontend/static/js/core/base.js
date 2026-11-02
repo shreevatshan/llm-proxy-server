@@ -28,6 +28,65 @@
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Session loss: a 401 from a same-origin management API call means the
+    // session expired or is gone. Send the browser to the matching login page
+    // (with a fixed ?reason= code and ?next=) instead of letting every call
+    // site show its own error toast.
+    // -----------------------------------------------------------------------
+    const AUTH_REDIRECT_PREFIXES = ['/auth/', '/admin/', '/dashboard/'];
+    // Calls whose 401 is a normal answer (bad credentials) or that run while
+    // signing in/out; their callers handle it.
+    const AUTH_REDIRECT_SKIP = new Set([
+        '/auth/login', '/auth/login/form', '/admin/login',
+        '/auth/logout', '/admin/logout', '/auth/pending/withdraw',
+    ]);
+    const AUTH_REASONS = new Set(['session_expired', 'session_invalid', 'signin_required']);
+
+    function requestUrl(input) {
+        try {
+            const raw = (typeof input === 'string' || input instanceof URL)
+                ? String(input)
+                : (input && input.url) || '';
+            return new URL(raw, window.location.origin);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function isProtectedPage() {
+        const path = window.location.pathname;
+        if (path.startsWith('/dashboard')) return true;
+        return path.startsWith('/admin/') && path !== '/admin/' && path !== '/admin/login';
+    }
+
+    function shouldRedirectOn401(input) {
+        const url = requestUrl(input);
+        if (!url || url.origin !== window.location.origin) return false;
+        const path = url.pathname;
+        if (!AUTH_REDIRECT_PREFIXES.some((p) => path.startsWith(p))) return false;
+        if (AUTH_REDIRECT_SKIP.has(path) || path.startsWith('/auth/zoho/link')) return false;
+        // Public pages (e.g. the home page probing /auth/me) must not redirect.
+        return isProtectedPage();
+    }
+
+    function redirectToLogin(response) {
+        if (!window.__authRedirecting) {
+            window.__authRedirecting = true;
+            const header = response.headers.get('X-Auth-Error');
+            const reason = AUTH_REASONS.has(header) ? header : 'signin_required';
+            const target = window.location.pathname.startsWith('/admin') ? '/admin/' : '/login';
+            const params = new URLSearchParams({
+                reason: reason,
+                next: window.location.pathname + window.location.search,
+            });
+            window.location.assign(target + '?' + params.toString());
+        }
+        // Never settle: the page is navigating away, so callers should neither
+        // render the response nor show error toasts.
+        return new Promise(() => {});
+    }
+
     const nativeFetch = window.fetch.bind(window);
     window.fetch = function (input, init) {
         init = init || {};
@@ -50,7 +109,12 @@
                 init.headers = headers;
             }
         }
-        return nativeFetch(input, init);
+        return nativeFetch(input, init).then((response) => {
+            if (response.status === 401 && shouldRedirectOn401(input)) {
+                return redirectToLogin(response);
+            }
+            return response;
+        });
     };
 })();
 

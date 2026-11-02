@@ -43,6 +43,7 @@ from app.auth.database import (
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
+from app.auth.cookies import set_session_cookie, clear_session_cookie
 from app.auth.models import (
     User, AdminUserCreate, UserResponse, DEFAULT_PROFILE_ID,
     ProfileCreate, ProfileUpdate, ProfileResponse, ProfileLimitsUpdate, ProfileOverallLimitsUpdate,
@@ -75,15 +76,6 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 templates = Jinja2Templates(directory="app/frontend/templates")
 
 logger = logging.getLogger(__name__)
-
-
-def _cookie_secure() -> bool:
-    """Whether auth cookies should carry the Secure flag.
-
-    Defaults to True (production-safe); set COOKIE_SECURE=false for local
-    plaintext-HTTP development.
-    """
-    return os.getenv("COOKIE_SECURE", "true").lower() != "false"
 
 
 # Placeholder returned instead of stored secrets (see _mask_secret).
@@ -153,15 +145,13 @@ async def admin_login_page(request: Request):
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Admin interface is disabled"
         )
-    
-    import time
-    return templates.TemplateResponse(
+
+    from app.routes.auth_pages import render_auth_page, ADMIN_NEXT_PREFIXES
+    return render_auth_page(
+        request,
         "auth/admin_login.html",
-        {
-            "request": request,
-            "title": "Admin Login - LLM Proxy Server",
-            "cache_version": str(int(time.time()))
-        }
+        {"title": "Admin Login - LLM Proxy Server"},
+        next_prefixes=ADMIN_NEXT_PREFIXES,
     )
 
 
@@ -171,53 +161,67 @@ async def admin_login(
     response: Response,
     db: AsyncSession = Depends(get_db)
 ):
-    """Admin login endpoint."""
+    """Admin login endpoint.
+
+    Browser form posts (``Accept`` includes ``text/html``) follow
+    POST/redirect/GET: failures 303 back to ``/admin/`` with a flash, success
+    303s to the validated ``next`` or the dashboard. Other clients keep the
+    JSON errors.
+    """
+    from fastapi.responses import RedirectResponse
+    from app.auth.flash import set_flash
+    from app.routes.auth_pages import safe_next, ADMIN_NEXT_PREFIXES
+
     if not is_admin_enabled():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Admin interface is disabled"
         )
-    
+
+    wants_html = "text/html" in request.headers.get("accept", "").lower()
+
     # Get form data from request
     form = await request.form()
     username = form.get("username")
     password = form.get("password")
-    
-    if not username or not password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username and password are required"
-        )
-    
+    raw_next = form.get("next")
+    next_url = safe_next(raw_next if isinstance(raw_next, str) else None, ADMIN_NEXT_PREFIXES)
+
+    def _fail(status_code: int, detail: str):
+        if not wants_html:
+            raise HTTPException(status_code=status_code, detail=detail)
+        target = "/admin/"
+        if next_url:
+            target += "?" + urllib.parse.urlencode({"next": next_url})
+        fail_response = RedirectResponse(url=target, status_code=status.HTTP_303_SEE_OTHER)
+        set_flash(fail_response, detail, "danger")
+        fail_response.headers["Cache-Control"] = "no-store"
+        return fail_response
+
+    if not isinstance(username, str) or not isinstance(password, str) or not username or not password:
+        return _fail(status.HTTP_400_BAD_REQUEST, "Username and password are required")
+
     # Authenticate admin
     admin_user = authenticate_admin(username, password)
     if not admin_user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid admin credentials"
-        )
-    
+        return _fail(status.HTTP_401_UNAUTHORIZED, "Invalid admin credentials")
+
     # Create access token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": admin_user.username}, 
+        data={"sub": admin_user.username},
         expires_delta=access_token_expires,
         is_admin=True
     )
-    
-    # Redirect to admin dashboard
-    from fastapi.responses import RedirectResponse
-    redirect_response = RedirectResponse(url="/admin/dashboard", status_code=status.HTTP_302_FOUND)
-    
-    # Set HTTP-only cookie for web interface on the redirect response
-    redirect_response.set_cookie(
-        key="access_token",
-        value=access_token,
-        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        httponly=True,
-        secure=_cookie_secure(),
-        samesite="lax"
+
+    # Redirect to the requested admin page (validated) or the dashboard
+    redirect_response = RedirectResponse(
+        url=next_url or "/admin/dashboard",
+        status_code=status.HTTP_303_SEE_OTHER if wants_html else status.HTTP_302_FOUND,
     )
+
+    # Set HTTP-only cookie for web interface on the redirect response
+    set_session_cookie(redirect_response, access_token)
     
     return redirect_response
 
@@ -2776,12 +2780,7 @@ async def admin_logout():
     redirect_response = RedirectResponse(url="/admin/", status_code=status.HTTP_302_FOUND)
     
     # Delete the cookie with the same parameters used when setting it
-    redirect_response.delete_cookie(
-        key="access_token",
-        httponly=True,
-        secure=_cookie_secure(),
-        samesite="lax"
-    )
+    clear_session_cookie(redirect_response)
     from app.auth.csrf import clear_csrf_cookie
     clear_csrf_cookie(redirect_response)
     

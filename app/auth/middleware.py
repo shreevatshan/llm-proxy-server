@@ -259,7 +259,7 @@ async def get_current_user_from_token(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User not found",
-            headers={"WWW-Authenticate": "Bearer"},
+            headers={"WWW-Authenticate": "Bearer", "X-Auth-Error": "session_invalid"},
         )
 
     # Cache the user for future requests
@@ -324,7 +324,7 @@ async def get_current_user_or_admin(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="User not found",
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": "Bearer", "X-Auth-Error": "session_invalid"},
             )
 
         # Cache the user

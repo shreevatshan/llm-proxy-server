@@ -1,0 +1,61 @@
+{% extends "layouts/auth_base.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+    <div class="auth-card-header">
+        <div class="auth-icon">
+            <i class="fas fa-link"></i>
+        </div>
+        <h1 class="auth-title">Link ZOHO Account</h1>
+        <p class="auth-subtitle">An account with this email already exists</p>
+    </div>
+
+    {% include "components/_auth_alert.html" %}
+
+    <p class="text-muted">
+        You signed in with ZOHO{% if zoho_name %} as <strong>{{ zoho_name }}</strong>{% endif %}.
+        The email <strong>{{ masked_email }}</strong> already belongs to the account
+        <strong>{{ masked_username }}</strong>.
+    </p>
+    <p class="text-muted small">
+        To link them, enter that account's password. You can then sign in with either ZOHO
+        or your password.{% if account_pending %} The account is still pending admin approval
+        and stays pending after linking.{% endif %}
+        If you choose not to link, no new account is created.
+    </p>
+
+    <form id="linkAccountForm" novalidate>
+        <div class="form-group">
+            <label for="linkPassword" class="form-label">Password for {{ masked_username }}</label>
+            <input type="password" class="form-control" id="linkPassword" name="password" required autocomplete="current-password">
+        </div>
+
+        <div class="form-group">
+            <button type="submit" class="btn btn-primary w-100" id="linkAccountBtn">
+                <i class="fas fa-link me-2"></i>Link accounts
+            </button>
+        </div>
+
+        <div class="form-group">
+            <button type="button" class="btn btn-outline-secondary w-100" id="declineLinkBtn">
+                Don't link
+            </button>
+        </div>
+    </form>
+
+    <div class="auth-links">
+        <small class="text-muted">
+            If you didn't create that account, contact {{ admin_email }}.
+        </small>
+    </div>
+    <div class="auth-links">
+        <a href="/login" class="text-muted">← Back to Login</a>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="/static/js/features/auth/link-account.js?v={{ cache_version | default('1') }}"></script>
+{% endblock %}

@@ -908,14 +908,21 @@ def create_management_app(
     templates = Jinja2Templates(directory="app/frontend/templates")
     mgmt_app.mount("/static", StaticFiles(directory="app/frontend/static"), name="static")
 
-    from app.routes import auth, dashboard, admin, pools, user_websearch
+    from app.routes import auth, auth_pages, dashboard, admin, pools, user_websearch
     mgmt_app.include_router(auth.router)
+    # GET /login and /signup (shared flash/alert rendering).
+    mgmt_app.include_router(auth_pages.router)
     mgmt_app.include_router(dashboard.router)
     mgmt_app.include_router(admin.router)
     # Prefixed /auth/pools and /auth/websearch, so they inherit the CSRF protection
     # the /auth/ prefix already has — no middleware change needed.
     mgmt_app.include_router(pools.router)
     mgmt_app.include_router(user_websearch.router)
+
+    # HTML page loads that fail auth (401/403) redirect to the login page with a
+    # flash instead of rendering raw JSON; API routes keep their JSON errors.
+    from app.auth.page_auth import install_page_auth_redirects
+    install_page_auth_redirects(mgmt_app)
 
     # Unified entry point: expose every provider API under this port too.
     # MountedApp hands each sub-app the same scope it gets on its own port.
@@ -939,20 +946,6 @@ def create_management_app(
                 "dashboard/home.html",
                 {"request": request, "user": None, "title": "LLM Proxy Server", "cache_version": str(int(_time.time()))}
             )
-
-    @mgmt_app.get("/login", response_class=HTMLResponse)
-    async def login_page(request: Request):
-        import time as _time
-        return templates.TemplateResponse(
-            "auth/login.html", {"request": request, "title": "Login - LLM Proxy Server", "cache_version": str(int(_time.time()))}
-        )
-
-    @mgmt_app.get("/signup", response_class=HTMLResponse)
-    async def signup_page(request: Request):
-        import time as _time
-        return templates.TemplateResponse(
-            "auth/signup.html", {"request": request, "title": "Sign Up - LLM Proxy Server", "cache_version": str(int(_time.time()))}
-        )
 
     @mgmt_app.get("/health")
     async def health_check():

@@ -3,18 +3,6 @@
 const USERNAME_MIN_LENGTH = 3;
 const USERNAME_MAX_LENGTH = 50;
 
-// Quote-safe HTML escaping (ui-utils.js is not loaded on the signup page).
-function escapeHtml(text) {
-    if (text === null || text === undefined) return '';
-    return String(text)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;')
-        .replace(/`/g, '&#96;');
-}
-
 function showFieldError(fieldId, message) {
     const field = document.getElementById(fieldId);
     const errorElement = document.getElementById(fieldId + '-error');
@@ -64,25 +52,6 @@ function showFieldHelp(fieldId) {
 function clearAllErrors() {
     const fields = ['username', 'email', 'password', 'confirmPassword'];
     fields.forEach(fieldId => clearFieldError(fieldId));
-}
-
-function showGeneralSuccess(message) {
-    const container = document.querySelector('.auth-card') || document.querySelector('.login-container');
-    if (!container) return;
-    const existingMessage = container.querySelector('.general-message');
-    if (existingMessage) {
-        existingMessage.remove();
-    }
-    const messageDiv = document.createElement('div');
-    messageDiv.className = 'general-message alert alert-success';
-    messageDiv.innerHTML = `<i class="fas fa-check-circle"></i> ${message}`;
-    messageDiv.style.marginTop = '1rem';
-    const form = container.querySelector('form');
-    if (form) {
-        container.insertBefore(messageDiv, form);
-    } else {
-        container.appendChild(messageDiv);
-    }
 }
 
 function validateUsername() {
@@ -271,20 +240,21 @@ document.addEventListener('DOMContentLoaded', function() {
     });
 });
 
+// Fields the server can attribute an error to (422 loc / X-Error-Field header).
+const SERVER_FIELDS = ['username', 'email', 'password'];
+
 document.getElementById('signupForm').addEventListener('submit', async function (e) {
     e.preventDefault();
 
-    // Clear any existing general messages
-    const existingMessage = document.querySelector('.general-message');
-    if (existingMessage) {
-        existingMessage.remove();
-    }
+    const submitButton = this.querySelector('button[type="submit"]');
+    if (submitButton.disabled) return;
+
+    AuthUI.clear();
 
     const formData = new FormData(this);
-    const username = formData.get('username').trim();
-    const email = formData.get('email').trim();
-    const password = formData.get('password');
-    const confirmPassword = formData.get('confirmPassword');
+    const username = (formData.get('username') || '').trim();
+    const email = (formData.get('email') || '').trim();
+    const password = formData.get('password') || '';
 
     // Validate all fields
     const isUsernameValid = validateUsernameForSubmission();
@@ -302,94 +272,49 @@ document.getElementById('signupForm').addEventListener('submit', async function 
     }
 
     // Disable submit button to prevent double submission
-    const submitButton = this.querySelector('button[type="submit"]');
     const originalText = submitButton.innerHTML;
     submitButton.disabled = true;
     submitButton.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Creating Account...';
 
-    try {
-        const response = await fetch('/auth/signup', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                username: username,
-                email: email,
-                password: password
-            })
-        });
+    const res = await AuthUI.request('/auth/signup', {
+        json: { username: username, email: email, password: password },
+    });
 
-        const data = await response.json();
+    if (res.ok) {
+        const adminEmail = (res.data && res.data.admin_email) || 'the administrator';
+        // Hide the form and show the pending approval notice (rendered as text).
+        this.style.display = 'none';
+        AuthUI.show(
+            `Account created and awaiting admin approval. Please contact ${adminEmail} for access.`,
+            { level: 'warning' }
+        );
+        return;
+    }
 
-        if (response.ok) {
-            const adminEmail = data.admin_email || 'the administrator';
-            // Hide the form and show a pending approval notice
-            document.getElementById('signupForm').style.display = 'none';
-            const container = document.querySelector('.auth-card') || document.querySelector('.login-container');
-            if (!container) return;
-            const existingMessage = container.querySelector('.general-message');
-            if (existingMessage) existingMessage.remove();
-            const pendingDiv = document.createElement('div');
-            pendingDiv.className = 'general-message alert alert-warning';
-            pendingDiv.style.marginTop = '1rem';
-            pendingDiv.innerHTML =
-                `<i class="fas fa-clock" style="flex-shrink:0;"></i>` +
-                `<span><strong>Account pending approval.</strong> ` +
-                `Your account has been created and is awaiting admin approval. ` +
-                `Please contact <strong>${escapeHtml(adminEmail)}</strong> for access.</span>`;
-            const backLink = container.querySelector('.back-link');
-            if (backLink) {
-                container.insertBefore(pendingDiv, backLink);
-            } else {
-                container.appendChild(pendingDiv);
-            }
-            const loginLink = document.createElement('div');
-            loginLink.className = 'back-link';
-            loginLink.style.marginTop = '1rem';
-            loginLink.innerHTML = '<small class="text-muted"><a href="/login">Back to Login</a></small>';
-            container.appendChild(loginLink);
-        } else {
-            // Handle server-side field errors
-            if (data.detail && typeof data.detail === 'object') {
-                let hasFieldErrors = false;
-                for (const [field, message] of Object.entries(data.detail)) {
-                    if (['username', 'email', 'password', 'confirmPassword'].includes(field)) {
-                        showFieldError(field, message);
-                        hasFieldErrors = true;
-                    }
-                }
-                
-                // Focus on the first error field
-                if (hasFieldErrors) {
-                    const firstInvalidField = document.querySelector('.form-control.is-invalid');
-                    if (firstInvalidField) {
-                        firstInvalidField.focus();
-                    }
-                }
-                
-                // If there are non-field errors, show them as general errors
-                if (!hasFieldErrors) {
-                    showFieldError('username', data.detail || 'Signup failed. Please try again.');
-                }
-            } else {
-                // Route plain-string errors to the correct field based on message content
-                const errorMsg = data.detail || 'Signup failed. Please try again.';
-                const lowerMsg = errorMsg.toLowerCase();
-                if (lowerMsg.includes('email')) {
-                    showFieldError('email', errorMsg);
-                } else if (lowerMsg.includes('password')) {
-                    showFieldError('password', errorMsg);
-                } else {
-                    showFieldError('username', errorMsg);
-                }
-            }
+    submitButton.disabled = false;
+    submitButton.innerHTML = originalText;
+
+    // Field errors stay inline; anything not tied to a field goes to the alert slot.
+    let hasFieldErrors = false;
+    const unmapped = [];
+    for (const [field, message] of Object.entries(res.fieldErrors || {})) {
+        if (SERVER_FIELDS.includes(field)) {
+            showFieldError(field, message);
+            hasFieldErrors = true;
+        } else if (message) {
+            unmapped.push(message);
         }
-    } catch (error) {
-        showFieldError('username', 'Network error. Please check your connection and try again.');
-    } finally {
-        // Re-enable submit button
-        submitButton.disabled = false;
-        submitButton.innerHTML = originalText;
+    }
+
+    if (hasFieldErrors) {
+        const firstInvalidField = document.querySelector('.form-control.is-invalid');
+        if (firstInvalidField) {
+            firstInvalidField.focus();
+        }
+        if (unmapped.length) {
+            AuthUI.show(unmapped.join(' '), { level: 'danger' });
+        }
+    } else {
+        AuthUI.show(res.message || 'Signup failed. Please try again.', { level: 'danger' });
     }
 });

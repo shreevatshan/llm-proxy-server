@@ -33,6 +33,12 @@ class RequestTrackerManager {
         this.eventSource.onerror = () => {
             this.connected = false;
             this._updateConnectionStatus(false);
+            // EventSource hides the HTTP status. CLOSED means the browser gave
+            // up (e.g. a 401 after the session expired), so probe the session:
+            // a 401 there makes the fetch wrapper in base.js redirect to login.
+            if (this.eventSource && this.eventSource.readyState === EventSource.CLOSED) {
+                fetch('/auth/me', { credentials: 'same-origin' }).catch(() => {});
+            }
         };
 
         this.durationTimerId = setInterval(() => this._updateDurations(), 1000);

@@ -3,7 +3,7 @@
 import os
 from datetime import datetime, timedelta
 from typing import Optional
-from jose import JWTError, jwt
+from jose import JWTError, ExpiredSignatureError, jwt
 from fastapi import HTTPException, status
 from .models import TokenData
 
@@ -51,11 +51,22 @@ def verify_token(token: str) -> TokenData:
     
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        # Purpose tokens (app.auth.purpose_tokens) carry aud/purpose and must
+        # never act as sessions. python-jose already rejects an unexpected aud
+        # when no audience is given, but keep the check explicit.
+        if "aud" in payload or "purpose" in payload:
+            raise credentials_exception
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
         is_admin: bool = payload.get("is_admin", False)
         token_data = TokenData(username=username, is_admin=is_admin)
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer", "X-Auth-Error": "session_expired"},
+        )
     except JWTError:
         raise credentials_exception
     

@@ -16,36 +16,42 @@ from app.auth.database import (
     update_user_profile, update_user_password, permanently_delete_user, verify_password,
     get_oauth_user_by_provider_id, create_oauth_user, update_oauth_user,
     is_self_delete_allowed, normalize_new_username,
+    get_user_by_id, link_oauth_identity, user_has_provider_identity,
+    OAuthEmailConflict, OAuthAlreadyLinked,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.models import (
     UserCreate, UserLogin, UserResponse, Token, APIKeyCreate,
     APIKeyResponse, APIKeyListResponse, UserUpdate, PasswordUpdate, AccountDelete,
-    ZohoOAuthCallback,
+    ZohoOAuthCallback, PendingWithdraw, OAuthLinkConfirm,
     MyQuotasResponse, QuotaSectionResponse, PoolSummary,
 )
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.auth.middleware import get_current_active_user, get_current_user_or_admin
+from app.auth.cookies import (
+    cookie_secure, set_session_cookie, set_temp_cookie, clear_temp_cookie,
+    OAUTH_LINK_COOKIE, PENDING_WITHDRAW_COOKIE,
+)
+from app.auth.flash import set_flash
+from app.auth.purpose_tokens import (
+    PURPOSE_OAUTH_LINK, PURPOSE_PENDING_WITHDRAW,
+    issue_purpose_token, read_purpose_token, user_binding_claims, claims_match_user,
+)
 from app.auth.admin import authenticate_admin, is_admin_enabled, AdminUser, get_admin_email
 from app.auth.models import User
 from app.auth.zoho_oauth import zoho_oauth
+from fastapi.responses import HTMLResponse
 from typing import Union
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["authentication"])
 
 # Name of the short-lived cookie holding the OAuth `state` value for CSRF
 # protection during the ZOHO OAuth redirect round-trip.
 _OAUTH_STATE_COOKIE = "zoho_oauth_state"
-
-
-def _cookie_secure() -> bool:
-    """Whether auth cookies should carry the Secure flag.
-
-    Defaults to True (production-safe); set COOKIE_SECURE=false for local
-    plaintext-HTTP development.
-    """
-    return os.getenv("COOKIE_SECURE", "true").lower() != "false"
 
 
 @router.post("/signup")
@@ -65,14 +71,18 @@ async def signup(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         try:
             user_data.username = normalize_new_username(user_data.username)
         except ValueError as e:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(e),
+                headers={"X-Error-Field": "username"},
+            )
 
         # Check if username already exists. The config-based admin is not in the
         # users table but owns its name for usage/quota purposes (is_reserved_username).
         if await get_user_by_username(db, user_data.username) or is_reserved_username(user_data.username):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username already registered"
+                detail="Username already registered",
+                headers={"X-Error-Field": "username"},
             )
 
         # Check if email already exists
@@ -80,14 +90,16 @@ async def signup(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
         if existing_email:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already registered"
+                detail="Email already registered",
+                headers={"X-Error-Field": "email"},
             )
         
         # Validate password length
         if len(user_data.password) < 6:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Password must be at least 6 characters long"
+                detail="Password must be at least 6 characters long",
+                headers={"X-Error-Field": "password"},
             )
         
         # Test password hashing before creating user
@@ -151,11 +163,13 @@ async def login(user_data: UserLogin, response: Response, db: AsyncSession = Dep
         if getattr(user, 'is_pending_approval', False):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Your account is pending admin approval. Please contact {admin_email} for access."
+                detail=f"Your account is pending admin approval. Please contact {admin_email} for access.",
+                headers={"X-Account-Status": "pending"},
             )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Your account has been deactivated. Please contact {admin_email} for assistance."
+            detail=f"Your account has been deactivated. Please contact {admin_email} for assistance.",
+            headers={"X-Account-Status": "deactivated"},
         )
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -164,14 +178,7 @@ async def login(user_data: UserLogin, response: Response, db: AsyncSession = Dep
     )
     
     # Set HTTP-only cookie for web interface
-    response.set_cookie(
-        key="access_token",
-        value=access_token,
-        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-        httponly=True,
-        secure=_cookie_secure(),
-        samesite="lax"
-    )
+    set_session_cookie(response, access_token)
 
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -193,11 +200,13 @@ async def login_form(form_data: OAuth2PasswordRequestForm = Depends(), db: Async
         if getattr(user, 'is_pending_approval', False):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Your account is pending admin approval. Please contact {admin_email} for access."
+                detail=f"Your account is pending admin approval. Please contact {admin_email} for access.",
+                headers={"X-Account-Status": "pending"},
             )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Your account has been deactivated. Please contact {admin_email} for assistance."
+            detail=f"Your account has been deactivated. Please contact {admin_email} for assistance.",
+            headers={"X-Account-Status": "deactivated"},
         )
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -682,24 +691,158 @@ async def get_my_quotas(
 
 
 # ZOHO OAuth Routes
+
+# Lifetimes of the short-lived auth-flow cookies (both scoped to /auth/).
+_OAUTH_LINK_TTL_SECONDS = 600
+_PENDING_WITHDRAW_TTL_SECONDS = 900
+
+_ZOHO = "zoho"
+
+
+def _oauth_redirect(url: str, message: Optional[str] = None, level: str = "danger",
+                    actions=(), source: Optional[str] = None) -> RedirectResponse:
+    """The one exit of the ZOHO OAuth flow: a 303 that always clears the one-time
+    state cookie and, when given, carries *message* as a flash (never in the URL)."""
+    resp = RedirectResponse(url=url, status_code=status.HTTP_303_SEE_OTHER)
+    resp.delete_cookie(key=_OAUTH_STATE_COOKIE)
+    if message:
+        set_flash(resp, message, level=level, actions=actions, source=source)
+    return resp
+
+
+def _issue_session(response: Response, user: User) -> None:
+    access_token = create_access_token(
+        data={"sub": user.username},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    set_session_cookie(response, access_token)
+
+
+def _set_withdraw_cookie(response: Response, user: User) -> None:
+    """Let a pending user withdraw their signup without a password (OAuth users have none)."""
+    token = issue_purpose_token(
+        PURPOSE_PENDING_WITHDRAW,
+        user_binding_claims(user),
+        timedelta(seconds=_PENDING_WITHDRAW_TTL_SECONDS),
+    )
+    set_temp_cookie(response, PENDING_WITHDRAW_COOKIE, token, max_age=_PENDING_WITHDRAW_TTL_SECONDS)
+
+
+def _pending_message(prefix: str = "") -> str:
+    return (
+        f"{prefix}Your account is pending admin approval. Please contact {get_admin_email()} "
+        "for access. If you no longer want this account, you can withdraw your signup."
+    )
+
+
+def _deactivated_message() -> str:
+    return f"Your account has been deactivated. Please contact {get_admin_email()} for assistance."
+
+
+def _is_pending(user: User) -> bool:
+    return bool(getattr(user, "is_pending_approval", False)) and not user.is_active
+
+
+def _finish_oauth_login(user: User) -> RedirectResponse:
+    """Sign an OAuth-authenticated user in, or explain why they cannot be."""
+    if user.is_active:
+        resp = _oauth_redirect("/dashboard/")
+        _issue_session(resp, user)
+        return resp
+    if _is_pending(user):
+        resp = _oauth_redirect(
+            "/login", _pending_message(), level="warning",
+            actions=["withdraw_pending"], source="oauth",
+        )
+        _set_withdraw_cookie(resp, user)
+        return resp
+    return _oauth_redirect("/login", _deactivated_message(), level="warning")
+
+
+def _not_you_hint() -> str:
+    return f" If you didn't create this account, contact {get_admin_email()}."
+
+
+async def _oauth_email_match(db: AsyncSession, user: User, user_info) -> RedirectResponse:
+    """A ZOHO identity whose email belongs to an existing account: offer an explicit link."""
+    admin_email = get_admin_email()
+    if user.oauth_provider == _ZOHO and user.oauth_sub == user_info.sub:
+        # The account already records this exact identity (its OAuthUser row is
+        # missing): restore the row rather than asking again. A matching provider
+        # sub is stronger evidence than the email, so no email verification is needed.
+        try:
+            await link_oauth_identity(
+                db, user, _ZOHO, user_info.sub, email=user_info.email, name=user_info.name,
+                first_name=user_info.first_name, last_name=user_info.last_name,
+                picture=user_info.picture, raw_data=json.dumps(user_info.model_dump()),
+            )
+        except OAuthAlreadyLinked:
+            # Raced with a concurrent callback; a rollback may have expired `user`.
+            oauth_user = await get_oauth_user_by_provider_id(db, _ZOHO, user_info.sub)
+            if oauth_user is None:
+                raise
+            user = oauth_user.user
+        return _finish_oauth_login(user)
+    if not user_info.email_verified:
+        return _oauth_redirect(
+            "/login",
+            "An account with this email already exists, but ZOHO has not verified this email "
+            "address, so it cannot be linked. Please sign in with your password instead."
+            + _not_you_hint(),
+            level="warning",
+        )
+    if await user_has_provider_identity(db, user, _ZOHO):
+        return _oauth_redirect(
+            "/login",
+            "An account with this email is already linked to a different ZOHO account. "
+            f"Please contact {admin_email} for help, including if you didn't create this account.",
+            level="warning",
+        )
+    if not user.hashed_password:
+        return _oauth_redirect(
+            "/login",
+            "An account with this email already exists but cannot be linked here. "
+            f"Please contact {admin_email} for help, including if you didn't create this account.",
+            level="warning",
+        )
+    claims = user_binding_claims(user)
+    claims.update({
+        "provider": _ZOHO,
+        "psub": user_info.sub,
+        "pemail": user_info.email,
+        "pname": (user_info.name or "")[:100],
+        "pfirst": (user_info.first_name or None) and user_info.first_name[:50],
+        "plast": (user_info.last_name or None) and user_info.last_name[:50],
+        "ppic": (user_info.picture or None) and user_info.picture[:500],
+    })
+    token = issue_purpose_token(PURPOSE_OAUTH_LINK, claims, timedelta(seconds=_OAUTH_LINK_TTL_SECONDS))
+    resp = _oauth_redirect("/auth/zoho/link")
+    set_temp_cookie(resp, OAUTH_LINK_COOKIE, token, max_age=_OAUTH_LINK_TTL_SECONDS)
+    return resp
+
+
 @router.get("/zoho/login")
 async def zoho_login(request: Request):
     """Initiate ZOHO OAuth login."""
     # Re-check if ZOHO OAuth is configured at runtime
     from app.auth.zoho_oauth import get_zoho_oauth
     current_zoho_oauth = get_zoho_oauth()
-    
+
     if not current_zoho_oauth:
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="ZOHO OAuth is not configured. Please set ZOHO_CLIENT_ID and ZOHO_CLIENT_SECRET environment variables."
+        return _oauth_redirect(
+            "/login", "ZOHO sign-in is not available. Please sign in with your username and password.",
+            level="warning",
         )
-    
+
     # Generate state parameter for CSRF protection
     state = secrets.token_urlsafe(32)
 
     # Get authorization URL
-    auth_url = await current_zoho_oauth.get_authorization_url(state=state)
+    try:
+        auth_url = await current_zoho_oauth.get_authorization_url(state=state)
+    except Exception:
+        logger.exception("Failed to build the ZOHO authorization URL")
+        return _oauth_redirect("/login", "ZOHO sign-in is temporarily unavailable. Please try again.")
 
     # Store the state in a short-lived HttpOnly cookie so the callback can
     # verify it matches, preventing login CSRF / session fixation.
@@ -709,50 +852,69 @@ async def zoho_login(request: Request):
         value=state,
         max_age=600,  # 10 minutes — long enough for the OAuth round-trip
         httponly=True,
-        secure=_cookie_secure(),
+        secure=cookie_secure(),
         samesite="lax",
     )
     return redirect_response
 
 
 @router.get("/zoho/callback")
-async def zoho_callback(request: Request, code: str, state: str = None, location: str = None,
-                       db: AsyncSession = Depends(get_db)):
-    """Handle ZOHO OAuth callback."""
+async def zoho_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None,
+                        location: Optional[str] = None, error: Optional[str] = None,
+                        error_description: Optional[str] = None,
+                        db: AsyncSession = Depends(get_db)):
+    """Handle ZOHO OAuth callback.
+
+    Every exit is a 303 (see _oauth_redirect) with a fixed flash message; provider
+    and exception text is logged, never shown.
+    """
     # Re-check if ZOHO OAuth is configured at runtime
     from app.auth.zoho_oauth import get_zoho_oauth
     current_zoho_oauth = get_zoho_oauth()
 
     if not current_zoho_oauth:
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="ZOHO OAuth is not configured"
+        return _oauth_redirect(
+            "/login", "ZOHO sign-in is not available. Please sign in with your username and password.",
+            level="warning",
         )
 
+    if error:
+        logger.info(
+            "ZOHO OAuth returned error=%r description=%r",
+            error[:100], (error_description or "")[:200],
+        )
+        if error == "access_denied":
+            return _oauth_redirect("/login", "ZOHO sign-in was cancelled.", level="info")
+        return _oauth_redirect("/login", "ZOHO sign-in failed. Please try again.")
+
     # Validate the OAuth `state` against the value set at /zoho/login (CSRF
-    # protection). Reject if missing or mismatched, then clear the cookie.
+    # protection). Reject if missing or mismatched; the cookie is cleared either way.
     expected_state = request.cookies.get(_OAUTH_STATE_COOKIE)
     # Compare as bytes: compare_digest raises TypeError on non-ASCII str, and
     # `state` is attacker-controlled (would turn hostile input into a 500).
     if not expected_state or not state or not secrets.compare_digest(
         state.encode("utf-8"), expected_state.encode("utf-8")
     ):
-        from urllib.parse import quote
-        msg = "OAuth state validation failed. Please try signing in again."
-        resp = RedirectResponse(url=f"/login?error={quote(msg)}", status_code=302)
-        resp.delete_cookie(key=_OAUTH_STATE_COOKIE)
-        return resp
+        return _oauth_redirect(
+            "/login", "Your ZOHO sign-in request expired or was invalid. Please try signing in again.",
+            level="warning",
+        )
+
+    if not code:
+        return _oauth_redirect("/login", "ZOHO sign-in did not complete. Please try again.", level="warning")
 
     try:
-        # Get user info from ZOHO
         user_info = await current_zoho_oauth.get_user_info(code, location)
-        
-        # Check if OAuth user already exists
-        oauth_user = await get_oauth_user_by_provider_id(db, "zoho", user_info.sub)
+    except Exception:
+        logger.exception("ZOHO OAuth: fetching user info failed")
+        return _oauth_redirect("/login", "We couldn't verify your ZOHO sign-in. Please try again.")
 
-        is_new_user = False
+    try:
+        raw_data = json.dumps(user_info.model_dump())
+
+        # A. This ZOHO identity is already linked: refresh its details and sign in.
+        oauth_user = await get_oauth_user_by_provider_id(db, _ZOHO, user_info.sub)
         if oauth_user:
-            # Existing OAuth user - update their information
             await update_oauth_user(
                 db,
                 oauth_user.id,
@@ -761,80 +923,276 @@ async def zoho_callback(request: Request, code: str, state: str = None, location
                 first_name=user_info.first_name,
                 last_name=user_info.last_name,
                 picture=user_info.picture,
-                raw_data=json.dumps(user_info.model_dump())
+                raw_data=raw_data
             )
             user = oauth_user.user
             # Ensure oauth_provider is set on the user (for users migrated or linked later)
             if not user.oauth_provider:
-                user.oauth_provider = "zoho"
+                user.oauth_provider = _ZOHO
                 user.oauth_sub = user_info.sub
                 await db.commit()
                 await db.refresh(user)
-        else:
-            # New OAuth user - create user and OAuth record
-            is_new_user = True
-            email_domain = user_info.email.split('@')[-1].lower() if '@' in user_info.email else ''
-            is_pending = email_domain != 'zohocorp.com'
+            return _finish_oauth_login(user)
+
+        # B. The email belongs to an existing account: linking must be explicit.
+        existing = await get_user_by_email(db, user_info.email)
+        if existing:
+            return await _oauth_email_match(db, existing, user_info)
+
+        # C. A brand-new user.
+        email_domain = user_info.email.split('@')[-1].lower() if '@' in user_info.email else ''
+        is_pending = email_domain != 'zohocorp.com'
+        try:
             user, oauth_user = await create_oauth_user(
                 db,
-                provider="zoho",
+                provider=_ZOHO,
                 provider_user_id=user_info.sub,
                 email=user_info.email,
                 name=user_info.name,
                 first_name=user_info.first_name,
                 last_name=user_info.last_name,
                 picture=user_info.picture,
-                raw_data=json.dumps(user_info.model_dump()),
+                raw_data=raw_data,
                 is_pending=is_pending,
                 email_verified=bool(user_info.email_verified),
             )
+        except OAuthEmailConflict:
+            # Raced with another signup on the same email: offer the link instead.
+            existing = await get_user_by_email(db, user_info.email)
+            if existing is None:
+                raise
+            return await _oauth_email_match(db, existing, user_info)
+        except OAuthAlreadyLinked:
+            # Raced with a concurrent callback for the same identity.
+            oauth_user = await get_oauth_user_by_provider_id(db, _ZOHO, user_info.sub)
+            if oauth_user is None:
+                raise
+            return _finish_oauth_login(oauth_user.user)
 
-            # Send signup webhook notification for new OAuth users
-            await send_signup_webhook(
-                username=user.username,
-                email=user.email,
-                signup_mode="oauth",
-                user_id=user.id,
-                is_pending=is_pending,
-                oauth_provider="zoho"
+        # Send signup webhook notification for new OAuth users
+        await send_signup_webhook(
+            username=user.username,
+            email=user.email,
+            signup_mode="oauth",
+            user_id=user.id,
+            is_pending=is_pending,
+            oauth_provider=_ZOHO
+        )
+        return _finish_oauth_login(user)
+
+    except Exception:
+        logger.exception("ZOHO OAuth callback failed")
+        try:
+            await db.rollback()
+        except Exception:
+            logger.exception("Rollback after ZOHO OAuth failure failed")
+        return _oauth_redirect("/login", "ZOHO sign-in failed due to a server error. Please try again.")
+
+
+def _mask_username(username: str) -> str:
+    username = username or ""
+    keep = 1 if len(username) <= 3 else 2
+    return username[:keep] + "***"
+
+
+def _mask_email(email: str) -> str:
+    email = email or ""
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return _mask_username(email)
+    return (local[:1] or "") + "***@" + domain
+
+
+async def _load_link_target(request: Request, db: AsyncSession):
+    """Resolve the pending OAuth link request from its cookie.
+
+    Returns ``(claims, user, problem)``; *problem* is None when the link may go
+    ahead, ``"invalid"`` when the request expired / was tampered with / no longer
+    matches the account, or ``"linked"`` when the account already has a ZOHO identity.
+    """
+    claims = read_purpose_token(request.cookies.get(OAUTH_LINK_COOKIE), PURPOSE_OAUTH_LINK)
+    if not claims or claims.get("provider") != _ZOHO or not claims.get("psub") or not claims.get("pemail"):
+        return None, None, "invalid"
+    uid = claims.get("uid")
+    if not isinstance(uid, int):
+        return claims, None, "invalid"
+    user = await get_user_by_id(db, uid)
+    # id + username + created_at: SQLite can hand a deleted user's id to a new account.
+    if user is None or not claims_match_user(claims, user):
+        return claims, None, "invalid"
+    if (user.email or "").lower() != str(claims.get("pemail")).lower():
+        return claims, user, "invalid"
+    if not user.hashed_password:
+        return claims, user, "invalid"
+    if await user_has_provider_identity(db, user, _ZOHO):
+        return claims, user, "linked"
+    return claims, user, None
+
+
+_LINK_EXPIRED_MESSAGE = "This account-link request has expired. Please continue with ZOHO again."
+_LINK_ALREADY_MESSAGE = "This account is already linked to a ZOHO account."
+
+
+@router.get("/zoho/link", response_class=HTMLResponse)
+async def zoho_link_page(request: Request, db: AsyncSession = Depends(get_db)):
+    """Ask the user whether to link their ZOHO identity to the existing account."""
+    from app.routes.auth_pages import render_auth_page
+
+    claims, user, problem = await _load_link_target(request, db)
+    if problem:
+        resp = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+        clear_temp_cookie(resp, OAUTH_LINK_COOKIE)
+        if problem == "linked":
+            set_flash(resp, _LINK_ALREADY_MESSAGE + " Please continue with ZOHO to sign in.", level="info")
+        else:
+            set_flash(resp, _LINK_EXPIRED_MESSAGE, level="warning")
+        return resp
+    return render_auth_page(request, "auth/link_account.html", {
+        "title": "Link ZOHO Account - LLM Proxy Server",
+        "masked_username": _mask_username(user.username),
+        "masked_email": _mask_email(user.email),
+        "zoho_name": claims.get("pname") or "",
+        "account_pending": _is_pending(user),
+        "admin_email": get_admin_email(),
+    })
+
+
+@router.post("/zoho/link")
+async def zoho_link_confirm(body: OAuthLinkConfirm, request: Request, response: Response,
+                            db: AsyncSession = Depends(get_db)):
+    """Link the ZOHO identity from the link cookie after verifying the account password."""
+    claims, user, problem = await _load_link_target(request, db)
+    if problem == "linked":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_LINK_ALREADY_MESSAGE)
+    if problem:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_LINK_EXPIRED_MESSAGE)
+
+    if not verify_password(body.password, user.hashed_password):
+        # The link cookie is kept so the user can retry.
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect password")
+
+    try:
+        await link_oauth_identity(
+            db, user, _ZOHO, claims["psub"],
+            email=claims["pemail"],
+            name=claims.get("pname") or claims["pemail"],
+            first_name=claims.get("pfirst"),
+            last_name=claims.get("plast"),
+            picture=claims.get("ppic"),
+        )
+    except OAuthAlreadyLinked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This ZOHO account is already linked to an account.",
+        )
+    except Exception:
+        logger.exception("Linking ZOHO identity to user %s failed", user.id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to link accounts. Please try again.",
+        )
+
+    clear_temp_cookie(response, OAUTH_LINK_COOKIE)
+    logger.info("Linked ZOHO identity to user %s", user.id)
+    if user.is_active:
+        _issue_session(response, user)
+        return {"message": "Accounts linked.", "redirect": "/dashboard/"}
+    if _is_pending(user):
+        _set_withdraw_cookie(response, user)
+        set_flash(
+            response, _pending_message("Your ZOHO account is now linked. "),
+            level="warning", actions=["withdraw_pending"], source="oauth",
+        )
+    else:
+        set_flash(response, "Your ZOHO account is now linked. " + _deactivated_message(), level="warning")
+    return {"message": "Accounts linked.", "redirect": "/login"}
+
+
+@router.post("/zoho/link/decline")
+async def zoho_link_decline(request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    """Decline linking: no account is created; explain how to proceed instead."""
+    _claims, user, _problem = await _load_link_target(request, db)
+    clear_temp_cookie(response, OAUTH_LINK_COOKIE)
+    admin_email = get_admin_email()
+    message = "No account was linked or created."
+    if user is not None:
+        if _is_pending(user):
+            message += (
+                " To use ZOHO sign-in instead, sign in with your password, choose "
+                "\"Withdraw signup\", then continue with ZOHO again."
             )
+        elif user.is_active and await is_self_delete_allowed(db):
+            message += (
+                " To use ZOHO sign-in with a new account, sign in with your password, delete the "
+                "existing account from your Profile page, then continue with ZOHO again."
+            )
+        else:
+            message += (
+                " To use ZOHO sign-in with a new account, contact "
+                f"{admin_email} to remove the existing account."
+            )
+    message += f" If you didn't create that account, contact {admin_email}."
+    set_flash(response, message, level="info")
+    return {"message": "No account was linked.", "redirect": "/login"}
 
-        # Block pending users before issuing a token
-        if not user.is_active:
-            admin_email = get_admin_email()
-            from urllib.parse import quote
-            msg = f"Your account is pending admin approval. Please contact {admin_email} for access."
-            return RedirectResponse(url=f"/login?error={quote(msg)}", status_code=302)
 
-        # Create access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user.username},
-            expires_delta=access_token_expires
+_WITHDRAW_EXPIRED_MESSAGE = "This withdraw option has expired. Please sign in again to withdraw."
+
+
+@router.post("/pending/withdraw")
+async def withdraw_pending_signup(body: PendingWithdraw, request: Request, response: Response,
+                                  db: AsyncSession = Depends(get_db)):
+    """Withdraw (permanently delete) a signup that is still pending approval.
+
+    Identified by username + password, or (no credentials given) by the short-lived
+    pending_withdraw cookie set after a ZOHO sign-in. Deliberately not gated by the
+    admin's self-delete setting: a pending account was never granted access.
+    """
+    if body.username or body.password:
+        if not body.username or not body.password:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username and password are required.",
+            )
+        user = await authenticate_user(db, body.username, body.password)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+            )
+    else:
+        claims = read_purpose_token(
+            request.cookies.get(PENDING_WITHDRAW_COOKIE), PURPOSE_PENDING_WITHDRAW
+        )
+        uid = claims.get("uid") if claims else None
+        user = await get_user_by_id(db, uid) if isinstance(uid, int) else None
+        if user is None or not claims_match_user(claims, user):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_WITHDRAW_EXPIRED_MESSAGE)
+
+    if not _is_pending(user):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only a signup that is still pending approval can be withdrawn.",
         )
 
-        # Create redirect response
-        redirect_response = RedirectResponse(url="/dashboard/", status_code=302)
-
-        # Set HTTP-only cookie for web interface
-        redirect_response.set_cookie(
-            key="access_token",
-            value=access_token,
-            max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            httponly=True,
-            secure=_cookie_secure(),
-            samesite="lax"
+    user_id = user.id
+    try:
+        from app.routes.pools import delete_user_account
+        success = await delete_user_account(db, user_id)
+    except Exception:
+        logger.exception("Withdrawing pending signup for user %s failed", user_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to withdraw your signup. Please try again.",
         )
-        # State validated; clear the one-time CSRF cookie.
-        redirect_response.delete_cookie(key=_OAUTH_STATE_COOKIE)
+    if not success:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=_WITHDRAW_EXPIRED_MESSAGE)
 
-        return redirect_response
-        
-    except Exception as e:
-        # Redirect to login page with error
-        error_msg = f"OAuth authentication failed: {str(e)}" if str(e) else "OAuth authentication failed: Unknown error"
-        from urllib.parse import quote
-        return RedirectResponse(url=f"/login?error={quote(error_msg)}", status_code=302)
+    logger.info("Pending signup withdrawn for user %s", user_id)
+    clear_temp_cookie(response, PENDING_WITHDRAW_COOKIE)
+    message = "Your signup has been withdrawn and your data deleted."
+    set_flash(response, message, level="success")
+    return {"message": message, "redirect": "/login"}
 
 
 @router.get("/zoho/status")

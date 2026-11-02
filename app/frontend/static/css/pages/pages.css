@@ -115,6 +115,49 @@
     margin-bottom: var(--space-2);
 }
 
+/* Shared auth alert slot (components/_auth_alert.html, js/features/auth/auth-ui.js).
+   Reuses the unified .alert-* level styles; only layout lives here. */
+.auth-alert:empty {
+    display: none;
+}
+
+.auth-alert .alert {
+    margin-bottom: var(--space-4);
+    align-items: flex-start;
+    color: var(--dark-text-primary);
+}
+
+.auth-alert-icon {
+    flex-shrink: 0;
+    margin-top: 0.2rem;
+}
+
+.auth-alert-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: var(--text-sm);
+}
+
+.auth-alert-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin-top: var(--space-3);
+}
+
+.auth-alert-action {
+    white-space: normal;
+}
+
+.auth-alert-close {
+    flex-shrink: 0;
+    margin-left: auto;
+    font-size: 0.75rem;
+    /* .btn-close ships a dark glyph; the auth pages sit on the dark palette. */
+    filter: invert(1) grayscale(1);
+}
+
 /* Legacy aliases kept for backwards compatibility */
 .login-page { background: var(--dark-bg-primary); min-height: 100vh; }
 .login-container { max-width: 420px; margin: 0 auto; }

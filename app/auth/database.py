@@ -211,9 +211,29 @@ async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User
 
 
 async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
-    """Get user by email."""
-    result = await db.execute(select(User).where(User.email == email))
-    return result.scalar_one_or_none()
+    """Get user by email, case-insensitively.
+
+    Emails are compared lower-cased so "Alice@x.com" and "alice@x.com" are the same
+    account at signup, admin create, profile update and OAuth sign-in. Databases
+    created before this check may hold case-variant duplicates; the oldest row wins
+    (deterministically) and the duplicate is logged rather than crashing the lookup.
+    """
+    if not email:
+        return None
+    from sqlalchemy import func
+    result = await db.execute(
+        select(User)
+        .where(func.lower(User.email) == func.lower(email))
+        .order_by(User.id)
+        .limit(2)
+    )
+    users = result.scalars().all()
+    if len(users) > 1:
+        logger.warning(
+            "Multiple users share an email case-insensitively (ids %s); using the oldest",
+            [u.id for u in users],
+        )
+    return users[0] if users else None
 
 
 async def get_user_by_id(db: AsyncSession, user_id: int) -> Optional[User]:
@@ -298,16 +318,35 @@ async def get_oauth_user_by_provider_id(db: AsyncSession, provider: str, provide
     return result.scalar_one_or_none()
 
 
+class OAuthEmailConflict(ValueError):
+    """An account with the OAuth identity's email already exists.
+
+    Linking an OAuth identity to an existing account is never silent: the caller
+    must ask the user and confirm with the account's password (link_oauth_identity).
+    """
+
+
+class OAuthAlreadyLinked(ValueError):
+    """The OAuth identity (provider + subject) is already linked to an account."""
+
+
 async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: str, email: str, name: str,
                            first_name: Optional[str] = None, last_name: Optional[str] = None,
                            picture: Optional[str] = None, raw_data: Optional[str] = None,
                            is_pending: bool = False, email_verified: bool = False) -> tuple[User, OAuthUser]:
-    """Create a new user with OAuth authentication.
+    """Create a NEW user authenticated by an OAuth identity.
 
-    An existing local account is auto-linked by email ONLY when the provider
-    asserts the email is verified (email_verified=True). Otherwise linking is
-    refused to prevent account takeover via an unverified attacker-controlled email.
+    Raises OAuthEmailConflict when an account with this email already exists
+    (including one created concurrently), and OAuthAlreadyLinked when the identity
+    was linked concurrently. Existing accounts are only ever linked explicitly,
+    through link_oauth_identity. ``email_verified`` is accepted for call-site
+    compatibility; the caller decides whether an email match may be offered a link.
     """
+    from sqlalchemy.exc import IntegrityError
+
+    if await get_user_by_email(db, email):
+        raise OAuthEmailConflict("An account with this email already exists")
+
     # Generate a unique username from email or name
     username = email.split('@')[0] if '@' in email else name.lower().replace(' ', '_')
 
@@ -319,37 +358,61 @@ async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: s
         username = f"{base_username}_{counter}"
         counter += 1
 
-    # Check if email exists
-    existing_user_by_email = await get_user_by_email(db, email)
-    if existing_user_by_email:
-        # Only auto-link to an existing local account when the provider has
-        # verified ownership of the email; otherwise refuse (email is unique, so
-        # a separate account with the same email cannot be created either).
-        if not email_verified:
-            raise ValueError(
-                "An account with this email already exists and the provider has not "
-                "verified the email address, so it cannot be linked automatically."
-            )
-        user = existing_user_by_email
-        # Update oauth_provider if not already set (linking existing account to OAuth)
-        if not user.oauth_provider:
-            user.oauth_provider = provider
-            user.oauth_sub = provider_user_id
-    else:
-        # Create new user
-        user = User(
-            username=username,
-            email=email,
-            hashed_password=None,  # No password for OAuth users
-            oauth_provider=provider,
-            oauth_sub=provider_user_id,
-            is_active=not is_pending,
-            is_pending_approval=is_pending
-        )
+    user = User(
+        username=username,
+        email=email,
+        hashed_password=None,  # No password for OAuth users
+        oauth_provider=provider,
+        oauth_sub=provider_user_id,
+        is_active=not is_pending,
+        is_pending_approval=is_pending
+    )
+    try:
         db.add(user)
         await db.flush()  # Flush to get the user ID
-    
-    # Create OAuth user record
+
+        oauth_user = OAuthUser(
+            user_id=user.id,
+            provider=provider,
+            provider_user_id=provider_user_id,
+            email=email,
+            name=name,
+            first_name=first_name,
+            last_name=last_name,
+            picture=picture,
+            raw_data=raw_data
+        )
+        db.add(oauth_user)
+        await db.commit()
+    except IntegrityError:
+        # Lost a race: someone created the email, or linked this identity, in between.
+        await db.rollback()
+        if await get_user_by_email(db, email):
+            raise OAuthEmailConflict("An account with this email already exists")
+        if await get_oauth_user_by_provider_id(db, provider, provider_user_id):
+            raise OAuthAlreadyLinked("This identity is already linked to an account")
+        raise
+    await db.refresh(user)
+    await db.refresh(oauth_user)
+
+    return user, oauth_user
+
+
+async def link_oauth_identity(db: AsyncSession, user: User, provider: str, provider_user_id: str,
+                              email: str, name: str, first_name: Optional[str] = None,
+                              last_name: Optional[str] = None, picture: Optional[str] = None,
+                              raw_data: Optional[str] = None) -> OAuthUser:
+    """Link an OAuth identity to an existing account (after explicit confirmation).
+
+    Inserts the OAuthUser row and records provider/sub on the user if those are still
+    empty. Never changes the account's active / pending-approval status. Raises
+    OAuthAlreadyLinked when the identity is already linked (to this or any account).
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    if await get_oauth_user_by_provider_id(db, provider, provider_user_id):
+        raise OAuthAlreadyLinked("This identity is already linked to an account")
+
     oauth_user = OAuthUser(
         user_id=user.id,
         provider=provider,
@@ -361,12 +424,32 @@ async def create_oauth_user(db: AsyncSession, provider: str, provider_user_id: s
         picture=picture,
         raw_data=raw_data
     )
-    db.add(oauth_user)
-    await db.commit()
+    try:
+        db.add(oauth_user)
+        if not user.oauth_provider:
+            user.oauth_provider = provider
+            user.oauth_sub = provider_user_id
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise OAuthAlreadyLinked("This identity is already linked to an account")
     await db.refresh(user)
     await db.refresh(oauth_user)
-    
-    return user, oauth_user
+    return oauth_user
+
+
+async def user_has_provider_identity(db: AsyncSession, user: User, provider: str) -> bool:
+    """Whether *user* already has an identity from *provider* linked.
+
+    Checks both the user's own oauth_provider field and its OAuthUser rows (queried,
+    not lazy-loaded, so this is safe on users loaded without oauth_accounts).
+    """
+    if user.oauth_provider == provider:
+        return True
+    result = await db.execute(
+        select(OAuthUser.id).where(OAuthUser.user_id == user.id, OAuthUser.provider == provider).limit(1)
+    )
+    return result.first() is not None
 
 
 async def update_oauth_user(db: AsyncSession, oauth_user_id: int, email: Optional[str] = None, 
@@ -532,8 +615,10 @@ async def update_user_profile(db: AsyncSession, user_id: int, username: Optional
                         logger.warning(f"Usage flush before rename of '{old_username}' failed: {e}")
                 user.username = username
 
-            if email is not None:
-                # Check if email is already taken by another user
+            if email is not None and email != user.email:
+                # Check if email is already taken by another user. Skipped when the
+                # email is unchanged, so a legacy case-variant duplicate (lookup
+                # returns the oldest row) can still save its profile.
                 existing_user = await get_user_by_email(db, email)
                 if existing_user and existing_user.id != user_id:
                     raise ValueError("Email already in use")

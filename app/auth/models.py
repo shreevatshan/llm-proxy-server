@@ -1531,6 +1531,18 @@ class AccountDelete(BaseModel):
     confirmation: str
 
 
+class PendingWithdraw(BaseModel):
+    """Withdraw a pending signup: by credentials, or (both omitted) by the
+    short-lived pending_withdraw cookie set after an OAuth sign-in."""
+    username: Optional[str] = Field(default=None, max_length=255)
+    password: Optional[str] = Field(default=None, max_length=1024)
+
+
+class OAuthLinkConfirm(BaseModel):
+    """Confirm linking an OAuth identity to an existing account by its password."""
+    password: str = Field(..., max_length=1024)
+
+
 # ---------------------------------------------------------------------------
 # Model-group Pydantic models
 # ---------------------------------------------------------------------------

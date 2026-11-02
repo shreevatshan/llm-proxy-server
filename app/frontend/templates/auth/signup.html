@@ -12,6 +12,8 @@
         <p class="auth-subtitle">LLM Proxy Server</p>
     </div>
 
+    {% include "components/_auth_alert.html" %}
+
     <form id="signupForm" novalidate>
         <div class="form-group">
             <label for="username" class="form-label">Username</label>
@@ -58,5 +60,5 @@
 {% endblock %}
 
 {% block extra_js %}
-<script src="/static/js/features/auth/signup.js"></script>
+<script src="/static/js/features/auth/signup.js?v={{ cache_version | default('1') }}"></script>
 {% endblock %}

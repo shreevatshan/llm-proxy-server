@@ -12,7 +12,10 @@
         <p class="auth-subtitle">LLM Proxy Server Administration</p>
     </div>
 
+    {% include "components/_auth_alert.html" %}
+
     <form method="POST" action="/admin/login">
+        <input type="hidden" name="next" value="{{ next or '' }}">
         <div class="form-group">
             <label for="username" class="form-label">Username</label>
             <input type="text" class="form-control" id="username" name="username" required autocomplete="username">

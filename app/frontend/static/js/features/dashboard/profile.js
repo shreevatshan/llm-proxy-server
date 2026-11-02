@@ -127,10 +127,10 @@ document.getElementById('updateProfileForm')?.addEventListener('submit', async f
 
                     // Force immediate redirect - multiple methods for redundancy
                     try {
-                        window.location.replace('/login?updated=true&t=' + new Date().getTime());
+                        window.location.replace('/login?reason=username_changed');
                     } catch (e) {
                         try {
-                            window.location.href = '/login?updated=true&t=' + new Date().getTime();
+                            window.location.href = '/login?reason=username_changed';
                         } catch (e2) {
                             // Redirect failed — clear the global block so the SPA
                             // isn't permanently wedged with every request rejected.
@@ -257,7 +257,7 @@ document.getElementById('confirmDeleteAccount')?.addEventListener('click', async
             deleteAccountModal.hide();
 
             setTimeout(() => {
-                window.location.href = '/login';
+                window.location.href = '/login?reason=account_deleted';
             }, 2000);
         } else if (response.headers.get('X-Account-Deletion-Disabled') === 'true') {
             // The admin turned deletion off after this page was loaded.
