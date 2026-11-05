@@ -252,5 +252,43 @@ class FindProviderKeyTests(unittest.TestCase):
         self.assertFalse(manager.has_provider_prefix(None))
 
 
+
+class PlatformAIWiringTests(unittest.TestCase):
+    def test_create_provider_config_maps_platformai_columns(self):
+        cred = SimpleNamespace(
+            provider_type="platformai", provider_key="platformai:main", instance_name="main", enabled=True,
+            provider_name="platformai", region=None, base_url=None, oauth_accounts_url=None, api_key=None,
+            oauth_client_id="cid", oauth_client_secret=None, oauth_refresh_token="r", pai_token_id="42",
+            deployments_json='["claude-haiku-5-5", "gpt-5.5"]',
+        )
+        config = ProviderManager()._create_provider_config(cred)
+        self.assertEqual(config["provider_key"], "platformai:main")
+        self.assertEqual((config["oauth_client_id"], config["oauth_refresh_token"]), ("cid", "r"))
+        self.assertEqual((config["pai_token_id"], config["models"]), ("42", ["claude-haiku-5-5", "gpt-5.5"]))
+
+        from app.providers.platformai import PlatformAIProvider
+        provider = PlatformAIProvider(config)
+        self.assertEqual(provider.full_provider_name, "platformai:main")
+        self.assertEqual(provider.base_url, "https://platformai.zoho.in")
+        self.assertEqual((provider.auth_mode, provider.models), ("oauth", ["claude-haiku-5-5", "gpt-5.5"]))
+        asyncio.run(ProviderManager().close_provider_clients({"p": provider}))
+        self.assertTrue(provider.client.is_closed)
+
+    def test_close_prefers_aclose_and_falls_back_to_close(self):
+        calls = []
+
+        class AcloseOnly:
+            async def aclose(self):
+                calls.append("aclose")
+
+        class CloseOnly:
+            async def close(self):
+                calls.append("close")
+
+        providers = {"a": SimpleNamespace(client=AcloseOnly()), "b": SimpleNamespace(client=CloseOnly())}
+        asyncio.run(ProviderManager().close_provider_clients(providers))
+        self.assertEqual(calls, ["aclose", "close"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,9 @@ let providersData = null;
 let modelsData = null;
 let currentEditingProvider = null;
 
+// Display names for provider types whose id does not capitalise well.
+const PROVIDER_TYPE_LABELS = { platformai: 'PlatformAI' };
+
 
 class ProviderManager {
     constructor() {
@@ -209,7 +212,8 @@ class ProviderManager {
                 typeTitle = providerName.toUpperCase();
             } else {
                 providerType = groupKey;
-                typeTitle = providerType.charAt(0).toUpperCase() + providerType.slice(1);
+                typeTitle = PROVIDER_TYPE_LABELS[providerType]
+                    || providerType.charAt(0).toUpperCase() + providerType.slice(1);
             }
             
             const enabledCount = typeProviders.filter(p => p.enabled).length;
@@ -237,7 +241,8 @@ class ProviderManager {
                 if (provider.provider_type === 'custom') {
                     badgeName = 'Custom';
                 } else {
-                    badgeName = provider.provider_type.charAt(0).toUpperCase() + provider.provider_type.slice(1);
+                    badgeName = PROVIDER_TYPE_LABELS[provider.provider_type]
+                        || provider.provider_type.charAt(0).toUpperCase() + provider.provider_type.slice(1);
                 }
 
                 // Show supported API badges

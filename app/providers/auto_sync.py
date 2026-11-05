@@ -378,6 +378,7 @@ async def _create_provider_instance(provider_creds):
         from app.providers.azure_provider import AzureProvider
         from app.providers.bedrock_provider import BedrockProvider
         from app.providers.google_provider import GoogleProvider
+        from app.providers.platformai import PlatformAIProvider
         from app.providers.custom_providers import create_custom_provider
         
         # Map specific provider types to their implementations
@@ -385,6 +386,7 @@ async def _create_provider_instance(provider_creds):
             'azure': AzureProvider,
             'bedrock': BedrockProvider,
             'google': GoogleProvider,
+            'platformai': PlatformAIProvider,
         }
         
         # Reuse the runtime provider config builder so discovery instances are

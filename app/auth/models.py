@@ -14,6 +14,23 @@ from typing import Optional, List, Literal
 VALID_AZURE_BACKENDS = {"openai", "foundry"}
 DEPLOYMENT_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
 
+# PlatformAI model names as the gateway spells them (e.g. "claude-haiku-5-5").
+PLATFORMAI_MODEL_NAME_PATTERN = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:@-]*$')
+
+
+def _platformai_model_names(names):
+    """Strip, de-duplicate and validate a PlatformAI provider's model list."""
+    out = []
+    for name in names:
+        stripped = (name or "").strip()
+        if not stripped:
+            continue
+        if not PLATFORMAI_MODEL_NAME_PATTERN.match(stripped):
+            raise ValueError(f"Invalid PlatformAI model name '{stripped}'.")
+        if stripped not in out:
+            out.append(stripped)
+    return out
+
 # Width of the users.username column. SQLite does not enforce VARCHAR limits, so
 # signup validates against this explicitly to keep names portable to backends
 # (Postgres/MySQL) that would reject an over-long value at INSERT time.
@@ -810,6 +827,17 @@ class ProviderCredentials(Base):
     # auth header style ("x-api-key" default, or "bearer").
     anthropic_base_url = Column(String(500), nullable=True)
     anthropic_auth_style = Column(String(20), nullable=True)
+
+    # PlatformAI: Zoho OAuth credentials (the alternative to api_key) and the
+    # optional BYOK credential id sent as Z-Token-Id. Not named
+    # client_id/client_secret: a startup migration drops legacy columns with
+    # those names on every boot. pai_token_id is a string so JSON clients never
+    # round the 13+ digit id.
+    oauth_client_id = Column(String(200), nullable=True)
+    oauth_client_secret = Column(String(500), nullable=True)
+    oauth_refresh_token = Column(String(1000), nullable=True)
+    oauth_accounts_url = Column(String(500), nullable=True)
+    pai_token_id = Column(String(30), nullable=True)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -2212,6 +2240,13 @@ class ProviderCredentialsCreate(BaseModel):
     anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
     anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
 
+    # PlatformAI (API key in api_key, or Zoho OAuth refresh-token credentials)
+    oauth_client_id: Optional[str] = None
+    oauth_client_secret: Optional[str] = None
+    oauth_refresh_token: Optional[str] = None
+    oauth_accounts_url: Optional[str] = None
+    pai_token_id: Optional[str] = None
+
     @field_validator('anthropic_auth_style')
     @classmethod
     def validate_anthropic_auth_style(cls, v):
@@ -2281,6 +2316,8 @@ class ProviderCredentialsCreate(BaseModel):
                     "discovery_api_version is required when dynamic_discovery is enabled "
                     "for an Azure provider."
                 )
+        if self.provider_type == "platformai" and self.deployments:
+            self.deployments = _platformai_model_names(self.deployments)
         return self
 
 
@@ -2310,6 +2347,13 @@ class ProviderCredentialsUpdate(BaseModel):
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
     anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
     anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
+
+    # PlatformAI (API key in api_key, or Zoho OAuth refresh-token credentials)
+    oauth_client_id: Optional[str] = None
+    oauth_client_secret: Optional[str] = None
+    oauth_refresh_token: Optional[str] = None
+    oauth_accounts_url: Optional[str] = None
+    pai_token_id: Optional[str] = None
 
     @field_validator('anthropic_auth_style')
     @classmethod
@@ -2413,6 +2457,13 @@ class ProviderCredentialsResponse(BaseModel):
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
     anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
     anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
+
+    # PlatformAI (API key in api_key, or Zoho OAuth refresh-token credentials)
+    oauth_client_id: Optional[str] = None
+    oauth_client_secret: Optional[str] = None
+    oauth_refresh_token: Optional[str] = None
+    oauth_accounts_url: Optional[str] = None
+    pai_token_id: Optional[str] = None
     
     created_at: datetime
     updated_at: datetime

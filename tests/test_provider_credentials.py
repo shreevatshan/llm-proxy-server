@@ -337,5 +337,114 @@ class LegacyRoundTripTests(_ProviderRouteTestCase):
         self.assertIsNone((await self._row("azure:discovery"))["deployments_json"])
 
 
+
+REFRESH = "1000.sentinel-refresh-token-9d2e"
+CLIENT_SECRET = "sentinel-client-secret-5c1a"
+PAI_API_KEY = "193-sentinel-api-key-77ab"
+
+
+class PlatformAICredentialTests(_ProviderRouteTestCase):
+    PLATFORMAI = {
+        "provider_type": "platformai", "provider_name": "platformai", "instance_name": "main",
+        "oauth_client_id": "1000.CLIENT", "oauth_client_secret": CLIENT_SECRET,
+        "oauth_refresh_token": REFRESH, "deployments": ["claude-haiku-5-5", " gpt-5.5 ", "claude-haiku-5-5"],
+    }
+    API_KEY_PROVIDER = {
+        "provider_type": "platformai", "provider_name": "platformai", "instance_name": "key",
+        "api_key": PAI_API_KEY, "deployments": ["claude-haiku-5-5"],
+    }
+
+    async def test_create_stores_and_masks_secrets_without_logging_them(self):
+        with self.assertLogs(level="INFO") as logs:
+            response = await self._create(**self.PLATFORMAI)
+        output = "\n".join(logs.output)
+        self.assertNotIn(REFRESH, output)
+        self.assertNotIn(CLIENT_SECRET, output)
+        row = await self._row("platformai:main")
+        self.assertEqual((row["oauth_refresh_token"], row["oauth_client_secret"]), (REFRESH, CLIENT_SECRET))
+        self.assertIsNone(row["region"])
+        self.assertEqual(row["supported_apis"], '["openai", "anthropic"]')
+        self.assertEqual(row["deployments_json"], '["claude-haiku-5-5", "gpt-5.5"]')
+        self.assertEqual((response.oauth_refresh_token, response.oauth_client_secret), (MASK, MASK))
+        self.assertEqual(response.deployments, ["claude-haiku-5-5", "gpt-5.5"])
+        detail = await self._detail("platformai:main")
+        self.assertEqual(detail.oauth_refresh_token, MASK)
+        self.assertEqual(detail.oauth_client_id, "1000.CLIENT")
+
+    async def test_create_with_api_key(self):
+        with self.assertLogs(level="INFO") as logs:
+            response = await self._create(**self.API_KEY_PROVIDER, pai_token_id="5434566543234")
+        self.assertNotIn(PAI_API_KEY, "\n".join(logs.output))
+        row = await self._row("platformai:key")
+        self.assertEqual((row["api_key"], row["pai_token_id"]), (PAI_API_KEY, "5434566543234"))
+        self.assertIsNone(row["oauth_refresh_token"])
+        self.assertEqual((response.api_key, response.pai_token_id), (MASK, "5434566543234"))
+
+    async def test_create_requires_api_key_or_oauth_pair(self):
+        for field in ("oauth_refresh_token", "oauth_client_id"):
+            with self.subTest(field=field):
+                with self.assertRaises(HTTPException) as ctx:
+                    await self._create(**{**self.PLATFORMAI, field: " "})
+                self.assertEqual(ctx.exception.status_code, 422)
+                self.assertIn(field, ctx.exception.detail)
+        with self.assertRaises(HTTPException):
+            await self._create(**{**self.PLATFORMAI, "oauth_refresh_token": MASK})
+        with self.assertRaises(HTTPException):
+            await self._create(**{**self.API_KEY_PROVIDER, "api_key": MASK})
+
+    def test_model_names_validated(self):
+        with self.assertRaises(ValueError):
+            ProviderCredentialsCreate.model_validate({**self.API_KEY_PROVIDER, "deployments": ["bad name"]})
+
+    async def test_upsert_keeps_stored_secrets_when_omitted(self):
+        await self._create(**self.PLATFORMAI)
+        fields = {k: v for k, v in self.PLATFORMAI.items() if k not in ("oauth_refresh_token", "oauth_client_secret")}
+        await self._create(upsert=True, **fields, pai_token_id="42")
+        row = await self._row("platformai:main")
+        self.assertEqual((row["oauth_refresh_token"], row["pai_token_id"]), (REFRESH, "42"))
+
+    async def test_put_keeps_masked_secrets_and_clears_overrides(self):
+        await self._create(**self.PLATFORMAI)
+        await self._update("platformai:main", oauth_refresh_token=MASK, oauth_client_secret=MASK,
+                           pai_token_id="42", deployments=["gpt-5.5", ""])
+        row = await self._row("platformai:main")
+        self.assertEqual((row["oauth_refresh_token"], row["oauth_client_secret"]), (REFRESH, CLIENT_SECRET))
+        self.assertEqual((row["pai_token_id"], row["deployments_json"]), ("42", '["gpt-5.5"]'))
+        await self._update("platformai:main", pai_token_id="")  # empty clears the override
+        self.assertIsNone((await self._row("platformai:main"))["pai_token_id"])
+        with self.assertRaises(HTTPException) as ctx:
+            await self._update("platformai:main", deployments=["bad name"])
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    async def test_switching_api_key_to_oauth_clears_the_key(self):
+        await self._create(**self.API_KEY_PROVIDER)
+        await self._update("platformai:key", api_key="", oauth_client_id="1000.C", oauth_refresh_token=REFRESH)
+        row = await self._row("platformai:key")
+        self.assertIsNone(row["api_key"])
+        self.assertEqual(row["oauth_refresh_token"], REFRESH)
+
+    async def test_rename_keeps_oauth_columns(self):
+        await self._create(**{**self.PLATFORMAI, "oauth_accounts_url": "https://accounts.example",
+                              "pai_token_id": "42"})
+        await self._update("platformai:main", instance_name="renamed", oauth_refresh_token=MASK)
+        row = await self._row("platformai:renamed")
+        self.assertEqual(row["oauth_refresh_token"], REFRESH)
+        self.assertEqual(row["oauth_accounts_url"], "https://accounts.example")
+        self.assertEqual(row["oauth_client_id"], "1000.CLIENT")
+        self.assertEqual(row["pai_token_id"], "42")
+
+    async def test_export_gates_secrets_and_import_round_trips(self):
+        await self._create(**{**self.PLATFORMAI, "pai_token_id": "42"})
+        redacted = (await self._export())["providers"][0]
+        self.assertIsNone(redacted["oauth_refresh_token"])
+        self.assertIsNone(redacted["oauth_client_secret"])
+        self.assertEqual((redacted["oauth_client_id"], redacted["pai_token_id"]), ("1000.CLIENT", "42"))
+        full = await self._export(include_secrets=True)
+        self.assertEqual(full["providers"][0]["oauth_refresh_token"], REFRESH)
+        await self._set_column("platformai:main", "oauth_refresh_token", "stale")
+        await self._import(full)
+        self.assertEqual((await self._row("platformai:main"))["oauth_refresh_token"], REFRESH)
+
+
 if __name__ == "__main__":
     unittest.main()

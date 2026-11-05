@@ -1563,8 +1563,12 @@ async def update_provider_credentials(
 
 
 # Optional provider fields where an empty string from the admin form means
-# "clear this override" rather than "leave unchanged".
-_CLEARABLE_PROVIDER_FIELDS = frozenset({"anthropic_base_url", "anthropic_auth_style"})
+# "clear this override" rather than "leave unchanged". api_key is listed for
+# PlatformAI, whose form clears it to switch the provider to OAuth; other
+# forms never send an empty api_key.
+_CLEARABLE_PROVIDER_FIELDS = frozenset({
+    "anthropic_base_url", "anthropic_auth_style", "oauth_accounts_url", "pai_token_id", "api_key",
+})
 
 
 def _provider_update_fields(provider_type: str, kwargs: dict) -> dict:
@@ -1651,6 +1655,11 @@ async def _rename_provider_with_models(
             supported_apis=fields.get('supported_apis', old_credentials.supported_apis),
             anthropic_base_url=fields.get('anthropic_base_url', old_credentials.anthropic_base_url),
             anthropic_auth_style=fields.get('anthropic_auth_style', old_credentials.anthropic_auth_style),
+            oauth_client_id=fields.get('oauth_client_id', old_credentials.oauth_client_id),
+            oauth_client_secret=fields.get('oauth_client_secret', old_credentials.oauth_client_secret),
+            oauth_refresh_token=fields.get('oauth_refresh_token', old_credentials.oauth_refresh_token),
+            oauth_accounts_url=fields.get('oauth_accounts_url', old_credentials.oauth_accounts_url),
+            pai_token_id=fields.get('pai_token_id', old_credentials.pai_token_id),
         )
         
         # Add new provider to session
@@ -3437,8 +3446,17 @@ async def _run_auto_migrations():
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add supported_apis column: {e}")
 
-        # Native-Anthropic overrides for custom providers.
-        for column_name, column_type in (("anthropic_base_url", "VARCHAR(500)"), ("anthropic_auth_style", "VARCHAR(20)")):
+        # Native-Anthropic overrides for custom providers, and PlatformAI's
+        # Zoho OAuth credentials / BYOK token id.
+        for column_name, column_type in (
+            ("anthropic_base_url", "VARCHAR(500)"),
+            ("anthropic_auth_style", "VARCHAR(20)"),
+            ("oauth_client_id", "VARCHAR(200)"),
+            ("oauth_client_secret", "VARCHAR(500)"),
+            ("oauth_refresh_token", "VARCHAR(1000)"),
+            ("oauth_accounts_url", "VARCHAR(500)"),
+            ("pai_token_id", "VARCHAR(30)"),
+        ):
             try:
                 result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))
                 columns = [row[1] for row in result.fetchall()]
@@ -3599,7 +3617,7 @@ async def _run_auto_migrations():
             ))
             await conn.execute(text(
                 "UPDATE provider_credentials SET supported_apis = '[\"openai\", \"anthropic\"]' "
-                "WHERE supported_apis IS NULL AND provider_type = 'bedrock'"
+                "WHERE supported_apis IS NULL AND provider_type IN ('bedrock', 'platformai')"
             ))
             await conn.execute(text(
                 "UPDATE provider_credentials SET supported_apis = '[\"openai\"]' "

@@ -51,6 +51,7 @@ from app.auth.models import (
     ProfileMemberResponse, UserProfileAssign, ProviderConfigurationResponse, ModelConfigurationResponse,
     ModelManagementTree, ToggleRequest, BulkToggleRequest, BulkUserActionRequest, ModelSearchResponse,
     ProviderCredentialsCreate, ProviderCredentialsUpdate, ProviderCredentialsResponse,
+    _platformai_model_names,
     AdminPasswordReset, AdminUserModify, VALID_AZURE_BACKENDS,
     UserManagementSettingsResponse, UserManagementSettingsUpdate,
     ModelGroupCreate, ModelGroupUpdate, ModelGroupMembersUpdate, ModelGroupResponse,
@@ -84,7 +85,7 @@ _SECRET_MASK = "********"
 # Secret fields that _mask_secret masks in read/detail responses. A client
 # echoing the mask back on update means "leave unchanged", so these values
 # must never be persisted (see _strip_masked_secrets).
-_MASKED_SECRET_FIELDS = ("api_key", "secret_access_key")
+_MASKED_SECRET_FIELDS = ("api_key", "secret_access_key", "oauth_client_secret", "oauth_refresh_token")
 
 
 def _mask_secret(value: Optional[str]) -> Optional[str]:
@@ -107,6 +108,17 @@ def _strip_masked_secrets(update_data: dict) -> dict:
         if update_data.get(field) == _SECRET_MASK:
             update_data.pop(field)
     return update_data
+
+
+def _platformai_response_fields(credentials) -> dict:
+    """PlatformAI credential fields for a provider response, secrets masked."""
+    return {
+        "oauth_client_id": getattr(credentials, "oauth_client_id", None),
+        "oauth_client_secret": _mask_secret(getattr(credentials, "oauth_client_secret", None)),
+        "oauth_refresh_token": _mask_secret(getattr(credentials, "oauth_refresh_token", None)),
+        "oauth_accounts_url": getattr(credentials, "oauth_accounts_url", None),
+        "pai_token_id": getattr(credentials, "pai_token_id", None),
+    }
 
 
 def _provider_update_data(provider_data: BaseModel, *, exclude: tuple = ()) -> dict:
@@ -2915,6 +2927,7 @@ async def get_provider_credential(
             supported_apis=supported_apis,
             anthropic_base_url=credentials.anthropic_base_url,
             anthropic_auth_style=credentials.anthropic_auth_style,
+            **_platformai_response_fields(credentials),
             created_at=credentials.created_at,
             updated_at=credentials.updated_at
         )
@@ -3003,6 +3016,25 @@ async def create_provider_credential(
                     inferred_apis.append("anthropic")
                 provider_data.supported_apis = inferred_apis
 
+            if provider_data.provider_type == "platformai":
+                # Required only here: an upsert of an existing provider keeps the stored values.
+                def _given(name):
+                    value = (getattr(provider_data, name) or "").strip()
+                    return bool(value) and value != _SECRET_MASK
+
+                if not _given("api_key"):
+                    missing = [n for n in ("oauth_client_id", "oauth_refresh_token") if not _given(n)]
+                    if missing:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=(
+                                "A PlatformAI provider needs an api_key, or oauth_client_id and "
+                                f"oauth_refresh_token (missing: {' and '.join(missing)})."
+                            ),
+                        )
+                if not provider_data.supported_apis:
+                    provider_data.supported_apis = ["openai", "anthropic"]
+
             # Serialize supported_apis for storage
             supported_apis_json = None
             if provider_data.supported_apis:
@@ -3030,6 +3062,11 @@ async def create_provider_credential(
                 supported_apis=supported_apis_json,
                 anthropic_base_url=provider_data.anthropic_base_url,
                 anthropic_auth_style=provider_data.anthropic_auth_style,
+                oauth_client_id=provider_data.oauth_client_id,
+                oauth_client_secret=provider_data.oauth_client_secret,
+                oauth_refresh_token=provider_data.oauth_refresh_token,
+                oauth_accounts_url=provider_data.oauth_accounts_url,
+                pai_token_id=provider_data.pai_token_id,
             )
             
             logging.info(f"✅ Provider credentials created: {credentials.provider_key}")
@@ -3073,6 +3110,7 @@ async def create_provider_credential(
             supported_apis=supported_apis,
             anthropic_base_url=credentials.anthropic_base_url,
             anthropic_auth_style=credentials.anthropic_auth_style,
+            **_platformai_response_fields(credentials),
             created_at=credentials.created_at,
             updated_at=credentials.updated_at
         )
@@ -3119,6 +3157,15 @@ async def update_provider_credential(
         decoded_provider_key = urllib.parse.unquote(provider_key)
         
         update_data = _provider_update_data(provider_data)
+
+        if update_data.get("deployments") is not None:
+            # Update payloads carry no provider_type; validate against the stored one.
+            stored = await get_provider_credentials(db, decoded_provider_key)
+            if stored is not None and stored.provider_type == "platformai":
+                try:
+                    update_data["deployments"] = _platformai_model_names(update_data["deployments"])
+                except ValueError as e:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
         credentials = await update_provider_credentials(db, decoded_provider_key, **update_data)
         if not credentials:
@@ -3168,6 +3215,7 @@ async def update_provider_credential(
             supported_apis=supported_apis,
             anthropic_base_url=credentials.anthropic_base_url,
             anthropic_auth_style=credentials.anthropic_auth_style,
+            **_platformai_response_fields(credentials),
             created_at=credentials.created_at,
             updated_at=credentials.updated_at
         )
@@ -3274,6 +3322,11 @@ async def export_provider_config(
                 "supported_apis": supported_apis,
                 "anthropic_base_url": cred.anthropic_base_url,
                 "anthropic_auth_style": cred.anthropic_auth_style,
+                "oauth_client_id": cred.oauth_client_id,
+                "oauth_client_secret": cred.oauth_client_secret if include_secrets else None,
+                "oauth_refresh_token": cred.oauth_refresh_token if include_secrets else None,
+                "oauth_accounts_url": cred.oauth_accounts_url,
+                "pai_token_id": cred.pai_token_id,
             })
 
         models_export = [
@@ -3427,6 +3480,11 @@ async def import_provider_config(
                     supported_apis=supported_apis_json,
                     anthropic_base_url=provider_data.get("anthropic_base_url"),
                     anthropic_auth_style=provider_data.get("anthropic_auth_style"),
+                    oauth_client_id=provider_data.get("oauth_client_id"),
+                    oauth_client_secret=provider_data.get("oauth_client_secret"),
+                    oauth_refresh_token=provider_data.get("oauth_refresh_token"),
+                    oauth_accounts_url=provider_data.get("oauth_accounts_url"),
+                    pai_token_id=provider_data.get("pai_token_id"),
                 )
 
                 if existing and overwrite:

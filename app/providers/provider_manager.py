@@ -25,6 +25,7 @@ from app.providers.custom_providers import create_custom_provider
 from app.providers.azure_provider import AzureProvider
 from app.providers.bedrock_provider import BedrockProvider
 from app.providers.google_provider import GoogleProvider
+from app.providers.platformai import PlatformAIProvider
 from app.providers.azure_deployments import build_azure_config_fields, merge_azure_deployments, normalize_azure_deployments
 from opentelemetry import trace
 from opentelemetry import context as otel_context
@@ -134,7 +135,10 @@ class ProviderManager:
             try:
                 # Close AsyncOpenAI / AsyncAzureOpenAI client
                 client = getattr(provider, 'client', None)
-                if client and hasattr(client, 'close'):
+                # Prefer aclose(): a raw httpx.AsyncClient has no close().
+                if client and hasattr(client, 'aclose'):
+                    await client.aclose()
+                elif client and hasattr(client, 'close'):
                     await client.close()
                 # Close separate responses client (e.g. Azure v1 client)
                 responses_client = getattr(provider, '_responses_client', None)
@@ -223,6 +227,7 @@ class ProviderManager:
                     'azure': AzureProvider,
                     'bedrock': BedrockProvider,
                     'google': GoogleProvider,
+                    'platformai': PlatformAIProvider,
                 }
                 
                 for cred in credentials_list:
@@ -266,6 +271,21 @@ class ProviderManager:
             config_dict.update({
                 'api_key': cred.api_key,
                 'base_url': cred.base_url
+            })
+        elif cred.provider_type == 'platformai':
+            config_dict.update({
+                'provider_key': cred.provider_key,
+                'base_url': cred.base_url,
+                'api_key': cred.api_key,
+                'oauth_accounts_url': getattr(cred, 'oauth_accounts_url', None),
+                'oauth_client_id': getattr(cred, 'oauth_client_id', None),
+                'oauth_client_secret': getattr(cred, 'oauth_client_secret', None),
+                'oauth_refresh_token': getattr(cred, 'oauth_refresh_token', None),
+                'pai_token_id': getattr(cred, 'pai_token_id', None),
+                # Admin-entered model list (the gateway has no listing endpoint).
+                'models': merge_azure_deployments(
+                    normalize_azure_deployments(getattr(cred, 'deployments_json', None))
+                ),
             })
         elif cred.provider_type == 'bedrock':
             config_dict.update({

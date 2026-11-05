@@ -7,7 +7,7 @@
 // them with this fixed placeholder (see _mask_secret in app/routes/admin.py).
 // These fields must never be pre-filled with (or submitted as) the mask.
 const SECRET_MASK = '********';
-const SECRET_FIELDS = ['api_key', 'secret_access_key'];
+const SECRET_FIELDS = ['api_key', 'secret_access_key', 'oauth_client_secret', 'oauth_refresh_token'];
 
 class ProviderFormManager {
     constructor() {
@@ -42,6 +42,9 @@ class ProviderFormManager {
                 break;
             case 'bedrock':
                 formFields = this.getBedrockFormFields();
+                break;
+            case 'platformai':
+                formFields = this.getPlatformAIFormFields();
                 break;
             case 'custom':
                 formFields = this.getCustomFormFields();
@@ -274,6 +277,118 @@ class ProviderFormManager {
         `;
     }
 
+    getPlatformAIFormFields() {
+        return `
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="mb-3">
+                        <label for="platformai_auth_mode" class="form-label">
+                            <i class="fas fa-user-lock"></i> Authentication <span class="text-danger">*</span>
+                        </label>
+                        <select id="platformai_auth_mode" class="form-select"
+                                onchange="window.ProviderFormManager.togglePlatformAIAuth()">
+                            <option value="api_key" selected>API key</option>
+                            <option value="oauth">Zoho OAuth</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="col-md-6">
+                    <div class="mb-3">
+                        <label for="base_url" class="form-label">
+                            <i class="fas fa-link"></i> Gateway URL
+                        </label>
+                        <input type="text" id="base_url" class="form-control"
+                               placeholder="https://platformai.zoho.in">
+                        <div class="form-text">Leave blank for https://platformai.zoho.in.</div>
+                    </div>
+                </div>
+            </div>
+            <div id="platformai-api-key-fields">
+                <div class="mb-3">
+                    <label for="api_key" class="form-label">
+                        <i class="fas fa-key"></i> API Key <span class="text-danger">*</span>
+                    </label>
+                    <input type="password" id="api_key" class="form-control" required autocomplete="off">
+                </div>
+            </div>
+            <div id="platformai-oauth-fields" style="display: none;">
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label for="oauth_client_id" class="form-label">
+                                <i class="fas fa-id-badge"></i> OAuth Client ID <span class="text-danger">*</span>
+                            </label>
+                            <input type="text" id="oauth_client_id" class="form-control"
+                                   placeholder="1000.xxxxxxxx" autocomplete="off">
+                            <div class="form-text">The client that issued the refresh token.</div>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label for="oauth_accounts_url" class="form-label">
+                                <i class="fas fa-user-shield"></i> Accounts URL
+                            </label>
+                            <input type="text" id="oauth_accounts_url" class="form-control"
+                                   placeholder="https://accounts.zoho.in">
+                        </div>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label for="oauth_refresh_token" class="form-label">
+                        <i class="fas fa-key"></i> Refresh Token <span class="text-danger">*</span>
+                    </label>
+                    <input type="password" id="oauth_refresh_token" class="form-control"
+                           placeholder="1000.xxxxxxxx.xxxxxxxx" autocomplete="off">
+                </div>
+                <div class="mb-3">
+                    <label for="oauth_client_secret" class="form-label">
+                        <i class="fas fa-lock"></i> OAuth Client Secret
+                    </label>
+                    <input type="password" id="oauth_client_secret" class="form-control"
+                           placeholder="Only for a confidential/self client" autocomplete="off">
+                </div>
+            </div>
+            <div class="mb-3">
+                <label for="platformai_models" class="form-label">
+                    <i class="fas fa-list"></i> Models <span class="text-danger">*</span>
+                </label>
+                <textarea id="platformai_models" class="form-control" rows="3"
+                          placeholder="claude-haiku-5-5, gpt-5.5"></textarea>
+                <div class="form-text">
+                    Model names exactly as PlatformAI spells them, comma- or newline-separated.
+                    PlatformAI has no model listing API, so only these are served.
+                </div>
+            </div>
+            <div class="mb-3">
+                <label for="pai_token_id" class="form-label">
+                    <i class="fas fa-tag"></i> BYOK Token ID
+                </label>
+                <input type="text" id="pai_token_id" class="form-control" inputmode="numeric"
+                       placeholder="Optional, e.g. 5434566543234">
+                <div class="form-text">
+                    Sent as <code>Z-Token-Id</code>: routes calls through a provider credential added on the
+                    console's Model Providers page instead of PlatformAI's metered access.
+                </div>
+            </div>
+        `;
+    }
+
+    togglePlatformAIAuth() {
+        const mode = document.getElementById('platformai_auth_mode')?.value || 'api_key';
+        const apiKeyFields = document.getElementById('platformai-api-key-fields');
+        const oauthFields = document.getElementById('platformai-oauth-fields');
+        if (apiKeyFields) apiKeyFields.style.display = mode === 'api_key' ? 'block' : 'none';
+        if (oauthFields) oauthFields.style.display = mode === 'oauth' ? 'block' : 'none';
+        // A masked (already stored) secret is never required again.
+        const require = (id, on) => {
+            const element = document.getElementById(id);
+            if (element) element.required = on && !element.dataset.stored;
+        };
+        require('api_key', mode === 'api_key');
+        require('oauth_client_id', mode === 'oauth');
+        require('oauth_refresh_token', mode === 'oauth');
+    }
+
     async submitProviderForm(event) {
         console.log('🚀 Form submission started - event:', event);
         event.preventDefault();
@@ -352,7 +467,7 @@ class ProviderFormManager {
             if (!isEdit) formData.enabled = true;
 
             // Collect provider-specific fields
-            const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name'];
+            const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name', 'oauth_client_id', 'oauth_client_secret', 'oauth_refresh_token', 'oauth_accounts_url', 'pai_token_id'];
             fields.forEach(field => {
                 const element = document.getElementById(field);
                 if (element && element.value.trim()) {
@@ -441,6 +556,34 @@ class ProviderFormManager {
                 formData.anthropic_base_url = anthropicBaseUrl;
                 const anthropicAuthStyle = document.getElementById('anthropic_auth_style');
                 formData.anthropic_auth_style = anthropicAuthStyle ? anthropicAuthStyle.value : '';
+            }
+
+            // PlatformAI: empty override fields clear previously saved values.
+            if (providerType === 'platformai') {
+                const value = id => (document.getElementById(id)?.value || '').trim();
+                const mode = value('platformai_auth_mode') || 'api_key';
+                formData.base_url = value('base_url');
+                formData.pai_token_id = value('pai_token_id');
+                if (formData.pai_token_id && !/^\d+$/.test(formData.pai_token_id)) {
+                    this.showFormAlert('danger', 'BYOK Token ID must be a number.');
+                    this.resetButtonState(submitBtn, btnContent, btnLoading);
+                    return;
+                }
+                if (mode === 'api_key') {
+                    // The API key wins over OAuth fields; drop them from this save.
+                    ['oauth_client_id', 'oauth_client_secret', 'oauth_refresh_token'].forEach(f => delete formData[f]);
+                } else {
+                    // Clearing the stored API key switches the provider to OAuth.
+                    formData.api_key = '';
+                    formData.oauth_accounts_url = value('oauth_accounts_url');
+                }
+                const models = value('platformai_models').split(/[\n,]+/).map(m => m.trim()).filter(Boolean);
+                if (models.length === 0) {
+                    this.showFormAlert('danger', 'List at least one PlatformAI model.');
+                    this.resetButtonState(submitBtn, btnContent, btnLoading);
+                    return;
+                }
+                formData.deployments = [...new Set(models)];
             }
 
             const url = isEdit && window.currentEditingProvider ? 
@@ -644,7 +787,7 @@ class ProviderFormManager {
 
     populateProviderFields(provider) {
         // Populate common fields
-        const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name'];
+        const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name', 'oauth_client_id', 'oauth_client_secret', 'oauth_refresh_token', 'oauth_accounts_url', 'pai_token_id'];
         fields.forEach(field => {
             const element = document.getElementById(field);
             if (element && provider[field]) {
@@ -688,6 +831,18 @@ class ProviderFormManager {
             if (provider.dynamic_discovery !== true) {
                 window.AzureManager.setDeploymentGroups(provider.deployment_groups);
             }
+        }
+
+        if (provider.provider_type === 'platformai') {
+            ['api_key', 'oauth_client_secret', 'oauth_refresh_token'].forEach(id => {
+                const element = document.getElementById(id);
+                if (element && provider[id] === SECRET_MASK) element.dataset.stored = '1';
+            });
+            const mode = document.getElementById('platformai_auth_mode');
+            if (mode) mode.value = provider.api_key ? 'api_key' : (provider.oauth_refresh_token ? 'oauth' : 'api_key');
+            const models = document.getElementById('platformai_models');
+            if (models) models.value = (provider.deployments || []).join('\n');
+            this.togglePlatformAIAuth();
         }
 
         // Custom providers: each filled base URL marks a natively supported API.
