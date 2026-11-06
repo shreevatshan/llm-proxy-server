@@ -174,9 +174,12 @@ class AzureProvider(OpenAICompatibleProvider):
         # Azure's v1 API (GA Aug 2025) uses /openai/v1/ base path with standard OpenAI()
         # client.  This replaces the need for api-version and AzureOpenAI() for v1 callers.
         # See: https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle
+        from app.providers.url_guard import http_client_for
         self._v1_client = AsyncOpenAI(
             base_url=f"{self.endpoint}/openai/v1/",
-            api_key=self.api_key
+            api_key=self.api_key,
+            # BYOK: no redirects, every request's destination re-checked (url_guard).
+            http_client=http_client_for(config),
         )
         # Backward-compat alias used by OpenAICompatibleProvider._get_responses_client()
         self._responses_client = self._v1_client
@@ -213,7 +216,11 @@ class AzureProvider(OpenAICompatibleProvider):
     def _init_foundry_anthropic_client(self) -> None:
         try:
             from anthropic import AsyncAnthropic
+            from app.providers.url_guard import http_client_for
+            guarded = http_client_for(getattr(self, "config", None))
+            extra = {"http_client": guarded} if guarded is not None else {}
             self._anthropic_client = AsyncAnthropic(
+                **extra,
                 base_url=f"{self.endpoint}/anthropic",
                 api_key=self.api_key,
                 # Explicit timeout disables the SDK's client-side non-streaming
@@ -295,10 +302,12 @@ class AzureProvider(OpenAICompatibleProvider):
             _evicted_key, evicted = self._deployment_clients.popitem(last=False)
             self._schedule_client_close(evicted)
 
+        from app.providers.url_guard import http_client_for
         client = AsyncAzureOpenAI(
             azure_endpoint=self.endpoint,
             api_key=self.api_key,
             api_version=eff,
+            http_client=http_client_for(getattr(self, "config", None)),
         )
         self._deployment_clients[eff] = client
         return client
@@ -526,7 +535,9 @@ class AzureProvider(OpenAICompatibleProvider):
 
             import aiohttp  # already in requirements; local import keeps the module usable
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, params=params) as response:
+                # BYOK endpoints never follow redirects (url_guard).
+                allow_redirects = not (getattr(self, "config", None) or {}).get("byok")
+                async with session.get(url, headers=headers, params=params, allow_redirects=allow_redirects) as response:
                     if response.status == 200:
                         data = await response.json()
                         models = [

@@ -79,6 +79,12 @@ async def sync_provider_models(db: AsyncSession, provider_key: str) -> Dict[str,
             add_span_attributes(span, {
                 "provider.type": provider_creds.provider_type
             })
+
+            owner = getattr(provider_creds, "owner_user_id", None)
+            if isinstance(owner, int) and (not provider_creds.enabled or provider_creds.admin_disabled):
+                # A disabled BYOK instance is not contacted at all (its owner's
+                # credentials stay unused while it is off, whoever switched it off).
+                return {"error": "Instance is disabled"}
             
             # Handle different provider types
             if provider_creds.provider_type == "azure":
@@ -374,36 +380,10 @@ async def _create_provider_instance(provider_creds):
     Create a provider instance from credentials for model discovery.
     """
     try:
-        # Import provider classes
-        from app.providers.azure_provider import AzureProvider
-        from app.providers.bedrock_provider import BedrockProvider
-        from app.providers.google_provider import GoogleProvider
-        from app.providers.platformai import PlatformAIProvider
-        from app.providers.custom_providers import create_custom_provider
-        
-        # Map specific provider types to their implementations
-        specialized_providers = {
-            'azure': AzureProvider,
-            'bedrock': BedrockProvider,
-            'google': GoogleProvider,
-            'platformai': PlatformAIProvider,
-        }
-        
-        # Reuse the runtime provider config builder so discovery instances are
-        # configured identically to the serving instances (the previous local
-        # builder diverged: it omitted base_url for OpenAI and cross-region /
-        # app-profile flags + base_url for Bedrock, so discovery could see a
-        # different model set than runtime).
-        config = provider_manager._create_provider_config(provider_creds)
-
-        # Use specialized provider if available, otherwise use custom provider
-        if provider_creds.provider_type in specialized_providers:
-            provider_class = specialized_providers[provider_creds.provider_type]
-            return provider_class(config)
-        else:
-            # All other providers (custom / openai_compatible)
-            return create_custom_provider(config)
-
+        # Reuse the runtime provider builder so discovery instances are configured
+        # identically to the serving instances (same config and provider class;
+        # a BYOK row's SSRF check runs off the event loop).
+        return await provider_manager.build_provider(provider_creds)
     except Exception as e:
         print(f"Error creating provider instance: {e}")
         import traceback
@@ -671,3 +651,53 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
                 "action": action,
                 "error": error_msg
             }
+
+
+async def sync_byok_provider(db: AsyncSession, provider_key: str) -> Dict[str, Any]:
+    """Load and sync one BYOK (user-owned) instance, touching nothing else.
+
+    The admin path (auto_sync_on_provider_change) rebuilds the whole registry
+    first; a user saving their own instance must not cost everyone that. This
+    rebuilds just this instance (provider_manager.upsert_byok_provider), fetches
+    its models, and swaps its slice of the model cache under the cache's write
+    lock. Errors are shortened for display to the owner (no upstream bodies).
+    """
+    from app.providers.provider_manager import _sanitize_error
+
+    creds = await get_provider_credentials(db, provider_key)
+    if creds is None or not isinstance(getattr(creds, "owner_user_id", None), int):
+        return {"error": "Provider not found"}
+    if not creds.enabled or creds.admin_disabled:
+        await provider_manager.remove_byok_provider(provider_key, forget_owner=False)
+        return {"error": "Instance is disabled", "models": []}
+
+    build_error = await provider_manager.upsert_byok_provider(provider_key)
+    if build_error:
+        provider_manager.record_sync_status(provider_key, False, 0, build_error)
+        return {"error": build_error, "models": []}
+
+    started_at = time.time()
+    result = await sync_provider_models(db, provider_key)
+    model_ids = list(result.get("models") or []) if "error" not in result else []
+    synced = bool(model_ids)
+    error = None if synced else _sanitize_error(Exception(result.get("error") or "No models returned"))
+    recorded = provider_manager.record_sync_status(
+        provider_key, synced, len(model_ids), error, started_at=started_at,
+    )
+    if recorded:
+        models = [
+            ModelInfo(
+                id=model_id, object="model", created=int(time.time()),
+                owned_by=provider_key, provider=provider_key,
+            )
+            for model_id in model_ids
+        ]
+        # Locked read-modify-write of just this instance's slice.
+        await provider_manager.model_cache.update_provider_models(provider_key, models)
+        await provider_manager.refresh_model_configurations()
+        if synced:
+            provider_manager.mark_provider_synced(provider_key)
+    out = {"provider_key": provider_key, "models": model_ids, "model_count": len(model_ids)}
+    if error:
+        out["error"] = error
+    return out

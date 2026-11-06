@@ -908,7 +908,7 @@ def create_management_app(
     templates = Jinja2Templates(directory="app/frontend/templates")
     mgmt_app.mount("/static", StaticFiles(directory="app/frontend/static"), name="static")
 
-    from app.routes import auth, auth_pages, dashboard, admin, pools, user_websearch
+    from app.routes import auth, auth_pages, dashboard, admin, pools, user_websearch, user_providers
     mgmt_app.include_router(auth.router)
     # GET /login and /signup (shared flash/alert rendering).
     mgmt_app.include_router(auth_pages.router)
@@ -918,6 +918,8 @@ def create_management_app(
     # the /auth/ prefix already has — no middleware change needed.
     mgmt_app.include_router(pools.router)
     mgmt_app.include_router(user_websearch.router)
+    # A user's own provider instances (BYOK), /auth/providers: same CSRF coverage.
+    mgmt_app.include_router(user_providers.router)
 
     # HTML page loads that fail auth (401/403) redirect to the login page with a
     # flash instead of rendering raw JSON; API routes keep their JSON errors.

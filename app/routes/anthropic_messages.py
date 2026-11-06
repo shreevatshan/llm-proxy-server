@@ -22,6 +22,7 @@ from app.anthropic_models import (
     AnthropicErrorDetail,
     is_anthropic_terminal_stream_event,
 )
+from app.byok import byok_registry
 from app.providers.provider_manager import provider_manager
 from app.providers.custom_providers import CustomProvider
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
@@ -70,9 +71,10 @@ async def _check_model_exists(provider: object, model_name: str) -> str:
       "missing"          — not in cache, not found after a live refresh
     """
     cache = provider_manager.model_cache
-    cached_models = cache.get_enabled_models()
-    known_ids = {m.id for m in cached_models}
-    if model_name in known_ids:
+    # Existence only: access was already enforced by the caller. Not
+    # get_enabled_models(), which hides every BYOK model (it is the identity-less
+    # listing), so an owner's own model would always miss and refresh live.
+    if cache.has_model_id(model_name):
         return "cache_hit"
 
     # Cache miss — try a single live refresh to handle the staleness window.
@@ -510,15 +512,21 @@ async def count_message_tokens(
 
             model_name = payload.get("model", "")
             provider = None
+            # Someone else's BYOK model, named by an id the caller could not resolve:
+            # treated exactly like a name nothing serves (local estimate), so neither
+            # their credentials nor a 404-vs-estimate difference is reachable.
+            foreign_byok = False
             if isinstance(model_name, str) and model_name:
                 # Best-effort resolution: this endpoint deliberately degrades to a
                 # local estimate for models it cannot route, so an unresolvable or
                 # forbidden name must keep its raw form rather than raise.
+                resolved = False
                 try:
                     model_name = await resolve_model_for_request(
                         request_obj, auth, model_name, envelope_override="anthropic"
                     )
                     payload["model"] = model_name
+                    resolved = True
                 except ModelUnavailable as e:
                     # A model in outage is refused like everywhere else: degrading
                     # would send the count to the provider that is down.
@@ -526,7 +534,9 @@ async def count_message_tokens(
                         raise
                 except ModelAccessDenied:
                     pass
-                provider = await provider_manager.get_anthropic_provider_for_model(model_name)
+                foreign_byok = not resolved and byok_registry.is_byok_model(model_name)
+                if not foreign_byok:
+                    provider = await provider_manager.get_anthropic_provider_for_model(model_name)
 
             add_span_attributes(span, {
                 "anthropic.model": model_name,
@@ -535,7 +545,7 @@ async def count_message_tokens(
 
             # Per-user model access enforcement (no quota is spent) — this can
             # invoke provider.anthropic_count_tokens upstream, so gate it.
-            if isinstance(model_name, str) and model_name:
+            if isinstance(model_name, str) and model_name and not foreign_byok:
                 await enforce_access_and_limits(request_obj, auth, model_name, envelope_override="anthropic", consume_quota=False)
 
             if provider:

@@ -19,6 +19,7 @@ from fastapi import Request
 from app.api_envelope import envelope_for
 from app.auth.admin import AdminUser
 from app.auth.models import APIKey, User
+from app.byok import byok_registry, is_owner
 from app.concurrency_slots import charge_with_slot
 from app.model_access_dep import enforce_model_access
 from app.outages import outage_registry
@@ -74,7 +75,12 @@ async def enforce_group_rate_limit(
     if user_id is None or username is None:
         return
 
-    if rate_limit_tracker.group_for(model_id) == DEFAULT_GROUP_ID:
+    if is_owner(auth, byok_registry.owner_of_model(model_id)):
+        # The caller's own BYOK instance: they pay upstream, so no RPM/RPD/model-group
+        # or pool quota is charged (the request is still recorded as usage). The
+        # per-user concurrency slot is still taken: it protects the proxy itself.
+        charge = _no_charge
+    elif rate_limit_tracker.group_for(model_id) == DEFAULT_GROUP_ID:
         charge = lambda: rate_limit_tracker.check_and_increment(user_id, username)
     else:
         charge = lambda: rate_limit_tracker.check_group_limit(user_id, username, model_id)
@@ -82,6 +88,11 @@ async def enforce_group_rate_limit(
     decision = await charge_with_slot(request, user_id, charge)
     if decision is not None:
         _raise(request, decision, envelope_override)
+
+
+async def _no_charge():
+    """A charge that never denies: concurrency-only accounting (BYOK)."""
+    return None
 
 
 def enforce_not_in_outage(request: Request, model_id: Optional[str], envelope_override: Optional[str] = None) -> None:

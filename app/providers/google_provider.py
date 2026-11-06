@@ -48,7 +48,8 @@ class GoogleProvider(OpenAICompatibleProvider):
         super().__init__(config)
         
         # Get API key from config or environment
-        self.api_key = config.get('api_key') or os.getenv('GOOGLE_API_KEY')
+        # A BYOK instance never falls back to the server's own GOOGLE_API_KEY.
+        self.api_key = config.get('api_key') or (None if config.get('byok') else os.getenv('GOOGLE_API_KEY'))
         if not self.api_key:
             raise ValueError("Google API key is required. Set GOOGLE_API_KEY environment variable or provide in config.")
         
@@ -56,9 +57,12 @@ class GoogleProvider(OpenAICompatibleProvider):
         self.base_url = config.get('base_url') or "https://generativelanguage.googleapis.com/v1beta/openai/"
         
         # Initialize OpenAI client with configurable endpoint
+        from app.providers.url_guard import http_client_for
         self.client = AsyncOpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            # BYOK: no redirects, every request's destination re-checked (url_guard).
+            http_client=http_client_for(config),
         )
         
         #print(f"[GOOGLE_PROVIDER] Initialized with OpenAI-compatible API at {self.base_url}")

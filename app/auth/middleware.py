@@ -55,12 +55,25 @@ async def verify_response_ownership(response_id: str, auth) -> None:
     or admin-created responses) is treated as unowned and allowed. Otherwise the
     caller must match the recorded ``user_id`` or the request is rejected with a
     404 (not 403, to avoid confirming the response exists).
+
+    A response stored on a BYOK instance (app/byok.py) is an exception to all of
+    the above: retrieve/delete/cancel run on the owner's credentials, so only the
+    instance's owner passes -- not the admin, not an unowned mapping.
     """
-    if isinstance(auth, AdminUser):
-        return
+    from app.byok import byok_registry, is_owner
     from .database import AsyncSessionLocal as _SessionLocal, get_response_provider_mapping
+    if isinstance(auth, AdminUser) and not byok_registry.all_keys():
+        return  # nothing BYOK exists: keep the admin's bypass free of a DB read
     async with _SessionLocal() as db:
         mapping = await get_response_provider_mapping(db, response_id)
+    if mapping is not None:
+        owner = byok_registry.owner_of(getattr(mapping, "provider_key", None))
+        if owner is not None:
+            if not is_owner(auth, owner):
+                raise HTTPException(status_code=404, detail="Response not found")
+            return
+    if isinstance(auth, AdminUser):
+        return
     if mapping is not None and mapping.user_id is not None:
         if mapping.user_id != get_owner_user_id(auth):
             raise HTTPException(status_code=404, detail="Response not found")

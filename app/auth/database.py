@@ -7,7 +7,7 @@ import hashlib
 import functools
 import logging
 from pathlib import Path
-from sqlalchemy import create_engine, event, false, String
+from sqlalchemy import create_engine, event, false, func, String
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, Session, selectinload
 from sqlalchemy.future import select
@@ -996,6 +996,20 @@ async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
         ):
             await db.execute(_sql_delete(_model).where(_model.user_id == user_id))
 
+        # BYOK instances (and their models and references) go with the account: a
+        # reused user id must never inherit someone else's upstream credentials.
+        # The in-memory registry is cleaned up by the caller after commit
+        # (provider_manager.remove_byok_provider; see pools.delete_user_account).
+        owned = await get_user_provider_credentials(db, user_id)
+        owned_keys = [cred.provider_key for cred in owned]
+        if owned_keys:
+            await db.execute(
+                _sql_delete(ModelConfiguration).where(ModelConfiguration.provider_key.in_(owned_keys))
+            )
+            await _remove_model_references(db, provider_keys=owned_keys)
+            for cred in owned:
+                await db.delete(cred)
+
         # Usage rows are keyed by user_id and go with the account, so a later user
         # who takes this username inherits neither the history nor today's quota.
         # Callers hold request_tracker.pause_flush() around this and drop the
@@ -1013,9 +1027,30 @@ async def permanently_delete_user(db: AsyncSession, user_id: int) -> bool:
 
 # Model Management Database Operations (Updated to use unified ProviderCredentials system)
 
-async def get_all_provider_configurations(db: AsyncSession) -> List[ProviderCredentials]:
-    """Get all provider credentials (for backward compatibility with admin interface)."""
-    result = await db.execute(select(ProviderCredentials))
+def _global_providers_only():
+    """WHERE clause for global (admin) provider rows: BYOK rows have an owner."""
+    return ProviderCredentials.owner_user_id.is_(None)
+
+
+def _global_models_only():
+    """WHERE clause for models of global providers (excludes every BYOK instance's models)."""
+    return ModelConfiguration.provider_key.notin_(
+        select(ProviderCredentials.provider_key).where(ProviderCredentials.owner_user_id.isnot(None))
+    )
+
+
+async def get_all_provider_configurations(
+    db: AsyncSession, include_byok: bool = False,
+) -> List[ProviderCredentials]:
+    """Get provider credentials (for backward compatibility with admin interface).
+
+    BYOK (user-owned) rows are left out unless ``include_byok``: admin tooling must
+    never list or sweep them (app/byok.py).
+    """
+    query = select(ProviderCredentials)
+    if not include_byok:
+        query = query.where(_global_providers_only())
+    result = await db.execute(query)
     return result.scalars().all()
 
 
@@ -1058,9 +1093,18 @@ async def get_model_configuration(db: AsyncSession, model_id: str) -> Optional[M
     return result.scalar_one_or_none()
 
 
-async def get_all_model_configurations(db: AsyncSession) -> List[ModelConfiguration]:
-    """Get all model configurations."""
-    result = await db.execute(select(ModelConfiguration))
+async def get_all_model_configurations(
+    db: AsyncSession, include_byok: bool = False,
+) -> List[ModelConfiguration]:
+    """Get model configurations.
+
+    Models of BYOK (user-owned) instances are left out unless ``include_byok``, so
+    admin listings, bulk toggles, refresh and stale-model sweeps never touch them.
+    """
+    query = select(ModelConfiguration)
+    if not include_byok:
+        query = query.where(_global_models_only())
+    result = await db.execute(query)
     return result.scalars().all()
 
 
@@ -1387,7 +1431,8 @@ async def search_models_and_providers(db: AsyncSession, query: str) -> Dict[str,
     # Search models
     models_result = await db.execute(
         select(ModelConfiguration).where(
-            ModelConfiguration.model_name.ilike(f"%{query}%")
+            ModelConfiguration.model_name.ilike(f"%{query}%"),
+            _global_models_only(),
         )
     )
     models = models_result.scalars().all()
@@ -1398,7 +1443,8 @@ async def search_models_and_providers(db: AsyncSession, query: str) -> Dict[str,
             (ProviderCredentials.instance_name.ilike(f"%{query}%")) |
             (ProviderCredentials.provider_name.ilike(f"%{query}%")) |
             (ProviderCredentials.provider_type.ilike(f"%{query}%")) |
-            (ProviderCredentials.provider_key.ilike(f"%{query}%"))
+            (ProviderCredentials.provider_key.ilike(f"%{query}%")),
+            _global_providers_only(),
         )
     )
     providers = providers_result.scalars().all()
@@ -1410,15 +1456,22 @@ async def search_models_and_providers(db: AsyncSession, query: str) -> Dict[str,
 
 
 async def get_model_configurations_dict(db: AsyncSession) -> Dict[str, bool]:
-    """Get model configurations as a dictionary for caching."""
-    models = await get_all_model_configurations(db)
+    """Get model configurations as a dictionary for caching (BYOK included)."""
+    models = await get_all_model_configurations(db, include_byok=True)
     return {model.model_id: model.is_enabled for model in models}
 
 
 async def get_provider_configurations_dict(db: AsyncSession) -> Dict[str, bool]:
-    """Get provider configurations as a dictionary for caching (uses ProviderCredentials now)."""
-    providers = await get_all_provider_configurations(db)
-    return {provider.provider_key: provider.enabled for provider in providers}  # Changed from is_enabled to enabled
+    """Get provider configurations as a dictionary for caching (BYOK included).
+
+    A provider the admin switched off (admin_disabled, BYOK only) is off whatever its
+    owner's own flag says.
+    """
+    providers = await get_all_provider_configurations(db, include_byok=True)
+    return {
+        provider.provider_key: bool(provider.enabled) and not bool(getattr(provider, "admin_disabled", False))
+        for provider in providers
+    }
 
 
 # Provider Credentials Database Operations
@@ -1431,10 +1484,77 @@ async def get_provider_credentials(db: AsyncSession, provider_key: str) -> Optio
     return result.scalar_one_or_none()
 
 
-async def get_all_provider_credentials(db: AsyncSession) -> List[ProviderCredentials]:
-    """Get all provider credentials."""
-    result = await db.execute(select(ProviderCredentials))
+async def get_all_provider_credentials(
+    db: AsyncSession, include_byok: bool = False,
+) -> List[ProviderCredentials]:
+    """Get provider credentials.
+
+    Global (admin) rows only unless ``include_byok``. Only the provider registry
+    loader needs BYOK rows; every admin listing, export and sweep must not see them.
+    """
+    query = select(ProviderCredentials)
+    if not include_byok:
+        query = query.where(_global_providers_only())
+    result = await db.execute(query)
     return result.scalars().all()
+
+
+async def get_global_provider_credentials(db: AsyncSession) -> List[ProviderCredentials]:
+    """Global (admin-managed) provider rows only."""
+    return await get_all_provider_credentials(db, include_byok=False)
+
+
+async def get_user_provider_credentials(db: AsyncSession, user_id: int) -> List[ProviderCredentials]:
+    """The BYOK instances one user owns, oldest first."""
+    result = await db.execute(
+        select(ProviderCredentials)
+        .where(ProviderCredentials.owner_user_id == user_id)
+        .order_by(ProviderCredentials.created_at, ProviderCredentials.id)
+    )
+    return result.scalars().all()
+
+
+async def get_user_provider_credential(
+    db: AsyncSession, user_id: int, provider_key: str,
+) -> Optional[ProviderCredentials]:
+    """One BYOK instance, only if ``user_id`` owns it (the IDOR guard: filter on both)."""
+    result = await db.execute(
+        select(ProviderCredentials).where(
+            ProviderCredentials.provider_key == provider_key,
+            ProviderCredentials.owner_user_id == user_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def count_user_providers(db: AsyncSession, user_id: int) -> int:
+    result = await db.execute(
+        select(func.count(ProviderCredentials.id)).where(ProviderCredentials.owner_user_id == user_id)
+    )
+    return int(result.scalar() or 0)
+
+
+async def get_all_byok_provider_credentials(db: AsyncSession) -> List[Tuple[ProviderCredentials, Optional[str]]]:
+    """Every BYOK instance with its owner's username (None if the user row is gone)."""
+    result = await db.execute(
+        select(ProviderCredentials, User.username)
+        .outerjoin(User, User.id == ProviderCredentials.owner_user_id)
+        .where(ProviderCredentials.owner_user_id.isnot(None))
+        .order_by(ProviderCredentials.owner_user_id, ProviderCredentials.provider_key)
+    )
+    return [(row[0], row[1]) for row in result.all()]
+
+
+async def count_models_by_provider(db: AsyncSession, provider_keys: List[str]) -> Dict[str, int]:
+    """Model rows per provider_key, for the given keys."""
+    if not provider_keys:
+        return {}
+    result = await db.execute(
+        select(ModelConfiguration.provider_key, func.count(ModelConfiguration.id))
+        .where(ModelConfiguration.provider_key.in_(list(provider_keys)))
+        .group_by(ModelConfiguration.provider_key)
+    )
+    return {pk: int(n) for pk, n in result.all()}
 
 
 async def create_provider_credentials(
@@ -1534,6 +1654,11 @@ async def update_provider_credentials(
         if new_provider_name and new_provider_name != credentials.provider_name:
             key_will_change = True
         
+        if key_will_change and credentials.owner_user_id is not None:
+            # A BYOK instance's key is its identity: usage history, the owner map and
+            # the user's clients all name it. Never re-key one.
+            raise ValueError("A BYOK instance's provider name and instance name cannot be changed")
+
         if key_will_change:
             # Generate new provider key using provider_name:instance_name format
             final_instance_name = new_instance_name or credentials.instance_name
@@ -1660,6 +1785,10 @@ async def _rename_provider_with_models(
             oauth_refresh_token=fields.get('oauth_refresh_token', old_credentials.oauth_refresh_token),
             oauth_accounts_url=fields.get('oauth_accounts_url', old_credentials.oauth_accounts_url),
             pai_token_id=fields.get('pai_token_id', old_credentials.pai_token_id),
+            # Never dropped by a rename: losing owner_user_id would turn a user's
+            # private instance into a global one.
+            owner_user_id=old_credentials.owner_user_id,
+            admin_disabled=bool(old_credentials.admin_disabled),
         )
         
         # Add new provider to session
@@ -2602,6 +2731,50 @@ def _window_tables(window: str, year: Optional[int], month: Optional[int]):
     return [(RequestUsage, [RequestUsage.date >= today - timedelta(days=29)])]  # default 30d
 
 
+def _instance_of(model: Optional[str]) -> Optional[str]:
+    """The provider_key of a usage row's model, or None for a model without one."""
+    if not model or "/" not in model:
+        return None
+    return model.split("/", 1)[0]
+
+
+def _byok_owner_from_key(provider_key: str) -> Optional[int]:
+    """The owner id embedded in a BYOK instance name ('x:byok-42-slug' -> 42)."""
+    from app.byok import BYOK_INSTANCE_PREFIX, instance_part
+    rest = instance_part(provider_key)[len(BYOK_INSTANCE_PREFIX):]
+    head = rest.split("-", 1)[0]
+    return int(head) if head.isdigit() else None
+
+
+def fold_usage_by_instance(per_model: list, per_user: list) -> list:
+    """per_model rows folded by instance (provider_key), BYOK instances flagged.
+
+    The owner of a BYOK instance is read from its name (byok-{user_id}-…) and
+    labelled from per_user. Only the owner can produce a BYOK instance's rows (any
+    other caller is refused, and refused requests are not counted), and a deleted
+    user's usage goes with the account. Models without an instance prefix go into a
+    single "(unattributed)" bucket rather than surfacing as fake instances.
+    """
+    from app.byok import is_byok_provider_key
+    labels = {r["user_id"]: r.get("user_identity") for r in per_user}
+    folded: dict = {}
+    for r in per_model:
+        key = _instance_of(r["model"]) or "(unattributed)"
+        folded[key] = folded.get(key, 0) + int(r["request_count"])
+    out = []
+    for key, count in folded.items():
+        byok = key != "(unattributed)" and is_byok_provider_key(key)
+        owner_id = _byok_owner_from_key(key) if byok else None
+        out.append({
+            "provider_key": key,
+            "request_count": count,
+            "is_byok": byok,
+            "owner_user_id": owner_id,
+            "owner_identity": labels.get(owner_id) if owner_id is not None else None,
+        })
+    return sorted(out, key=lambda x: (-x["request_count"], x["provider_key"]))
+
+
 async def get_usage_aggregates(
     db: AsyncSession,
     filter_user_id: Optional[int] = None,
@@ -2609,6 +2782,7 @@ async def get_usage_aggregates(
     window: str = "30d",
     year: Optional[int] = None,
     month: Optional[int] = None,
+    filter_instance: Optional[str] = None,
 ) -> dict:
     """Return aggregated usage data for the requested time window.
 
@@ -2631,12 +2805,34 @@ async def get_usage_aggregates(
             where.append(tbl.user_id == filter_user_id)
         if filter_model is not None:
             where.append(tbl.model == filter_model)
+        if filter_instance is not None:
+            where.append(_on_instance(tbl.model, filter_instance))
         return where
 
     tables = _window_tables(window, year, month)
     result: dict = {"window": window}
     if window == "month" and year and month:
         result.update({"year": year, "month": month})
+
+    if filter_instance is not None and filter_model is None:
+        # One instance: its models, and who sent the requests.
+        row_sets = [
+            (await db.execute(_model_rows_q(tbl, where + _filters(tbl)))).all()
+            for tbl, where in tables
+        ]
+        user_rows: list = []
+        for tbl, where in tables:
+            user_rows.extend((await db.execute(_user_rows_q(tbl, where + _filters(tbl)))).all())
+        from app.byok import is_byok_provider_key
+        result["breakdown"] = _merge_model_rows(*row_sets)
+        result["breakdown_users"] = _fold_identities(_user_row_dicts(user_rows))
+        result["instance"] = {
+            "provider_key": filter_instance,
+            "is_byok": is_byok_provider_key(filter_instance),
+            "owner_user_id": _byok_owner_from_key(filter_instance)
+            if is_byok_provider_key(filter_instance) else None,
+        }
+        return result
 
     if filter_user_id is not None or filter_model is not None:
         if filter_model is not None:
@@ -2659,15 +2855,22 @@ async def get_usage_aggregates(
         user_rows.extend((await db.execute(_user_rows_q(tbl, where))).all())
         model_row_sets.append((await db.execute(_model_rows_q(tbl, where))).all())
 
+    from app.byok import is_byok_model
     per_user = _fold_identities(_user_row_dicts(user_rows))
     per_model = _merge_model_rows(*model_row_sets)
+    for r in per_model:
+        r["is_byok"] = is_byok_model(r["model"])
+    per_instance = fold_usage_by_instance(per_model, per_user)
     result.update({
         "per_user": per_user,
         "per_model": per_model,
+        "per_instance": per_instance,
         "totals": {
             "requests": sum(r["request_count"] for r in per_user),
             "unique_users": len(per_user),
             "unique_models": len(per_model),
+            "unique_instances": len(per_instance),
+            "byok_requests": sum(r["request_count"] for r in per_model if r["is_byok"]),
         },
     })
     return result
@@ -2794,6 +2997,7 @@ async def get_usage_timeseries(
     month: Optional[int] = None,
     user_ids: Optional[list] = None,
     pool_ids: Optional[list] = None,
+    filter_instance: Optional[str] = None,
 ) -> list[dict]:
     """Return ordered, zero-filled time buckets of request counts for the window.
 
@@ -2824,6 +3028,8 @@ async def get_usage_timeseries(
             q = q.where(tbl.user_id == filter_user_id)
         if filter_model is not None:
             q = q.where(tbl.model == filter_model)
+        if filter_instance is not None:
+            q = q.where(_on_instance(tbl.model, filter_instance))
         if user_ids is not None:
             q = q.where(tbl.user_id.in_(list(dict.fromkeys(user_ids))) if user_ids else false())
         if pool_ids is not None:
@@ -3456,6 +3662,10 @@ async def _run_auto_migrations():
             ("oauth_refresh_token", "VARCHAR(1000)"),
             ("oauth_accounts_url", "VARCHAR(500)"),
             ("pai_token_id", "VARCHAR(30)"),
+            # BYOK (app/byok.py): owner of a user instance, and the admin's kill switch.
+            # NOT NULL needs the DEFAULT for SQLite to accept the ALTER on a non-empty table.
+            ("owner_user_id", "INTEGER"),
+            ("admin_disabled", "BOOLEAN NOT NULL DEFAULT 0"),
         ):
             try:
                 result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))
@@ -3467,6 +3677,33 @@ async def _run_auto_migrations():
                     ))
             except Exception as e:
                 logger.warning("Auto-migration: Could not add %s column: %s", column_name, e)
+
+        # create_all never adds an index to an existing table.
+        try:
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_provider_credentials_owner_user_id "
+                "ON provider_credentials (owner_user_id)"
+            ))
+        except Exception as e:
+            logger.warning("Auto-migration: Could not index provider_credentials.owner_user_id: %s", e)
+
+        # The 'byok-' instance prefix is reserved for user-owned instances; an admin
+        # row using it would be treated as BYOK by name-based usage counting. Such
+        # rows are not loaded (see ProviderManager._load_providers_from_database).
+        try:
+            result = await conn.execute(text(
+                "SELECT provider_key FROM provider_credentials "
+                "WHERE owner_user_id IS NULL AND instance_name LIKE 'byok-%'"
+            ))
+            reserved = [row[0] for row in result.fetchall()]
+            if reserved:
+                logger.error(
+                    "Provider instances %s use the reserved 'byok-' prefix without an owner "
+                    "and will not be loaded; rename them in the admin Providers tab.",
+                    reserved,
+                )
+        except Exception as e:
+            logger.warning("Auto-migration: reserved-prefix check failed: %s", e)
 
         # Add 'apis' column to model_aliases so mappings can be scoped to
         # specific API surfaces. NULL (legacy rows) means "all surfaces".
@@ -4396,10 +4633,14 @@ async def model_group_overview(db: AsyncSession) -> dict:
     from app.rate_limit import provider_key_of
 
     groups = await list_model_groups(db)
-    models = {m.model_id: bool(m.is_enabled) for m in (await db.execute(select(ModelConfiguration))).scalars()}
+    # Users' own (BYOK) models belong to no group: they are quota-exempt.
+    models = {
+        m.model_id: bool(m.is_enabled)
+        for m in (await db.execute(select(ModelConfiguration).where(_global_models_only()))).scalars()
+    }
     providers = {
         p.provider_key: bool(p.enabled)
-        for p in (await db.execute(select(ProviderCredentials))).scalars()
+        for p in (await db.execute(select(ProviderCredentials).where(_global_providers_only()))).scalars()
     }
     by_model = {m.model_id: g.id for g in groups for m in g.members}
     by_instance = {m.provider_key: g.id for g in groups for m in g.instance_members}

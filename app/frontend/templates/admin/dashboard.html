@@ -491,6 +491,26 @@
         <h3>No Providers Configured</h3>
         <p>Click "Add Provider" to configure your first provider.</p>
     </div>
+
+    <!-- Users' own provider instances (BYOK): read-only apart from disable / delete -->
+    <div class="card mt-4" id="byok-admin-card">
+        <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+            <div>
+                <h5 class="mb-0"><i class="fas fa-user-gear me-2"></i>BYOK instances</h5>
+                <div class="small text-muted">
+                    Providers users added with their own keys. Only the owner can use one; their
+                    traffic is quota-exempt and appears in the Usage tab (By Instance).
+                    Keys are never shown.
+                </div>
+            </div>
+            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="window.ByokAdminManager?.load()" title="Refresh">
+                <i class="fas fa-rotate"></i>
+            </button>
+        </div>
+        <div class="card-body p-0" id="byok-admin-body">
+            <p class="text-center text-muted py-4 mb-0">Loading…</p>
+        </div>
+    </div>
     </div>
 </div>
 
@@ -564,12 +584,17 @@
             <div class="stat-number" id="usage-unique-models">-</div>
             <div class="stat-label">Models Used</div>
         </div>
+        <div class="stat-card" id="usage-stat-byok" title="Requests served by users' own provider instances (quota-exempt)">
+            <div class="stat-number" id="usage-byok-requests">-</div>
+            <div class="stat-label">BYOK Requests</div>
+        </div>
     </div>
     <div class="section-header">
         <div class="d-flex align-items-center gap-3 flex-wrap w-100">
             <div id="usage-toggle" class="btn-group" role="group" aria-label="View toggle">
                 <button type="button" class="btn btn-secondary btn-sm" id="usage-toggle-user" onclick="window.UsageManager?.setView('user')">By User</button>
                 <button type="button" class="btn btn-secondary btn-sm" id="usage-toggle-model" onclick="window.UsageManager?.setView('model')">By Model</button>
+                <button type="button" class="btn btn-secondary btn-sm" id="usage-toggle-instance" onclick="window.UsageManager?.setView('instance')">By Instance</button>
                 <button type="button" class="btn btn-secondary btn-sm" id="usage-toggle-pool" onclick="window.UsageManager?.setView('pool')">By Pool</button>
             </div>
             <button type="button" class="btn btn-outline-secondary btn-sm" id="usage-back" style="display:none;" onclick="window.UsageManager?.back()">
@@ -1539,6 +1564,7 @@
 <script src="/static/js/features/providers/search-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/models-view.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/azure-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/byok-admin-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/tracking/user-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/tracking/request-tracker.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/tracking/usage-manager.js?v={{ cache_version }}"></script>

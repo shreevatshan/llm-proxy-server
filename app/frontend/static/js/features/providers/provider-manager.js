@@ -21,6 +21,7 @@ class ProviderManager {
     /** Opening the tab: restore the last view, then load (loadUnifiedProviderData covers both views). */
     async loadTab() {
         this.showView(this.view, { load: false });
+        window.ByokAdminManager?.load();
         await this.loadUnifiedProviderData();
     }
 

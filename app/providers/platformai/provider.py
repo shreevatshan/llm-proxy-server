@@ -96,9 +96,13 @@ class PlatformAIProvider(BaseProvider):
         self.accounts_url = (config.get("oauth_accounts_url") or DEFAULT_ACCOUNTS_URL).rstrip("/")
         self.provider_key = config.get("provider_key") or self.full_provider_name
         self.models = _normalize_models(config.get("models"))
-        self.client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
-        )
+        timeout = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
+        if config.get("byok"):
+            # BYOK: no redirects, every request's destination re-checked (url_guard).
+            from app.providers.url_guard import guarded_http_client
+            self.client = guarded_http_client(timeout=timeout)
+        else:
+            self.client = httpx.AsyncClient(timeout=timeout)
         api_key = (config.get("api_key") or "").strip()
         self.tokens: Optional[PlatformAITokenManager] = None
         if api_key:

@@ -12,6 +12,32 @@ const SECRET_FIELDS = ['api_key', 'secret_access_key', 'oauth_client_secret', 'o
 class ProviderFormManager {
     constructor() {
         this.isSubmitting = false;
+        this.configure({});
+    }
+
+    /**
+     * Where the form saves and what happens after. The defaults are the admin
+     * dashboard's; the user dashboard's "My Providers" tab (byok-manager.js)
+     * configures BYOK mode, where the instance-name input holds a slug the server
+     * turns into `byok-{user_id}-{slug}`, and a provider's identity (provider name,
+     * instance name) is fixed once created.
+     */
+    configure(options) {
+        this.options = {
+            mode: 'admin',
+            createUrl: '/admin/providers',
+            updateUrl: key => `/admin/providers?provider_key=${encodeURIComponent(key)}`,
+            detailUrl: key => `/admin/providers/detail?provider_key=${encodeURIComponent(key)}`,
+            onSaved: () => {
+                window.ProviderManager.cancelProviderForm();
+                window.ProviderManager.loadUnifiedProviderData();
+            },
+            ...options,
+        };
+    }
+
+    get isByok() {
+        return this.options.mode === 'byok';
     }
 
     updateProviderForm() {
@@ -361,7 +387,7 @@ class ProviderFormManager {
             </div>
             <div class="mb-3">
                 <label for="pai_token_id" class="form-label">
-                    <i class="fas fa-tag"></i> BYOK Token ID
+                    <i class="fas fa-tag"></i> Z-Token ID
                 </label>
                 <input type="text" id="pai_token_id" class="form-control" inputmode="numeric"
                        placeholder="Optional, e.g. 5434566543234">
@@ -449,7 +475,7 @@ class ProviderFormManager {
 
             if (!instanceName) {
                 console.log('❌ Instance name validation failed');
-                this.showFormAlert('danger', 'Please enter an instance name');
+                this.showFormAlert('danger', this.isByok ? 'Please enter a name' : 'Please enter an instance name');
                 this.resetButtonState(submitBtn, btnContent, btnLoading);
                 return;
             }
@@ -461,6 +487,11 @@ class ProviderFormManager {
                 provider_type: providerType,
                 instance_name: instanceName,
             };
+            if (this.isByok) {
+                // The server derives the instance name from the slug.
+                delete formData.instance_name;
+                if (!isEdit) formData.slug = instanceName.toLowerCase();
+            }
             // A new provider starts on. An edit leaves the on/off switch alone: it is the
             // provider toggle's to set, and sending true here re-enabled a disabled
             // provider (and with it every model) whenever its form was saved.
@@ -484,6 +515,11 @@ class ProviderFormManager {
             // For providers, set provider_name to provider_type if not already set
             if (!formData.provider_name) {
                 formData.provider_name = providerType;
+            }
+            if (this.isByok && isEdit) {
+                // A BYOK provider's identity is fixed once created.
+                delete formData.provider_name;
+                delete formData.provider_type;
             }
 
             // Handle Azure-specific fields
@@ -565,7 +601,7 @@ class ProviderFormManager {
                 formData.base_url = value('base_url');
                 formData.pai_token_id = value('pai_token_id');
                 if (formData.pai_token_id && !/^\d+$/.test(formData.pai_token_id)) {
-                    this.showFormAlert('danger', 'BYOK Token ID must be a number.');
+                    this.showFormAlert('danger', 'Z-Token ID must be a number.');
                     this.resetButtonState(submitBtn, btnContent, btnLoading);
                     return;
                 }
@@ -586,9 +622,9 @@ class ProviderFormManager {
                 formData.deployments = [...new Set(models)];
             }
 
-            const url = isEdit && window.currentEditingProvider ? 
-                `/admin/providers?provider_key=${encodeURIComponent(window.currentEditingProvider.provider_key)}` : 
-                '/admin/providers';
+            const url = isEdit && window.currentEditingProvider ?
+                this.options.updateUrl(window.currentEditingProvider.provider_key) :
+                this.options.createUrl;
             const method = isEdit ? 'PUT' : 'POST';
 
             // NOTE: never log `formData` here — it contains provider API keys/secrets.
@@ -628,20 +664,22 @@ class ProviderFormManager {
                 }
 
                 this.showFormAlert('success', successMsg);
-                setTimeout(() => {
-                    window.ProviderManager.cancelProviderForm();
-                    window.ProviderManager.loadUnifiedProviderData();
-                }, 2500);
+                setTimeout(() => this.options.onSaved(result, isEdit), this.isByok ? 1200 : 2500);
             } else {
                 const error = await response.json();
                 console.error('❌ Error response:', error);
                 
-                // Special handling for "Provider already exists" error
-                if (response.status === 400 && error.detail && error.detail.includes('Provider already exists')) {
+                // Special handling for "Provider already exists" error (admin only:
+                // a BYOK user just picks another name).
+                if (!this.isByok && response.status === 400 && error.detail && error.detail.includes('Provider already exists')) {
                     const providerKey = `${formData.provider_type}:${formData.provider_name}`;
                     await this.showProviderExistsModal(formData.provider_name, providerKey);
                 } else {
-                    this.showFormAlert('danger', `Failed to ${isEdit ? 'update' : 'create'} provider: ${error.detail || 'Unknown error'}`);
+                    const detail = typeof error.detail === 'string' ? error.detail
+                        : Array.isArray(error.detail) ? error.detail.map(d => d.msg || '').join('; ')
+                        : 'Unknown error';
+                    const safe = window.UIUtils?.escapeHtml ? window.UIUtils.escapeHtml(detail) : detail;
+                    this.showFormAlert('danger', `Failed to ${isEdit ? 'update' : 'create'} provider: ${safe}`);
                 }
             }
         } catch (error) {
@@ -662,7 +700,7 @@ class ProviderFormManager {
         
         try {
             // Load the existing provider data
-            const response = await fetch(`/admin/providers/detail?provider_key=${encodeURIComponent(providerKey)}`, {
+            const response = await fetch(this.options.detailUrl(providerKey), {
                 credentials: 'include'
             });
 

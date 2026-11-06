@@ -79,69 +79,66 @@ templates = Jinja2Templates(directory="app/frontend/templates")
 logger = logging.getLogger(__name__)
 
 
-# Placeholder returned instead of stored secrets (see _mask_secret).
-_SECRET_MASK = "********"
+# Provider helpers live in app.providers.provider_service, shared with the BYOK
+# user router; the underscore names stay importable here (tests use them).
+from app.providers.provider_service import (
+    SECRET_MASK as _SECRET_MASK,
+    MASKED_SECRET_FIELDS as _MASKED_SECRET_FIELDS,
+    mask_secret as _mask_secret,
+    strip_masked_secrets as _strip_masked_secrets,
+    platformai_response_fields as _platformai_response_fields,
+    provider_update_data as _provider_update_data,
+    parse_azure_deployment_fields as _parse_azure_deployment_fields,
+    build_credentials_response as _build_credentials_response,
+    infer_azure_supported_apis as _infer_azure_supported_apis,
+    check_platformai_create as _check_platformai_create,
+)
+from app.byok import byok_registry, is_byok_instance_name
+from app.auth.database import _global_models_only
 
-# Secret fields that _mask_secret masks in read/detail responses. A client
-# echoing the mask back on update means "leave unchanged", so these values
-# must never be persisted (see _strip_masked_secrets).
-_MASKED_SECRET_FIELDS = ("api_key", "secret_access_key", "oauth_client_secret", "oauth_refresh_token")
 
+async def _reject_byok_provider(db: AsyncSession, provider_key: Optional[str]) -> None:
+    """404 for a BYOK (user-owned) instance on a generic admin route.
 
-def _mask_secret(value: Optional[str]) -> Optional[str]:
-    """Mask a stored secret for read/detail responses (write-only semantics).
-
-    Returns a fixed placeholder when a value is set (so the UI knows a secret
-    exists) and None when it is absent. The real value is never returned.
+    Generic admin tooling never edits, toggles, deletes or inspects a user's own
+    instance; the admin manages those through /admin/byok/* only. Decided by the
+    owner column (and the live owner map), not the name, so a legacy ownerless
+    'byok-' row stays manageable -- the admin can rename it away from the prefix.
     """
-    return _SECRET_MASK if value else None
+    if not provider_key:
+        return
+    owner = byok_registry.owner_of(provider_key)
+    if owner is not None and owner > 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider not found: {provider_key}")
+    cred = await get_provider_credentials(db, provider_key)
+    if cred is not None and cred.owner_user_id is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider not found: {provider_key}")
 
 
-def _strip_masked_secrets(update_data: dict) -> dict:
-    """Drop secret fields whose submitted value is the mask placeholder.
-
-    Detail responses return secrets as ``_SECRET_MASK``; if a client round-trips
-    that literal on an update, persisting it would corrupt the stored credential.
-    Treat it as "unchanged" and strip it before writing.
-    """
-    for field in _MASKED_SECRET_FIELDS:
-        if update_data.get(field) == _SECRET_MASK:
-            update_data.pop(field)
-    return update_data
+async def _reject_byok_model(db: AsyncSession, model_id: Optional[str]) -> None:
+    """404 for a model of a BYOK instance on a generic admin route."""
+    if model_id:
+        await _reject_byok_provider(db, model_id.split("/", 1)[0])
 
 
-def _platformai_response_fields(credentials) -> dict:
-    """PlatformAI credential fields for a provider response, secrets masked."""
-    return {
-        "oauth_client_id": getattr(credentials, "oauth_client_id", None),
-        "oauth_client_secret": _mask_secret(getattr(credentials, "oauth_client_secret", None)),
-        "oauth_refresh_token": _mask_secret(getattr(credentials, "oauth_refresh_token", None)),
-        "oauth_accounts_url": getattr(credentials, "oauth_accounts_url", None),
-        "pai_token_id": getattr(credentials, "pai_token_id", None),
-    }
+def _reject_reserved_instance_name(instance_name: Optional[str]) -> None:
+    """The 'byok-' instance prefix is reserved for user-owned instances (422)."""
+    if instance_name and is_byok_instance_name(instance_name.strip()):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Instance names starting with 'byok-' are reserved for user-owned (BYOK) instances",
+        )
 
 
-def _provider_update_data(provider_data: BaseModel, *, exclude: tuple = ()) -> dict:
-    """Column values an update/upsert request writes.
-
-    Only fields the client set (or validators derived) that are not None;
-    masked secrets mean "unchanged" and are dropped; ``supported_apis`` is
-    stored as JSON text.
-    """
-    update_data = {
-        field: value
-        for field, value in provider_data.model_dump(exclude_unset=True).items()
-        if value is not None and field not in exclude
-    }
-    _strip_masked_secrets(update_data)
-    if isinstance(update_data.get('supported_apis'), list):
-        update_data['supported_apis'] = json.dumps(update_data['supported_apis'])
-    return update_data
-
-
-def _parse_azure_deployment_fields(raw_deployments):
-    groups = normalize_azure_deployments(raw_deployments)
-    return groups, merge_azure_deployments(groups)
+def _check_admin_provider_name(provider_type: str, provider_name: Optional[str]) -> None:
+    """A custom provider_name must be safe to embed in a provider key (no ':' or '/')."""
+    if provider_name is None:
+        return
+    if ":" in provider_name or "/" in provider_name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="provider_name must not contain ':' or '/'",
+        )
 
 
 class AdminLogin(BaseModel):
@@ -309,6 +306,7 @@ async def get_provider_models(
     db: AsyncSession = Depends(get_db)
 ):
     """Get all models for a specific provider using query parameter."""
+    await _reject_byok_provider(db, provider_key)
     try:
         # No need to URL decode since Query parameter handles this automatically
         models = await get_models_by_provider(db, provider_key)
@@ -335,8 +333,10 @@ async def sync_models_from_providers(
         logger.info("Forcing complete provider manager refresh before sync...")
         await provider_manager.refresh_providers_from_database()
         
-        # Get all models from provider manager (this will use the refreshed providers)
-        all_models = await provider_manager._fetch_all_models()
+        # Get all models from provider manager (this will use the refreshed providers).
+        # Users' own (BYOK) instances are not the admin's to sync: they are neither
+        # fetched here nor listed as stale below (identify_stale_models skips them).
+        all_models = await provider_manager._fetch_all_models(include_byok=False)
         
         # Filter models to only include those from valid providers in database
         valid_models = []
@@ -398,7 +398,7 @@ async def sync_models_from_providers(
         # and providers that weren't fetched at all (disabled). Their saved models
         # aren't stale — the provider just wasn't reached — so keep them out of the
         # stale list, where "Remove" would drop their admin-set enabled states.
-        fetched_provider_keys = set(provider_manager.providers.keys())
+        fetched_provider_keys = set(provider_manager.providers.keys()) - byok_registry.all_keys()
         failed_providers = []
         for key in sorted((valid_provider_keys & fetched_provider_keys) - synced_providers):
             sync_status = provider_manager.get_sync_status(key) or {}
@@ -434,8 +434,12 @@ async def sync_models_from_providers(
         if failed_providers:
             logger.warning(f"Providers failed to sync: {failed_providers}")
 
-        # Update the cache with all synced models
-        provider_manager.model_cache.update_models(valid_models)
+        # Update the cache with all synced models, keeping the BYOK instances' slice
+        # (they were not fetched here, so replacing the whole list would drop them).
+        byok_models = [
+            m for m in provider_manager.model_cache.get_models() if byok_registry.is_byok_model(m.id)
+        ]
+        provider_manager.model_cache.update_models(valid_models + byok_models)
         logger.info(f"Cache updated with {len(valid_models)} models")
         
         return {
@@ -469,8 +473,10 @@ async def remove_stale_models(
     """Remove stale models from the database."""
     try:
         from app.auth.database import delete_stale_models
-        
-        deleted_count = await delete_stale_models(db, request.model_ids)
+
+        # A user's own (BYOK) models are never the admin's to delete.
+        model_ids = [m for m in request.model_ids if not byok_registry.is_byok_model(m)]
+        deleted_count = await delete_stale_models(db, model_ids)
         # Group members, access exceptions and aliases naming them were cleaned up too.
         await reload_reference_caches()
 
@@ -519,7 +525,11 @@ async def reinit_system(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Reinitialize system by clearing ALL provider and model configurations from database."""
+    """Reinitialize system by clearing ALL global provider and model configurations.
+
+    Users' own (BYOK) instances are user data, not global configuration, and are
+    kept: get_all_provider_credentials / clear_all_model_configurations skip them.
+    """
     try:
         # Clear all model configurations
         models_cleared = await clear_all_model_configurations(db)
@@ -565,6 +575,7 @@ async def toggle_provider(
     try:
         # Log for debugging
         logging.info(f"Admin provider toggle request - Provider Key: {provider_key}, Enabled: {toggle_data.enabled}")
+        await _reject_byok_provider(db, provider_key)
         
         # Use toggle_provider_configuration which properly updates cache
         success = await toggle_provider_configuration(db, provider_key, toggle_data.enabled)
@@ -604,6 +615,7 @@ async def toggle_model(
     try:
         # Log for debugging
         logging.info(f"Admin model toggle (query) request - Model ID: {model_id}, Enabled: {toggle_data.enabled}")
+        await _reject_byok_model(db, model_id)
         
         # Check if model exists in database before trying to toggle
         from app.auth.database import get_model_configuration
@@ -1959,7 +1971,10 @@ async def _outage_targets(db: AsyncSession):
     """(provider keys, model ids) an outage may name."""
     from app.auth.models import ModelConfiguration
     provider_keys = {p.provider_key for p in await get_all_provider_credentials(db)}
-    model_ids = set((await db.execute(select(ModelConfiguration.model_id))).scalars().all())
+    # Users' own (BYOK) instances and models are never outage targets.
+    model_ids = set((await db.execute(
+        select(ModelConfiguration.model_id).where(_global_models_only())
+    )).scalars().all())
     return provider_keys, model_ids
 
 
@@ -1989,7 +2004,8 @@ async def create_outages_endpoint(
     unknown = [pk for pk in body.provider_keys if pk not in provider_keys]
     unknown += [
         m for m in body.model_ids
-        if m not in model_ids and not provider_manager.model_cache.has_model_id(m)
+        if byok_registry.is_byok_model(m)
+        or (m not in model_ids and not provider_manager.model_cache.has_model_id(m))
     ]
     if unknown:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown provider instance(s) or model(s): {unknown}")
@@ -2129,7 +2145,10 @@ async def upsert_model_alias_endpoint(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-    if await get_model_configuration(db, body.target_model_id) is None:
+    target_row = await get_model_configuration(db, body.target_model_id)
+    if target_row is None or byok_registry.is_byok_model(body.target_model_id):
+        # A user's own (BYOK) model is never a mapping target: it would route other
+        # users' requests at it (they would be refused) or leak that it exists.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Unknown target model: {body.target_model_id}",
@@ -2347,7 +2366,9 @@ async def _check_members(
     new_models = [m for m in body.model_ids if m not in current_models]
     if new_models:
         found = set((await db.execute(
-            select(ModelConfiguration.model_id).where(ModelConfiguration.model_id.in_(new_models))
+            select(ModelConfiguration.model_id).where(
+                ModelConfiguration.model_id.in_(new_models), _global_models_only(),
+            )
         )).scalars().all())
         missing = [m for m in new_models if m not in found]
         if missing:
@@ -2717,7 +2738,8 @@ async def upsert_profile_model_access_exception(
     is needed — untoggled models keep following the global config.
     """
     profile = await _require_profile(db, profile_id)
-    if not await get_model_configuration(db, model_id):
+    if byok_registry.is_byok_model(model_id) or not await get_model_configuration(db, model_id):
+        # Profiles never govern a user's own (BYOK) models.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found")
 
     prev_mode = profile.model_access_mode or "default"
@@ -2878,6 +2900,7 @@ async def get_provider_credential(
     try:
         # URL decode the provider_key
         decoded_provider_key = urllib.parse.unquote(provider_key)
+        await _reject_byok_provider(db, decoded_provider_key)
         
         credentials = await get_provider_credentials(db, decoded_provider_key)
         if not credentials:
@@ -2886,8 +2909,7 @@ async def get_provider_credential(
                 detail=f"Provider credentials not found: {decoded_provider_key}"
             )
         
-        # Parse deployments JSON if present
-        deployment_groups, deployments = _parse_azure_deployment_fields(credentials.deployments_json)
+        _deployment_groups, deployments = _parse_azure_deployment_fields(credentials.deployments_json)
 
         # Get dynamic_discovery from database
         # For backward compatibility: if not stored, infer from deployments (legacy behavior)
@@ -2896,41 +2918,7 @@ async def get_provider_credential(
             # Legacy: infer from deployments if not explicitly set
             dynamic_discovery = not bool(deployments)
         
-        # Parse supported_apis JSON
-        supported_apis = None
-        if credentials.supported_apis:
-            try:
-                supported_apis = json.loads(credentials.supported_apis)
-            except (json.JSONDecodeError, TypeError):
-                supported_apis = ["openai"]
-
-        return ProviderCredentialsResponse(
-            id=credentials.id,
-            provider_key=credentials.provider_key,
-            provider_type=credentials.provider_type,
-            instance_name=credentials.instance_name,
-            enabled=credentials.enabled,
-            endpoint=credentials.endpoint,
-            api_key=_mask_secret(credentials.api_key),
-            discovery_api_version=credentials.discovery_api_version,
-            azure_backend=credentials.azure_backend or ("openai" if credentials.provider_type == "azure" else None),
-            region=credentials.region,
-            access_key_id=credentials.access_key_id,
-            secret_access_key=_mask_secret(credentials.secret_access_key),
-            base_url=credentials.base_url,
-            deployments=deployments,
-            openai_deployments=deployment_groups.get("openai", []),
-            anthropic_deployments=deployment_groups.get("anthropic", []),
-            deployment_groups=deployment_groups.get("groups", []),
-            provider_name=credentials.provider_name,
-            dynamic_discovery=dynamic_discovery,
-            supported_apis=supported_apis,
-            anthropic_base_url=credentials.anthropic_base_url,
-            anthropic_auth_style=credentials.anthropic_auth_style,
-            **_platformai_response_fields(credentials),
-            created_at=credentials.created_at,
-            updated_at=credentials.updated_at
-        )
+        return _build_credentials_response(credentials, dynamic_discovery=dynamic_discovery)
     except HTTPException:
         raise
     except Exception as e:
@@ -2960,6 +2948,8 @@ async def create_provider_credential(
         if not provider_data.provider_name:
             # This should not happen now that provider_name is required, but keep for safety
             provider_data.provider_name = provider_data.provider_type
+        _reject_reserved_instance_name(provider_data.instance_name)
+        _check_admin_provider_name(provider_data.provider_type, provider_data.provider_name)
         
         # Generate provider key using provider_name:instance_name format
         provider_key = f"{provider_data.provider_name}:{provider_data.instance_name}"
@@ -2970,15 +2960,7 @@ async def create_provider_credential(
             if upsert:
                 logging.info(f"🔄 Provider exists, updating due to upsert=True: {provider_key}")
                 # Auto-infer supported_apis for Azure upsert
-                if provider_data.provider_type == "azure" and not provider_data.supported_apis:
-                    inferred_apis = ["openai"]
-                    if (
-                        provider_data.azure_backend == "foundry"
-                        and provider_data.anthropic_deployments
-                        and len(provider_data.anthropic_deployments) > 0
-                    ):
-                        inferred_apis.append("anthropic")
-                    provider_data.supported_apis = inferred_apis
+                _infer_azure_supported_apis(provider_data)
 
                 # Convert create data to update data (provider_type is fixed)
                 update_data = _provider_update_data(provider_data, exclude=("provider_type",))
@@ -3006,34 +2988,13 @@ async def create_provider_credential(
             logging.info(f"💾 Creating new provider credentials in database...")
 
             # Auto-infer supported_apis for Azure providers
-            if provider_data.provider_type == "azure" and not provider_data.supported_apis:
-                inferred_apis = ["openai"]
-                if (
-                    provider_data.azure_backend == "foundry"
-                    and provider_data.anthropic_deployments
-                    and len(provider_data.anthropic_deployments) > 0
-                ):
-                    inferred_apis.append("anthropic")
-                provider_data.supported_apis = inferred_apis
+            _infer_azure_supported_apis(provider_data)
 
-            if provider_data.provider_type == "platformai":
-                # Required only here: an upsert of an existing provider keeps the stored values.
-                def _given(name):
-                    value = (getattr(provider_data, name) or "").strip()
-                    return bool(value) and value != _SECRET_MASK
-
-                if not _given("api_key"):
-                    missing = [n for n in ("oauth_client_id", "oauth_refresh_token") if not _given(n)]
-                    if missing:
-                        raise HTTPException(
-                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                            detail=(
-                                "A PlatformAI provider needs an api_key, or oauth_client_id and "
-                                f"oauth_refresh_token (missing: {' and '.join(missing)})."
-                            ),
-                        )
-                if not provider_data.supported_apis:
-                    provider_data.supported_apis = ["openai", "anthropic"]
+            # Required only here: an upsert of an existing provider keeps the stored values.
+            try:
+                _check_platformai_create(provider_data)
+            except ValueError as e:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
 
             # Serialize supported_apis for storage
             supported_apis_json = None
@@ -3076,44 +3037,7 @@ async def create_provider_credential(
             sync_result = await auto_sync_on_provider_change(db, credentials.provider_key, action="create")
             logging.info(f"Auto-sync result for new provider {credentials.provider_key}: {sync_result}")
         
-        # Parse deployments JSON for response
-        deployment_groups, deployments = _parse_azure_deployment_fields(credentials.deployments_json)
-        
-        # Parse supported_apis JSON for response
-        supported_apis = None
-        if credentials.supported_apis:
-            try:
-                supported_apis = json.loads(credentials.supported_apis)
-            except (json.JSONDecodeError, TypeError):
-                supported_apis = ["openai"]
-
-        response = ProviderCredentialsResponse(
-            id=credentials.id,
-            provider_key=credentials.provider_key,
-            provider_type=credentials.provider_type,
-            instance_name=credentials.instance_name,
-            provider_name=credentials.provider_name,
-            enabled=credentials.enabled,
-            endpoint=credentials.endpoint,
-            api_key=_mask_secret(credentials.api_key),
-            discovery_api_version=credentials.discovery_api_version,
-            azure_backend=credentials.azure_backend or ("openai" if credentials.provider_type == "azure" else None),
-            region=credentials.region,
-            access_key_id=credentials.access_key_id,
-            secret_access_key=_mask_secret(credentials.secret_access_key),
-            base_url=credentials.base_url,
-            deployments=deployments,
-            openai_deployments=deployment_groups.get("openai", []),
-            anthropic_deployments=deployment_groups.get("anthropic", []),
-            deployment_groups=deployment_groups.get("groups", []),
-            dynamic_discovery=credentials.dynamic_discovery,
-            supported_apis=supported_apis,
-            anthropic_base_url=credentials.anthropic_base_url,
-            anthropic_auth_style=credentials.anthropic_auth_style,
-            **_platformai_response_fields(credentials),
-            created_at=credentials.created_at,
-            updated_at=credentials.updated_at
-        )
+        response = _build_credentials_response(credentials)
         
         # Add sync result to response for debugging
         if "error" in sync_result:
@@ -3155,6 +3079,10 @@ async def update_provider_credential(
     try:
         # URL decode the provider_key
         decoded_provider_key = urllib.parse.unquote(provider_key)
+        await _reject_byok_provider(db, decoded_provider_key)
+        _reject_reserved_instance_name(provider_data.instance_name)
+        if provider_data.provider_name is not None:
+            _check_admin_provider_name("", provider_data.provider_name)
         
         update_data = _provider_update_data(provider_data)
 
@@ -3181,44 +3109,7 @@ async def update_provider_credential(
             # A rename rewrote group members, aliases and access exceptions too.
             await reload_reference_caches()
         
-        # Parse deployments JSON for response
-        deployment_groups, deployments = _parse_azure_deployment_fields(credentials.deployments_json)
-        
-        # Parse supported_apis JSON for update response
-        supported_apis = None
-        if credentials.supported_apis:
-            try:
-                supported_apis = json.loads(credentials.supported_apis)
-            except (json.JSONDecodeError, TypeError):
-                supported_apis = ["openai"]
-
-        response = ProviderCredentialsResponse(
-            id=credentials.id,
-            provider_key=credentials.provider_key,
-            provider_type=credentials.provider_type,
-            instance_name=credentials.instance_name,
-            provider_name=credentials.provider_name,
-            enabled=credentials.enabled,
-            endpoint=credentials.endpoint,
-            api_key=_mask_secret(credentials.api_key),
-            discovery_api_version=credentials.discovery_api_version,
-            azure_backend=credentials.azure_backend or ("openai" if credentials.provider_type == "azure" else None),
-            region=credentials.region,
-            access_key_id=credentials.access_key_id,
-            secret_access_key=_mask_secret(credentials.secret_access_key),
-            base_url=credentials.base_url,
-            deployments=deployments,
-            openai_deployments=deployment_groups.get("openai", []),
-            anthropic_deployments=deployment_groups.get("anthropic", []),
-            deployment_groups=deployment_groups.get("groups", []),
-            dynamic_discovery=credentials.dynamic_discovery,
-            supported_apis=supported_apis,
-            anthropic_base_url=credentials.anthropic_base_url,
-            anthropic_auth_style=credentials.anthropic_auth_style,
-            **_platformai_response_fields(credentials),
-            created_at=credentials.created_at,
-            updated_at=credentials.updated_at
-        )
+        response = _build_credentials_response(credentials)
         
         # Add sync result to response for debugging
         if "error" in sync_result:
@@ -3247,6 +3138,8 @@ async def delete_provider_credential(
     try:
         # URL decode the provider_key
         decoded_provider_key = urllib.parse.unquote(provider_key)
+        # A user's own instance is deleted through /admin/byok/providers only.
+        await _reject_byok_provider(db, decoded_provider_key)
         
         success = await delete_provider_credentials(db, decoded_provider_key)
         if not success:
@@ -3272,6 +3165,106 @@ async def delete_provider_credential(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to delete provider credentials"
         )
+
+
+# ==================== BYOK: users' own provider instances ====================
+#
+# Read-only for the admin apart from two actions: switch an instance off (a kill
+# switch the owner cannot override) and delete it. Secrets are never shown, not
+# even masked-with-length; the generic /admin/providers routes 404 on these rows.
+
+def _byok_row_response(cred, username: Optional[str], model_count: int) -> "AdminByokProviderResponse":
+    from app.auth.models import AdminByokProviderResponse
+    host = None
+    for field in ("endpoint", "base_url", "anthropic_base_url"):
+        value = getattr(cred, field, None)
+        if value:
+            host = urllib.parse.urlparse(value).hostname
+            break
+    return AdminByokProviderResponse(
+        provider_key=cred.provider_key,
+        provider_type=cred.provider_type,
+        provider_name=cred.provider_name,
+        instance_name=cred.instance_name,
+        owner_user_id=cred.owner_user_id,
+        owner_username=username,
+        enabled=bool(cred.enabled),
+        admin_disabled=bool(cred.admin_disabled),
+        model_count=model_count,
+        endpoint_host=host,
+        has_secret=any(getattr(cred, f, None) for f in _MASKED_SECRET_FIELDS),
+        load_error=provider_manager.byok_load_errors.get(cred.provider_key),
+        created_at=cred.created_at,
+        updated_at=cred.updated_at,
+    )
+
+
+async def _byok_row(db: AsyncSession, provider_key: str):
+    from app.auth.database import get_provider_credentials as _get
+    cred = await _get(db, urllib.parse.unquote(provider_key))
+    if cred is None or cred.owner_user_id is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="BYOK provider not found")
+    return cred
+
+
+@router.get("/byok/providers")
+async def list_byok_providers(
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every user's own provider instance, with its owner. Secrets are never included."""
+    from app.auth.database import count_models_by_provider, get_all_byok_provider_credentials
+    rows = await get_all_byok_provider_credentials(db)
+    counts = await count_models_by_provider(db, [cred.provider_key for cred, _ in rows])
+    return [_byok_row_response(cred, username, counts.get(cred.provider_key, 0)) for cred, username in rows]
+
+
+@router.put("/byok/providers/disable")
+async def set_byok_provider_disabled(
+    provider_key: str = Query(...),
+    disabled: bool = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Switch a user's instance off (or back on). Off wins over the owner's own toggle."""
+    from app.providers.auto_sync import sync_byok_provider
+    cred = await _byok_row(db, provider_key)
+    cred.admin_disabled = bool(disabled)
+    cred.updated_at = datetime.utcnow()
+    await db.commit()
+    if disabled:
+        await provider_manager.remove_byok_provider(cred.provider_key, forget_owner=False)
+        provider_manager.model_cache.update_single_provider_config(cred.provider_key, False)
+    else:
+        # Back on only if its owner has it on; sync reloads it and its models.
+        provider_manager.model_cache.update_single_provider_config(cred.provider_key, bool(cred.enabled))
+        if cred.enabled:
+            await sync_byok_provider(db, cred.provider_key)
+    logger.info(
+        "BYOK admin-%s by %s: %s (owner id %s)",
+        "disable" if disabled else "enable", current_admin.username, cred.provider_key, cred.owner_user_id,
+    )
+    await db.refresh(cred)
+    from app.auth.database import count_models_by_provider
+    from app.auth.database import get_user_by_id as _user
+    owner = await _user(db, cred.owner_user_id)
+    counts = await count_models_by_provider(db, [cred.provider_key])
+    return _byok_row_response(cred, owner.username if owner else None, counts.get(cred.provider_key, 0))
+
+
+@router.delete("/byok/providers")
+async def delete_byok_provider(
+    provider_key: str = Query(...),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a user's instance and its models. Usage history is kept."""
+    cred = await _byok_row(db, provider_key)
+    key, owner_id = cred.provider_key, cred.owner_user_id
+    await delete_provider_credentials(db, key)
+    await provider_manager.remove_byok_provider(key, forget_owner=True)
+    logger.info("BYOK admin-delete by %s: %s (owner id %s)", current_admin.username, key, owner_id)
+    return {"message": f"BYOK provider deleted: {key}", "provider_key": key}
 
 
 @router.get("/providers/export")
@@ -3403,6 +3396,17 @@ async def import_provider_config(
                 provider_key = provider_data.get("provider_key")
                 if not provider_key:
                     errors.append("Skipped entry with missing provider_key")
+                    continue
+                # Never create or overwrite a user's own (BYOK) instance from a file:
+                # checked on the key (an overwrite looks rows up by it) *and* the name
+                # (a create builds the key from it), and on the stored row's owner.
+                existing_row = await get_provider_credentials(db, provider_key)
+                if (
+                    byok_registry.is_byok(provider_key)
+                    or is_byok_instance_name(str(provider_data.get("instance_name") or ""))
+                    or (existing_row is not None and existing_row.owner_user_id is not None)
+                ):
+                    errors.append(f"Provider '{provider_key}': BYOK (user-owned) instances cannot be imported")
                     continue
 
                 # Validate Azure-specific fields
@@ -3537,6 +3541,10 @@ async def import_provider_config(
             and not any(m.get("is_enabled", True) for m in rows)
         }
         for model_data in model_rows:
+            if byok_registry.is_byok_model(str(model_data.get("model_id") or "")) or byok_registry.is_byok(
+                str(model_data.get("provider_key") or "")
+            ):
+                continue  # a user's own instance's models are not the admin's to restore
             try:
                 await create_or_update_model_configuration(
                     db,
@@ -3639,7 +3647,7 @@ async def get_usage_years_endpoint(
 
 @router.get("/usage")
 async def get_usage(
-    view: Optional[str] = Query(None, description="'user', 'model' or 'pool' for drill-down"),
+    view: Optional[str] = Query(None, description="'user', 'model', 'instance' or 'pool' for drill-down"),
     id: Optional[str] = Query(None, description="Identity value to drill into"),
     # Annotated so a direct call (tests) gets a real None, not the Query marker.
     user_id: Annotated[Optional[int], Query(description="Exact user_id when view=user; disambiguates a shared label")] = None,
@@ -3721,11 +3729,15 @@ async def get_usage(
 
     filter_user_id: Optional[int] = None
     filter_model: Optional[str] = None
+    filter_instance: Optional[str] = None
 
     if view == "user" and id is not None:
         filter_user_id = await _resolve_usage_user_id(db, id, user_id)
     elif view == "model" and id is not None:
         filter_model = id
+    elif view == "instance" and id is not None:
+        # One provider instance (BYOK included): its models and who used them.
+        filter_instance = id
 
     result = await get_usage_aggregates(
         db,
@@ -3734,7 +3746,12 @@ async def get_usage(
         window=window,
         year=year,
         month=month,
+        filter_instance=filter_instance,
     )
+    if filter_instance is not None and result.get("instance", {}).get("owner_user_id") is not None:
+        from app.auth.database import get_user_by_id as _get_user
+        owner = await _get_user(db, result["instance"]["owner_user_id"])
+        result["instance"]["owner_identity"] = owner.username if owner else None
     result["timeseries"] = await get_usage_timeseries(
         db,
         filter_user_id=filter_user_id,
@@ -3742,6 +3759,7 @@ async def get_usage(
         window=window,
         year=year,
         month=month,
+        filter_instance=filter_instance,
     )
     result["earliest_date"] = await get_usage_earliest_date(db)
 

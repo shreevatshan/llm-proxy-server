@@ -18,6 +18,7 @@ from typing import Optional, Union
 from fastapi import Request
 
 from app.api_envelope import envelope_for
+from app.byok import byok_registry, is_owner
 from app.auth.admin import AdminUser
 from app.auth.models import APIKey, User
 from app.providers.provider_manager import provider_manager
@@ -72,15 +73,21 @@ def _message(model_id: str) -> str:
 def caller_may_use(auth, model_id: str) -> bool:
     """The per-user access decision for `model_id`.
 
-    AdminUser and identity-less principals bypass it; everyone else gets their
-    profile's rules (app/cache.py:is_model_allowed_for_user).
+    A BYOK model (app/byok.py) is decided first and for everyone: only its owner,
+    with the model and instance enabled. That check sits before the bypass below on
+    purpose -- the admin and identity-less principals never reach a user's own
+    instance. Otherwise AdminUser and identity-less principals bypass the check;
+    everyone else gets their profile's rules (app/cache.py:is_model_allowed_for_user).
     """
+    cache = provider_manager.model_cache
+    if byok_registry.is_byok_model(model_id):
+        return is_owner(auth, byok_registry.owner_of_model(model_id)) and cache._byok_enabled(model_id)
     if isinstance(auth, AdminUser):
         return True
     user_id = getattr(auth, "user_id", None) or getattr(auth, "id", None)
     if user_id is None:
         return True
-    return provider_manager.model_cache.is_model_allowed_for_user(user_id, model_id)
+    return cache.is_model_allowed_for_user(user_id, model_id)
 
 
 async def enforce_model_access(
@@ -97,6 +104,16 @@ async def enforce_model_access(
         return
 
     envelope = envelope_for(request.url.path, envelope_override)
+    if byok_registry.is_byok_model(model_id):
+        # Someone else's BYOK model: report it as not existing (404), never as
+        # denied, so user instances cannot be probed. Local import: model_resolution
+        # imports this module.
+        from app.model_resolution import ModelUnavailable
+        if envelope == "anthropic":
+            raise ModelUnavailable.anthropic(model_id)
+        if envelope == "azure":
+            raise ModelUnavailable.azure(model_id)
+        raise ModelUnavailable.openai(model_id)
     if envelope == "anthropic":
         raise ModelAccessDenied.anthropic(model_id)
     if envelope == "azure":

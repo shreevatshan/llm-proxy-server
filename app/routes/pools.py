@@ -1725,6 +1725,10 @@ async def delete_user_account(db: AsyncSession, user_id: int) -> bool:
     # against it. A user who is not in a pool gets a no-op guard.
     membership = await _pool_of(db, user_id)
     guarded_pool_id = membership.pool_id if membership else None
+    # The user's own (BYOK) instances are deleted with the account (by
+    # permanently_delete_user); their registry entries are dropped after commit.
+    from app.byok import byok_registry
+    owned_keys = byok_registry.keys_for(user_id)
 
     async with pool_guard(guarded_pool_id):
         async with request_tracker.pause_flush():
@@ -1734,6 +1738,10 @@ async def delete_user_account(db: AsyncSession, user_id: int) -> bool:
                 await request_tracker.forget_user(user_id)
     if success:
         await invalidate_after_user_delete(pool_id, pooled_usernames)
+        if owned_keys:
+            from app.providers.provider_manager import provider_manager
+            for key in owned_keys:
+                await provider_manager.remove_byok_provider(key, forget_owner=True)
     return success
 
 

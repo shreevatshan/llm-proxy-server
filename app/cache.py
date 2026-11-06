@@ -6,6 +6,7 @@ import os
 from typing import List, Optional, Dict, Set, Tuple
 from opentelemetry import context as otel_context
 from app.openai_models import ModelInfo
+from app.byok import byok_registry, UNKNOWN_OWNER
 from app.tracing import create_span, add_span_attributes, set_span_error, safe_detach
 
 logger = logging.getLogger(__name__)
@@ -430,10 +431,42 @@ class ModelCache:
         return self.filter_enabled_models(list(self._models))
 
     def filter_enabled_models(self, models: List[ModelInfo]) -> List[ModelInfo]:
-        """Drop models the global gate blocks (see _passes_global_gate)."""
-        return [model for model in models if self._passes_global_gate(model.id)]
+        """Drop models the global gate blocks (see _passes_global_gate).
+
+        BYOK models are dropped too: this is the listing for callers with no user
+        identity (the admin, identity-less principals), and a BYOK instance is
+        visible to its owner only (get_enabled_models_for_user).
+        """
+        return [
+            model for model in models
+            if not byok_registry.is_byok_model(model.id) and self._passes_global_gate(model.id)
+        ]
     
     # ==================== Model Access ====================
+
+    def _byok_enabled(self, model_id: str) -> bool:
+        """A BYOK model's own on/off state: the model's flag and its instance's.
+
+        Owner-set (the owner toggles both); admin_disabled folds into the provider
+        flag. Profile rules and model groups never apply to a user's own instance.
+        """
+        if not self.is_model_enabled(model_id):
+            return False
+        provider_key = model_id.split('/', 1)[0] if '/' in model_id else model_id
+        return self.is_provider_enabled(provider_key)
+
+    def byok_access_for_user(self, user_id: Optional[int], model_id: str) -> Optional[bool]:
+        """Access to a BYOK model for ``user_id``: None when the model is not BYOK.
+
+        True only for the owner, with the model and instance enabled. Everyone else
+        -- other users, and user_id None (admin, identity-less) -- gets False.
+        """
+        owner = byok_registry.owner_of_model(model_id)
+        if owner is None:
+            return None
+        if owner == UNKNOWN_OWNER or user_id is None or owner != user_id:
+            return False
+        return self._byok_enabled(model_id)
 
     def _passes_global_gate(self, model_id: str) -> bool:
         """True if the model, its provider and its model group are globally enabled."""
@@ -454,6 +487,10 @@ class ModelCache:
           deny    : always denied (overrides the global gate).
           custom  : explicit exception wins (beats the gate); otherwise follow global.
         """
+        if byok_registry.is_byok_model(model_id):
+            # A profile has no owner: no profile, not even allow-mode, reaches a
+            # user's own instance. The owner is let in by is_model_allowed_for_user.
+            return False
         mode = profile.access_mode
         if mode == "allow":
             return True
@@ -465,25 +502,44 @@ class ModelCache:
         return self._passes_global_gate(model_id)
 
     def is_model_allowed_for_user(self, user_id: int, model_id: str) -> bool:
-        """Effective access for a user: their profile's rules (see is_model_allowed_for_profile)."""
+        """Effective access for a user: their own BYOK models, else their profile's rules
+        (see is_model_allowed_for_profile)."""
+        byok = self.byok_access_for_user(user_id, model_id)
+        if byok is not None:
+            return byok
         from app.profiles import profile_registry
         return self.is_model_allowed_for_profile(profile_registry.for_user(user_id), model_id)
 
     def get_enabled_models_for_user(self, user_id: int) -> List[ModelInfo]:
         """All models filtered by the user's effective access (may include
-        globally-disabled models when the user's mode overrides the gate)."""
-        from app.profiles import profile_registry
-        profile = profile_registry.for_user(user_id)
-        models_snapshot = list(self._models)
-        return [m for m in models_snapshot if self.is_model_allowed_for_profile(profile, m.id)]
-
-    def get_models_with_access_for_user(self, user_id: int) -> List[Tuple[ModelInfo, bool]]:
-        """(model, allowed) for every model the user can use, plus globally-enabled
-        models their profile disables (allowed=False) so the UI can show them as disabled."""
+        globally-disabled models when the user's mode overrides the gate), plus the
+        user's own enabled BYOK models."""
         from app.profiles import profile_registry
         profile = profile_registry.for_user(user_id)
         out = []
         for m in list(self._models):
+            byok = self.byok_access_for_user(user_id, m.id)
+            if byok is None:
+                if self.is_model_allowed_for_profile(profile, m.id):
+                    out.append(m)
+            elif byok:
+                out.append(m)
+        return out
+
+    def get_models_with_access_for_user(self, user_id: int) -> List[Tuple[ModelInfo, bool]]:
+        """(model, allowed) for every model the user can use, plus globally-enabled
+        models their profile disables (allowed=False) so the UI can show them as disabled.
+        The user's own BYOK models are listed with their own on/off state; other
+        users' are never listed."""
+        from app.profiles import profile_registry
+        profile = profile_registry.for_user(user_id)
+        out = []
+        for m in list(self._models):
+            owner = byok_registry.owner_of_model(m.id)
+            if owner is not None:
+                if owner == user_id:
+                    out.append((m, self._byok_enabled(m.id)))
+                continue
             allowed = self.is_model_allowed_for_profile(profile, m.id)
             if allowed or self._passes_global_gate(m.id):
                 out.append((m, allowed))

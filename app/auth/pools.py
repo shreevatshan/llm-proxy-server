@@ -175,10 +175,15 @@ def _fold_models_into_scopes(usage_rows: List[dict]) -> Dict[Tuple[int, str, int
     its rows fold into, so carries written before the move describe a partition that no
     longer exists. It self-corrects at local midnight.
     """
+    from app.byok import is_byok_model
     from app.rate_limit import rate_limit_tracker
 
     folded: Dict[Tuple[int, str, int], int] = {}
     for row in usage_rows:
+        # A member's own BYOK traffic spent no quota (app/byok.py), so it is in no
+        # scope: settlement, the pool display and admission must not count it.
+        if is_byok_model(row["model"]):
+            continue
         uid = row["user_id"]
         count = int(row["request_count"])
         scope = rate_limit_tracker.scope_for_model(row["model"]) or ("overall", 0)

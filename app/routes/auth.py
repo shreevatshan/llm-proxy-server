@@ -602,8 +602,11 @@ async def get_my_quotas(
 
     # Accessible models for this user (same filter as GET /v1/models and /auth/api/models).
     accessible = await provider_manager.get_all_models(user_id=current_user.id)
+    from app.byok import is_byok_model
     models_by_group: dict[int, list[str]] = {}
     for m in accessible:
+        if is_byok_model(m.id):
+            continue  # the caller's own instances are quota-exempt: in no quota section
         models_by_group.setdefault(rate_limit_tracker.group_for(m.id), []).append(m.id)
 
     # Pool membership, resolved once. When pooled, the daily limit of every section is

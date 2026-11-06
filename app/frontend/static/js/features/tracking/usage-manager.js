@@ -3,6 +3,17 @@
  * Displays per-user and per-model request counts for a selectable time window.
  */
 
+// Mirrors app.byok.is_byok_model: the provider key is everything before the first
+// '/', and a BYOK instance's name (after the key's first ':') starts with 'byok-'.
+function isByokModelId(modelId) {
+    if (!modelId) return false;
+    const key = String(modelId).split('/', 1)[0];
+    const colon = key.indexOf(':');
+    return colon >= 0 && key.slice(colon + 1).startsWith('byok-');
+}
+
+const BYOK_BADGE = '<span class="badge bg-info text-dark ms-1" title="A user\'s own provider (BYOK)">BYOK</span>';
+
 const MONTH_NAMES = [
     '', 'January', 'February', 'March', 'April', 'May', 'June',
     'July', 'August', 'September', 'October', 'November', 'December',
@@ -10,7 +21,7 @@ const MONTH_NAMES = [
 
 class UsageManager {
     constructor() {
-        this.currentView = 'user'; // 'user' | 'model' | 'pool'
+        this.currentView = 'user'; // 'user' | 'model' | 'instance' | 'pool'
         this._cache = null;
         this._refreshTimer = null;
         this._refreshIntervalMs = 60_000;
@@ -197,6 +208,8 @@ class UsageManager {
         this._renderDrilldownStats(entry.axis, data.breakdown);
         if (entry.axis === 'user') {
             this._renderModelBreakdown(data.breakdown);
+        } else if (entry.axis === 'instance') {
+            this._renderInstanceBreakdown(data);
         } else if (entry.axis === 'pool') {
             this._renderPoolMemberBreakdown(data.breakdown);
         } else {
@@ -407,6 +420,8 @@ class UsageManager {
         this._renderChart(...this._topLevelChartArgs());
         if (this.currentView === 'user') {
             this._renderUserTable(this._cache.per_user);
+        } else if (this.currentView === 'instance') {
+            this._renderInstanceTable(this._cache.per_instance || []);
         } else if (this.currentView === 'pool') {
             // `|| []` covers a deploy where this script is newer than a cached payload.
             this._renderPoolTable(this._cache.per_pool || []);
@@ -473,7 +488,7 @@ class UsageManager {
      * deepest segment is where you already are, so it isn't.
      */
     _drilldownHeader() {
-        const root = { user: 'By User', model: 'By Model', pool: 'By Pool' }[this.currentView] || 'Overall';
+        const root = { user: 'By User', model: 'By Model', instance: 'By Instance', pool: 'By Pool' }[this.currentView] || 'Overall';
         const crumb = (text, depth) =>
             `<span class="usage-crumb" data-depth="${depth}" role="button" tabindex="0" ` +
             `style="cursor:pointer;text-decoration:underline;text-underline-offset:3px;color:var(--mono-text-muted);">${this._esc(text)}</span>`;
@@ -530,7 +545,7 @@ class UsageManager {
         const total = this._cache?.totals?.requests || rows.reduce((s, r) => s + r.request_count, 0);
         const rowsHtml = rows.map(r => `
             <tr class="usage-drilldown-row" data-axis="model" data-id="${this._esc(r.model)}" style="cursor:pointer;" title="Click to see breakdown by user">
-                <td>${this._esc(r.model)}</td>
+                <td>${this._esc(r.model)}${(r.is_byok ?? isByokModelId(r.model)) ? BYOK_BADGE : ''}</td>
                 <td>${r.request_count.toLocaleString()}</td>
                 <td class="text-end">${this._pct(r.request_count, total)}</td>
                 <td class="text-end">${this._deleteButton()}</td>
@@ -544,6 +559,76 @@ class UsageManager {
             </div>`;
         this._bindRowClicks(container);
         this._bindDeleteButtons(container);
+    }
+
+    // One row per provider instance. BYOK instances (users' own) carry a badge and
+    // their owner. No delete button: the usage purge has no per-instance axis.
+    _renderInstanceTable(rows) {
+        const container = document.getElementById('usage-table-container');
+        if (!rows || rows.length === 0) { container.innerHTML = this._emptyState(); return; }
+        const total = this._cache?.totals?.requests || rows.reduce((s, r) => s + r.request_count, 0);
+        const rowsHtml = rows.map(r => {
+            const drillable = r.provider_key !== '(unattributed)';
+            const owner = r.is_byok
+                ? this._esc(r.owner_identity || (r.owner_user_id != null ? `user #${r.owner_user_id}` : '—'))
+                : '<span class="text-muted">Shared</span>';
+            return `
+            <tr class="${drillable ? 'usage-drilldown-row' : ''}" data-axis="instance" data-id="${this._esc(r.provider_key)}"
+                ${drillable ? 'style="cursor:pointer;" title="Click to see breakdown by model and user"' : ''}>
+                <td><code>${this._esc(r.provider_key)}</code>${r.is_byok ? BYOK_BADGE : ''}</td>
+                <td>${owner}</td>
+                <td>${r.request_count.toLocaleString()}</td>
+                <td class="text-end">${this._pct(r.request_count, total)}</td>
+            </tr>`;
+        }).join('');
+        container.innerHTML = `
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead><tr><th>Instance</th><th>Owner</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
+                    <tbody>${rowsHtml}</tbody>
+                </table>
+            </div>`;
+        this._bindRowClicks(container);
+    }
+
+    // An instance's models, and who sent the requests (for a BYOK instance, its owner).
+    _renderInstanceBreakdown(data) {
+        const container = document.getElementById('usage-table-container');
+        const header = this._drilldownHeader();
+        const models = data.breakdown || [];
+        const users = data.breakdown_users || [];
+        if (!models.length) {
+            container.innerHTML = header + this._emptyState();
+            this._bindBreadcrumb(container);
+            return;
+        }
+        const inst = data.instance || {};
+        const total = models.reduce((s, r) => s + r.request_count, 0);
+        const note = inst.is_byok
+            ? `<p class="small text-muted mb-2">${BYOK_BADGE} Owned by <strong>${this._esc(inst.owner_identity || `user #${inst.owner_user_id}`)}</strong>. Quota-exempt: these requests used the owner's own key.</p>`
+            : '';
+        const modelRows = models.map(r => `
+            <tr><td>${this._esc(r.model)}</td><td>${r.request_count.toLocaleString()}</td>
+                <td class="text-end">${this._pct(r.request_count, total)}</td></tr>`).join('');
+        const userRows = users.map(r => `
+            <tr><td>${this._esc(r.user_identity)}</td>
+                <td>${r.user_type ? `<span class="badge bg-secondary">${this._esc(r.user_type)}</span>` : ''}</td>
+                <td>${r.request_count.toLocaleString()}</td>
+                <td class="text-end">${this._pct(r.request_count, total)}</td></tr>`).join('');
+        container.innerHTML = header + note + `
+            <div class="table-responsive mb-3">
+                <table class="table table-hover mb-0">
+                    <thead><tr><th>Model</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
+                    <tbody>${modelRows}</tbody>
+                </table>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-hover mb-0">
+                    <thead><tr><th>User</th><th>Type</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
+                    <tbody>${userRows}</tbody>
+                </table>
+            </div>`;
+        this._bindBreadcrumb(container);
     }
 
     _renderPoolTable(rows) {
@@ -634,7 +719,7 @@ class UsageManager {
         const total = rows.reduce((s, r) => s + r.request_count, 0);
         const rowsHtml = rows.map(r => `
             <tr>
-                <td>${this._esc(r.model)}</td>
+                <td>${this._esc(r.model)}${isByokModelId(r.model) ? BYOK_BADGE : ''}</td>
                 <td>${r.request_count.toLocaleString()}</td>
                 <td class="text-end">${this._pct(r.request_count, total)}</td>
             </tr>`).join('');
@@ -657,6 +742,7 @@ class UsageManager {
         set('usage-total-requests', totals.requests);
         set('usage-unique-users', totals.unique_users);
         set('usage-unique-models', totals.unique_models);
+        set('usage-byok-requests', totals.byok_requests);
     }
 
     // When something is selected, collapse the three-tile overview into a two-tile
@@ -675,8 +761,12 @@ class UsageManager {
         const totalLabel = document.querySelector('#usage-stat-total .stat-label');
         if (totalLabel) totalLabel.textContent = 'Total Requests';
 
-        if (axis === 'user') {
-            // Selected a user → second tile shows how many models they used.
+        // The BYOK tile is an overview number; a selection has its own scope.
+        const byokCard = document.getElementById('usage-stat-byok');
+        if (byokCard) byokCard.style.display = 'none';
+
+        if (axis === 'user' || axis === 'instance') {
+            // Selected a user (or an instance) → second tile shows how many models.
             this._setStatTile('usage-unique-users', 'usage-unique-models',
                 'usage-stat-users', 'usage-stat-models', rows.length, 'Models Used');
         } else if (axis === 'pool') {
@@ -718,6 +808,9 @@ class UsageManager {
             if (l) l.textContent = text;
         };
         label('usage-stat-total', pool ? 'Pooled Requests' : 'Total Requests');
+        // BYOK traffic is never pooled, so the tile has nothing to say on By Pool.
+        const byokCard = document.getElementById('usage-stat-byok');
+        if (byokCard) byokCard.style.display = pool ? 'none' : '';
         label('usage-stat-users', pool ? 'Pool Members' : 'Unique Users');
         label('usage-stat-models', pool ? 'Pools' : 'Models Used');
     }
@@ -853,7 +946,7 @@ class UsageManager {
                 btn.classList.remove('active');
             }
         };
-        ['user', 'model', 'pool'].forEach(key => {
+        ['user', 'model', 'instance', 'pool'].forEach(key => {
             apply(document.getElementById(`usage-toggle-${key}`), view === key);
         });
         // Ensure indicator is positioned when toggle re-renders (view switch doesn't change window)

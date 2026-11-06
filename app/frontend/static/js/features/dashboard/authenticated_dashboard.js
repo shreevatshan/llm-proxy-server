@@ -357,8 +357,16 @@ function _displayModels() {
         const name = model.model_name;
         const apis = _modelApiSupport[name] || ['openai'];
         const badges = apis.map(_apiBadge).join('');
+        // One of the user's own providers (My Providers tab): same parse as app.byok.
+        const key = name.split('/', 1)[0];
+        const isByok = key.includes(':') && key.slice(key.indexOf(':') + 1).startsWith('byok-');
+        const byokTag = isByok
+            ? `<span class="api-badge" title="Your own provider (My Providers)"><i class="fas fa-server me-1"></i>BYOK</span>`
+            : '';
         const disabledTag = model.disabled
-            ? `<span class="api-badge model-disabled-badge" title="Disabled for your profile — contact an admin for access"><i class="fas fa-ban me-1"></i>disabled</span>`
+            ? (isByok
+                ? `<span class="api-badge model-disabled-badge" title="Turned off in My Providers"><i class="fas fa-ban me-1"></i>off</span>`
+                : `<span class="api-badge model-disabled-badge" title="Disabled for your profile — contact an admin for access"><i class="fas fa-ban me-1"></i>disabled</span>`)
             : '';
         const outageTitle = model.outage ? escapeHtml(`Outage: ${model.outage}`) : '';
         const outageTag = model.outage
@@ -369,7 +377,7 @@ function _displayModels() {
             <div class="model-list-item${classes}"${model.outage ? ` title="${outageTitle}"` : ''}>
                 <div class="model-info">
                     <div class="model-name">${escapeHtml(name)}</div>
-                    <div class="api-badges">${badges}${outageTag}${disabledTag}</div>
+                    <div class="api-badges">${byokTag}${badges}${outageTag}${disabledTag}</div>
                 </div>
                 <button class="copy-button" data-model-name="${escapeHtml(name)}" onclick="copyModelName(this)">
                     <i class="fas fa-copy"></i> Copy

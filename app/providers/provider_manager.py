@@ -27,6 +27,7 @@ from app.providers.bedrock_provider import BedrockProvider
 from app.providers.google_provider import GoogleProvider
 from app.providers.platformai import PlatformAIProvider
 from app.providers.azure_deployments import build_azure_config_fields, merge_azure_deployments, normalize_azure_deployments
+from app.byok import byok_registry, is_byok_instance_name
 from opentelemetry import trace
 from opentelemetry import context as otel_context
 from app.tracing import (
@@ -69,6 +70,12 @@ class ProviderManager:
         # Outcome of each provider's last model fetch, keyed by provider_key, for the
         # admin dashboard. In-memory only: resets on restart until the next sync.
         self._sync_status: Dict[str, Dict[str, Any]] = {}
+
+        # BYOK instances that could not be built (undecryptable secret, URL refused,
+        # missing credentials), keyed by provider_key, for the owner's dashboard.
+        self.byok_load_errors: Dict[str, str] = {}
+        # Serialises single-instance BYOK registry edits against each other.
+        self._byok_lock: Optional[asyncio.Lock] = None
 
     def record_sync_status(
         self,
@@ -202,62 +209,123 @@ class ProviderManager:
             print("Database-only mode: No providers will be loaded. Use the admin panel to configure providers.")
             # No fallback to YAML - database-only mode
     
-    async def _load_providers_from_database(self, target: Optional[Dict[str, BaseProvider]] = None):
+    _SPECIALIZED_PROVIDERS = {
+        'azure': AzureProvider,
+        'bedrock': BedrockProvider,
+        'google': GoogleProvider,
+        'platformai': PlatformAIProvider,
+    }
+
+    def _build_provider(self, cred, check_urls: bool = True) -> BaseProvider:
+        """Instantiate the provider object for one credentials row (may raise).
+
+        Synchronous: for a BYOK row the SSRF check resolves DNS on the calling
+        thread. Async code uses build_provider, which moves that off the loop.
+        """
+        # Use specialized provider if available, otherwise use custom/OpenAI-compatible
+        # (all other providers, including 'custom' and legacy 'openai_compatible').
+        provider_factory = self._SPECIALIZED_PROVIDERS.get(cred.provider_type, create_custom_provider)
+        provider_config = self._create_provider_config(cred, check_urls=check_urls)
+        return provider_factory(provider_config)
+
+    async def build_provider(self, cred) -> BaseProvider:
+        """_build_provider for async callers (may raise).
+
+        A BYOK row's upstream URLs are checked in a worker thread first: the check
+        resolves DNS, and a slow resolver for a user-chosen host must not stall
+        the event loop.
+        """
+        if _row_owner(cred) is None:
+            return self._build_provider(cred)
+        from app.providers.url_guard import validate_cred_row
+        await asyncio.to_thread(validate_cred_row, cred)
+        return self._build_provider(cred, check_urls=False)
+
+    @staticmethod
+    def _should_load(cred) -> bool:
+        """Whether a row belongs in the live registry."""
+        if not cred.enabled or getattr(cred, "admin_disabled", False) is True:
+            return False
+        if _row_owner(cred) is None and is_byok_instance_name(cred.instance_name):
+            # The 'byok-' prefix is reserved for user-owned instances; an ownerless
+            # row using it would be quota-exempt by name. Refused (see migrations).
+            print(f"Refusing to load {cred.provider_key}: reserved 'byok-' prefix without an owner")
+            return False
+        return True
+
+    async def _load_providers_from_database(
+        self,
+        target: Optional[Dict[str, BaseProvider]] = None,
+        owners_target: Optional[Dict[str, int]] = None,
+    ):
         """Load providers from database (async).
 
         Populates ``target`` when given (used by refresh to build a fresh
-        registry off to the side), otherwise ``self.providers``.
+        registry off to the side), otherwise ``self.providers``. The BYOK owner map
+        (every owned row, enabled or not) goes to ``owners_target`` likewise, or
+        straight into the registry when no target is given.
         """
         registry = self.providers if target is None else target
+        owners: Dict[str, int] = {} if owners_target is None else owners_target
+        load_errors: Dict[str, str] = {}
         try:
             from app.auth.database import AsyncSessionLocal, get_all_provider_credentials
             
             # Use async session for initialization
             async with AsyncSessionLocal() as db:
-                # Get all provider credentials from database
-                credentials_list = await get_all_provider_credentials(db)
+                # Every row, BYOK included: this is the one reader that needs them all.
+                credentials_list = await get_all_provider_credentials(db, include_byok=True)
                 
                 if not credentials_list:
                     print("No provider credentials found in database. Use the admin panel to configure providers.")
+                    if target is None:
+                        byok_registry.replace(owners)
+                        self.byok_load_errors = load_errors
                     return
                 
-                # Initialize providers from database credentials
-                # Map specific provider types to their implementations
-                specialized_providers = {
-                    'azure': AzureProvider,
-                    'bedrock': BedrockProvider,
-                    'google': GoogleProvider,
-                    'platformai': PlatformAIProvider,
-                }
-                
                 for cred in credentials_list:
-                    if cred.enabled:
-                        try:
-                            # Use specialized provider if available, otherwise use custom/OpenAI-compatible
-                            if cred.provider_type in specialized_providers:
-                                provider_factory = specialized_providers[cred.provider_type]
-                            else:
-                                # All other providers (including 'custom' and legacy 'openai_compatible')
-                                provider_factory = create_custom_provider
-                            
-                            provider_config = self._create_provider_config(cred)
-                            registry[cred.provider_key] = provider_factory(provider_config)
-                            print(f"Initialized {cred.provider_key} provider from database")
-                        except Exception as e:
-                            print(f"Failed to initialize {cred.provider_key} provider: {e}")
+                    if _row_owner(cred) is not None:
+                        owners[cred.provider_key] = _row_owner(cred)
+                    if not self._should_load(cred):
+                        continue
+                    try:
+                        registry[cred.provider_key] = await self.build_provider(cred)
+                        print(f"Initialized {cred.provider_key} provider from database")
+                    except Exception as e:
+                        if _row_owner(cred) is not None:
+                            load_errors[cred.provider_key] = _sanitize_error(e)
+                        print(f"Failed to initialize {cred.provider_key} provider: {e}")
 
                 print(f"Loaded {len(registry)} providers from database")
+            if target is None:
+                byok_registry.replace(owners)
+                self.byok_load_errors = load_errors
+            else:
+                self._pending_byok_load_errors = load_errors
                 
         except Exception as e:
             print(f"Database provider loading failed: {e}")
             raise
     
-    def _create_provider_config(self, cred) -> Dict[str, Any]:
-        """Create provider configuration dict from database credentials."""
+    def _create_provider_config(self, cred, check_urls: bool = True) -> Dict[str, Any]:
+        """Create provider configuration dict from database credentials.
+
+        A BYOK row (owner_user_id set) gets its secrets decrypted into the dict --
+        never onto the ORM row, which could be flushed back as plaintext -- its
+        upstream URLs re-checked by the SSRF guard (unless ``check_urls=False``:
+        the caller already ran it, see build_provider), its credentials required (no
+        fallback to the server's own environment or AWS role), and ``byok: True``
+        so providers build guarded HTTP clients. Raises on any of those failing.
+        """
+        if _row_owner(cred) is not None:
+            cred = _byok_view(cred, check_urls=check_urls)
         config_dict = {
             'name': cred.instance_name,
             'enabled': cred.enabled
         }
+        if isinstance(cred, _ByokCredView):
+            config_dict['byok'] = True
+            config_dict['owner_user_id'] = cred.owner_user_id
         
         # Add provider_name for OpenAI-compatible providers
         if hasattr(cred, 'provider_name') and cred.provider_name:
@@ -322,13 +390,19 @@ class ProviderManager:
         return config_dict
     
     
-    async def _fetch_all_models(self) -> List[ModelInfo]:
-        """Fetch all available models from all providers (internal method)."""
+    async def _fetch_all_models(self, include_byok: bool = True) -> List[ModelInfo]:
+        """Fetch all available models from all providers (internal method).
+
+        ``include_byok=False`` leaves users' own instances out (admin sync and
+        refresh, which are not the admin's to run on them).
+        """
         all_models = []
         
         # Create tasks for all providers with timeout
         tasks = []
         for provider_name, provider in self.providers.items():
+            if not include_byok and byok_registry.is_byok(provider_name):
+                continue
             task = asyncio.create_task(
                 self._fetch_models_with_timeout(provider_name, provider)
             )
@@ -900,12 +974,17 @@ class ProviderManager:
         Serialised: two overlapping refreshes would each capture the same "old"
         registry, so the first one's freshly built registry would be swapped out by
         the second without ever having its clients closed.
+
+        Also holds the BYOK edit lock: the refresh swaps in a registry and owner map
+        built from one database read, so a single-instance edit (upsert/remove)
+        landing between that read and the swap would otherwise be discarded.
         """
         lock = getattr(self, "_refresh_lock", None)
         if lock is None:
             lock = self._refresh_lock = asyncio.Lock()
         async with lock:
-            await self._refresh_providers_from_database_locked()
+            async with self._byok_edit_lock():
+                await self._refresh_providers_from_database_locked()
 
     async def _refresh_providers_from_database_locked(self) -> None:
         try:
@@ -916,8 +995,14 @@ class ProviderManager:
             # empty/partial map. On failure the swap never happens, so the old
             # registry keeps serving.
             new_providers: Dict[str, BaseProvider] = {}
-            await self._load_providers_from_database(target=new_providers)
+            new_owners: Dict[str, int] = {}
+            self._pending_byok_load_errors = {}
+            await self._load_providers_from_database(target=new_providers, owners_target=new_owners)
+            # Owner map first: a BYOK key briefly in the registry without its owner
+            # reads as UNKNOWN_OWNER and is denied (fail closed), never as global.
+            byok_registry.replace(new_owners)
             self.providers = new_providers
+            self.byok_load_errors = self._pending_byok_load_errors
             # Drop status for providers that were deleted or disabled.
             self._sync_status = {k: v for k, v in self._sync_status.items() if k in new_providers}
 
@@ -935,6 +1020,81 @@ class ProviderManager:
             print(f"Error refreshing providers from database: {e}")
             raise
     
+    # ==================== BYOK single-instance registry edits ====================
+
+    def _byok_edit_lock(self) -> asyncio.Lock:
+        if self._byok_lock is None:
+            self._byok_lock = asyncio.Lock()
+        return self._byok_lock
+
+    async def upsert_byok_provider(self, provider_key: str) -> Optional[str]:
+        """(Re)load one BYOK instance from the database without touching any other.
+
+        The full refresh rebuilds every provider and its clients; a user editing
+        their own instance must not cost everyone that. Copy-on-write swap of the
+        registry, owner map updated first. A disabled (by owner or admin) instance is
+        taken out of routing and its models out of the cache.
+
+        Returns the build error for the owner's dashboard, or None on success.
+        """
+        from app.auth.database import AsyncSessionLocal, get_provider_credentials
+
+        async with self._byok_edit_lock():
+            async with AsyncSessionLocal() as db:
+                cred = await get_provider_credentials(db, provider_key)
+            if cred is None or _row_owner(cred) is None:
+                await self._drop_byok_locked(provider_key, forget_owner=cred is None)
+                return None
+
+            byok_registry.set(provider_key, _row_owner(cred))
+            live = bool(cred.enabled) and not bool(cred.admin_disabled)
+            self.model_cache.update_single_provider_config(provider_key, live)
+            if not live:
+                await self._drop_byok_locked(provider_key, forget_owner=False)
+                return None
+
+            try:
+                provider = await self.build_provider(cred)
+            except Exception as e:
+                error = _sanitize_error(e)
+                self.byok_load_errors = {**self.byok_load_errors, provider_key: error}
+                await self._drop_byok_locked(provider_key, forget_owner=False)
+                print(f"Failed to initialize BYOK provider {provider_key}: {e}")
+                return error
+
+            old = self.providers.get(provider_key)
+            registry = dict(self.providers)
+            registry[provider_key] = provider
+            self.providers = registry
+            self.byok_load_errors = {k: v for k, v in self.byok_load_errors.items() if k != provider_key}
+            if old is not None and old is not provider:
+                task = asyncio.create_task(self._deferred_close_providers({provider_key: old}))
+                self._track_task(task)
+            return None
+
+    async def remove_byok_provider(self, provider_key: str, forget_owner: bool = True) -> None:
+        """Take one BYOK instance out of routing and its models out of the cache.
+
+        ``forget_owner`` drops it from the owner map too (the row is deleted). A
+        disabled row keeps its owner entry, so its key stays denied to everyone else.
+        """
+        async with self._byok_edit_lock():
+            await self._drop_byok_locked(provider_key, forget_owner=forget_owner)
+
+    async def _drop_byok_locked(self, provider_key: str, forget_owner: bool) -> None:
+        old = self.providers.get(provider_key)
+        if old is not None:
+            registry = dict(self.providers)
+            registry.pop(provider_key, None)
+            self.providers = registry
+            task = asyncio.create_task(self._deferred_close_providers({provider_key: old}, grace_seconds=1.0))
+            self._track_task(task)
+        await self.model_cache.update_provider_models(provider_key, [])
+        self._sync_status.pop(provider_key, None)
+        if forget_owner:
+            byok_registry.discard(provider_key)
+            self.byok_load_errors = {k: v for k, v in self.byok_load_errors.items() if k != provider_key}
+
     async def get_all_models(self, api_filter: str = None, user_id: Optional[int] = None) -> List[ModelInfo]:
         """Get all available models (from cache, filtered by configuration).
 
@@ -1021,6 +1181,11 @@ class ProviderManager:
                     candidates = self.model_cache.bare_model_candidates(candidate_name)
                     for candidate in candidates:
                         provider_key = candidate.split('/', 1)[0]
+                        # Never a BYOK instance: this net has no caller to check
+                        # ownership against. Owners reach theirs by canonical id,
+                        # which resolve_model_for_request produces for them.
+                        if byok_registry.is_byok(provider_key):
+                            continue
                         if provider_key in self.providers:
                             return provider_key, candidate_name
 
@@ -1043,11 +1208,22 @@ class ProviderManager:
             return None
         if provider_name in self.providers:
             return provider_name
-        candidates = [
-            full_name for full_name in self.providers.keys()
-            if full_name.startswith(f"{provider_name}:")
-        ]
+        candidates = self._family_candidates(provider_name)
         return candidates[0] if len(candidates) == 1 else None
+
+    def _family_candidates(self, provider_name: str) -> List[str]:
+        """Registered keys in the 'provider_name:' family, BYOK instances excluded.
+
+        A bare family prefix ('azure/...', 'custom/...') never reaches a user's own
+        instance: otherwise one user adding 'azure:byok-…' would make 'azure/'
+        ambiguous for everyone, and the error would list other users' keys. Exact
+        keys still resolve (see the callers).
+        """
+        prefix = f"{provider_name}:"
+        return [
+            full_name for full_name in self.providers.keys()
+            if full_name.startswith(prefix) and not byok_registry.is_byok(full_name)
+        ]
 
     def has_provider_prefix(self, provider_name: str) -> bool:
         """Whether `provider_name` names a registered provider or provider family.
@@ -1062,9 +1238,7 @@ class ProviderManager:
             return False
         if provider_name in self.providers:
             return True
-        return any(
-            full_name.startswith(f"{provider_name}:") for full_name in self.providers
-        )
+        return bool(self._family_candidates(provider_name))
 
     def _get_provider(self, provider_name: str) -> BaseProvider:
         """Get provider by name."""
@@ -1079,10 +1253,7 @@ class ProviderManager:
                 # resolve when EXACTLY ONE instance matches; routing to an
                 # arbitrary instance (dict-insertion order) is nondeterministic
                 # and may pick an instance that doesn't serve the model.
-                candidates = [
-                    full_name for full_name in self.providers.keys()
-                    if full_name.startswith(f"{provider_name}:")
-                ]
+                candidates = self._family_candidates(provider_name)
                 if len(candidates) == 1:
                     return self.providers[candidates[0]]
                 if len(candidates) > 1:
@@ -1445,8 +1616,10 @@ class ProviderManager:
         try:
             from app.auth.database import AsyncSessionLocal, refresh_models_from_providers
             
-            # Fetch fresh models from all providers
-            fresh_models = await self._fetch_all_models()
+            # Fetch fresh models from all global providers. BYOK instances are the
+            # owners' own: neither refetched nor cleared (clear_all_model_configurations
+            # skips them) and their cache slice is kept below.
+            fresh_models = await self._fetch_all_models(include_byok=False)
             
             if not fresh_models:
                 print("No models fetched from providers. Database will be cleared but no new models added.")
@@ -1473,8 +1646,9 @@ class ProviderManager:
             async with AsyncSessionLocal() as db:
                 result = await refresh_models_from_providers(db, models_data)
                 
-                # Update model cache
-                self.model_cache.update_models(fresh_models)
+                # Update model cache, keeping the BYOK instances' slice
+                byok_models = [m for m in self.model_cache.get_models() if byok_registry.is_byok_model(m.id)]
+                self.model_cache.update_models(fresh_models + byok_models)
                 await self._load_model_configurations()
                 
                 print(f"Model refresh completed: cleared {result['cleared']}, created {result['created']}")
@@ -1485,6 +1659,81 @@ class ProviderManager:
             import traceback
             traceback.print_exc()
             return {"error": str(e)}
+
+
+_MAX_ERROR_CHARS = 300
+
+
+def _row_owner(cred) -> Optional[int]:
+    """A credentials row's BYOK owner id, or None for a global row.
+
+    Only a real int counts, so a stand-in row object without the column (tests,
+    mocks) reads as global rather than as owned by a truthy placeholder.
+    """
+    owner = getattr(cred, "owner_user_id", None)
+    return owner if isinstance(owner, int) and not isinstance(owner, bool) else None
+
+
+def _sanitize_error(error: Exception) -> str:
+    """A short, single-line error safe to show a BYOK owner (no upstream bodies)."""
+    text = (str(error) or "").strip()
+    text = text.splitlines()[0].strip() if text else type(error).__name__
+    return text[:_MAX_ERROR_CHARS] + ("…" if len(text) > _MAX_ERROR_CHARS else "")
+
+
+class _ByokCredView:
+    """Read-only view of a BYOK credentials row with its secrets decrypted.
+
+    Built for _create_provider_config only. Attribute reads fall through to the ORM
+    row; secret fields come back decrypted. Nothing is ever written to the row.
+    """
+
+    is_byok_view = True
+
+    def __init__(self, cred, secrets: Dict[str, Any]):
+        object.__setattr__(self, "_cred", cred)
+        object.__setattr__(self, "_secrets", secrets)
+
+    def __getattr__(self, name):
+        secrets = object.__getattribute__(self, "_secrets")
+        if name in secrets:
+            return secrets[name]
+        return getattr(object.__getattribute__(self, "_cred"), name)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("BYOK credential view is read-only")
+
+
+def _byok_view(cred, check_urls: bool = True) -> _ByokCredView:
+    """Decrypt, SSRF-check and credential-check a BYOK row (raises ValueError on failure).
+
+    ``check_urls=False`` skips the SSRF check (blocking DNS) for a caller that
+    already ran it off the event loop.
+    """
+    from app.auth import secret_box
+    from app.providers.url_guard import validate_cred_row
+
+    try:
+        secrets = {field: secret_box.decrypt(getattr(cred, field, None)) for field in secret_box.SECRET_FIELDS}
+    except secret_box.SecretDecryptError as e:
+        raise ValueError("Stored credentials cannot be decrypted; re-enter them") from e
+
+    if check_urls:
+        validate_cred_row(cred)
+
+    ptype = cred.provider_type
+    if ptype == "bedrock" and not (getattr(cred, "access_key_id", None) and secrets.get("secret_access_key")):
+        # Without explicit keys boto3 would use the proxy host's own AWS credentials.
+        raise ValueError("A BYOK Bedrock instance needs an access key ID and secret access key")
+    if ptype in ("google", "azure") and not secrets.get("api_key"):
+        raise ValueError(f"A BYOK {ptype} instance needs an API key")
+    if ptype == "azure" and not getattr(cred, "endpoint", None):
+        raise ValueError("A BYOK Azure instance needs an endpoint")
+    if ptype not in ("azure", "google", "bedrock", "platformai") and not (
+        getattr(cred, "base_url", None) or getattr(cred, "endpoint", None) or getattr(cred, "anthropic_base_url", None)
+    ):
+        raise ValueError("A BYOK custom instance needs a base URL")
+    return _ByokCredView(cred, secrets)
 
 
 # Global provider manager instance

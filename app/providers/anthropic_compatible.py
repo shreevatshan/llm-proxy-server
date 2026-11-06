@@ -254,6 +254,11 @@ class AnthropicCompatibleProvider(BaseProvider):
             base_url = _anthropic_base_url(config.get("anthropic_base_url") or self.base_url or "")
 
             client_kwargs: Dict[str, Any] = {"base_url": base_url}
+            from app.providers.url_guard import http_client_for
+            guarded = http_client_for(config)
+            if guarded is not None:
+                # BYOK: no redirects, every request's destination re-checked.
+                client_kwargs["http_client"] = guarded
             if (config.get("anthropic_auth_style") or "").lower() == "bearer":
                 # e.g. OpenRouter: Authorization: Bearer, and no X-Api-Key.
                 client_kwargs["api_key"] = None

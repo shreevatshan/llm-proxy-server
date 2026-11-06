@@ -194,9 +194,12 @@ class OpenAICompatibleProvider(BaseProvider):
         """Initialize AsyncOpenAI client when OpenAI API is supported."""
         if "openai" not in getattr(self, "_supported_apis", []):
             return
+        from app.providers.url_guard import http_client_for
         self.client = AsyncOpenAI(
             base_url=self.base_url,
             api_key=getattr(self, "api_key", None) or _DEFAULT_API_KEY,
+            # BYOK: no redirects, every request's destination re-checked (url_guard).
+            http_client=http_client_for(getattr(self, "config", None)),
         )
     
     @abstractmethod

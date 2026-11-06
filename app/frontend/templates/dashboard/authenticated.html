@@ -310,6 +310,7 @@
     {'id': 'quotas', 'label': 'Quotas', 'icon': 'fa-gauge-high'},
     {'id': 'pool', 'label': 'Pool', 'icon': 'fa-users'},
     {'id': 'websearch', 'label': 'Web Search', 'icon': 'fa-magnifying-glass'},
+    {'id': 'byok', 'label': 'My Providers', 'icon': 'fa-server'},
 ] %}
 <div class="dash-layout">
 {{ dash_sidebar(sidebar_tabs, 'api-keys', 'Dashboard sections') }}
@@ -807,6 +808,106 @@
     </div>
 </div>
 
+<!-- ══════════════════════════════════════════════════════ My Providers (BYOK) -->
+<div class="section tab-content" id="byok-tab" style="display: none;">
+    <div class="d-flex flex-wrap justify-content-between align-items-start gap-2 mb-2">
+        <div>
+            <h4 class="mb-1"><i class="fas fa-server me-2"></i>My Providers</h4>
+        </div>
+        <button type="button" class="btn btn-primary" id="byok-add-btn" onclick="window.ByokManager.openForm()">
+            <i class="fas fa-plus me-1"></i>Add provider
+        </button>
+    </div>
+    <p class="small text-muted mb-3" id="byok-count"></p>
+
+    <div class="skeleton-stack" id="byok-loading" aria-busy="true" aria-label="Loading your providers">
+        <div class="skeleton skeleton-row"></div>
+        <div class="skeleton skeleton-row"></div>
+    </div>
+
+    <!-- Add / edit form: the admin provider form's fields, in BYOK mode (provider-forms.js) -->
+    <div class="card mb-4" id="byok-form-card" style="display: none;">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <h5 class="mb-0" id="form-title">Add Provider</h5>
+            <button class="btn btn-sm btn-outline-secondary" type="button" onclick="window.ByokManager.closeForm()" title="Cancel">
+                <i class="fas fa-times"></i>
+            </button>
+        </div>
+        <form id="provider-form" autocomplete="off">
+            <div class="card-body">
+                <div id="form-alerts" class="form-alerts"></div>
+                <div class="row">
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label for="provider_type" class="form-label">
+                                <i class="fas fa-server"></i> Provider type <span class="text-danger">*</span>
+                            </label>
+                            <select id="provider_type" class="form-select" onchange="updateProviderForm()" required>
+                                <option value="">Choose a provider type...</option>
+                                <option value="custom">OpenAI / Anthropic compatible</option>
+                                <option value="azure">Azure</option>
+                                <option value="google">Google AI</option>
+                                <option value="bedrock">AWS Bedrock</option>
+                                <option value="platformai">Zoho PlatformAI</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="col-md-6">
+                        <div class="mb-3">
+                            <label for="instance_name" class="form-label">
+                                <i class="fas fa-tag"></i> Name <span class="text-danger">*</span>
+                            </label>
+                            <div class="input-group">
+                                <span class="input-group-text font-monospace" id="byok-prefix">byok-</span>
+                                <input type="text" id="instance_name" class="form-control" placeholder="personal"
+                                       pattern="[a-z0-9][a-z0-9\-]{0,39}" maxlength="40" required
+                                       aria-describedby="byok-prefix byok-name-help">
+                            </div>
+                            <div class="form-text" id="byok-name-help">
+                                Lowercase letters, digits and hyphens. It can't be changed later.
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div id="provider-config-section" class="mb-2" style="display: none;">
+                    <div id="provider-specific-fields" class="provider-fields"></div>
+                </div>
+                <div class="form-text">
+                    <i class="fas fa-lock me-1"></i>Keys are stored encrypted and never shown again.
+                    URLs must be public <code>https</code> addresses.
+                </div>
+            </div>
+            <div class="card-footer d-flex justify-content-end gap-2">
+                <button type="button" class="btn btn-secondary" onclick="window.ByokManager.closeForm()">Cancel</button>
+                <button type="submit" class="btn btn-primary" id="submit-btn">
+                    <span class="btn-content"><i class="fas fa-save me-1"></i><span id="submit-text">Add provider</span></span>
+                    <div class="btn-loading d-none"><i class="fas fa-spinner fa-spin"></i> <span>Saving...</span></div>
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <div id="byok-list"></div>
+    <div id="byok-empty" class="empty-state" style="display: none;">
+        <div class="empty-state-icon"><i class="fas fa-server"></i></div>
+        <h3>No providers yet</h3>
+        <p>Add your own OpenAI-compatible endpoint, Azure, Google, Bedrock or PlatformAI account.</p>
+    </div>
+</div>
+
+<!-- BYOK models modal -->
+<div class="modal fade" id="byokModelsModal" tabindex="-1" aria-labelledby="byokModelsTitle" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="byokModelsTitle">Models</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body" id="byokModelsBody"></div>
+        </div>
+    </div>
+</div>
+
 <!-- Confirmation Modal -->
 <div class="modal fade" id="confirmModal" tabindex="-1" aria-labelledby="confirmModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
@@ -863,5 +964,8 @@
 <script src="/static/js/features/dashboard/pool-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/shared/websearch-params.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/dashboard/websearch-prefs-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/azure-manager.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/provider-forms.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/dashboard/byok-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/core/dash-sidebar.js?v={{ cache_version }}"></script>
 {% endblock %}

@@ -332,6 +332,11 @@ class WebSearchSettingsCache:
         cfg = self._snapshot.default
         if not cfg.enabled or not cfg.base_url:
             return False
+        # A user's own (BYOK) instance is unmetered, so it must not spend the
+        # admin's search backend; "*" does not reach it either.
+        from app.byok import byok_registry
+        if byok_registry.is_byok(provider_key):
+            return False
         if surface not in cfg.apply_to:
             return False
         if "*" in cfg.enabled_providers:

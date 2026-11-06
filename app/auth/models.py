@@ -838,10 +838,16 @@ class ProviderCredentials(Base):
     oauth_refresh_token = Column(String(1000), nullable=True)
     oauth_accounts_url = Column(String(500), nullable=True)
     pai_token_id = Column(String(30), nullable=True)
-    
+
+    # BYOK (app/byok.py): the user who owns this instance, NULL for a global
+    # (admin) instance. Only the owner can use a BYOK instance. admin_disabled is
+    # the admin's kill switch, separate from the owner's own `enabled` toggle.
+    owner_user_id = Column(Integer, nullable=True, index=True)
+    admin_disabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
+
     # Relationship to models
     models = relationship("ModelConfiguration", back_populates="provider", cascade="all, delete-orphan")
 
@@ -2464,9 +2470,91 @@ class ProviderCredentialsResponse(BaseModel):
     oauth_refresh_token: Optional[str] = None
     oauth_accounts_url: Optional[str] = None
     pai_token_id: Optional[str] = None
-    
+
     created_at: datetime
     updated_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# BYOK: a user's own provider instances (app/byok.py, app/routes/user_providers.py)
+# ---------------------------------------------------------------------------
+
+class UserProviderCreate(ProviderCredentialsCreate):
+    """A user's new BYOK instance. The user names it with a ``slug``; the server
+    builds the instance name (byok-{user_id}-{slug}) and provider key from it."""
+
+    slug: str
+    instance_name: Optional[str] = None   # ignored: always derived from slug
+    provider_name: Optional[str] = None   # custom only; fixed to the type otherwise
+
+    @model_validator(mode='after')
+    def validate_byok_identity(self):
+        from app.byok import (
+            SPECIALIZED_PROVIDER_TYPES, validate_bedrock_region, validate_provider_name,
+            validate_provider_type, validate_slug,
+        )
+        validate_provider_type(self.provider_type)
+        self.slug = validate_slug(self.slug)
+        if self.provider_type in SPECIALIZED_PROVIDER_TYPES:
+            self.provider_name = self.provider_type
+        else:
+            self.provider_name = validate_provider_name(self.provider_name)
+        self.region = validate_bedrock_region(self.region)
+        self.instance_name = None
+        return self
+
+
+class UserProviderUpdate(ProviderCredentialsUpdate):
+    """An edit to a user's BYOK instance. Its identity (provider name, instance
+    name, type) cannot change; values equal to the stored ones are accepted so a
+    form may send them back unchanged (checked by the route)."""
+
+    @model_validator(mode='after')
+    def validate_byok_region(self):
+        from app.byok import validate_bedrock_region
+        self.region = validate_bedrock_region(self.region)
+        return self
+
+
+class UserProviderResponse(ProviderCredentialsResponse):
+    """A user's BYOK instance as their dashboard shows it (secrets masked)."""
+
+    slug: str
+    admin_disabled: bool = False
+    model_count: int = 0
+    enabled_model_count: int = 0
+    # Why the instance is not serving (undecryptable secret, URL refused, ...).
+    load_error: Optional[str] = None
+    sync_state: Optional[str] = None
+    sync_error: Optional[str] = None
+    last_sync_at: Optional[float] = None
+
+
+class UserProviderModelToggle(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
+    model_id: str
+    enabled: bool
+
+
+class AdminByokProviderResponse(BaseModel):
+    """One user's BYOK instance as the admin's read-only list shows it."""
+    model_config = {"protected_namespaces": ()}
+
+    provider_key: str
+    provider_type: str
+    provider_name: str
+    instance_name: str
+    owner_user_id: int
+    owner_username: Optional[str] = None
+    enabled: bool
+    admin_disabled: bool
+    model_count: int = 0
+    endpoint_host: Optional[str] = None
+    has_secret: bool = False
+    load_error: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 # OAuth models

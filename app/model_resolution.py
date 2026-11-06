@@ -55,6 +55,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from app.api_envelope import envelope_for
+from app.byok import byok_registry
 from app.model_access_dep import ModelAccessDenied, caller_may_use
 from app.model_alias import (
     alias_source_name, apply_alias, current_api_surface, current_profile_id, model_alias_resolver,
@@ -287,7 +288,10 @@ def _may_use_for(auth) -> Callable[[str], bool]:
     the per-user check, mirroring enforce_model_access (app/model_access_dep.py).
     """
     if auth is PRE_AUTH:
-        return provider_manager.model_cache._passes_global_gate
+        # Before auth nobody is known to own anything: BYOK models are out. The
+        # caller-aware re-map after auth (_bind_profile_context) sees them.
+        gate = provider_manager.model_cache._passes_global_gate
+        return lambda model_id: not byok_registry.is_byok_model(model_id) and gate(model_id)
     return lambda model_id: caller_may_use(auth, model_id)
 
 
@@ -308,13 +312,27 @@ def _canonical_for_prefix(model: str) -> str:
 
 
 def _single(model_id: str, may_use: Callable[[str], bool], check_outage: bool) -> _Evaluation:
-    """Evaluate one canonical id: access first, then outage."""
+    """Evaluate one canonical id: access first, then outage.
+
+    Someone else's BYOK model is *unavailable* (404), not denied (403): a 403 would
+    confirm the instance exists, letting user keys be probed.
+    """
     if not may_use(model_id):
-        return _DENIED
+        return _UNAVAILABLE if byok_registry.is_byok_model(model_id) else _DENIED
     outage = outage_registry.outage_for(model_id) if check_outage else None
     if outage is not None:
         return _Evaluation("outage", outages=(outage,))
     return _Evaluation("ok", (model_id,))
+
+
+def _visible(pool: List[str], may_use: Callable[[str], bool]) -> List[str]:
+    """Drop BYOK candidates the caller may not use, as if they did not exist.
+
+    Other users' instances must not turn "unavailable" into "denied" for a bare
+    name. The owner keeps theirs, so their BYOK and the admin's instances
+    round-robin together.
+    """
+    return [m for m in pool if not byok_registry.is_byok_model(m) or may_use(m)]
 
 
 def _evaluate(
@@ -339,9 +357,9 @@ def _evaluate(
     if rest and provider_manager.has_provider_prefix(head):
         return _single(_canonical_for_prefix(name), may_use, check_outage)
 
-    pool = _filter_pool(cache.bare_model_candidates(name), api)
+    pool = _visible(_filter_pool(cache.bare_model_candidates(name), api), may_use)
     if not pool and allow_prefix_strip and rest:
-        pool = _filter_pool(cache.bare_model_candidates(rest), api)
+        pool = _visible(_filter_pool(cache.bare_model_candidates(rest), api), may_use)
     if not pool:
         return _UNAVAILABLE
     allowed = tuple(model_id for model_id in pool if may_use(model_id))

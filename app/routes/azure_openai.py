@@ -44,6 +44,7 @@ from app.openai_models import (
     ResponseObject,
     ModelInfo,
 )
+from app.byok import byok_registry, is_owner
 from app.providers.provider_manager import provider_manager
 from app.providers.openai_compatible import preserve_upstream_model
 from app.providers.azure_provider import azure_call_style, azure_api_version
@@ -158,8 +159,13 @@ async def _authenticate_azure(
     )
 
 
-def _get_azure_provider(provider_name: str):
-    """Resolve *provider_name* and verify it is an Azure provider."""
+def _get_azure_provider(provider_name: str, auth=None):
+    """Resolve *provider_name* and verify it is an Azure provider the caller may reach.
+
+    The deployment routes dispatch to the URL's provider, so this is where a BYOK
+    instance is guarded: anyone but its owner gets the same 404 as for a provider
+    that does not exist (no probing, and never the owner's credentials).
+    """
     from app.providers.azure_provider import AzureProvider
 
     try:
@@ -168,6 +174,18 @@ def _get_azure_provider(provider_name: str):
         raise HTTPException(
             status_code=404,
             detail={"error": {"code": "ProviderNotFound", "message": str(exc)}},
+        )
+
+    owner = byok_registry.owner_of(getattr(provider, "full_provider_name", None) or provider_name)
+    if owner is None:
+        owner = byok_registry.owner_of(provider_name)
+    if owner is not None and not is_owner(auth, owner):
+        raise HTTPException(
+            status_code=404,
+            detail={"error": {
+                "code": "ProviderNotFound",
+                "message": f"Provider '{provider_name}' not available or not enabled",
+            }},
         )
 
     if not isinstance(provider, AzureProvider):
@@ -275,7 +293,7 @@ async def list_deployments(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """List deployments for a specific Azure provider."""
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
     models: List[ModelInfo] = await provider.get_available_models()
     return {
         "object": "list",
@@ -308,7 +326,7 @@ async def azure_chat_completions(
 ):
     """Azure OpenAI chat completions endpoint."""
     request_started_at = time.monotonic()
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     # Signal the provider to use the legacy deployment-style upstream call and
     # forward the inbound api-version.  Pre-validate so streaming responses get
@@ -408,7 +426,7 @@ async def azure_completions(
 ):
     """Azure OpenAI text completions endpoint."""
     request_started_at = time.monotonic()
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     model_name = await canonicalize_provider_prefix(
         request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
@@ -485,7 +503,7 @@ async def azure_embeddings(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI embeddings endpoint."""
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     model_name = await canonicalize_provider_prefix(
         request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
@@ -537,7 +555,7 @@ async def azure_image_generation(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI image generation endpoint."""
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     model_name = await canonicalize_provider_prefix(
         request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
@@ -589,7 +607,7 @@ async def azure_audio_speech(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI text-to-speech endpoint."""
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     model_name = await canonicalize_provider_prefix(
         request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
@@ -667,7 +685,7 @@ async def azure_audio_transcription(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI audio transcription endpoint."""
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     model_name = await canonicalize_provider_prefix(
         request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
@@ -738,7 +756,7 @@ async def azure_audio_translation(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI audio translation endpoint."""
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     model_name = await canonicalize_provider_prefix(
         request_obj, map_model_name(_build_model_name(provider_name, deployment), auth))
@@ -802,7 +820,7 @@ async def azure_responses_create(
 ):
     """Azure OpenAI Responses API — create a response."""
     request_started_at = time.monotonic()
-    provider = _get_azure_provider(provider_name)
+    provider = _get_azure_provider(provider_name, auth)
 
     # For Responses API, model is in the request body — prefix it with provider
     if request.model and "/" not in request.model:
@@ -929,7 +947,7 @@ async def azure_responses_retrieve(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI Responses API — retrieve a response."""
-    _get_azure_provider(provider_name)  # validate provider
+    _get_azure_provider(provider_name, auth)  # validate provider
     # Ownership check (IDOR guard): only the creating user (or an admin) may
     # access a stored response.
     await verify_response_ownership(response_id, auth)
@@ -961,7 +979,7 @@ async def azure_responses_delete(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI Responses API — delete a response."""
-    _get_azure_provider(provider_name)  # validate provider
+    _get_azure_provider(provider_name, auth)  # validate provider
     # Ownership check (IDOR guard): see azure_responses_retrieve.
     await verify_response_ownership(response_id, auth)
 
@@ -989,7 +1007,7 @@ async def azure_responses_cancel(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI Responses API — cancel a response."""
-    _get_azure_provider(provider_name)  # validate provider
+    _get_azure_provider(provider_name, auth)  # validate provider
     # Ownership check (IDOR guard): see azure_responses_retrieve.
     await verify_response_ownership(response_id, auth)
 
@@ -1021,7 +1039,7 @@ async def azure_responses_list_input_items(
     auth: Union[User, AdminUser, APIKey] = Depends(_authenticate_azure),
 ):
     """Azure OpenAI Responses API — list input items for a response."""
-    _get_azure_provider(provider_name)  # validate provider
+    _get_azure_provider(provider_name, auth)  # validate provider
     # Ownership check (IDOR guard): see azure_responses_retrieve.
     await verify_response_ownership(response_id, auth)
 

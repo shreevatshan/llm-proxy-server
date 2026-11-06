@@ -261,7 +261,11 @@ class UserUsageManager {
                                     : 0;
                                 return `
                                     <tr>
-                                        <td>${window.UIUtils.escapeHtml(m.model)}</td>
+                                        <td>${window.UIUtils.escapeHtml(m.model)}${(() => {
+                                            const key = String(m.model || '').split('/', 1)[0];
+                                            const byok = key.includes(':') && key.slice(key.indexOf(':') + 1).startsWith('byok-');
+                                            return byok ? ' <span class="badge bg-info text-dark" title="Your own provider (My Providers)">BYOK</span>' : '';
+                                        })()}</td>
                                         <td class="text-end">${m.request_count.toLocaleString()}</td>
                                         <td class="text-end">${pct}%</td>
                                     </tr>

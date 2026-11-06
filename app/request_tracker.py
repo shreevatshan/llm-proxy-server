@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 from typing import Optional
 from app import time_utils
 from app.concurrency import TaskReentrantLock
+from app.byok import is_byok_model
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,23 @@ def _instance_match(column, provider_key: str):
     from sqlalchemy import func, or_
     prefix = f"{provider_key}/"
     return or_(func.substr(column, 1, len(prefix)) == prefix, column == provider_key)
+
+
+def _byok_match(column):
+    """SQL predicate: `column` is a model id on a BYOK instance (app/byok.py).
+
+    The exact mirror of app.byok.is_byok_model: take the provider key (everything
+    before the first '/', or the whole value when there is none), then test that
+    the part after its first ':' starts with 'byok-'. substr/instr rather than
+    LIKE, for the same reasons as _instance_match.
+    """
+    from sqlalchemy import case, func
+    prefix = case(
+        (func.instr(column, "/") > 0, func.substr(column, 1, func.instr(column, "/") - 1)),
+        else_=column,
+    )
+    colon = func.instr(prefix, ":")
+    return (colon > 0) & (func.substr(prefix, colon + 1, 5) == "byok-")
 
 
 @dataclass
@@ -284,7 +302,9 @@ class RequestTracker:
                     entry.server,
                     # The pool the sender is in *now*: pool usage is a filter on this
                     # column, so a request completed after leaving is not the pool's.
-                    self._pool_id_for(entry.user_id),
+                    # A request served by the sender's own BYOK instance is never the
+                    # pool's: it spent none of the shared quota.
+                    0 if is_byok_model(entry.model) else self._pool_id_for(entry.user_id),
                 )
                 async with self._usage_lock:
                     self._usage_buffer[key] += 1
@@ -512,6 +532,10 @@ class RequestTracker:
         def _is_grouped(model) -> bool:
             if not model:
                 return False
+            # BYOK traffic is quota-exempt (app/byok.py): never part of the Default
+            # group's day count, nor of a pool's.
+            if is_byok_model(model):
+                return True
             return model in grouped_models or provider_key_of(model) in grouped_providers
 
         buffered = 0
@@ -536,6 +560,7 @@ class RequestTracker:
                 if grouped_models:
                     exclude.append(RequestUsage.model.in_(list(grouped_models)))
                 exclude.extend(_instance_match(RequestUsage.model, pk) for pk in grouped_providers)
+                exclude.append(_byok_match(RequestUsage.model))
                 if exclude:
                     conditions.append(not_(or_(*exclude)))
                 result = await db.execute(
