@@ -125,6 +125,14 @@ class GoogleProvider(OpenAICompatibleProvider):
         and image generation but not responses or audio endpoints."""
         return ["/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/images/generations", "/v1/messages"]
 
+    async def decisions_create(self, request):
+        """Gemini's OpenAI-compatible layer has no /decisions, so the inherited
+        passthrough would only relay a confusing upstream 404. Gemini's native
+        Decisions API uses a different request shape and is not supported."""
+        raise NotImplementedError(
+            "The Decisions API is not supported by Google Gemini's OpenAI-compatible API"
+        )
+
     def get_supported_apis(self) -> List[str]:
         """Google exposes OpenAI APIs natively and Anthropic via adapter mode."""
         return ["openai", "anthropic"]

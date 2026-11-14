@@ -15,6 +15,7 @@ const AZURE_DEPLOYMENT_APIS = [
     { value: 'images', label: '/images/generations, /edits, /variations', short: '/images/*' },
     { value: 'speech', label: '/audio/speech', short: '/audio/speech' },
     { value: 'transcription', label: '/audio/transcriptions, /translations', short: '/audio/transcriptions' },
+    { value: 'decisions', label: '/decisions', short: '/decisions' },
 ];
 const AZURE_DEFAULT_APIS = ['chat', 'responses'];
 // Rows carried over from configs saved before deployment groups: they

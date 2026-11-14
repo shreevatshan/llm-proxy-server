@@ -18,7 +18,8 @@ from app.openai_models import (
     ResponseDeletedObject,
     ResponseInputTokensResult,
     CompactedResponseObject,
-    ResponseItemList
+    ResponseItemList,
+    DecisionCreateRequest,
 )
 from app.providers.base import BaseProvider, ProviderHTTPError
 from app.providers.custom_providers import create_custom_provider
@@ -1601,6 +1602,22 @@ class ProviderManager:
                 if isinstance(e, ValueError):
                     raise
                 raise Exception(f"Responses compact error: {str(e)}")
+
+    async def decisions_create(self, request: DecisionCreateRequest) -> Dict[str, Any]:
+        """Route a Decisions API request to the model's provider."""
+        with create_span("provider.decisions_create") as span:
+            try:
+                provider_name, _ = self._parse_model_name(request.model)
+                provider = self._get_provider(provider_name)
+                return await provider.decisions_create(request)
+            except Exception as e:
+                set_span_error(span, e)
+                # Preserve typed errors so the route maps them correctly
+                # (ProviderHTTPError -> upstream status/body, including Azure's
+                # per-deployment 400; NotImplementedError -> 400 unsupported_api).
+                if isinstance(e, (ValueError, NotImplementedError, ProviderHTTPError)):
+                    raise
+                raise Exception(f"Decisions create error: {str(e)}")
     
     def get_provider_for_model(self, model_name: str) -> BaseProvider:
         """Get provider for a specific model."""

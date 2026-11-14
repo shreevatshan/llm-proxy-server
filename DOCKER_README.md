@@ -2,7 +2,7 @@
 
 📦 **GitHub:** [shreevatshan/llm-proxy-server](https://github.com/shreevatshan/llm-proxy-server)
 
-A unified proxy server that exposes **OpenAI-compatible**, **Anthropic-compatible**, and **Azure OpenAI-compatible** API endpoints for multiple LLM providers including Azure OpenAI, AWS Bedrock, Google Gemini, OpenAI, Ollama, LlamaCpp, and any custom server. Supports Chat Completions, Embeddings, Images, Audio, the **OpenAI Responses API**, the **Anthropic Messages API**, and **Azure OpenAI deployment-based URLs**.
+A unified proxy server that exposes **OpenAI-compatible**, **Anthropic-compatible**, and **Azure OpenAI-compatible** API endpoints for multiple LLM providers including Azure OpenAI, AWS Bedrock, Google Gemini, OpenAI, Ollama, LlamaCpp, and any custom server. Supports Chat Completions, Embeddings, Images, Audio, the **OpenAI Responses API**, the **OpenAI Decisions API**, the **Anthropic Messages API**, and **Azure OpenAI deployment-based URLs**.
 
 ## Architecture
 
@@ -269,6 +269,70 @@ print(response.output_text)
 | `/v1/responses/{response_id}/input_items` | GET | List input items for a response |
 | `/v1/responses/input_tokens` | POST | Count input tokens |
 | `/v1/responses/compact` | POST | Compact a response |
+
+### 6. Decisions API
+
+The proxy relays the [OpenAI Decisions API](https://developers.openai.com/api/docs/guides/decisions): typed answers (`predicate` probabilities, `choice` picks and `score` ratings) about shared input from a decision model such as `gpt-6-luna`. The request body is forwarded as sent, with `model` mapped to the upstream id, and the upstream `{model, answers, usage}` object is relayed unchanged except that `model` echoes the name you sent (on the Azure OpenAI port the upstream `model` string is kept). The call is non-streaming and counts as one request toward rate limits.
+
+```python
+from openai import OpenAI  # openai-python >= 3.26.0 (>= 3.37.0 for developer/system/tool input items, input_json and image instructions)
+
+client = OpenAI(
+    base_url="http://localhost:11440/v1",
+    api_key="your-user-token"
+)
+
+decision = client.decisions.create(
+    model="openai:primary/gpt-6-luna",
+    input="The package arrived with a broken screen. I want my money back.",
+    questions=[
+        {"type": "predicate", "name": "damaged", "instructions": "Does the customer report a damaged item?"},
+        {
+            "type": "choice",
+            "name": "queue",
+            "instructions": "Which team should handle this ticket?",
+            "choices": [
+                {"value": "billing", "description": "Refunds and payments"},
+                {"value": "shipping", "description": "Delivery and damaged items"},
+            ],
+        },
+        {
+            "type": "score",
+            "name": "urgency",
+            "instructions": "How urgent is this ticket?",
+            "levels": [{"label": "low"}, {"label": "medium"}, {"label": "high"}],
+        },
+    ],
+)
+
+print(decision.answers)
+```
+
+```bash
+curl http://localhost:11440/v1/decisions \
+  -H "Authorization: Bearer your-user-token" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "openai:primary/gpt-6-luna",
+       "input": "The package arrived with a broken screen.",
+       "questions": [{"type": "predicate", "name": "damaged", "instructions": "Is the item damaged?"}]}'
+```
+
+On the Azure OpenAI port, use the plain `OpenAI` client with the v1 base URL and a Bearer token: `OpenAI(base_url="http://localhost:11439/openai/v1/", api_key="your-user-token")`. Dated `AzureOpenAI(api_version=...)` clients and the `api-key` header are not supported for this endpoint.
+
+#### Decisions API Endpoints
+
+| Endpoint | Port | Description |
+|---|---|---|
+| `/v1/decisions` | 11440 (OpenAI) | Create a decision |
+| `/openai/v1/decisions` | 11439 (Azure OpenAI) | Create a decision (Azure v1 path) |
+| `/openai/v1/decisions`, `/azure-openai/openai/v1/decisions` | 8765 (Management) | The same two endpoints through the management port |
+
+**Supported backends:**
+- Custom providers with the OpenAI API whose upstream serves the OpenAI-shaped `POST {base_url}/decisions` (OpenAI and compatible gateways).
+- Azure providers, for deployments (e.g. `gpt-6-luna`) whose deployment row selects `/decisions` in the provider form. It is never selected by default, and a deployment whose row does not select it gets `400 unsupported_api`. Deployments not listed in any row (dynamic discovery, legacy rows) are not gated. Requests go to `{endpoint}/openai/v1/decisions`.
+- Google, Bedrock, PlatformAI, Anthropic-only custom providers and Claude deployments on Foundry answer `400 unsupported_api`. A custom OpenAI provider whose server has no `/decisions` returns that server's own error (usually 404). Upstreams that use a different decisions request shape (e.g. OpenRouter's `/api/alpha/decisions`, Perplexity, Microsoft-Decision-1) are not supported.
+
+When a prefix-less model name such as `gpt-6-luna` is served by several providers, requests rotate across all of them, including ones that cannot serve decisions. Use the full model id (e.g. `openai:primary/gpt-6-luna`), or add a model mapping that pins the name to a decisions-capable provider.
 
 ### Model Naming Format
 

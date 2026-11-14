@@ -156,7 +156,8 @@ class ProviderFormManager {
                         <code>/responses</code> or <code>/messages</code> are offered on <code>/v1/messages</code>;
                         without <code>/messages</code> those requests are adapted onto <code>/chat/completions</code>,
                         or <code>/responses</code> when chat is not selected. <code>/messages</code> (Foundry) calls
-                        the deployment natively.
+                        the deployment natively. <code>/decisions</code> (e.g. gpt-6-luna) must be selected
+                        explicitly and is never offered on <code>/v1/messages</code>.
                     </div>
                 </div>
                 
@@ -651,6 +652,7 @@ class ProviderFormManager {
                         chat: '/chat/completions', responses: '/responses', anthropic: '/messages',
                         completions: '/completions', embeddings: '/embeddings', images: '/images/*',
                         speech: '/audio/speech', transcription: '/audio/transcriptions',
+                        decisions: '/decisions',
                     };
                     result.deployment_groups.forEach(group => {
                         const apis = (group.apis || []).length

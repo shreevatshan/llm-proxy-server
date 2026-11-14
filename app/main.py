@@ -582,7 +582,7 @@ def create_openai_app() -> FastAPI:
     async def _openai_unavailable_handler(req, exc: ModelUnavailable):
         return _JSONResponse(status_code=exc.status_code, content=exc.body)
 
-    from app.routes import models, chat, completions, embeddings, images, audio, responses
+    from app.routes import models, chat, completions, embeddings, images, audio, responses, decisions
     openai_app.include_router(models.router)
     openai_app.include_router(chat.router)
     openai_app.include_router(completions.router)
@@ -590,6 +590,7 @@ def create_openai_app() -> FastAPI:
     openai_app.include_router(images.router)
     openai_app.include_router(audio.router)
     openai_app.include_router(responses.router)
+    openai_app.include_router(decisions.router)
 
     @openai_app.get("/health")
     async def health_check():
@@ -605,7 +606,7 @@ def create_openai_app() -> FastAPI:
             "endpoints": [
                 "/v1/models", "/v1/chat/completions", "/v1/completions",
                 "/v1/embeddings", "/v1/images/generations",
-                "/v1/audio/speech", "/v1/responses",
+                "/v1/audio/speech", "/v1/responses", "/v1/decisions",
             ]
         }
 
@@ -780,7 +781,7 @@ def create_azure_openai_app() -> FastAPI:
     # By reusing the existing route modules with a prefix, we get all v1 endpoints
     # (chat/completions, models, embeddings, responses, etc.) with zero code duplication.
     # See: https://learn.microsoft.com/en-us/azure/foundry/openai/api-version-lifecycle
-    from app.routes import models, chat, completions, embeddings, images, audio, responses
+    from app.routes import models, chat, completions, embeddings, images, audio, responses, decisions
     azure_openai_app.include_router(models.router, prefix="/openai", tags=["azure_openai_v1"])
     azure_openai_app.include_router(chat.router, prefix="/openai", tags=["azure_openai_v1"])
     azure_openai_app.include_router(completions.router, prefix="/openai", tags=["azure_openai_v1"])
@@ -788,6 +789,7 @@ def create_azure_openai_app() -> FastAPI:
     azure_openai_app.include_router(images.router, prefix="/openai", tags=["azure_openai_v1"])
     azure_openai_app.include_router(audio.router, prefix="/openai", tags=["azure_openai_v1"])
     azure_openai_app.include_router(responses.router, prefix="/openai", tags=["azure_openai_v1"])
+    azure_openai_app.include_router(decisions.router, prefix="/openai", tags=["azure_openai_v1"])
 
     @azure_openai_app.get("/health")
     async def health_check():
@@ -820,6 +822,7 @@ def create_azure_openai_app() -> FastAPI:
                 "/openai/v1/audio/speech",
                 "/openai/v1/audio/transcriptions",
                 "/openai/v1/responses",
+                "/openai/v1/decisions",
             ]
         }
 

@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, AsyncGenerator, Optional
 import json
+import re
 from app.openai_models import (
     ChatCompletionRequest, 
     CompletionRequest, 
@@ -26,12 +27,19 @@ from app.openai_models import (
     ResponseDeletedObject,
     ResponseInputTokensResult,
     CompactedResponseObject,
-    ResponseItemList
+    ResponseItemList,
+    DecisionCreateRequest,
 )
 from app.anthropic_models import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
 )
+
+# Decision-only models (gpt-6-luna-decisions, microsoft-decision-1,
+# gemini-decision-1) cannot chat. Matches only those vendor slug endings, so chat
+# models or operator-named deployments that merely mention the word
+# ("decision-router", "loan-decision", "credit.decision") are left alone.
+_DECISION_ONLY_MODEL = re.compile(r"-(?:decisions|decision-\d+)$")
 
 
 @dataclass
@@ -162,7 +170,13 @@ class BaseProvider(ABC):
     async def responses_compact(self, request: ResponsesCompactRequest) -> CompactedResponseObject:
         """Compact a conversation. Default raises NotImplementedError."""
         raise NotImplementedError(f"Responses API compact not supported by {self.__class__.__name__}")
-    
+
+    # ==================== DECISIONS API ====================
+
+    async def decisions_create(self, request: DecisionCreateRequest) -> Dict[str, Any]:
+        """Handle POST /v1/decisions. Default raises NotImplementedError."""
+        raise NotImplementedError("The Decisions API is not supported by this provider")
+
     # ==================== ANTHROPIC MESSAGES API ====================
     
     def get_supported_apis(self) -> List[str]:
@@ -279,6 +293,8 @@ class BaseProvider(ABC):
             "rerank",
             "speech",
         )
+        if _DECISION_ONLY_MODEL.search(model_id):
+            return False
         return not any(marker in model_id for marker in unsupported_markers)
     
     def format_sse_data(self, data: Dict[str, Any]) -> str:

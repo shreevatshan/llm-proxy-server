@@ -6,7 +6,7 @@ rather than collapsing everything to a generic 500. This module centralises the
 header allowlist and the per-protocol JSON envelope builders.
 """
 
-from typing import Dict
+from typing import Dict, Optional
 
 from fastapi.responses import JSONResponse
 
@@ -51,6 +51,25 @@ def openai_provider_error_response(error: ProviderHTTPError) -> JSONResponse:
         status_code=error.status_code,
         content=body,
         headers=_safe_headers(error),
+    )
+
+
+def openai_error_response(
+    status_code: int,
+    message: str,
+    *,
+    type: str,
+    param: Optional[str] = None,
+    code: Optional[str] = None,
+) -> JSONResponse:
+    """A locally raised error in the OpenAI ``{"error": {...}}`` envelope.
+
+    The API apps register no HTTPException handler, so ``HTTPException`` reaches
+    clients as ``{"detail": ...}``, which OpenAI SDKs cannot parse.
+    """
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"message": message, "type": type, "param": param, "code": code}},
     )
 
 

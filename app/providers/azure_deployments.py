@@ -51,9 +51,11 @@ API_EMBEDDINGS = "embeddings"
 API_IMAGES = "images"
 API_SPEECH = "speech"
 API_TRANSCRIPTION = "transcription"
+API_DECISIONS = "decisions"
 DEPLOYMENT_APIS = (
     API_CHAT, API_RESPONSES, API_ANTHROPIC, API_COMPLETIONS,
     API_EMBEDDINGS, API_IMAGES, API_SPEECH, API_TRANSCRIPTION,
+    API_DECISIONS,
 )
 # APIs that make a deployment a conversational model (offered on /v1/messages).
 CONVERSATIONAL_APIS = frozenset({API_CHAT, API_RESPONSES, API_ANTHROPIC})

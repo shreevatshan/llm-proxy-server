@@ -619,3 +619,21 @@ class ResponseItemList(BaseModel):
 
     class Config:
         extra = "allow"
+
+
+# ==================== DECISIONS API MODELS ====================
+
+class DecisionCreateRequest(BaseModel):
+    """Request for POST /v1/decisions.
+
+    Only ``model`` is validated here. ``input``, ``questions`` and every other
+    field are forwarded exactly as sent (``extra="allow"``) and validated by the
+    upstream, whose limits differ per backend. There is no response model: the
+    upstream ``{model, answers, usage}`` object is relayed unchanged so new answer
+    types and usage fields pass through.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    model: str
+    input: Any = None
+    questions: Any = None

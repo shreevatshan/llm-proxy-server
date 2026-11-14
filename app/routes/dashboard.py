@@ -113,11 +113,11 @@ async def dashboard_home(
 
     # Extract endpoints and models for the user dashboard tabs
     from app.routes import (
-        models, chat, completions, embeddings, images, audio, responses,
+        models, chat, completions, embeddings, images, audio, responses, decisions,
         anthropic_messages, anthropic_models,
         azure_openai,
     )
-    openai_routers = [models, chat, completions, embeddings, images, audio, responses]
+    openai_routers = [models, chat, completions, embeddings, images, audio, responses, decisions]
     anthropic_routers = [anthropic_messages, anthropic_models]
     azure_legacy_routers = [azure_openai]
 
@@ -214,11 +214,11 @@ async def endpoints_page(
     # Auto-generate endpoint lists by introspecting the actual routers.
     # This ensures the dashboard always reflects the real registered routes.
     from app.routes import (
-        models, chat, completions, embeddings, images, audio, responses,
+        models, chat, completions, embeddings, images, audio, responses, decisions,
         anthropic_messages, anthropic_models,
         azure_openai,
     )
-    openai_routers = [models, chat, completions, embeddings, images, audio, responses]
+    openai_routers = [models, chat, completions, embeddings, images, audio, responses, decisions]
     anthropic_routers = [anthropic_messages, anthropic_models]
     azure_legacy_routers = [azure_openai]
 

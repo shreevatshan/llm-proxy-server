@@ -574,8 +574,8 @@ class UsageManager {
                 : '<span class="text-muted">Shared</span>';
             return `
             <tr class="${drillable ? 'usage-drilldown-row' : ''}" data-axis="instance" data-id="${this._esc(r.provider_key)}"
-                ${drillable ? 'style="cursor:pointer;" title="Click to see breakdown by model and user"' : ''}>
-                <td><code>${this._esc(r.provider_key)}</code>${r.is_byok ? BYOK_BADGE : ''}</td>
+                ${drillable ? 'style="cursor:pointer;" title="Click to see breakdown by model"' : ''}>
+                <td>${this._esc(r.provider_key)}${r.is_byok ? BYOK_BADGE : ''}</td>
                 <td>${owner}</td>
                 <td>${r.request_count.toLocaleString()}</td>
                 <td class="text-end">${this._pct(r.request_count, total)}</td>
@@ -591,12 +591,13 @@ class UsageManager {
         this._bindRowClicks(container);
     }
 
-    // An instance's models, and who sent the requests (for a BYOK instance, its owner).
+    // An instance's models. Rows drill into the `model` axis: usage model ids carry the
+    // instance prefix ('provider:instance/model'), so a model's users are already the
+    // users of it on this instance -- the same shape as pool -> member.
     _renderInstanceBreakdown(data) {
         const container = document.getElementById('usage-table-container');
         const header = this._drilldownHeader();
         const models = data.breakdown || [];
-        const users = data.breakdown_users || [];
         if (!models.length) {
             container.innerHTML = header + this._emptyState();
             this._bindBreadcrumb(container);
@@ -607,28 +608,24 @@ class UsageManager {
         const note = inst.is_byok
             ? `<p class="small text-muted mb-2">${BYOK_BADGE} Owned by <strong>${this._esc(inst.owner_identity || `user #${inst.owner_user_id}`)}</strong>. Quota-exempt: these requests used the owner's own key.</p>`
             : '';
+        // The breadcrumb already names the instance, so show the bare model name.
+        const prefix = `${inst.provider_key || ''}/`;
+        const shortName = m => (prefix.length > 1 && m.startsWith(prefix)) ? m.slice(prefix.length) : m;
         const modelRows = models.map(r => `
-            <tr><td>${this._esc(r.model)}</td><td>${r.request_count.toLocaleString()}</td>
-                <td class="text-end">${this._pct(r.request_count, total)}</td></tr>`).join('');
-        const userRows = users.map(r => `
-            <tr><td>${this._esc(r.user_identity)}</td>
-                <td>${r.user_type ? `<span class="badge bg-secondary">${this._esc(r.user_type)}</span>` : ''}</td>
+            <tr class="usage-drilldown-row" data-axis="model" data-id="${this._esc(r.model)}" data-label="${this._esc(shortName(r.model))}" style="cursor:pointer;" title="Click to see breakdown by user">
+                <td>${this._esc(shortName(r.model))}${isByokModelId(r.model) ? BYOK_BADGE : ''}</td>
                 <td>${r.request_count.toLocaleString()}</td>
-                <td class="text-end">${this._pct(r.request_count, total)}</td></tr>`).join('');
+                <td class="text-end">${this._pct(r.request_count, total)}</td>
+            </tr>`).join('');
         container.innerHTML = header + note + `
-            <div class="table-responsive mb-3">
+            <div class="table-responsive">
                 <table class="table table-hover mb-0">
                     <thead><tr><th>Model</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
                     <tbody>${modelRows}</tbody>
                 </table>
-            </div>
-            <div class="table-responsive">
-                <table class="table table-hover mb-0">
-                    <thead><tr><th>User</th><th>Type</th><th>Requests</th><th class="text-end">Percentage</th></tr></thead>
-                    <tbody>${userRows}</tbody>
-                </table>
             </div>`;
         this._bindBreadcrumb(container);
+        this._bindRowClicks(container);
     }
 
     _renderPoolTable(rows) {

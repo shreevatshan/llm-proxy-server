@@ -185,6 +185,7 @@ class CustomProvider(AnthropicCompatibleProvider, OpenAICompatibleProvider):
                 "/v1/audio/speech",
                 "/v1/audio/transcriptions",
                 "/v1/responses",
+                "/v1/decisions",
             ])
         if ("anthropic" in self._supported_apis and getattr(self, "_anthropic_client", None)) or "openai" in self._supported_apis:
             endpoints.append("/v1/messages")

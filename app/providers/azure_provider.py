@@ -57,6 +57,7 @@ from app.providers.azure_deployments import (
     API_ANTHROPIC,
     API_CHAT,
     API_COMPLETIONS,
+    API_DECISIONS,
     API_EMBEDDINGS,
     API_IMAGES,
     API_RESPONSES,
@@ -627,7 +628,7 @@ class AzureProvider(OpenAICompatibleProvider):
         return ["openai", "azure_openai"]
 
     def get_supported_endpoints(self) -> List[str]:
-        """Azure supports chat, completions, embeddings, images, audio, responses, and anthropic messages."""
+        """Azure supports chat, completions, embeddings, images, audio, responses, decisions, and anthropic messages."""
         endpoints = [
             "/v1/chat/completions",
             "/v1/completions",
@@ -653,6 +654,9 @@ class AzureProvider(OpenAICompatibleProvider):
         # always set in __init__, so no client-presence guard is needed here.
         endpoints.append("/openai/v1/responses")
         endpoints.append("/v1/responses")
+        # Decisions is also served off the v1 client (gpt-6-luna deployments).
+        endpoints.append("/openai/v1/decisions")
+        endpoints.append("/v1/decisions")
         return endpoints
 
     def _is_chat_capable_model(self, model_name: str) -> bool:
@@ -709,6 +713,7 @@ class AzureProvider(OpenAICompatibleProvider):
         API_SPEECH: "/audio/speech",
         API_TRANSCRIPTION: "/audio/transcriptions",
         API_ANTHROPIC: "/messages",
+        API_DECISIONS: "/decisions",
     }
 
     def _deployment_api_error(self, model_name: str, api: str) -> Optional[ProviderHTTPError]:
@@ -802,6 +807,17 @@ class AzureProvider(OpenAICompatibleProvider):
     async def audio_translation(self, request):
         self._require_deployment_api(request.model, API_TRANSCRIPTION)
         return await super().audio_translation(request)
+
+    async def decisions_create(self, request):
+        self._require_deployment_api(request.model, API_DECISIONS)
+        # Claude deployments on Foundry have no OpenAI-shaped upstream; refuse
+        # them here rather than relaying a confusing 404 from /openai/v1/decisions.
+        if "openai" not in self.get_supported_apis_for_model(request.model):
+            raise NotImplementedError(
+                f"Deployment '{self.get_model_id(request.model)}' has no OpenAI-compatible "
+                "upstream, so the Decisions API is unavailable for it"
+            )
+        return await super().decisions_create(request)
 
     # ==================== Anthropic Messages API ====================
 

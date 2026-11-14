@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from contextvars import ContextVar
+import json
 import logging
 from typing import List, Dict, Any, AsyncGenerator
 from openai import AsyncOpenAI
@@ -46,7 +47,8 @@ from app.openai_models import (
     ResponseDeletedObject,
     ResponseInputTokensResult,
     CompactedResponseObject,
-    ResponseItemList
+    ResponseItemList,
+    DecisionCreateRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -869,8 +871,67 @@ class OpenAICompatibleProvider(BaseProvider):
         
         try:
             response = await self._get_responses_client().responses.compact.create(**request_dict)
-            
+
             response_dict = response.model_dump() if hasattr(response, 'model_dump') else response.dict()
             return CompactedResponseObject(**response_dict)
         except Exception as e:
             raise Exception(f"{self.provider_type} responses compact error: {str(e)}")
+
+    # ==================== DECISIONS API ====================
+
+    async def decisions_create(self, request: DecisionCreateRequest) -> Dict[str, Any]:
+        """Relay POST /v1/decisions to ``{base_url}/decisions``.
+
+        The pinned SDK has no decisions resource, so this uses the generic
+        ``client.post``. The body is exactly what the client sent, with ``model``
+        mapped to the upstream id; it does not go through
+        ``_prepare_request_dict``, which would put ``extra_headers`` into the JSON
+        body and drop the client's explicit nulls. The upstream object is returned
+        as-is, except that ``model`` echoes the client's name unless
+        ``preserve_upstream_model`` is set.
+        """
+        # Azure: always the /openai/v1/ client (the deployment-style client would
+        # drop the deployment segment for /decisions).
+        client = self._get_responses_client()
+        if client is None:
+            # A custom provider configured without the OpenAI API.
+            raise NotImplementedError(
+                "The Decisions API needs an OpenAI-compatible upstream; this provider has none"
+            )
+        body = request.model_dump(exclude_unset=True)
+        body["model"] = self.get_model_id(request.model)
+        # Serialized here, not by the SDK: the request parser accepts NaN and
+        # Infinity, which JSON forbids, and the SDK's own allow_nan=False failure
+        # would surface below as a 502 "upstream" error for a call never made.
+        try:
+            payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        except ValueError as e:
+            raise ValueError("Request body contains NaN or Infinity, which JSON does not allow") from e
+        headers = dict(extra_request_headers.get({}))
+
+        try:
+            data = await client.post(
+                "/decisions",
+                cast_to=object,
+                content=payload,
+                options={"headers": headers} if headers else {},
+            )
+        except ProviderHTTPError:
+            raise
+        except Exception as e:
+            # Upstream failures (status errors, timeouts, and a JSON content-type
+            # with an unparseable body) map to the upstream's status or a
+            # sanitized 502, never to a client 400.
+            raise _translate_openai_sdk_error(e, self.provider_type) from e
+
+        if not isinstance(data, dict):
+            message = f"Upstream provider '{self.provider_type}' returned a non-object Decisions response"
+            logger.warning("%s (%s)", message, type(data).__name__)
+            raise ProviderHTTPError(
+                status_code=502,
+                message=message,
+                body={"error": {"message": message, "type": "upstream_error"}},
+            )
+        if not preserve_upstream_model.get():
+            data["model"] = echo_model_name(request)
+        return data
