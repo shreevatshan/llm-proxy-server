@@ -15,7 +15,8 @@ from app.auth.database import (
     get_provider_credentials, 
     create_or_update_model_configuration,
     get_models_by_provider,
-    get_model_configuration
+    get_model_configuration,
+    new_model_enabled_default,
 )
 from app.providers.provider_manager import provider_manager
 from app.openai_models import ModelInfo
@@ -51,13 +52,15 @@ async def clear_models_for_provider(db: AsyncSession, provider_key: str, commit:
         raise e
 
 
-async def sync_provider_models(db: AsyncSession, provider_key: str) -> Dict[str, Any]:
+async def sync_provider_models(db: AsyncSession, provider_key: str, keep_on_empty: bool = False) -> Dict[str, Any]:
     """
     Automatically sync models for a specific provider.
     
     Args:
         db: Database session
         provider_key: Provider key (e.g., "azure:primary", "ollama:local")
+        keep_on_empty: treat an empty model list as a failure and keep the saved
+            models (and their enabled states) instead of clearing them
         
     Returns:
         Dict with sync results including counts and any errors
@@ -88,9 +91,9 @@ async def sync_provider_models(db: AsyncSession, provider_key: str) -> Dict[str,
             
             # Handle different provider types
             if provider_creds.provider_type == "azure":
-                result = await _sync_azure_provider_models(db, provider_creds)
+                result = await _sync_azure_provider_models(db, provider_creds, keep_on_empty)
             else:
-                result = await _sync_dynamic_provider_models(db, provider_creds)
+                result = await _sync_dynamic_provider_models(db, provider_creds, keep_on_empty)
             
             # Add result metrics to span
             if "error" in result:
@@ -110,7 +113,7 @@ async def sync_provider_models(db: AsyncSession, provider_key: str) -> Dict[str,
             return {"error": error_msg}
 
 
-async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[str, Any]:
+async def _sync_azure_provider_models(db: AsyncSession, provider_creds, keep_on_empty: bool = False) -> Dict[str, Any]:
     """
     Sync models for Azure provider using deployment names.
     
@@ -131,6 +134,7 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
             # Capture enabled states before any mutation
             existing_models = await get_models_by_provider(db, provider_key)
             enabled_states = {model.model_id: model.is_enabled for model in existing_models}
+            new_model_enabled = new_model_enabled_default(provider_creds)
 
             deployment_groups = normalize_azure_deployments(provider_creds.deployments_json)
             azure_backend = getattr(provider_creds, "azure_backend", None) or "openai"
@@ -177,6 +181,11 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
                     if model_name not in deployments:
                         deployments.append(model_name)
 
+            if keep_on_empty and not deployments:
+                error_msg = "No models returned by the provider; saved models were kept"
+                set_span_error(span, error_msg)
+                return {"error": error_msg}
+
             # Fetch succeeded (or manual deployments are known): now it's safe to
             # clear and replace.
             # Clear and re-insert in one transaction: readers never see the provider
@@ -210,8 +219,9 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
                 # Create model ID in the format: provider_key/deployment_name
                 model_id = f"{provider_key}/{deployment_name}"
                 
-                # Use cached enabled state (before models were cleared)
-                is_enabled = enabled_states.get(model_id, True)  # Default True for new models
+                # Use cached enabled state (before models were cleared); a new
+                # model gets the provider's setting for new models.
+                is_enabled = enabled_states.get(model_id, new_model_enabled)
                 
                 await create_or_update_model_configuration(
                     db=db,
@@ -251,7 +261,7 @@ async def _sync_azure_provider_models(db: AsyncSession, provider_creds) -> Dict[
             return {"error": error_msg}
 
 
-async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dict[str, Any]:
+async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds, keep_on_empty: bool = False) -> Dict[str, Any]:
     """
     Sync models for providers that support dynamic model discovery.
     
@@ -271,6 +281,7 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
             # Capture enabled states before any mutation
             existing_models = await get_models_by_provider(db, provider_key)
             enabled_states = {model.model_id: model.is_enabled for model in existing_models}
+            new_model_enabled = new_model_enabled_default(provider_creds)
 
             # Create provider instance for model discovery
             provider_instance = await _create_provider_instance(provider_creds)
@@ -303,6 +314,11 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
                 return {"error": error_msg}
             finally:
                 await _close_provider_instance(provider_instance)
+
+            if keep_on_empty and not models:
+                error_msg = "No models returned by the provider; saved models were kept"
+                set_span_error(span, error_msg)
+                return {"error": error_msg}
 
             # Fetch succeeded: now it's safe to clear and replace.
             # Clear and re-insert in one transaction: readers never see the provider
@@ -339,8 +355,9 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds) -> Dic
                 else:
                     model_name = model.id
                 
-                # Use cached enabled state (before models were cleared)
-                is_enabled = enabled_states.get(model.id, True)  # Default True for new models
+                # Use cached enabled state (before models were cleared); a new
+                # model gets the provider's setting for new models.
+                is_enabled = enabled_states.get(model.id, new_model_enabled)
                 
                 await create_or_update_model_configuration(
                     db=db,
@@ -565,6 +582,13 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
                     if model_ids:
                         from app.openai_models import ModelInfo
 
+                        # Reload model configurations from DB (enabled states, the
+                        # provider's setting for new models) *before* the models
+                        # enter the listing, so a model the sync just saved as off is
+                        # never served in between. The full provider refresh already
+                        # ran at the top of this function; this is the lighter reload.
+                        await provider_manager.refresh_model_configurations()
+
                         synced_models = []
                         for model_id in model_ids:
                             synced_models.append(ModelInfo(
@@ -593,18 +617,6 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
                         print(f"🔍 Cache updated successfully")
                         
                         # Verify cache was updated
-                        cache_models_after = provider_manager.model_cache.get_models()
-                        print(f"🔍 Models in cache after update: {len(cache_models_after)}")
-
-                        # Reload model configurations from DB (enabled states,
-                        # etc.) for the just-synced models. The full provider
-                        # refresh already ran once at the top of this function, so
-                        # the previously-duplicated refresh_providers_from_database()
-                        # here is replaced with the lighter config reload.
-                        await provider_manager.refresh_model_configurations()
-                        print(f"🔍 Provider manager model configurations refreshed")
-
-                        # Verify cache after refresh
                         cache_models_final = provider_manager.model_cache.get_models()
                         print(f"🔍 Models in cache after refresh: {len(cache_models_final)}")
                         
@@ -653,6 +665,75 @@ async def auto_sync_on_provider_change(db: AsyncSession, provider_key: str, acti
             }
 
 
+async def sync_single_provider(db: AsyncSession, provider_key: str) -> Dict[str, Any]:
+    """Re-discover one global provider's models now (the admin's per-provider sync).
+
+    Unlike a provider save (auto_sync_on_provider_change) the registry is not rebuilt:
+    the provider's settings did not change, so only its models are fetched and saved,
+    and its slice of the listing replaced. The background sync's recently-synced skip
+    does not apply. Saved enabled states are kept, new models get the provider's
+    setting for new models, and models gone upstream are dropped.
+
+    A disabled provider is fetched too, so its models can be picked before it is
+    switched on; they are saved but not listed, and no sync status is recorded
+    (disabled providers show none).
+
+    Returns the sync_provider_models result plus ``added`` / ``removed`` model ids,
+    or a dict with ``error``.
+    """
+    from app.providers.provider_manager import _sanitize_error
+
+    creds = await get_provider_credentials(db, provider_key)
+    if creds is None:
+        return {"error": "Provider not found", "not_found": True}
+    enabled = bool(creds.enabled)
+    new_models_enabled = new_model_enabled_default(creds)
+    before = {m.model_id for m in await get_models_by_provider(db, provider_key)}
+
+    started_at = time.time()
+    # An empty list is a failure here: a hiccup upstream must not wipe the
+    # admin's per-model choices.
+    result = await sync_provider_models(db, provider_key, keep_on_empty=True)
+    model_ids = list(result.get("models") or []) if "error" not in result else []
+    synced = bool(model_ids)
+    error = None if synced else _sanitize_error(Exception(result.get("error") or "No models returned"))
+
+    if enabled:
+        recorded = provider_manager.record_sync_status(
+            provider_key, synced, len(model_ids), error, started_at=started_at,
+        )
+        if recorded:
+            models = [
+                ModelInfo(
+                    id=model_id, object="model", created=int(time.time()),
+                    owned_by=provider_key, provider=provider_key,
+                )
+                for model_id in model_ids
+            ]
+            # Configurations first, so a model just saved as off is never listed
+            # before its flag is loaded. A failed sync lists nothing (same policy
+            # as every other sync path); the saved rows are kept.
+            await provider_manager.refresh_model_configurations()
+            await provider_manager.model_cache.update_provider_models(provider_key, models)
+            if synced:
+                provider_manager.mark_provider_synced(provider_key)
+    elif synced:
+        await provider_manager.refresh_model_configurations()
+
+    out = {
+        "provider_key": provider_key,
+        "provider_enabled": enabled,
+        "new_models_enabled": new_models_enabled,
+        "model_count": len(model_ids),
+        "models": model_ids,
+        "added": sorted(set(model_ids) - before) if synced else [],
+        "removed": sorted(before - set(model_ids)) if synced else [],
+    }
+    if error:
+        out["error"] = error
+    return out
+
+
 async def sync_byok_provider(db: AsyncSession, provider_key: str) -> Dict[str, Any]:
     """Load and sync one BYOK (user-owned) instance, touching nothing else.
 
@@ -692,9 +773,11 @@ async def sync_byok_provider(db: AsyncSession, provider_key: str) -> Dict[str, A
             )
             for model_id in model_ids
         ]
+        # Configurations first: the models must not be listed before their saved
+        # flags (and the instance's setting for new models) are loaded.
+        await provider_manager.refresh_model_configurations()
         # Locked read-modify-write of just this instance's slice.
         await provider_manager.model_cache.update_provider_models(provider_key, models)
-        await provider_manager.refresh_model_configurations()
         if synced:
             provider_manager.mark_provider_synced(provider_key)
     out = {"provider_key": provider_key, "models": model_ids, "model_count": len(model_ids)}

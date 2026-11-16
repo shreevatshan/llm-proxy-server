@@ -670,6 +670,13 @@ class AdminProtectionTests(_DbCase):
         from app.auth.models import ToggleRequest
         await self._expect_404(r.toggle_provider(ToggleRequest(enabled=False), BYOK_KEY, a, self.db))
         await self._expect_404(r.toggle_model(ToggleRequest(enabled=False), BYOK_MODEL, a, self.db))
+        from app.auth.models import ProviderSettingsUpdate
+        await self._expect_404(r.get_provider_settings(BYOK_KEY, a, self.db))
+        await self._expect_404(r.put_provider_settings(
+            ProviderSettingsUpdate(auto_enable_new_models=False), BYOK_KEY, a, self.db))
+        from app.auth.models import BulkToggleRequest
+        await self._expect_404(r.bulk_toggle_models(
+            BulkToggleRequest(action="disable_all", provider_key=BYOK_KEY), a, self.db))
 
     @property
     def admin(self):

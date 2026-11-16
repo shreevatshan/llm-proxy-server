@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker, Session, selectinload
 from sqlalchemy.future import select
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Sequence, Tuple
+from typing import Optional, List, Dict, Sequence, Set, Tuple
 from .models import Base, User, APIKey, ModelConfiguration, ModelAlias, ProviderCredentials, OAuthUser, ResponseProviderMapping, RequestUsage, RequestUsageHourly, RequestUsageMonthly, UserRateLimit, GlobalRateLimit, ModelGroup, ModelGroupMember, ModelGroupInstanceMember, ModelOutage, UserModelGroupRateLimit, UserModelAccessPolicy, UserModelAccessException, WebSearchSettings, WebSearchBackend, UserWebSearchSettings, UserWebSearchBackendParams, WEBSEARCH_BACKEND_PARAMS, WEBSEARCH_PARAM_FIELDS, UserManagementSettings, UserManagementSettingsResponse, PoolSettings, PoolSettingsResponse, UserProfile, ProfileModelGroupLimit, ProfileModelAccessException, DEFAULT_PROFILE_ID, USERNAME_MIN_LENGTH, USERNAME_MAX_LENGTH
 from app.providers.azure_deployments import serialize_azure_deployments
 
@@ -1404,13 +1404,44 @@ async def toggle_model_configuration(db: AsyncSession, model_id: str, enabled: b
         raise e
 
 
+async def update_provider_settings(
+    db: AsyncSession, provider_key: str, fields: Dict[str, object],
+) -> Optional[ProviderCredentials]:
+    """Write the given per-provider settings (PROVIDER_SETTINGS_FIELDS only).
+
+    None when the provider does not exist. Setting auto_enable_new_models only
+    decides how models discovered later start; saved models keep their own flags.
+    """
+    from app.auth.models import PROVIDER_SETTINGS_FIELDS
+
+    unknown = set(fields) - set(PROVIDER_SETTINGS_FIELDS)
+    if unknown:
+        raise ValueError(f"Not a provider setting: {', '.join(sorted(unknown))}")
+    try:
+        provider = await get_provider_credentials(db, provider_key)
+        if not provider:
+            return None
+        for name, value in fields.items():
+            setattr(provider, name, value)
+        if fields:
+            provider.updated_at = datetime.utcnow()
+            await db.commit()
+            await db.refresh(provider)
+        return provider
+    except Exception:
+        await db.rollback()
+        raise
+
+
 @with_db_retry()
-async def bulk_toggle_all_models(db: AsyncSession, enabled: bool) -> bool:
-    """Enable or disable every model. Provider flags are left alone; see
-    toggle_provider_configuration."""
+async def bulk_toggle_all_models(db: AsyncSession, enabled: bool, provider_key: Optional[str] = None) -> bool:
+    """Enable or disable every model, or only ``provider_key``'s. Provider flags are
+    left alone; see toggle_provider_configuration. BYOK models are never touched."""
     try:
         # Update all models
         models = await get_all_model_configurations(db)
+        if provider_key is not None:
+            models = [m for m in models if m.provider_key == provider_key]
         for model in models:
             model.is_enabled = enabled
             model.updated_at = datetime.utcnow()
@@ -1472,6 +1503,25 @@ async def get_provider_configurations_dict(db: AsyncSession) -> Dict[str, bool]:
         provider.provider_key: bool(provider.enabled) and not bool(getattr(provider, "admin_disabled", False))
         for provider in providers
     }
+
+
+def new_model_enabled_default(provider) -> bool:
+    """The enabled state a provider's newly discovered models get.
+
+    Only an explicit False holds new models back, so a row or stand-in without the
+    column (or a legacy NULL) keeps the old behaviour of enabling them.
+    """
+    return getattr(provider, "auto_enable_new_models", True) is not False
+
+
+async def get_new_models_off_provider_keys(db: AsyncSession) -> Set[str]:
+    """Keys of providers (BYOK included) whose newly discovered models start disabled."""
+    result = await db.execute(
+        select(ProviderCredentials.provider_key).where(
+            ProviderCredentials.auto_enable_new_models.is_(False)
+        )
+    )
+    return set(result.scalars().all())
 
 
 # Provider Credentials Database Operations
@@ -1791,6 +1841,9 @@ async def _rename_provider_with_models(
             # private instance into a global one.
             owner_user_id=old_credentials.owner_user_id,
             admin_disabled=bool(old_credentials.admin_disabled),
+            auto_enable_new_models=fields.get(
+                'auto_enable_new_models', new_model_enabled_default(old_credentials)
+            ),
         )
         
         # Add new provider to session
@@ -3669,6 +3722,8 @@ async def _run_auto_migrations():
             # NOT NULL needs the DEFAULT for SQLite to accept the ALTER on a non-empty table.
             ("owner_user_id", "INTEGER"),
             ("admin_disabled", "BOOLEAN NOT NULL DEFAULT 0"),
+            # Existing providers keep today's behaviour: new models arrive enabled.
+            ("auto_enable_new_models", "BOOLEAN NOT NULL DEFAULT 1"),
         ):
             try:
                 result = await conn.execute(text("PRAGMA table_info(provider_credentials)"))

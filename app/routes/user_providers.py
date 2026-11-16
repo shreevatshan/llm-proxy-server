@@ -302,7 +302,9 @@ async def update_my_provider(
     if body.provider_name is not None and body.provider_name != cred.provider_name:
         raise HTTPException(status_code=422, detail="A provider's name cannot be changed; add a new one instead")
 
-    update_data = provider_update_data(body, exclude=("instance_name", "provider_name"))
+    # auto_enable_new_models is an admin-panel setting; a user's instance keeps the
+    # default (new models enabled), as on create.
+    update_data = provider_update_data(body, exclude=("instance_name", "provider_name", "auto_enable_new_models"))
     if "enabled" in update_data and cred.admin_disabled:
         update_data.pop("enabled")  # the admin's switch wins; toggle refuses it outright
     try:

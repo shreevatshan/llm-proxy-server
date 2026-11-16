@@ -8,6 +8,7 @@ class ModelsView {
     constructor() {
         this._models = [];              // [{model_id, model_name, provider_key, is_enabled}]
         this._providerOff = new Set();  // provider_keys switched off
+        this._newModelsOff = new Set(); // provider_keys whose new models start disabled
         this._groupOf = {};             // model_id -> {name, enabled} for named groups
         this._loadSeq = 0;
     }
@@ -28,9 +29,10 @@ class ModelsView {
             }
             this._models = (await mResp.json())
                 .sort((a, b) => a.provider_key.localeCompare(b.provider_key) || a.model_id.localeCompare(b.model_id));
-            this._providerOff = new Set(pResp.ok
-                ? (await pResp.json()).filter(p => p.enabled === false).map(p => p.provider_key)
-                : []);
+            const providers = pResp.ok ? await pResp.json() : [];
+            this._providerOff = new Set(providers.filter(p => p.enabled === false).map(p => p.provider_key));
+            this._newModelsOff = new Set(
+                providers.filter(p => p.auto_enable_new_models === false).map(p => p.provider_key));
             this._groupOf = {};
             if (gResp.ok) {
                 (await gResp.json()).filter(g => !g.is_default).forEach(g => {
@@ -74,21 +76,56 @@ class ModelsView {
         container.querySelectorAll('[data-action="toggle-model"]').forEach(el => {
             el.addEventListener('change', () => this.toggle(el.dataset.modelId, el.checked));
         });
+        container.querySelectorAll('[data-action="provider-bulk"]').forEach(el => {
+            el.addEventListener('click', () => this.bulkProvider(el.dataset.providerKey, el.dataset.bulk));
+        });
+        container.querySelectorAll('[data-action="provider-settings"]').forEach(el => {
+            el.addEventListener('click', () => window.ProviderSettings?.open(el.dataset.providerKey));
+        });
     }
 
     _section(providerKey, models) {
         const esc = window.UIUtils.escapeHtml;
+        const pk = esc(providerKey);
         const total = this._models.filter(m => m.provider_key === providerKey);
         const on = total.filter(m => m.is_enabled).length;
         const off = this._providerOff.has(providerKey)
             ? '<span class="ma-tag ma-tag-off" title="Switched off in the Providers view: none of its models are served"><i class="fas fa-ban me-1"></i>provider off</span>'
             : '';
+        const autoOn = !this._newModelsOff.has(providerKey);
         return `
         <div class="pm-provider-head">
-            <span class="pm-provider-name"><i class="fas fa-server me-2"></i>${esc(providerKey)}${off}</span>
-            <span class="pm-provider-count">${on}/${total.length} enabled</span>
+            <span class="pm-provider-name"><i class="fas fa-server me-2"></i>${pk}${off}</span>
+            <span class="pm-provider-tools">
+                <span class="pm-provider-count">${on}/${total.length} enabled</span>
+                <button type="button" class="btn btn-outline-success btn-sm" data-action="provider-bulk" data-bulk="enable_all"
+                    data-provider-key="${pk}" title="Enable every model of ${pk}">
+                    <i class="fas fa-check-circle me-1"></i>Enable all
+                </button>
+                <button type="button" class="btn btn-outline-danger btn-sm" data-action="provider-bulk" data-bulk="disable_all"
+                    data-provider-key="${pk}" title="Disable every model of ${pk}">
+                    <i class="fas fa-times-circle me-1"></i>Disable all
+                </button>
+                <button type="button" class="btn btn-outline-secondary btn-sm pm-settings-btn${autoOn ? '' : ' is-held'}"
+                    data-action="provider-settings" data-provider-key="${pk}"
+                    title="${this._gearTitle(autoOn)}" aria-label="Settings for ${pk}">
+                    <i class="fas fa-gear"></i>
+                </button>
+            </span>
         </div>
         ${models.map(m => this._row(m)).join('')}`;
+    }
+
+    _gearTitle(autoOn) {
+        return autoOn ? 'Provider settings'
+            : 'Provider settings (new models stay disabled until you enable them)';
+    }
+
+    /** The Provider settings dialog saved: reflect what this view shows of it. */
+    applyProviderSettings(providerKey, settings) {
+        if (settings.auto_enable_new_models === false) this._newModelsOff.add(providerKey);
+        else this._newModelsOff.delete(providerKey);
+        this.render();
     }
 
     _row(m) {
@@ -142,6 +179,34 @@ class ModelsView {
         } catch (e) {
             window.UIUtils?.showToast('Network error updating model.', 'error');
             await this.load();
+        }
+    }
+
+    async bulkProvider(providerKey, action) {
+        const enabling = action === 'enable_all';
+        const confirmed = await window.UIUtils?.showConfirmModal(
+            enabling ? 'Enable all models' : 'Disable all models',
+            `${enabling ? 'Enable' : 'Disable'} every model of ${providerKey} for all users? Other providers are unchanged.`,
+        );
+        if (!confirmed) return;
+        try {
+            const resp = await fetch('/admin/models/bulk-toggle', {
+                method: 'PUT',
+                credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action, provider_key: providerKey }),
+            });
+            if (resp.ok) {
+                const result = await resp.json();
+                window.UIUtils?.showToast(result.message || 'Models updated.', 'success');
+                await this.load();
+                this._afterChange();
+            } else {
+                const err = await resp.json().catch(() => ({}));
+                window.UIUtils?.showToast(err.detail || 'Failed to update models.', 'error');
+            }
+        } catch (e) {
+            window.UIUtils?.showToast('Network error updating models.', 'error');
         }
     }
 

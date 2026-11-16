@@ -854,6 +854,11 @@ class ProviderCredentials(Base):
     owner_user_id = Column(Integer, nullable=True, index=True)
     admin_disabled = Column(Boolean, default=False, server_default=text("0"), nullable=False)
 
+    # The enabled state a model gets when a sync first discovers it. Off = new
+    # models arrive disabled until switched on, so a provider can serve a chosen
+    # few. Models already known keep their own flag either way.
+    auto_enable_new_models = Column(Boolean, default=True, server_default=text("1"), nullable=False)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -2107,6 +2112,7 @@ class ProviderConfigurationResponse(BaseModel):
     enabled: bool  # Changed from is_enabled to enabled for consistency
     model_count: int
     enabled_model_count: int
+    auto_enable_new_models: bool = True  # off = newly discovered models start disabled
     supported_apis: Optional[List[str]] = None
     # Outcome of the last model sync (in-memory; None until the provider is first synced)
     sync_state: Optional[str] = None  # "ok" | "failed"
@@ -2140,6 +2146,26 @@ class ToggleRequest(BaseModel):
 
 class BulkToggleRequest(BaseModel):
     action: str  # "enable_all" or "disable_all"
+    provider_key: Optional[str] = None  # only this provider's models; None = every model
+
+
+# Per-provider settings edited in the admin's Provider settings dialog (the gear in
+# the Models view). Each is a ProviderCredentials column; to add one, add the column,
+# a field to both models below, and a row to #providerSettingsModal.
+PROVIDER_SETTINGS_FIELDS = ("auto_enable_new_models",)
+
+
+class ProviderSettingsUpdate(BaseModel):
+    """A partial update: only the fields sent are changed."""
+    model_config = {"extra": "forbid"}
+
+    auto_enable_new_models: Optional[bool] = None
+
+
+class ProviderSettingsResponse(BaseModel):
+    provider_key: str
+    auto_enable_new_models: bool
+    updated_at: Optional[datetime] = None
 
 
 class BulkUserActionRequest(BaseModel):
@@ -2233,7 +2259,8 @@ class ProviderCredentialsCreate(BaseModel):
     instance_name: str
     provider_name: str  # Provider name (e.g., "ollama", "azure", "openai", "bedrock", "google")
     enabled: bool = True
-    
+    auto_enable_new_models: bool = True  # off = newly discovered models start disabled
+
     # Provider-specific fields (all optional)
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
@@ -2353,7 +2380,8 @@ class ProviderCredentialsCreate(BaseModel):
 class ProviderCredentialsUpdate(BaseModel):
     instance_name: Optional[str] = None
     enabled: Optional[bool] = None
-    
+    auto_enable_new_models: Optional[bool] = None
+
     # Provider-specific fields (all optional)
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
@@ -2476,7 +2504,8 @@ class ProviderCredentialsResponse(BaseModel):
     provider_type: str
     instance_name: str
     enabled: bool
-    
+    auto_enable_new_models: bool = True
+
     # Provider-specific fields
     endpoint: Optional[str] = None
     api_key: Optional[str] = None

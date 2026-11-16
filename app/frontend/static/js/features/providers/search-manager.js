@@ -192,6 +192,9 @@ class SearchManager {
         container.querySelectorAll('[data-action="toggle-provider"]').forEach(el => {
             el.addEventListener('change', () => window.ProviderManager.toggleProviderEnabled(el.dataset.providerKey, el.checked));
         });
+        container.querySelectorAll('[data-action="sync-provider"]').forEach(el => {
+            el.addEventListener('click', () => window.ProviderManager.syncProvider(el.dataset.providerKey, el));
+        });
         container.querySelectorAll('[data-action="edit-provider"]').forEach(el => {
             el.addEventListener('click', () => window.ProviderManager.editProvider(el.dataset.providerKey));
         });
@@ -234,6 +237,10 @@ class SearchManager {
                                    data-action="toggle-provider" data-provider-key="${pk}">
                             <span class="toggle-slider"></span>
                         </label>
+                        <button class="btn btn-sm btn-outline-secondary" data-action="sync-provider" data-provider-key="${pk}"
+                                title="Sync models" aria-label="Sync models of ${pk}">
+                            <i class="fas fa-sync-alt"></i>
+                        </button>
                         <button class="btn btn-sm btn-outline-primary" data-action="edit-provider" data-provider-key="${pk}" title="Edit">
                             <i class="fas fa-edit"></i>
                         </button>

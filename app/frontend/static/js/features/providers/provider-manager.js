@@ -277,6 +277,10 @@ class ProviderManager {
                                            data-action="toggle-provider" data-provider-key="${pk}">
                                     <span class="toggle-slider"></span>
                                 </label>
+                                <button class="btn btn-sm btn-outline-secondary" data-action="sync-provider" data-provider-key="${pk}"
+                                        title="Sync models" aria-label="Sync models of ${pk}">
+                                    <i class="fas fa-sync-alt"></i>
+                                </button>
                                 <button class="btn btn-sm btn-outline-primary" data-action="edit-provider" data-provider-key="${pk}" title="Edit">
                                     <i class="fas fa-edit"></i>
                                 </button>
@@ -305,6 +309,9 @@ class ProviderManager {
         });
         listContainer.querySelectorAll('[data-action="toggle-provider"]').forEach(el => {
             el.addEventListener('change', () => this.toggleProviderEnabled(el.dataset.providerKey, el.checked));
+        });
+        listContainer.querySelectorAll('[data-action="sync-provider"]').forEach(el => {
+            el.addEventListener('click', () => this.syncProvider(el.dataset.providerKey, el));
         });
         listContainer.querySelectorAll('[data-action="edit-provider"]').forEach(el => {
             el.addEventListener('click', () => this.editProvider(el.dataset.providerKey));
@@ -381,6 +388,8 @@ class ProviderManager {
         // Reset form
         if (providerType) providerType.value = '';
         if (instanceName) instanceName.value = '';
+        const autoEnable = document.getElementById('auto_enable_new_models');
+        if (autoEnable) autoEnable.checked = true;
         if (specificFields) specificFields.innerHTML = '';
         if (configSection) configSection.style.display = 'none';
         if (window.ProviderFormManager) {
@@ -496,6 +505,45 @@ class ProviderManager {
             `input[data-action="toggle-provider"][data-provider-key="${CSS.escape(providerKey)}"]`
         );
         checkboxes.forEach(cb => { cb.checked = !enabled; });
+    }
+
+    /**
+     * Re-discover one provider's models now (Providers view card and Models view
+     * header). Saved models keep their switch; new ones follow the provider's
+     * "Enable new models" setting. Reloads whichever view is open.
+     */
+    async syncProvider(providerKey, btn) {
+        const esc = window.UIUtils.escapeHtml;
+        const icon = btn?.querySelector('i');
+        if (btn) { btn.disabled = true; btn.setAttribute('aria-busy', 'true'); }
+        icon?.classList.add('fa-spin');
+        try {
+            const response = await fetch(`/admin/providers/sync?provider_key=${encodeURIComponent(providerKey)}`, {
+                method: 'POST',
+                credentials: 'include',
+            });
+            const result = await response.json().catch(() => ({}));
+            if (response.ok) {
+                const added = result.added || [];
+                let message = esc(result.message || `Synced ${providerKey}`);
+                if (added.length) {
+                    const shown = added.slice(0, 5).map(id => esc(id.split('/').slice(1).join('/') || id)).join(', ');
+                    message += `<br>New: ${shown}${added.length > 5 ? ` and ${added.length - 5} more` : ''}`;
+                }
+                window.UIUtils.showToast(message, 'success', added.length ? 9000 : 5000);
+            } else {
+                window.UIUtils.showToast(esc(result.detail || `Sync failed for ${providerKey}`), 'error', 9000);
+            }
+        } catch (error) {
+            window.UIUtils.showToast(esc(`Error syncing ${providerKey}: ${error.message}`), 'error');
+        } finally {
+            if (btn) { btn.disabled = false; btn.removeAttribute('aria-busy'); }
+            icon?.classList.remove('fa-spin');
+        }
+        // Counts, sync status and (in the Models view) the model list all changed,
+        // on failure too (a failed sync hides the provider's models).
+        window.SearchManager?.clearModelsCache();
+        await this.loadUnifiedProviderData();
     }
 
     async editProvider(providerKey) {

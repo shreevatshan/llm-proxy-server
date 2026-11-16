@@ -742,8 +742,13 @@ class ProviderManager:
             }
         ) as span:
             try:
-                from app.auth.database import AsyncSessionLocal, create_or_update_model_configuration
-                
+                from app.auth.database import (
+                    AsyncSessionLocal,
+                    create_or_update_model_configuration,
+                    get_provider_credentials,
+                    new_model_enabled_default,
+                )
+
                 async with AsyncSessionLocal() as db:
                     try:
                         # Get existing models to preserve enabled states and detect stale models
@@ -760,9 +765,11 @@ class ProviderManager:
                             await db.delete(existing_by_id[model_id])
                         
                         # Upsert current models, touching only rows that actually change
-                        # (is_enabled is admin-owned and always preserved).
+                        # (is_enabled is admin-owned and always preserved). A new model
+                        # gets the provider's setting for new models, looked up once.
                         updated_count = 0
                         inserted_count = 0
+                        new_model_enabled = None
                         for model in models:
                             model_name = model.id.split('/', 1)[1] if '/' in model.id else model.id
                             existing = existing_by_id.get(model.id)
@@ -773,6 +780,10 @@ class ProviderManager:
                                     updated_count += 1
                                 continue
                             
+                            if new_model_enabled is None:
+                                new_model_enabled = new_model_enabled_default(
+                                    await get_provider_credentials(db, provider_name)
+                                )
                             # Not under this provider; the helper's lookup still covers a
                             # row filed under another provider_key.
                             await create_or_update_model_configuration(
@@ -780,7 +791,7 @@ class ProviderManager:
                                 model_id=model.id,
                                 provider_key=provider_name,
                                 model_name=model_name,
-                                is_enabled=True,
+                                is_enabled=new_model_enabled,
                                 commit=False,
                             )
                             inserted_count += 1
@@ -837,6 +848,7 @@ class ProviderManager:
                 from app.auth.database import (
                     AsyncSessionLocal,
                     get_model_configurations_dict,
+                    get_new_models_off_provider_keys,
                     get_provider_configurations_dict,
                 )
 
@@ -846,9 +858,12 @@ class ProviderManager:
                         # Load configurations from database
                         model_configs = await get_model_configurations_dict(db)
                         provider_configs = await get_provider_configurations_dict(db)
+                        new_models_off = await get_new_models_off_provider_keys(db)
 
                         # Update cache
-                        self.model_cache.update_model_configurations(model_configs, provider_configs)
+                        self.model_cache.update_model_configurations(
+                            model_configs, provider_configs, new_models_off
+                        )
 
                         # Per-profile access rules live in app.profiles, loaded
                         # by the rate limiter; only the global gate is loaded here.
@@ -1662,17 +1677,25 @@ class ProviderManager:
     async def refresh_models_from_providers(self) -> Dict[str, int]:
         """Refresh all models by fetching from providers and updating database."""
         try:
-            from app.auth.database import AsyncSessionLocal, refresh_models_from_providers
-            
+            from app.auth.database import (
+                AsyncSessionLocal,
+                get_new_models_off_provider_keys,
+                refresh_models_from_providers,
+            )
+
             # Fetch fresh models from all global providers. BYOK instances are the
             # owners' own: neither refetched nor cleared (clear_all_model_configurations
             # skips them) and their cache slice is kept below.
             fresh_models = await self._fetch_all_models(include_byok=False)
-            
+
             if not fresh_models:
                 print("No models fetched from providers. Database will be cleared but no new models added.")
                 return {"cleared": 0, "created": 0, "error": "No models available from providers"}
-            
+
+            # Every model is recreated as new, so each gets its provider's setting.
+            async with AsyncSessionLocal() as db:
+                new_models_off = await get_new_models_off_provider_keys(db)
+
             # Convert ModelInfo objects to database format
             models_data = []
             for model in fresh_models:
@@ -1687,7 +1710,7 @@ class ProviderManager:
                     'model_id': model.id,
                     'provider_key': provider_key,
                     'model_name': model.id.split('/')[-1] if '/' in model.id else model.id,
-                    'is_enabled': True
+                    'is_enabled': provider_key not in new_models_off,
                 })
             
             # Update database

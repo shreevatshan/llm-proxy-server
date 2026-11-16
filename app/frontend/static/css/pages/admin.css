@@ -1037,6 +1037,36 @@ input:checked + .model-toggle-slider:before {
     flex-shrink: 0;
 }
 
+/* Per-provider controls: count, enable all / disable all, settings gear. */
+.pm-provider-head {
+    flex-wrap: wrap;
+}
+
+.pm-provider-tools {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+
+/* Provider settings gear: dotted when a setting differs from its default (today:
+   new models held back), so that reads without opening the dialog. Sized by
+   .user-settings-btn below. */
+.pm-settings-btn {
+    position: relative;
+}
+
+.pm-settings-btn.is-held::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent-500);
+}
+
 .ma-model-id {
     font-family: var(--font-family-mono);
     font-size: 0.8rem;
@@ -1521,8 +1551,10 @@ input:checked + .model-toggle-slider:before {
    ACCOUNT POLICIES (User Management)
    ================================ */
 
-/* Square icon button at the far right of the User Management header. */
-.user-settings-btn {
+/* Square settings gear: the User Management header's, and each provider's in the
+   Models view. */
+.user-settings-btn,
+.pm-settings-btn {
     width: 2rem;
     height: 2rem;
     padding: 0;
@@ -1543,6 +1575,24 @@ input:checked + .model-toggle-slider:before {
 
 .policy-row-text {
     min-width: 0;
+}
+
+/* Several settings in one dialog (Provider settings): a rule between rows. */
+.policy-row + .policy-row {
+    margin-top: 1rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--mono-4);
+}
+
+/* The provider a Provider settings dialog is for, under its title. */
+.provider-settings-key {
+    display: block;
+    margin-top: 0.25rem;
+    font-family: var(--font-family-mono);
+    font-size: 0.8rem;
+    font-weight: 400;
+    color: var(--mono-text-muted);
+    word-break: break-all;
 }
 
 .policy-row-title {

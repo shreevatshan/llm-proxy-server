@@ -174,6 +174,7 @@ def credentials_response_fields(credentials, dynamic_discovery: Any = ...) -> Di
         instance_name=credentials.instance_name,
         provider_name=credentials.provider_name,
         enabled=credentials.enabled,
+        auto_enable_new_models=getattr(credentials, "auto_enable_new_models", True) is not False,
         endpoint=credentials.endpoint,
         api_key=mask_secret(credentials.api_key),
         discovery_api_version=credentials.discovery_api_version,

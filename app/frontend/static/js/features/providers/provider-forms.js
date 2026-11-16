@@ -512,6 +512,10 @@ class ProviderFormManager {
             // provider (and with it every model) whenever its form was saved.
             if (!isEdit) formData.enabled = true;
 
+            // Admin form only (the BYOK form has no such switch).
+            const autoEnable = document.getElementById('auto_enable_new_models');
+            if (autoEnable && !this.isByok) formData.auto_enable_new_models = autoEnable.checked;
+
             // Collect provider-specific fields
             const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name', 'oauth_client_id', 'oauth_client_secret', 'oauth_refresh_token', 'oauth_accounts_url', 'pai_token_id'];
             fields.forEach(field => {
@@ -852,6 +856,9 @@ class ProviderFormManager {
     }
 
     populateProviderFields(provider) {
+        const autoEnable = document.getElementById('auto_enable_new_models');
+        if (autoEnable) autoEnable.checked = provider.auto_enable_new_models !== false;
+
         // Populate common fields
         const fields = ['endpoint', 'api_key', 'azure_backend', 'region', 'access_key_id', 'secret_access_key', 'base_url', 'provider_name', 'oauth_client_id', 'oauth_client_secret', 'oauth_refresh_token', 'oauth_accounts_url', 'pai_token_id'];
         fields.forEach(field => {

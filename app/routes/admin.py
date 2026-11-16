@@ -40,6 +40,7 @@ from app.auth.database import (
     upsert_profile_limits, upsert_profile_group_limit, set_group_limit_for_all_profiles,
     get_profile_limits, set_profile_model_mode, list_profile_model_exceptions,
     upsert_profile_model_exception, delete_profile_model_exception, set_profile_model_exceptions_bulk,
+    new_model_enabled_default, update_provider_settings,
 )
 from app.auth.webhook import send_signup_webhook
 from app.auth.middleware import get_current_admin
@@ -51,6 +52,7 @@ from app.auth.models import (
     ProfileMemberResponse, UserProfileAssign, ProviderConfigurationResponse, ModelConfigurationResponse,
     ModelManagementTree, ToggleRequest, BulkToggleRequest, BulkUserActionRequest, ModelSearchResponse,
     ProviderCredentialsCreate, ProviderCredentialsUpdate, ProviderCredentialsResponse,
+    ProviderSettingsResponse, ProviderSettingsUpdate,
     _platformai_model_names,
     AdminPasswordReset, AdminUserModify, VALID_AZURE_BACKENDS,
     UserManagementSettingsResponse, UserManagementSettingsUpdate,
@@ -67,7 +69,7 @@ from app.auth.models import (
 from app.auth.admin import AdminUser, authenticate_admin, is_admin_enabled, get_admin_email
 from app.auth.auth import create_access_token, ACCESS_TOKEN_EXPIRE_MINUTES
 from app.providers.provider_manager import provider_manager
-from app.providers.auto_sync import auto_sync_on_provider_change, sync_provider_models
+from app.providers.auto_sync import auto_sync_on_provider_change, sync_provider_models, sync_single_provider
 from app.providers.azure_deployments import merge_azure_deployments, normalize_azure_deployments, normalize_deployment_groups, validate_deployment_names
 from datetime import timedelta, datetime
 from pydantic import BaseModel
@@ -279,6 +281,7 @@ async def get_models_management(
                 enabled=provider.enabled,  # Using unified ProviderCredentials.enabled field
                 model_count=len(provider_models),
                 enabled_model_count=len(enabled_models),
+                auto_enable_new_models=new_model_enabled_default(provider),
                 supported_apis=_supported_apis,
                 created_at=provider.created_at,
                 updated_at=provider.updated_at
@@ -330,6 +333,7 @@ async def sync_models_from_providers(
         # First, get all provider credentials from database to know which providers are valid
         valid_providers = await get_all_provider_credentials(db)
         valid_provider_keys = {p.provider_key for p in valid_providers}
+        new_model_enabled = {p.provider_key: new_model_enabled_default(p) for p in valid_providers}
         
         # Force a complete provider manager refresh to handle provider renames
         logger.info("Forcing complete provider manager refresh before sync...")
@@ -384,9 +388,13 @@ async def sync_models_from_providers(
             # Track which provider this model belongs to
             synced_providers.add(provider_key)
             
-            # Check if model already exists to preserve its enabled state
+            # Check if model already exists to preserve its enabled state; a new
+            # model gets its provider's setting for new models.
             existing_model = await get_model_configuration(db, model.id)
-            is_enabled = existing_model.is_enabled if existing_model else True
+            is_enabled = (
+                existing_model.is_enabled if existing_model
+                else new_model_enabled.get(provider_key, True)
+            )
             
             await create_or_update_model_configuration(
                 db, model.id, provider_key, model_name, is_enabled, commit=False
@@ -660,16 +668,24 @@ async def bulk_toggle_models(
     current_admin: AdminUser = Depends(get_current_admin),
     db: AsyncSession = Depends(get_db)
 ):
-    """Enable or disable all models."""
+    """Enable or disable all models, or only one provider's (provider_key)."""
     try:
         if bulk_data.action not in ["enable_all", "disable_all"]:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Action must be 'enable_all' or 'disable_all'"
             )
+        provider_key = bulk_data.provider_key
+        if provider_key is not None:
+            await _reject_byok_provider(db, provider_key)
+            if await get_provider_credentials(db, provider_key) is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Provider not found: {provider_key}"
+                )
         
         enabled = bulk_data.action == "enable_all"
-        success = await bulk_toggle_all_models(db, enabled)
+        success = await bulk_toggle_all_models(db, enabled, provider_key=provider_key)
         
         if not success:
             raise HTTPException(
@@ -680,10 +696,12 @@ async def bulk_toggle_models(
         # Refresh cache
         await provider_manager.refresh_model_configurations()
         
+        scope = f"All models of {provider_key}" if provider_key else "All models"
         return {
-            "message": f"All models {'enabled' if enabled else 'disabled'}",
+            "message": f"{scope} {'enabled' if enabled else 'disabled'}",
             "action": bulk_data.action,
-            "enabled": enabled
+            "enabled": enabled,
+            "provider_key": provider_key,
         }
     except HTTPException:
         raise
@@ -2874,6 +2892,7 @@ async def list_provider_credentials(
                 enabled=cred.enabled,
                 model_count=len(provider_models),
                 enabled_model_count=len(enabled_models),
+                auto_enable_new_models=new_model_enabled_default(cred),
                 sync_state=sync_status.get("state"),
                 sync_error=sync_status.get("error"),
                 last_sync_at=sync_status.get("last_sync_at"),
@@ -2978,6 +2997,9 @@ async def create_provider_credential(
                 logging.info(f"🔄 Starting auto-sync for updated provider: {credentials.provider_key}")
                 sync_result = await auto_sync_on_provider_change(db, credentials.provider_key, action="update")
                 logging.info(f"Auto-sync result for updated provider {credentials.provider_key}: {sync_result}")
+                if "auto_enable_new_models" in update_data:
+                    # A failed or empty sync skips the config reload.
+                    await provider_manager.refresh_model_configurations()
                 
             else:
                 logging.warning(f"❌ Provider already exists: {provider_key}")
@@ -3010,6 +3032,7 @@ async def create_provider_credential(
                 provider_type=provider_data.provider_type,
                 instance_name=provider_data.instance_name,
                 enabled=provider_data.enabled,
+                auto_enable_new_models=provider_data.auto_enable_new_models,
                 endpoint=provider_data.endpoint,
                 api_key=provider_data.api_key,
                 discovery_api_version=provider_data.discovery_api_version,
@@ -3110,6 +3133,9 @@ async def update_provider_credential(
         # Automatically sync models for the updated provider
         sync_result = await auto_sync_on_provider_change(db, credentials.provider_key, action="update")
         logging.info(f"Auto-sync result for updated provider {credentials.provider_key}: {sync_result}")
+        if "auto_enable_new_models" in update_data:
+            # A failed or empty sync skips the config reload.
+            await provider_manager.refresh_model_configurations()
         if credentials.provider_key != decoded_provider_key:
             # A rename rewrote group members, aliases and access exceptions too.
             await reload_reference_caches()
@@ -3131,6 +3157,101 @@ async def update_provider_credential(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update provider credentials"
         )
+
+
+def _provider_settings_response(cred) -> ProviderSettingsResponse:
+    return ProviderSettingsResponse(
+        provider_key=cred.provider_key,
+        auto_enable_new_models=new_model_enabled_default(cred),
+        updated_at=cred.updated_at,
+    )
+
+
+@router.get("/providers/settings", response_model=ProviderSettingsResponse)
+async def get_provider_settings(
+    provider_key: str = Query(..., description="Provider key"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """The provider's settings shown in its Provider settings dialog."""
+    await _reject_byok_provider(db, provider_key)
+    cred = await get_provider_credentials(db, provider_key)
+    if cred is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider not found: {provider_key}")
+    return _provider_settings_response(cred)
+
+
+@router.put("/providers/settings", response_model=ProviderSettingsResponse)
+async def put_provider_settings(
+    body: ProviderSettingsUpdate,
+    provider_key: str = Query(..., description="Provider key"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Change some of the provider's settings; fields not sent are left alone.
+
+    Nothing is synced. auto_enable_new_models decides how models discovered later
+    start; saved models keep their own flags.
+    """
+    await _reject_byok_provider(db, provider_key)
+    fields = body.model_dump(exclude_unset=True, exclude_none=True)
+    try:
+        cred = await update_provider_settings(db, provider_key, fields)
+    except Exception as e:
+        logging.error(f"Failed to update settings of {provider_key}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update the provider's settings",
+        )
+    if cred is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider not found: {provider_key}")
+    if "auto_enable_new_models" in fields:
+        # The serving cache treats a not-yet-saved model by this setting.
+        await provider_manager.refresh_model_configurations()
+    return _provider_settings_response(cred)
+
+
+@router.post("/providers/sync")
+async def sync_provider(
+    provider_key: str = Query(..., description="Provider key to sync"),
+    current_admin: AdminUser = Depends(get_current_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Re-discover one provider's models now.
+
+    Saved models keep their enabled state; new ones get the provider's setting for
+    new models; models gone upstream are dropped. An empty or failed fetch keeps the
+    saved models. 502 when the provider cannot be listed.
+    """
+    await _reject_byok_provider(db, provider_key)
+    result = await sync_single_provider(db, provider_key)
+    if result.get("not_found"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Provider not found: {provider_key}")
+    if "error" in result:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Sync failed for {provider_key}: {result['error']}",
+        )
+    added, removed = result["added"], result["removed"]
+    message = f"Synced {result['model_count']} models from {provider_key}"
+    if added:
+        state = "enabled" if result["new_models_enabled"] else "disabled until you enable them"
+        message += f"; {len(added)} new ({state})"
+    if removed:
+        message += f"; {len(removed)} no longer listed upstream, removed"
+    if not added and not removed:
+        message += "; no changes"
+    if not result["provider_enabled"]:
+        message += ". The provider is off, so none are served until you switch it on"
+    return {
+        "message": message,
+        "provider_key": provider_key,
+        "provider_enabled": result["provider_enabled"],
+        "new_models_enabled": result["new_models_enabled"],
+        "model_count": result["model_count"],
+        "added": added,
+        "removed": removed,
+    }
 
 
 @router.delete("/providers")
@@ -3304,6 +3425,7 @@ async def export_provider_config(
                 "instance_name": cred.instance_name,
                 "provider_name": cred.provider_name,
                 "enabled": cred.enabled,
+                "auto_enable_new_models": new_model_enabled_default(cred),
                 "endpoint": cred.endpoint,
                 "api_key": cred.api_key if include_secrets else None,
                 "discovery_api_version": cred.discovery_api_version,
@@ -3499,6 +3621,10 @@ async def import_provider_config(
                     oauth_accounts_url=provider_data.get("oauth_accounts_url"),
                     pai_token_id=provider_data.get("pai_token_id"),
                 )
+                # Older exports lack it: a new provider then gets the column default,
+                # an overwritten one keeps its stored value.
+                if isinstance(provider_data.get("auto_enable_new_models"), bool):
+                    provider_kwargs["auto_enable_new_models"] = provider_data["auto_enable_new_models"]
 
                 if existing and overwrite:
                     # Update in place instead of delete+create. delete and create

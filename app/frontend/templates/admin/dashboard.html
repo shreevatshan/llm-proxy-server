@@ -442,6 +442,18 @@
                                 </div>
                             </div>
                         </div>
+
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" role="switch" id="auto_enable_new_models"
+                                   aria-describedby="auto_enable_new_models_help" checked>
+                            <label class="form-check-label" for="auto_enable_new_models">
+                                Enable new models automatically
+                            </label>
+                            <div class="form-text" id="auto_enable_new_models_help">
+                                Turn off to keep every model this provider adds disabled until you switch it on
+                                in the Models view. Models already listed keep their current state.
+                            </div>
+                        </div>
                     </div>
                     
                     <!-- Provider-specific Configuration -->
@@ -1328,6 +1340,47 @@
     </div>
 </div>
 
+<!-- Provider Settings Modal (opened from the gear in each provider's header in the
+     Models view). One .policy-row per setting; its switch's data-setting names the
+     field of GET/PUT /admin/providers/settings (see provider-settings.js). -->
+<div class="modal fade" id="providerSettingsModal" tabindex="-1" aria-labelledby="providerSettingsModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title" id="providerSettingsModalLabel">
+                    <i class="fas fa-gear me-2"></i>
+                    Provider settings
+                    <span class="provider-settings-key" id="provider-settings-key"></span>
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body">
+                <div class="alert alert-danger small" id="provider-settings-error" role="alert" hidden></div>
+                <div class="policy-row">
+                    <div class="policy-row-text">
+                        <label class="policy-row-title" for="provider-setting-auto-enable">Enable new models</label>
+                        <p class="policy-row-desc" id="provider-setting-auto-enable-desc">
+                            Models this provider adds later start enabled. When turned off, they stay
+                            disabled until you switch them on. Models already listed keep their state.
+                        </p>
+                    </div>
+                    <div class="policy-row-control">
+                        <span class="policy-row-state" data-on="On" data-off="Off" aria-hidden="true"></span>
+                        <div class="form-check form-switch m-0">
+                            <input class="form-check-input" type="checkbox" role="switch" id="provider-setting-auto-enable"
+                                data-setting="auto_enable_new_models" aria-describedby="provider-setting-auto-enable-desc">
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <span class="me-auto small text-muted">Changes save immediately.</span>
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Done</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <!-- Import Config Modal -->
 <div class="modal fade" id="importConfigModal" tabindex="-1" aria-labelledby="importConfigModalLabel" aria-hidden="true">
     <div class="modal-dialog modal-dialog-centered">
@@ -1571,6 +1624,7 @@
 <script src="/static/js/features/providers/model-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/search-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/models-view.js?v={{ cache_version }}"></script>
+<script src="/static/js/features/providers/provider-settings.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/azure-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/providers/byok-admin-manager.js?v={{ cache_version }}"></script>
 <script src="/static/js/features/tracking/user-manager.js?v={{ cache_version }}"></script>

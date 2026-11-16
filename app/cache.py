@@ -3,7 +3,7 @@ import threading
 import time
 import logging
 import os
-from typing import List, Optional, Dict, Set, Tuple
+from typing import FrozenSet, Iterable, List, Optional, Dict, Set, Tuple
 from opentelemetry import context as otel_context
 from app.openai_models import ModelInfo
 from app.byok import byok_registry, UNKNOWN_OWNER
@@ -35,6 +35,9 @@ class ModelCache:
         # Model configuration cache (use separate lock for config to reduce contention)
         self._model_configs: Dict[str, bool] = {}  # model_id -> enabled status
         self._provider_configs: Dict[str, bool] = {}  # provider_key -> enabled status
+        # Providers whose models start disabled: a model of theirs that has no saved
+        # flag yet (just discovered, row not loaded) is off rather than on.
+        self._new_models_off: FrozenSet[str] = frozenset()
         self._config_last_updated: float = 0
         self._config_lock: Optional[asyncio.Lock] = None
 
@@ -337,25 +340,48 @@ class ModelCache:
     
     # Model Configuration Methods
     
-    def update_model_configurations(self, model_configs: Dict[str, bool], provider_configs: Dict[str, bool]) -> None:
-        """Update model and provider configurations (atomic assignment - thread-safe)."""
+    def update_model_configurations(
+        self,
+        model_configs: Dict[str, bool],
+        provider_configs: Dict[str, bool],
+        new_models_off: Optional[Iterable[str]] = None,
+    ) -> None:
+        """Update model and provider configurations (atomic assignment - thread-safe).
+
+        ``new_models_off`` replaces the providers whose unsaved models read as off;
+        None keeps the current set.
+        """
         # Atomic reference swaps are thread-safe in Python
+        if new_models_off is not None:
+            self._new_models_off = frozenset(new_models_off)
         self._model_configs = model_configs
         self._provider_configs = provider_configs
         self._config_last_updated = time.time()
-    
-    async def update_model_configurations_async(self, model_configs: Dict[str, bool], provider_configs: Dict[str, bool]) -> None:
+
+    async def update_model_configurations_async(
+        self,
+        model_configs: Dict[str, bool],
+        provider_configs: Dict[str, bool],
+        new_models_off: Optional[Iterable[str]] = None,
+    ) -> None:
         """Update model and provider configurations (async version with lock)."""
         self._ensure_locks()
         async with self._config_lock:
-            self._model_configs = model_configs
-            self._provider_configs = provider_configs
-            self._config_last_updated = time.time()
-    
+            self.update_model_configurations(model_configs, provider_configs, new_models_off)
+
     def is_model_enabled(self, model_id: str) -> bool:
-        """Check if a model is enabled (default True if not in config)."""
+        """Check if a model is enabled.
+
+        A model with no saved flag (e.g. just discovered by a sync whose row is not
+        loaded yet) follows its provider's setting for new models: on unless the
+        provider holds new models back.
+        """
         # Snapshot read - no lock needed for simple dict lookup
-        return self._model_configs.get(model_id, True)
+        enabled = self._model_configs.get(model_id)
+        if enabled is not None:
+            return enabled
+        provider_key = model_id.split('/', 1)[0] if '/' in model_id else model_id
+        return provider_key not in self._new_models_off
     
     def is_provider_enabled(self, provider_key: str) -> bool:
         """Check if a provider is enabled (default True if not in config)."""
