@@ -6,6 +6,7 @@ services:
       - "11440:11440"  # OpenAI API
       - "11439:11439"  # Azure OpenAI API
       - "2027:2027"    # Anthropic API
+      - "11366:11366"  # TypeSafe System One API
       - "8765:8765"    # Management panel
     volumes:
       # Database persistence - the container will create this directory with proper permissions
@@ -38,6 +39,7 @@ services:
       - OPENAI_SERVER_PORT=11440
       - AZURE_OPENAI_SERVER_PORT=11439
       - ANTHROPIC_SERVER_PORT=2027
+      - TYPESAFE_SERVER_PORT=11366
       - MANAGEMENT_SERVER_PORT=8765
       # Admin Configuration
       - LLMPROXY_ADMIN_ENABLED=true

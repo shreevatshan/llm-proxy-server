@@ -166,16 +166,18 @@ class RequestTrackerManager {
 
     _updateStats() {
         const total = this.activeRequests.size;
-        let openai = 0, anthropic = 0, azure = 0;
+        let openai = 0, anthropic = 0, azure = 0, typesafe = 0;
         for (const req of this.activeRequests.values()) {
             if (req.server === 'openai') openai++;
             else if (req.server === 'anthropic') anthropic++;
             else if (req.server === 'azure_openai') azure++;
+            else if (req.server === 'systemone') typesafe++;
         }
         this._setText('total-active-requests', total);
         this._setText('openai-active-requests', openai);
         this._setText('anthropic-active-requests', anthropic);
         this._setText('azure-active-requests', azure);
+        this._setText('typesafe-active-requests', typesafe);
     }
 
     _updateConnectionStatus(connected) {
@@ -217,7 +219,8 @@ class RequestTrackerManager {
         const map = {
             openai: { cls: 'info', label: 'OpenAI' },
             anthropic: { cls: 'info', label: 'Anthropic' },
-            azure_openai: { cls: 'info', label: 'Azure' }
+            azure_openai: { cls: 'info', label: 'Azure' },
+            systemone: { cls: 'info', label: 'TypeSafe' }
         };
         const s = map[server] || { cls: 'secondary', label: server };
         return '<span class="badge bg-' + s.cls + '">' + s.label + '</span>';

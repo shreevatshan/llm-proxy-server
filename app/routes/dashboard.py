@@ -116,10 +116,13 @@ async def dashboard_home(
         models, chat, completions, embeddings, images, audio, responses, decisions,
         anthropic_messages, anthropic_models,
         azure_openai,
+        systemone, typesafe_models,
     )
     openai_routers = [models, chat, completions, embeddings, images, audio, responses, decisions]
     anthropic_routers = [anthropic_messages, anthropic_models]
     azure_legacy_routers = [azure_openai]
+    # The TypeSafe app's own routes (port 11366); never part of openai_routers.
+    typesafe_routers = [typesafe_models, systemone]
 
     openai_endpoints = _extract_endpoints_from_routers(openai_routers)
     anthropic_endpoints = _extract_endpoints_from_routers(anthropic_routers)
@@ -127,6 +130,8 @@ async def dashboard_home(
         _extract_endpoints_from_routers(azure_legacy_routers)
         + _extract_endpoints_from_routers(openai_routers, prefix="/openai")
     )
+    # Full /v1 paths: the TypeSafe base URL has no /v1 (the SDK appends it).
+    typesafe_endpoints = _extract_endpoints_from_routers(typesafe_routers)
 
     # Strip /v1 prefix from OpenAI endpoint paths
     for ep in openai_endpoints:
@@ -165,10 +170,12 @@ async def dashboard_home(
             "openai_port": config.server.openai_port,
             "anthropic_port": config.server.anthropic_port,
             "azure_openai_port": config.server.azure_openai_port,
+            "typesafe_port": config.server.typesafe_port,
             "management_port": config.server.management_port,
             "openai_endpoints_json": _safe_json(openai_endpoints),
             "anthropic_endpoints_json": _safe_json(anthropic_endpoints),
             "azure_endpoints_json": _safe_json(azure_endpoints),
+            "typesafe_endpoints_json": _safe_json(typesafe_endpoints),
             "models_json": _safe_json(models_list),
             # 4get has no discovery endpoint; the Web Search tab offers this list.
             "fourget_scrapers": FOURGET_WEB_SCRAPERS,
@@ -207,7 +214,7 @@ async def endpoints_page(
     request: Request,
     current_user: User = Depends(get_current_active_user)
 ):
-    """User endpoints page - view available OpenAI and Anthropic API endpoints."""
+    """User endpoints page - view available OpenAI, Anthropic, Azure and TypeSafe API endpoints."""
     from app.config import config
     import time
 
@@ -217,10 +224,13 @@ async def endpoints_page(
         models, chat, completions, embeddings, images, audio, responses, decisions,
         anthropic_messages, anthropic_models,
         azure_openai,
+        systemone, typesafe_models,
     )
     openai_routers = [models, chat, completions, embeddings, images, audio, responses, decisions]
     anthropic_routers = [anthropic_messages, anthropic_models]
     azure_legacy_routers = [azure_openai]
+    # The TypeSafe app's own routes (port 11366); never part of openai_routers.
+    typesafe_routers = [typesafe_models, systemone]
 
     openai_endpoints = _extract_endpoints_from_routers(openai_routers)
     anthropic_endpoints = _extract_endpoints_from_routers(anthropic_routers)
@@ -229,6 +239,8 @@ async def endpoints_page(
         _extract_endpoints_from_routers(azure_legacy_routers)
         + _extract_endpoints_from_routers(openai_routers, prefix="/openai")
     )
+    # Full /v1 paths: the TypeSafe base URL has no /v1 (the SDK appends it).
+    typesafe_endpoints = _extract_endpoints_from_routers(typesafe_routers)
 
     # Strip /v1 prefix from OpenAI endpoint paths — the base URL already
     # includes /v1, so paths shown to the user should be relative (e.g.
@@ -248,10 +260,12 @@ async def endpoints_page(
             "openai_port": config.server.openai_port,
             "anthropic_port": config.server.anthropic_port,
             "azure_openai_port": config.server.azure_openai_port,
+            "typesafe_port": config.server.typesafe_port,
             "management_port": config.server.management_port,
             "openai_endpoints_json": _safe_json(openai_endpoints),
             "anthropic_endpoints_json": _safe_json(anthropic_endpoints),
             "azure_openai_endpoints_json": _safe_json(azure_endpoints),
+            "typesafe_endpoints_json": _safe_json(typesafe_endpoints),
         }
     )
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"

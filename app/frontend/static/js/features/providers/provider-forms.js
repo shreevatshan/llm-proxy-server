@@ -157,7 +157,9 @@ class ProviderFormManager {
                         without <code>/messages</code> those requests are adapted onto <code>/chat/completions</code>,
                         or <code>/responses</code> when chat is not selected. <code>/messages</code> (Foundry) calls
                         the deployment natively. <code>/decisions</code> (e.g. gpt-6-luna) must be selected
-                        explicitly and is never offered on <code>/v1/messages</code>.
+                        explicitly and is never offered on <code>/v1/messages</code>. <code>/systemone</code>
+                        (Microsoft-Decision-1) is served only on the TypeSafe port. <code>/messages</code> and
+                        <code>/systemone</code> are listed only when Azure Backend is Foundry.
                     </div>
                 </div>
                 
@@ -254,6 +256,18 @@ class ProviderFormManager {
                             <option value="">x-api-key:</option>
                             <option value="bearer">Authorization: Bearer</option>
                         </select>
+                    </div>
+                </div>
+            </div>
+            <div class="row">
+                <div class="col-md-6">
+                    <div class="mb-3">
+                        <label for="systemone_base_url" class="form-label">
+                            <i class="fas fa-list-check"></i> System One base URL
+                        </label>
+                        <input type="url" id="systemone_base_url" class="form-control"
+                               placeholder="e.g., https://api.typesafe.ai/v1">
+                        <div class="form-text">Complete server URL including /v1 path. Leave blank if the server has no System One API.</div>
                     </div>
                 </div>
             </div>
@@ -579,18 +593,30 @@ class ProviderFormManager {
             if (providerType === 'custom') {
                 const openaiBaseUrl = (document.getElementById('base_url')?.value || '').trim();
                 const anthropicBaseUrl = (document.getElementById('anthropic_base_url')?.value || '').trim();
-                if (!openaiBaseUrl && !anthropicBaseUrl) {
-                    this.showFormAlert('danger', 'Please provide an OpenAI base URL, an Anthropic base URL, or both');
+                const systemOneBaseUrl = (document.getElementById('systemone_base_url')?.value || '').trim();
+                if (!openaiBaseUrl && !anthropicBaseUrl && !systemOneBaseUrl) {
+                    this.showFormAlert('danger', 'Please provide an OpenAI, Anthropic or System One base URL (at least one)');
                     this.resetButtonState(submitBtn, btnContent, btnLoading);
                     return;
                 }
                 const supportedApis = [];
                 if (openaiBaseUrl) supportedApis.push('openai');
                 if (anthropicBaseUrl) supportedApis.push('anthropic');
+                if (systemOneBaseUrl) supportedApis.push('systemone');
+                // Keep values this form does not manage (it used to drop every unknown value on save).
+                const stored = window.currentEditingProvider?.supported_apis;
+                if (Array.isArray(stored)) {
+                    stored.forEach(api => {
+                        if (!['openai', 'systemone', 'anthropic'].includes(api) && !supportedApis.includes(api)) {
+                            supportedApis.push(api);
+                        }
+                    });
+                }
                 formData.supported_apis = supportedApis;
                 // Empty strings clear previously saved values.
                 formData.base_url = openaiBaseUrl;
                 formData.anthropic_base_url = anthropicBaseUrl;
+                formData.systemone_base_url = systemOneBaseUrl;
                 const anthropicAuthStyle = document.getElementById('anthropic_auth_style');
                 formData.anthropic_auth_style = anthropicAuthStyle ? anthropicAuthStyle.value : '';
             }
@@ -652,12 +678,12 @@ class ProviderFormManager {
                         chat: '/chat/completions', responses: '/responses', anthropic: '/messages',
                         completions: '/completions', embeddings: '/embeddings', images: '/images/*',
                         speech: '/audio/speech', transcription: '/audio/transcriptions',
-                        decisions: '/decisions',
+                        decisions: '/decisions', systemone: '/systemone',
                     };
                     result.deployment_groups.forEach(group => {
                         const apis = (group.apis || []).length
                             ? group.apis.map(api => apiLabels[api] || api).join(', ')
-                            : `legacy ${group.legacy_mode || ''} (all APIs)`;
+                            : `legacy ${group.legacy_mode || ''} (all APIs except /systemone)`;
                         successMsg += `<br>${apis}: ${(group.deployments || []).join(', ')}`;
                     });
                 }
@@ -892,6 +918,14 @@ class ProviderFormManager {
             const anthropicBaseUrl = document.getElementById('anthropic_base_url');
             const anthropicAuthStyle = document.getElementById('anthropic_auth_style');
             if (baseUrl) baseUrl.value = apis.includes('openai') ? (provider.base_url || '') : '';
+            const systemOneBaseUrl = document.getElementById('systemone_base_url');
+            if (systemOneBaseUrl) {
+                // Rows written without a separate System One URL serve it from
+                // base_url; show that URL explicitly (saving then stores it here).
+                systemOneBaseUrl.value = apis.includes('systemone')
+                    ? (provider.systemone_base_url || provider.base_url || '')
+                    : '';
+            }
             if (anthropicBaseUrl) {
                 // Older records enabled native Anthropic without a separate URL
                 // (it was derived from base_url); show that URL explicitly.

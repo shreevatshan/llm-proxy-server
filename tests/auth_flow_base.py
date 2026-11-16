@@ -44,7 +44,7 @@ def management_app():
     global _APP
     if _APP is None:
         from app.main import create_management_app
-        _APP = create_management_app(FastAPI(), FastAPI(), FastAPI())
+        _APP = create_management_app(FastAPI(), FastAPI(), FastAPI(), FastAPI())
     return _APP
 
 

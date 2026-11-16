@@ -217,7 +217,7 @@
         font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase; width: auto;
         font-family: var(--font-family-mono);
     }
-    .api-badge.openai, .api-badge.anthropic, .api-badge.azure_openai {
+    .api-badge.openai, .api-badge.anthropic, .api-badge.azure_openai, .api-badge.systemone {
         background-color: var(--mono-3); color: var(--mono-text-secondary);
         border: 1px solid var(--mono-5); font-family: var(--font-family-mono);
     }
@@ -434,6 +434,35 @@
                 <i class="fas fa-chevron-down foot-chevron"></i>
             </div>
             <div class="endpoints-collapse" id="azure-openai-endpoints"></div>
+        </div>
+    </div>
+
+    <!-- TypeSafe (System One) -->
+    <div class="endpoint-section">
+        <div class="provider-block" id="typesafe-block">
+            <div class="provider-head">
+                <span class="provider-socket"></span>
+                <span class="provider-name">TypeSafe System One</span>
+            </div>
+            <div class="provider-routes">
+                <div class="route-row direct">
+                    <span class="route-url" id="typesafe-base-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('typesafe-base-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+                <div class="route-row gateway">
+                    <span class="route-url" id="typesafe-unified-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('typesafe-unified-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+            </div>
+            <div class="provider-foot" role="button" tabindex="0" aria-expanded="false" aria-controls="typesafe-endpoints" onclick="toggleEndpoints('typesafe')" onkeydown="handleEndpointCardKeydown(event, 'typesafe')">
+                <span class="foot-label"><span class="foot-count" id="typesafe-count">0</span> request endpoints</span>
+                <i class="fas fa-chevron-down foot-chevron"></i>
+            </div>
+            <div class="endpoints-collapse" id="typesafe-endpoints"></div>
         </div>
     </div>
 </div>
@@ -844,7 +873,7 @@
                             </label>
                             <select id="provider_type" class="form-select" onchange="updateProviderForm()" required>
                                 <option value="">Choose a provider type...</option>
-                                <option value="custom">OpenAI / Anthropic compatible</option>
+                                <option value="custom">OpenAI / Anthropic / System One compatible</option>
                                 <option value="azure">Azure</option>
                                 <option value="google">Google AI</option>
                                 <option value="bedrock">AWS Bedrock</option>
@@ -946,6 +975,7 @@
     const _openaiPort     = "{{ openai_port }}";
     const _anthropicPort  = "{{ anthropic_port }}";
     const _azurePort      = "{{ azure_openai_port }}";
+    const _typesafePort   = "{{ typesafe_port }}";
     const _managementPort = "{{ management_port }}";
     {# SECURITY INVARIANT: the *_json context vars are pre-dumped by _safe_json
        in app/routes/dashboard.py, which escapes `<`, `>`, `&` and U+2028/U+2029,
@@ -955,6 +985,7 @@
     const endpointsData         = {{ openai_endpoints_json|safe }};
     const anthropicEndpointsData= {{ anthropic_endpoints_json|safe }};
     const azureEndpointsData    = {{ azure_endpoints_json|safe }};
+    const typesafeEndpointsData = {{ typesafe_endpoints_json|safe }};
     const modelsData            = {{ models_json|safe }};
 </script>
 <script src="/static/js/core/ui-utils.js?v={{ cache_version }}"></script>

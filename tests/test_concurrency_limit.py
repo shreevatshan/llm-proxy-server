@@ -327,7 +327,7 @@ class SlotLifetimeTests(PoolTestCase):
 def test_every_api_app_wraps_its_routes_in_slots():
     from app import main
 
-    for name in ("create_openai_app", "create_anthropic_app", "create_azure_openai_app"):
+    for name in ("create_openai_app", "create_anthropic_app", "create_azure_openai_app", "create_typesafe_app"):
         layers = [m.cls for m in getattr(main, name)().user_middleware]
         assert ConcurrencySlotMiddleware in layers, name
         # Just inside tracking, which test_user_id_span_attribute pins at index 0.

@@ -102,7 +102,7 @@ class ByokManager {
         const key = this._esc(p.provider_key);
         const jsKey = this._esc(JSON.stringify(p.provider_key));
         const typeLabel = {
-            custom: 'OpenAI / Anthropic compatible', azure: 'Azure', google: 'Google AI',
+            custom: 'OpenAI / Anthropic / System One compatible', azure: 'Azure', google: 'Google AI',
             bedrock: 'AWS Bedrock', platformai: 'Zoho PlatformAI',
         }[p.provider_type] || p.provider_type;
         const problem = p.load_error || (p.sync_state === 'failed' ? p.sync_error : null);

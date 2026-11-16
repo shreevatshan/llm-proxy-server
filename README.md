@@ -3,7 +3,7 @@
 🐳 **Docker Hub:** [shreevatshan/llm-proxy-server](https://hub.docker.com/r/shreevatshan/llm-proxy-server)
 
 ### What does it do?
-This is a hosted, unified proxy server that sits between your applications and the AI models they call. It translates requests on the fly, exposing perfectly compatible API endpoints for **OpenAI**, **Anthropic**, and **Azure OpenAI**
+This is a hosted, unified proxy server that sits between your applications and the AI models they call. It translates requests on the fly, exposing perfectly compatible API endpoints for **OpenAI**, **Anthropic**, and **Azure OpenAI**, and passes **TypeSafe System One** requests through unchanged to System One-compatible upstreams
 
 You can route zero-code-change requests from your favorite SDKs to **AWS Bedrock, Google Gemini, OpenAI, Claude, Ollama, Llama.cpp**, and more.
 

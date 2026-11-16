@@ -258,7 +258,7 @@ class MiddlewareOrderTests(unittest.TestCase):
     begin_trace_identity() capture it as the current span.
     """
 
-    APPS = ("create_openai_app", "create_anthropic_app", "create_azure_openai_app")
+    APPS = ("create_openai_app", "create_anthropic_app", "create_azure_openai_app", "create_typesafe_app")
 
     def _layers(self, app):
         return [

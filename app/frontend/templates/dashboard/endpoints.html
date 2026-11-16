@@ -374,6 +374,38 @@
             <div class="endpoints-collapse" id="azure-openai-endpoints"></div>
         </div>
     </div>
+
+    <!-- TypeSafe (System One) -->
+    <div class="endpoint-section">
+        <div class="provider-block" id="typesafe-block">
+            <div class="provider-head">
+                <span class="provider-socket"></span>
+                <span class="provider-name">TypeSafe System One</span>
+                <span class="provider-meta">TypeSafe SDK base_url &nbsp;·&nbsp; suffix <b>none</b></span>
+            </div>
+            <div class="provider-routes">
+                <div class="route-row direct">
+                    <span class="route-label"><span class="route-glyph"></span>Direct</span>
+                    <span class="route-url" id="typesafe-base-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('typesafe-base-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+                <div class="route-row gateway">
+                    <span class="route-label"><span class="route-glyph"></span>Gateway</span>
+                    <span class="route-url" id="typesafe-unified-url"></span>
+                    <button class="copy-btn" onclick="copyText(document.getElementById('typesafe-unified-url').dataset.url, this)">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+            </div>
+            <div class="provider-foot" role="button" tabindex="0" aria-expanded="false" aria-controls="typesafe-endpoints" onclick="toggleEndpoints('typesafe')" onkeydown="handleEndpointCardKeydown(event, 'typesafe')">
+                <span class="foot-label"><span class="foot-count" id="typesafe-count">0</span> request endpoints</span>
+                <i class="fas fa-chevron-down foot-chevron"></i>
+            </div>
+            <div class="endpoints-collapse" id="typesafe-endpoints"></div>
+        </div>
+    </div>
 </div>
 
 <!-- Toast Notification Container -->
@@ -386,17 +418,21 @@
     const openaiPort = "{{ openai_port }}";
     const anthropicPort = "{{ anthropic_port }}";
     const azureOpenaiPort = "{{ azure_openai_port }}";
+    const typesafePort = "{{ typesafe_port }}";
     const managementPort = "{{ management_port }}";
 
     const openaiBaseUrl = `http://${domain}:${openaiPort}/v1`;
     const anthropicBaseUrl = `http://${domain}:${anthropicPort}`;
     const azureOpenaiBaseUrl = `http://${domain}:${azureOpenaiPort}`;
+    // No /v1: the TypeSafe SDKs append /v1/... to their base_url themselves.
+    const typesafeBaseUrl = `http://${domain}:${typesafePort}`;
 
     // Unified base URLs: every provider is also reachable through the single
     // management port under a path prefix (see create_management_app).
     const openaiUnifiedUrl = `http://${domain}:${managementPort}/openai/v1`;
     const anthropicUnifiedUrl = `http://${domain}:${managementPort}/anthropic`;
     const azureOpenaiUnifiedUrl = `http://${domain}:${managementPort}/azure-openai`;
+    const typesafeUnifiedUrl = `http://${domain}:${managementPort}/typesafe`;
 
     {# SECURITY INVARIANT: *_json are pre-dumped by _safe_json in
        app/routes/dashboard.py, which escapes `<`, `>`, `&` and U+2028/U+2029,
@@ -407,6 +443,8 @@
     const anthropicEndpoints = {{ anthropic_endpoints_json | safe }};
 
     const azureOpenaiEndpoints = {{ azure_openai_endpoints_json | safe }};
+
+    const typesafeEndpoints = {{ typesafe_endpoints_json | safe }};
 
     function renderEndpoints(endpoints, containerId, baseUrl) {
         const container = document.getElementById(containerId);
@@ -557,12 +595,16 @@
         setUrl('openai-unified-url', openaiUnifiedUrl);
         setUrl('anthropic-unified-url', anthropicUnifiedUrl);
         setUrl('azure-openai-unified-url', azureOpenaiUnifiedUrl);
+        setUrl('typesafe-base-url', typesafeBaseUrl);
+        setUrl('typesafe-unified-url', typesafeUnifiedUrl);
         setCount('openai-count', openaiEndpoints);
         setCount('anthropic-count', anthropicEndpoints);
         setCount('azure-openai-count', azureOpenaiEndpoints);
+        setCount('typesafe-count', typesafeEndpoints);
         renderEndpoints(openaiEndpoints, 'openai-endpoints', openaiBaseUrl);
         renderEndpoints(anthropicEndpoints, 'anthropic-endpoints', anthropicBaseUrl);
         renderEndpoints(azureOpenaiEndpoints, 'azure-openai-endpoints', azureOpenaiBaseUrl);
+        renderEndpoints(typesafeEndpoints, 'typesafe-endpoints', typesafeBaseUrl);
     });
 </script>
 {% endblock %}

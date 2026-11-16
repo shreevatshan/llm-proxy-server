@@ -1,6 +1,10 @@
 class ModelAliasManager {
-    static API_SURFACES = ['openai', 'anthropic', 'azure_openai'];
-    static API_LABELS = { openai: 'OpenAI', anthropic: 'Anthropic', azure_openai: 'Azure OpenAI' };
+    static API_SURFACES = ['openai', 'anthropic', 'azure_openai', 'systemone'];
+    // New mappings start on these; TypeSafe System One is opt-in (as on the server).
+    static DEFAULT_SURFACES = ['openai', 'anthropic', 'azure_openai'];
+    static API_LABELS = {
+        openai: 'OpenAI', anthropic: 'Anthropic', azure_openai: 'Azure OpenAI', systemone: 'TypeSafe System One',
+    };
     static MATCH_LABELS = { exact: 'Exact', contains: 'Contains', regex: 'Regex' };
     static MATCH_ICONS = { exact: 'fa-equals', contains: 'fa-search', regex: 'fa-code' };
     static MATCH_HELP = {
@@ -539,7 +543,7 @@ class ModelAliasManager {
     }
 
     _setApis(apis) {
-        const selected = new Set(apis || ModelAliasManager.API_SURFACES);
+        const selected = new Set(apis || ModelAliasManager.DEFAULT_SURFACES);
         ModelAliasManager.API_SURFACES.forEach(api => {
             const box = document.getElementById(`model-alias-api-${api}`);
             if (box) box.checked = selected.has(api);
@@ -584,7 +588,7 @@ class ModelAliasManager {
         document.getElementById('model-alias-target').value = '';
         const select = document.getElementById('model-alias-match-type');
         if (select) select.value = 'exact';
-        this._setApis(ModelAliasManager.API_SURFACES);
+        this._setApis(ModelAliasManager.DEFAULT_SURFACES);
         this._closeMenu();
         this._setEditing(null);
         this.updateMatchHelp();

@@ -63,6 +63,7 @@ from app.model_alias import (
 )
 from app.outages import Outage, describe, outage_registry
 from app.profiles import profile_id_for_auth, profile_registry
+from app.providers.base import SYSTEMONE_API
 from app.providers.provider_manager import provider_manager
 
 logger = logging.getLogger(__name__)
@@ -220,6 +221,13 @@ def candidate_ids(
     return [model_id for model_id in pool if not outage_registry.is_in_outage(model_id)]
 
 
+def _serves_systemone(provider, model_id: str) -> bool:
+    try:
+        return bool(provider.supports_api_for_model(model_id, SYSTEMONE_API))
+    except Exception:
+        return False
+
+
 def _filter_pool(pool: List[str], api: Optional[str]) -> List[str]:
     """Drop candidates that could only fail, then globally disabled ones."""
     if not pool:
@@ -241,6 +249,11 @@ def _filter_pool(pool: List[str], api: Optional[str]) -> List[str]:
     #    documented best-effort and matches substrings like "speech"), so it must
     #    never be the reason a pool empties: a name the user could reach with an
     #    explicit canonical id must not 404 just because it was written bare.
+    #    The System One surface is the exception: its capability is exact (a
+    #    configured "systemone" API with a usable client), so a bare name no
+    #    System One upstream serves is unavailable there -- fallback aliases can
+    #    then fire, and another user's BYOK instance can never turn a 400 into a
+    #    404 (the visibility filter runs after this one).
     if api:
         supported = []
         for model_id, provider in live:
@@ -250,8 +263,16 @@ def _filter_pool(pool: List[str], api: Optional[str]) -> List[str]:
             except Exception:
                 logger.debug("supports_api_for_model failed for %s", model_id, exc_info=True)
                 supported.append((model_id, provider))
-        if supported:
+        if supported or api == SYSTEMONE_API:
             live = supported
+        else:
+            # The backstop keeps no System One model: its surfaces are explicit
+            # configuration, not a guess (a ["systemone"]-only custom provider
+            # has no OpenAI client; an Azure /systemone row is Decision-1), so a
+            # bare chat name only such a model answers to is unavailable (404)
+            # rather than a charged error. Other models are unaffected.
+            live = [(model_id, provider) for model_id, provider in live
+                    if not _serves_systemone(provider, model_id)]
 
     # 3. Globally disabled models are out of rotation. No backstop here: if an
     #    all-disabled pool still resolved, "disabled" would mean nothing.

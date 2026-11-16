@@ -3,6 +3,11 @@ uvicorn==0.38.0
 pydantic==2.12.5
 PyYAML==6.0.3
 httpx==0.28.1
+# zstd request bodies on the TypeSafe port (TypeSafe SDKs compress by default);
+# Python 3.14+ uses the stdlib compression.zstd instead. Deliberately not
+# "zstandard" (detected by httpx) or "backports.zstd" (detected by urllib3/requests
+# and aiohttp): those would start offering zstd to upstreams on every port.
+pyzstd==0.17.0; python_version < "3.14"
 aiohttp==3.14.1
 boto3==1.43.32
 google-genai==2.8.0

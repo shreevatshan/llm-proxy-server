@@ -403,6 +403,46 @@ async def get_current_user_optional(
         return None
 
 
+async def credentials_are_valid(request: Request) -> bool:
+    """Whether the request carries credentials authenticate_jwt_or_api_key accepts.
+
+    The same token sources and checks (a Bearer header or the access_token
+    cookie; an admin or active-user JWT; an active API key with an active
+    owner), with none of its side effects: no tracking identity, no rate-limit
+    charge, no last-used update. For work that must not run for anonymous or
+    forged callers before the real auth dependency does, e.g. decompressing a
+    request body (app/request_encoding.py). Infrastructure errors propagate.
+    """
+    bearer = None
+    scheme, _, param = (request.headers.get("authorization") or "").partition(" ")
+    if scheme.lower() == "bearer" and param.strip():
+        bearer = param.strip()  # what HTTPBearer(auto_error=False) yields
+    token = bearer or request.cookies.get("access_token")
+    if not token:
+        return False
+    try:
+        token_data = verify_token(token)
+    except (JWTError, HTTPException):
+        token_data = None
+    if token_data is not None:
+        if token_data.is_admin and token_data.username == get_admin_username():
+            return True
+        cached_user = auth_cache.get_cached_user(token_data.username)
+        if cached_user and cached_user.is_active:
+            return True
+        async with AsyncSessionLocal() as db:
+            user = await get_user_by_username(db, username=token_data.username)
+        if user is not None and user.is_active:
+            return True
+    if not bearer:
+        return False  # API keys are only accepted from the Authorization header
+    cached = auth_cache.get_cached_api_key(bearer)
+    if cached and cached.is_active and cached.user_is_active:
+        return True
+    async with AsyncSessionLocal() as db:
+        return await get_api_key(db, bearer) is not None
+
+
 async def authenticate_jwt_or_api_key(
     request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(security),

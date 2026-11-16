@@ -55,6 +55,30 @@ def platformai_response_fields(credentials) -> dict:
     }
 
 
+# Custom-provider URL fields and the API each one serves natively.
+_CUSTOM_API_URL_FIELDS = (
+    ("openai", ("base_url", "endpoint")),
+    ("anthropic", ("anthropic_base_url",)),
+    ("systemone", ("systemone_base_url",)),
+)
+
+
+def custom_supported_apis_from_urls(data) -> list:
+    """The APIs a custom provider serves natively, from which base URLs are filled
+    (as the provider form derives them); the OpenAI API when none is."""
+    def filled(name):
+        value = data.get(name) if isinstance(data, dict) else getattr(data, name, None)
+        return isinstance(value, str) and bool(value.strip())
+    apis = [api for api, fields in _CUSTOM_API_URL_FIELDS if any(filled(f) for f in fields)]
+    return apis or ["openai"]
+
+
+def infer_custom_supported_apis(provider_data) -> None:
+    """A custom provider created without supported_apis gets them from its URLs."""
+    if getattr(provider_data, "provider_type", None) == "custom" and not provider_data.supported_apis:
+        provider_data.supported_apis = custom_supported_apis_from_urls(provider_data)
+
+
 def provider_update_data(provider_data: BaseModel, *, exclude: tuple = ()) -> dict:
     """Column values an update/upsert request writes.
 
@@ -98,6 +122,11 @@ def infer_azure_supported_apis(provider_data) -> None:
             and len(provider_data.anthropic_deployments) > 0
         ):
             inferred_apis.append("anthropic")
+        if provider_data.azure_backend == "foundry" and any(
+            "systemone" in ((group.get("apis") if isinstance(group, dict) else getattr(group, "apis", None)) or [])
+            for group in (getattr(provider_data, "deployment_groups", None) or [])
+        ):
+            inferred_apis.append("systemone")  # Microsoft-Decision-1 rows
         provider_data.supported_apis = inferred_apis
 
 
@@ -161,6 +190,7 @@ def credentials_response_fields(credentials, dynamic_discovery: Any = ...) -> Di
         supported_apis=parse_supported_apis(credentials.supported_apis),
         anthropic_base_url=credentials.anthropic_base_url,
         anthropic_auth_style=credentials.anthropic_auth_style,
+        systemone_base_url=getattr(credentials, "systemone_base_url", None),
         **platformai_response_fields(credentials),
         created_at=credentials.created_at,
         updated_at=credentials.updated_at,

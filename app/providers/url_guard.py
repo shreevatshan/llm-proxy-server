@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 import httpx
 
 # Credential-row fields that hold an upstream URL.
-URL_FIELDS = ("endpoint", "base_url", "anthropic_base_url", "oauth_accounts_url")
+URL_FIELDS = ("endpoint", "base_url", "anthropic_base_url", "systemone_base_url", "oauth_accounts_url")
 
 
 class UnsafeUpstreamURL(ValueError):

@@ -1,13 +1,14 @@
 """
 LLM Proxy Server - Multi-Server Application Factory
 
-Creates four FastAPI applications sharing the same provider_manager,
+Creates five FastAPI applications sharing the same provider_manager,
 model_cache, database, and auth system:
 
 1. OpenAI API Server (port 11440) - OpenAI-compatible API endpoints
 2. Anthropic API Server (port 2027) - Anthropic Messages API endpoints
 3. Azure OpenAI API Server (port 11439) - Azure OpenAI-compatible API endpoints
-4. Management Server (port 8765) - Admin panel, user login, dashboard
+4. TypeSafe API Server (port 11366) - TypeSafe System One API (TypeSafe-native)
+5. Management Server (port 8765) - Admin panel, user login, dashboard
 """
 
 from fastapi import FastAPI, Request, Depends
@@ -49,10 +50,10 @@ _startup_complete = False
 
 
 async def shared_startup():
-    """Initialize shared resources used by all three servers.
+    """Initialize shared resources used by all API servers.
 
-    Protected by _startup_lock because asyncio.gather starts all three
-    server lifespans concurrently — without the lock, multiple coroutines
+    Protected by _startup_lock because asyncio.gather starts all server
+    lifespans concurrently — without the lock, multiple coroutines
     could pass the _startup_complete check before the first one finishes.
     """
     global _startup_complete
@@ -355,10 +356,26 @@ def _model_from_multipart(body: bytes, content_type: str) -> Optional[str]:
         return None
 
 
-def _add_request_tracking(app: FastAPI, server_name: str):
-    """Add request tracking middleware to an API server."""
+def _add_request_tracking(app: FastAPI, server_name: str, *, decode_content_encoding: bool = False):
+    """Add request tracking middleware to an API server.
+
+    ``decode_content_encoding`` (TypeSafe app only) decodes a gzip/x-gzip/zstd
+    request body in place before anything reads it (app/request_encoding.py),
+    because TypeSafe SDKs compress by default. The other apps leave encoded
+    bodies alone, exactly as before.
+    """
     from app.concurrency_slots import ConcurrencySlotMiddleware
     from app.request_tracker import request_tracker
+    if decode_content_encoding:
+        from app.request_encoding import BodyEncodingError, decode_request_body, zstd_available
+        if not zstd_available():
+            # TypeSafe SDKs zstd-compress by default and never fall back, so say
+            # so at startup instead of letting every SDK call fail with a 415.
+            logger.error(
+                "%s app: no zstd library (install pyzstd, see requirements.txt); "
+                "zstd request bodies will be refused with 415", server_name,
+            )
+            print(f"⚠ {server_name} app: no zstd library; zstd request bodies will get 415")
 
     # Registered first so it sits just inside track_requests, which must stay the
     # outermost user middleware (tests/test_user_id_span_attribute.py). It wraps every
@@ -386,6 +403,16 @@ def _add_request_tracking(app: FastAPI, server_name: str):
         from opentelemetry import trace as _trace
         begin_trace_identity(_trace.get_current_span())
 
+        decoded_body = False
+        if decode_content_encoding:
+            # Before anything reads the body: the sniff and alias rewrite below,
+            # route parsing, and paths outside _TRACKED_PREFIXES. Returned, not
+            # raised: an exception raised in middleware becomes a bare 500.
+            try:
+                decoded_body = await decode_request_body(request) is not None
+            except BodyEncodingError as e:
+                return e.to_response()
+
         path = request.url.path
         if not any(path.startswith(p) for p in _TRACKED_PREFIXES):
             return await call_next(request)
@@ -412,11 +439,14 @@ def _add_request_tracking(app: FastAPI, server_name: str):
             content_length = request.headers.get("content-length")
             content_type = request.headers.get("content-type", "")
             too_large = (
-                "application/json" not in content_type.lower()
+                ("application/json" not in content_type.lower() or decoded_body)
                 and content_length is not None
                 and content_length.isdigit()
                 and int(content_length) > _MAX_SNIFF_BODY_BYTES
             )
+            # A body that was just decompressed may be ~1000x its wire size, so
+            # it is not parsed a second time here when large; the route still
+            # resolves (and alias-maps) the model itself.
 
             if not too_large:
                 body_bytes = await request.body()
@@ -837,21 +867,167 @@ def create_azure_openai_app() -> FastAPI:
     return azure_openai_app
 
 
+# ==================== TypeSafe API Server ====================================
+
+def _add_typesafe_error_handlers(app: FastAPI) -> None:
+    """Render every error on the TypeSafe app in TypeSafe's shape.
+
+    ``{"detail": {"error_type", "message"}}`` (FastAPI's detail[] list for 422)
+    plus an ``x-typesafe-request-id`` header. Shared code keeps raising its
+    OpenAI-shaped bodies (envelope_for picks "openai" for /v1/* paths); only
+    these handlers convert them, so the other apps are unaffected. Exception
+    handlers belong to the sub-app, so this also holds under /typesafe on the
+    management port.
+    """
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exception_handlers import http_exception_handler
+    from fastapi.exceptions import RequestValidationError
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from app.model_access_dep import ModelAccessDenied
+    from app.model_resolution import ModelUnavailable
+    from app.rate_limit import RateLimitExceeded
+    from app.routes._errors import (
+        TYPESAFE_REQUEST_ID_HEADER,
+        to_typesafe_body,
+        typesafe_error_type,
+        typesafe_json_response,
+        typesafe_request_id,
+    )
+
+    # Bodies go through typesafe_json_response (ensure_ascii, allow_nan): an
+    # error that echoes client input (a lone surrogate or NaN in the model name,
+    # a 422 detail[] input) must stay that error, not become a 500.
+    _JSON = typesafe_json_response
+
+    def _with_id(request: Request, headers=None) -> dict:
+        out = dict(headers or {})
+        out[TYPESAFE_REQUEST_ID_HEADER] = typesafe_request_id(request)
+        return out
+
+    @app.exception_handler(RateLimitExceeded)
+    async def _typesafe_rl_handler(request: Request, exc: RateLimitExceeded):
+        return _JSON(429, to_typesafe_body(exc.body, 429), _with_id(request, exc.headers))
+
+    @app.exception_handler(ModelAccessDenied)
+    async def _typesafe_access_handler(request: Request, exc: ModelAccessDenied):
+        return _JSON(exc.status_code, to_typesafe_body(exc.body, exc.status_code), _with_id(request))
+
+    @app.exception_handler(ModelUnavailable)
+    async def _typesafe_unavailable_handler(request: Request, exc: ModelUnavailable):
+        return _JSON(exc.status_code, to_typesafe_body(exc.body, exc.status_code), _with_id(request))
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _typesafe_http_handler(request: Request, exc: StarletteHTTPException):
+        detail = exc.detail
+        if exc.status_code == 401 and isinstance(detail, str):
+            # authenticate_jwt_or_api_key: TypeSafe answers 403 for a missing key
+            # and 401 for an invalid one.
+            missing = not request.headers.get("authorization") and not request.cookies.get("access_token")
+            if missing:
+                return _JSON(403, {"detail": {"error_type": "authentication_error",
+                                              "message": "Must supply an API key! Check your request and try again."}},
+                             _with_id(request))
+            return _JSON(401, {"detail": {"error_type": "authentication_error", "message": detail}},
+                         _with_id(request, exc.headers))
+        if isinstance(detail, str) and exc.status_code not in (404, 405):
+            # e.g. auth's 500 "Authentication error", FastAPI's 400 "There was an
+            # error parsing the body". Router 404/405 keep FastAPI's shape, as
+            # api.typesafe.ai does.
+            return _JSON(exc.status_code,
+                         {"detail": {"error_type": typesafe_error_type(exc.status_code), "message": detail}},
+                         _with_id(request, exc.headers))
+        response = await http_exception_handler(request, exc)
+        response.headers[TYPESAFE_REQUEST_ID_HEADER] = typesafe_request_id(request)
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def _typesafe_validation_handler(request: Request, exc: RequestValidationError):
+        # FastAPI's own body (request_validation_exception_handler), serialized safely.
+        return _JSON(422, {"detail": jsonable_encoder(exc.errors())}, _with_id(request))
+
+    @app.exception_handler(Exception)
+    async def _typesafe_500_handler(request: Request, exc: Exception):
+        logger.error("TypeSafe API unhandled error: %s", exc, exc_info=exc)
+        return _JSON(500, {"detail": {"error_type": "api_error", "message": "Internal server error"}},
+                     _with_id(request))
+
+
+def create_typesafe_app() -> FastAPI:
+    """Create the TypeSafe API server (port 11366).
+
+    TypeSafe-native: POST /v1/systemone (System One passthrough to custom
+    providers with a System One base URL, Azure Microsoft-Decision-1 deployment
+    rows) and a TypeSafe-shaped GET /v1/models, so
+    the official TypeSafe SDKs work with base_url set to this server (no /v1).
+    gzip/x-gzip/zstd request bodies are decoded (TypeSafe SDKs compress by
+    default) and every error uses TypeSafe's ``{"detail": ...}`` shape.
+    """
+    from app.providers.base import SYSTEMONE_API
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        await shared_startup()
+        yield
+
+    typesafe_app = FastAPI(
+        title="LLM Proxy Server - TypeSafe API",
+        description="TypeSafe System One API for custom System One upstreams",
+        version="1.0.0",
+        lifespan=lifespan
+    )
+
+    _add_cors(typesafe_app)
+    # server_name doubles as the API surface (routing, model listing, aliases).
+    _add_request_tracking(typesafe_app, SYSTEMONE_API, decode_content_encoding=True)
+    _instrument_app(typesafe_app, "TypeSafe API")
+    _add_typesafe_error_handlers(typesafe_app)
+
+    from app.routes import systemone, typesafe_models
+    typesafe_app.include_router(systemone.router)
+    typesafe_app.include_router(typesafe_models.router)
+
+    @typesafe_app.get("/health")
+    async def health_check():
+        # Unauthenticated: expose only liveness (no provider inventory).
+        return {"status": "healthy"}
+
+    @typesafe_app.get("/api")
+    async def api_info():
+        return {
+            "message": "LLM Proxy Server - TypeSafe API",
+            "version": "1.0.0",
+            "endpoints": ["/v1/systemone", "/v1/models"]
+        }
+
+    @typesafe_app.get("/")
+    async def root_redirect():
+        """Redirect to management server's root page."""
+        return RedirectResponse(
+            url=f"http://{config.server.domain}:{config.server.management_port}/",
+            status_code=302
+        )
+
+    return typesafe_app
+
+
 # ==================== Management Server ======================================
 
 def create_management_app(
     openai_app: FastAPI,
     anthropic_app: FastAPI,
     azure_openai_app: FastAPI,
+    typesafe_app: FastAPI,
 ) -> FastAPI:
     """Create the management server (port 8765).
 
-    The three provider API apps are mounted under path prefixes so every API is
+    The four provider API apps are mounted under path prefixes so every API is
     reachable through this single port in addition to its own dedicated port:
 
       /openai/*        -> openai_app        (same as the OpenAI port)
       /anthropic/*     -> anthropic_app     (same as the Anthropic port)
       /azure-openai/*  -> azure_openai_app  (same as the Azure OpenAI port)
+      /typesafe/*      -> typesafe_app      (same as the TypeSafe port)
 
     Note that Starlette's ``Mount`` does **not** strip the prefix from
     ``scope["path"]`` — it only sets ``root_path``, and ``request.url.path`` is
@@ -931,7 +1107,7 @@ def create_management_app(
 
     # Unified entry point: expose every provider API under this port too.
     # MountedApp hands each sub-app the same scope it gets on its own port.
-    sub_apps = (openai_app, anthropic_app, azure_openai_app)
+    sub_apps = (openai_app, anthropic_app, azure_openai_app, typesafe_app)
     for prefix, sub_app in zip(MOUNTED_API_PREFIXES, sub_apps, strict=True):
         mgmt_app.mount(prefix, MountedApp(sub_app, prefix))
 

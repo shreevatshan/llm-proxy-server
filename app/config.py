@@ -14,6 +14,7 @@ class ServerConfig(BaseModel):
     openai_port: int = 11440  # OpenAI API server port
     anthropic_port: int = 2027  # Anthropic API server port
     azure_openai_port: int = 11439  # Azure OpenAI API server port
+    typesafe_port: int = 11366  # TypeSafe (System One) API server port
     management_port: int = 8765  # Management (admin + user login) server port
     timezone: str = "UTC"  # IANA timezone name, e.g. "Asia/Kolkata"
     # Credentialed CORS allowlist for the cookie-authenticated management app.
@@ -76,6 +77,7 @@ def load_config_from_env() -> Config:
         openai_port=int(os.getenv("OPENAI_SERVER_PORT", "11440")),
         anthropic_port=int(os.getenv("ANTHROPIC_SERVER_PORT", "2027")),
         azure_openai_port=int(os.getenv("AZURE_OPENAI_SERVER_PORT", "11439")),
+        typesafe_port=int(os.getenv("TYPESAFE_SERVER_PORT", "11366")),
         management_port=int(os.getenv("MANAGEMENT_SERVER_PORT", "8765")),
         timezone=tz_name,
     )

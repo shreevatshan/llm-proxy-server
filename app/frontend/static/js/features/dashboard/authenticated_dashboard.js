@@ -169,10 +169,13 @@ function initEndpointsTab() {
     const openaiBaseUrl    = `http://${_domain}:${_openaiPort}/v1`;
     const anthropicBaseUrl = `http://${_domain}:${_anthropicPort}`;
     const azureBaseUrl     = `http://${_domain}:${_azurePort}`;
+    // No /v1: the TypeSafe SDKs append /v1/... to their base_url themselves.
+    const typesafeBaseUrl  = (typeof _typesafePort !== 'undefined') ? `http://${_domain}:${_typesafePort}` : null;
 
     _setUrl('openai-base-url', openaiBaseUrl);
     _setUrl('anthropic-base-url', anthropicBaseUrl);
     _setUrl('azure-openai-base-url', azureBaseUrl);
+    if (typesafeBaseUrl) _setUrl('typesafe-base-url', typesafeBaseUrl);
 
     // Unified base URLs: every provider is also reachable through the single
     // management port under a path prefix (see create_management_app).
@@ -180,6 +183,7 @@ function initEndpointsTab() {
         _setUrl('openai-unified-url',       `http://${_domain}:${_managementPort}/openai/v1`);
         _setUrl('anthropic-unified-url',    `http://${_domain}:${_managementPort}/anthropic`);
         _setUrl('azure-openai-unified-url', `http://${_domain}:${_managementPort}/azure-openai`);
+        _setUrl('typesafe-unified-url',     `http://${_domain}:${_managementPort}/typesafe`);
     }
 
     _setCount('openai-count', endpointsData);
@@ -189,6 +193,10 @@ function initEndpointsTab() {
     _renderEndpoints(endpointsData,          'openai-endpoints',    openaiBaseUrl);
     _renderEndpoints(anthropicEndpointsData,  'anthropic-endpoints', anthropicBaseUrl);
     _renderEndpoints(azureEndpointsData,      'azure-openai-endpoints', azureBaseUrl);
+    if (typesafeBaseUrl && typeof typesafeEndpointsData !== 'undefined') {
+        _setCount('typesafe-count', typesafeEndpointsData);
+        _renderEndpoints(typesafeEndpointsData, 'typesafe-endpoints', typesafeBaseUrl);
+    }
 }
 
 // Render a URL with syntax highlighting: dim the scheme, mute the shared host,

@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, AsyncGenerator, Set
+from typing import List, Dict, Any, Optional, AsyncGenerator, Set, Tuple
 import json
 import asyncio
 import logging
@@ -156,6 +156,12 @@ class ProviderManager:
                 v1_client = getattr(provider, '_v1_client', None)
                 if v1_client and v1_client is not client and v1_client is not responses_client and hasattr(v1_client, 'close'):
                     await v1_client.close()
+                # Close a custom provider's separate System One client (it is the
+                # OpenAI client itself when both APIs are enabled).
+                systemone_client = getattr(provider, '_systemone_client', None)
+                if (systemone_client and systemone_client not in (client, responses_client, v1_client)
+                        and hasattr(systemone_client, 'close')):
+                    await systemone_client.close()
                 # Close Azure per-api-version deployment clients (otherwise these
                 # AsyncAzureOpenAI instances leak on shutdown and every refresh).
                 deployment_clients = getattr(provider, '_deployment_clients', None)
@@ -386,6 +392,7 @@ class ProviderManager:
                 'supported_apis': supported_apis,
                 'anthropic_base_url': getattr(cred, 'anthropic_base_url', None),
                 'anthropic_auth_style': getattr(cred, 'anthropic_auth_style', None),
+                'systemone_base_url': getattr(cred, 'systemone_base_url', None),
             })
         
         return config_dict
@@ -926,10 +933,13 @@ class ProviderManager:
 
             # Close HTTP clients before discarding the provider to release FDs
             try:
-                for attr in ('client', '_responses_client', '_v1_client', '_anthropic_client'):
+                closed = set()
+                for attr in ('client', '_responses_client', '_v1_client', '_anthropic_client',
+                             '_systemone_client'):
                     client = getattr(provider, attr, None)
-                    if not client:
+                    if not client or id(client) in closed:
                         continue
+                    closed.add(id(client))
                     # Prefer aclose() (anthropic SDK), fall back to close().
                     if hasattr(client, 'aclose'):
                         await client.aclose()
@@ -959,6 +969,8 @@ class ProviderManager:
 
             # Remove all models for this provider from cache
             self.model_cache.invalidate_provider(provider_key)
+            from app.providers.custom_providers import forget_systemone_meta
+            forget_systemone_meta(provider_key)
             print(f"Models for provider {provider_key} removed from cache")
 
             return True
@@ -1091,6 +1103,8 @@ class ProviderManager:
             task = asyncio.create_task(self._deferred_close_providers({provider_key: old}, grace_seconds=1.0))
             self._track_task(task)
         await self.model_cache.update_provider_models(provider_key, [])
+        from app.providers.custom_providers import forget_systemone_meta
+        forget_systemone_meta(provider_key)
         self._sync_status.pop(provider_key, None)
         if forget_owner:
             byok_registry.discard(provider_key)
@@ -1618,6 +1632,23 @@ class ProviderManager:
                 if isinstance(e, (ValueError, NotImplementedError, ProviderHTTPError)):
                     raise
                 raise Exception(f"Decisions create error: {str(e)}")
+
+    async def systemone_create(
+        self, request: Any, headers: Optional[Dict[str, str]] = None
+    ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """Route a System One API request to the model's provider."""
+        with create_span("provider.systemone_create") as span:
+            try:
+                provider_name, _ = self._parse_model_name(request.model)
+                provider = self._get_provider(provider_name)
+                return await provider.systemone_create(request, headers)
+            except Exception as e:
+                set_span_error(span, e)
+                # Typed errors keep their mapping in the route (ProviderHTTPError ->
+                # upstream status/body; NotImplementedError / ValueError -> 400).
+                if isinstance(e, (ValueError, NotImplementedError, ProviderHTTPError)):
+                    raise
+                raise Exception(f"System One create error: {str(e)}")
     
     def get_provider_for_model(self, model_name: str) -> BaseProvider:
         """Get provider for a specific model."""
@@ -1748,6 +1779,7 @@ def _byok_view(cred, check_urls: bool = True) -> _ByokCredView:
         raise ValueError("A BYOK Azure instance needs an endpoint")
     if ptype not in ("azure", "google", "bedrock", "platformai") and not (
         getattr(cred, "base_url", None) or getattr(cred, "endpoint", None) or getattr(cred, "anthropic_base_url", None)
+        or getattr(cred, "systemone_base_url", None)
     ):
         raise ValueError("A BYOK custom instance needs a base URL")
     return _ByokCredView(cred, secrets)

@@ -316,7 +316,7 @@ class DecisionsSurfaceTests(unittest.TestCase):
 
     def test_management_mounts_match_their_dedicated_ports(self):
         mgmt = create_management_app(
-            self._app(create_openai_app), FastAPI(), self._app(create_azure_openai_app)
+            self._app(create_openai_app), FastAPI(), self._app(create_azure_openai_app), FastAPI()
         )
         for path, endpoint, server, preserve in (
             ("/openai/v1/decisions", "/v1/decisions", "openai", False),

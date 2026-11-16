@@ -3,8 +3,9 @@
 LLM Proxy Server - Startup Script
 
 This script starts the LLM Proxy Server that provides OpenAI-compatible,
-Anthropic-compatible, and Azure OpenAI-compatible API endpoints for multiple
-LLM providers including Ollama, Azure OpenAI, AWS Bedrock, and GCP Gemini.
+Anthropic-compatible, Azure OpenAI-compatible and TypeSafe System One API
+endpoints for multiple LLM providers including Ollama, Azure OpenAI, AWS
+Bedrock, and GCP Gemini.
 """
 
 # CRITICAL: Apply OpenTelemetry context.detach() patch FIRST!
@@ -34,7 +35,7 @@ import os
 # ---------------------------------------------------------------------------
 # Crash / exception / hang diagnostics → log file (size-bounded)
 #
-# All four servers share one event loop, so a single blocking call freezes
+# All five servers share one event loop, so a single blocking call freezes
 # every endpoint at once.  We capture three kinds of evidence to a file so it
 # survives container restarts and can be inspected after the fact:
 #
@@ -184,10 +185,16 @@ if os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"):
 
 
 async def _run_multi_server():
-    """Run four servers concurrently in one process."""
+    """Run five servers concurrently in one process."""
     import asyncio
 
-    from app.main import create_openai_app, create_anthropic_app, create_azure_openai_app, create_management_app
+    from app.main import (
+        create_anthropic_app,
+        create_azure_openai_app,
+        create_management_app,
+        create_openai_app,
+        create_typesafe_app,
+    )
 
     servers = []
 
@@ -221,8 +228,19 @@ async def _run_multi_server():
     )
     servers.append(uvicorn.Server(azure_openai_cfg))
 
-    # Management server (also mounts the three API apps for a unified entry point)
-    mgmt_app = create_management_app(openai_app, anthropic_app, azure_openai_app)
+    # TypeSafe API server (System One). Registered before management, which
+    # must stay the last server.
+    typesafe_app = create_typesafe_app()
+    typesafe_cfg = uvicorn.Config(
+        typesafe_app,
+        host=config.server.host,
+        port=config.server.typesafe_port,
+        log_level="info",
+    )
+    servers.append(uvicorn.Server(typesafe_cfg))
+
+    # Management server (also mounts the four API apps for a unified entry point)
+    mgmt_app = create_management_app(openai_app, anthropic_app, azure_openai_app, typesafe_app)
     mgmt_cfg = uvicorn.Config(
         mgmt_app,
         host=config.server.host,
@@ -235,8 +253,9 @@ async def _run_multi_server():
     print(f"  OpenAI API         → http://{config.server.host}:{config.server.openai_port}")
     print(f"  Anthropic API      → http://{config.server.host}:{config.server.anthropic_port}")
     print(f"  Azure OpenAI API   → http://{config.server.host}:{config.server.azure_openai_port}")
+    print(f"  TypeSafe API       → http://{config.server.host}:{config.server.typesafe_port}")
     print(f"  Management         → http://{config.server.host}:{config.server.management_port}")
-    print(f"  Unified (all APIs) → http://{config.server.host}:{config.server.management_port}/{{openai,anthropic,azure-openai}}/")
+    print(f"  Unified (all APIs) → http://{config.server.host}:{config.server.management_port}/{{openai,anthropic,azure-openai,typesafe}}/")
     print()
 
     await asyncio.gather(*(s.serve() for s in servers))

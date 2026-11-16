@@ -41,6 +41,12 @@ from app.anthropic_models import (
 # ("decision-router", "loan-decision", "credit.decision") are left alone.
 _DECISION_ONLY_MODEL = re.compile(r"-(?:decisions|decision-\d+)$")
 
+# The TypeSafe System One API (POST /v1/systemone on the TypeSafe app). One token
+# serves as that app's server name / API surface (app/main.py), a custom
+# provider's supported_apis value, and a model-alias surface, the same way
+# "openai", "anthropic" and "azure_openai" do.
+SYSTEMONE_API = "systemone"
+
 
 @dataclass
 class AnthropicRequestMetadata:
@@ -176,6 +182,18 @@ class BaseProvider(ABC):
     async def decisions_create(self, request: DecisionCreateRequest) -> Dict[str, Any]:
         """Handle POST /v1/decisions. Default raises NotImplementedError."""
         raise NotImplementedError("The Decisions API is not supported by this provider")
+
+    # ==================== SYSTEM ONE API ====================
+
+    async def systemone_create(
+        self, request: Any, headers: Optional[Dict[str, str]] = None
+    ) -> "tuple[Dict[str, Any], Dict[str, str]]":
+        """Handle POST /v1/systemone -> (upstream body, upstream response headers).
+
+        Default raises NotImplementedError. Capability is
+        ``supports_api_for_model(model, SYSTEMONE_API)``.
+        """
+        raise NotImplementedError("The System One API is not supported by this provider")
 
     # ==================== ANTHROPIC MESSAGES API ====================
     

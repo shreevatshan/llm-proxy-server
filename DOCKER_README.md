@@ -2,17 +2,18 @@
 
 📦 **GitHub:** [shreevatshan/llm-proxy-server](https://github.com/shreevatshan/llm-proxy-server)
 
-A unified proxy server that exposes **OpenAI-compatible**, **Anthropic-compatible**, and **Azure OpenAI-compatible** API endpoints for multiple LLM providers including Azure OpenAI, AWS Bedrock, Google Gemini, OpenAI, Ollama, LlamaCpp, and any custom server. Supports Chat Completions, Embeddings, Images, Audio, the **OpenAI Responses API**, the **OpenAI Decisions API**, the **Anthropic Messages API**, and **Azure OpenAI deployment-based URLs**.
+A unified proxy server that exposes **OpenAI-compatible**, **Anthropic-compatible**, **Azure OpenAI-compatible** and **TypeSafe-compatible** API endpoints for multiple LLM providers including Azure OpenAI, AWS Bedrock, Google Gemini, OpenAI, Ollama, LlamaCpp, and any custom server. Supports Chat Completions, Embeddings, Images, Audio, the **OpenAI Responses API**, the **OpenAI Decisions API**, the **TypeSafe System One API**, the **Anthropic Messages API**, and **Azure OpenAI deployment-based URLs**.
 
 ## Architecture
 
-The server runs **four services** in a single container:
+The server runs **five services** in a single container:
 
 | Service | Default Port | Purpose |
 |---------|-------------|--------|
 | **OpenAI API** | `11440` | OpenAI-compatible API endpoints (`/v1/chat/completions`, `/v1/models`, etc.) |
 | **Anthropic API** | `2027` | Anthropic Messages API endpoints (`/v1/messages`, `/v1/models`) |
 | **Azure OpenAI API** | `11439` | Azure OpenAI-compatible deployment-based endpoints (`/openai/deployments/{provider}/{deployment}/chat/completions`, etc.) |
+| **TypeSafe API** | `11366` | TypeSafe System One API (`/v1/systemone`, `/v1/models`), TypeSafe-native for the TypeSafe SDKs |
 | **Management** | `8765` | Admin dashboard, user login, provider configuration |
 
 ## Quick Start
@@ -22,6 +23,7 @@ docker run -d \
   -p 11440:11440 \
   -p 2027:2027 \
   -p 11439:11439 \
+  -p 11366:11366 \
   -p 8765:8765 \
   -v ./data:/llm-proxy-server/data \
   -e JWT_SECRET_KEY=your-secret-key-change-this \
@@ -34,6 +36,7 @@ docker run -d \
 - OpenAI API: `http://localhost:11440/v1`
 - Anthropic API: `http://localhost:2027/v1`
 - Azure OpenAI API: `http://localhost:11439/openai`
+- TypeSafe API: `http://localhost:11366` (the TypeSafe SDK's `base_url`)
 
 ## Configuration
 
@@ -50,6 +53,7 @@ services:
       - "11440:11440"  # OpenAI API
       - "2027:2027"    # Anthropic API
       - "11439:11439"  # Azure OpenAI API
+      - "11366:11366"  # TypeSafe System One API
       - "8765:8765"    # Management panel
     volumes:
       - ./data:/llm-proxy-server/data
@@ -65,6 +69,7 @@ services:
       - OPENAI_SERVER_PORT=11440
       - ANTHROPIC_SERVER_PORT=2027
       - AZURE_OPENAI_SERVER_PORT=11439
+      - TYPESAFE_SERVER_PORT=11366
       - MANAGEMENT_SERVER_PORT=8765
 
       # Admin Configuration
@@ -114,6 +119,7 @@ backends described under [Web Search Interception](#web-search-interception).
 | `OPENAI_SERVER_PORT` | No | `11440` | Port for OpenAI API server |
 | `ANTHROPIC_SERVER_PORT` | No | `2027` | Port for Anthropic API server |
 | `AZURE_OPENAI_SERVER_PORT` | No | `11439` | Port for Azure OpenAI API server |
+| `TYPESAFE_SERVER_PORT` | No | `11366` | Port for the TypeSafe (System One) API server |
 | `MANAGEMENT_SERVER_PORT` | No | `8765` | Port for management panel |
 | `LLMPROXY_ADMIN_ENABLED` | No | `false` | Enable admin dashboard (disabled by default) |
 | `LLMPROXY_ADMIN_USERNAME` | No | `admin` | Default admin username (only when admin enabled) |
@@ -137,9 +143,9 @@ Supported provider types:
 - **Azure OpenAI** — Azure-hosted OpenAI models
 - **AWS Bedrock** — Bedrock models (supports both OpenAI and Anthropic API formats)
 - **Google AI** — Gemini models
-- **Custom** — Any OpenAI-compatible and/or Anthropic-compatible server (OpenAI, Ollama, LlamaCpp, vLLM, etc.)
+- **Custom** — Any OpenAI-compatible, Anthropic-compatible and/or TypeSafe System One-compatible server (OpenAI, Ollama, LlamaCpp, vLLM, TypeSafe, OpenRouter, etc.)
 
-Custom providers can be configured to support **OpenAI API**, **Anthropic API**, or **both**.
+Custom providers can be configured to support the **OpenAI API**, the **Anthropic API** and/or the **TypeSafe System One API**: each has its own base URL field (**OpenAI base URL**, **Anthropic base URL**, **System One base URL**), and a filled field means the server serves that API natively (see [7. TypeSafe System One API](#7-typesafe-system-one-api)).
 
 ### 2. OpenAI API
 
@@ -330,9 +336,79 @@ On the Azure OpenAI port, use the plain `OpenAI` client with the v1 base URL and
 **Supported backends:**
 - Custom providers with the OpenAI API whose upstream serves the OpenAI-shaped `POST {base_url}/decisions` (OpenAI and compatible gateways).
 - Azure providers, for deployments (e.g. `gpt-6-luna`) whose deployment row selects `/decisions` in the provider form. It is never selected by default, and a deployment whose row does not select it gets `400 unsupported_api`. Deployments not listed in any row (dynamic discovery, legacy rows) are not gated. Requests go to `{endpoint}/openai/v1/decisions`.
-- Google, Bedrock, PlatformAI, Anthropic-only custom providers and Claude deployments on Foundry answer `400 unsupported_api`. A custom OpenAI provider whose server has no `/decisions` returns that server's own error (usually 404). Upstreams that use a different decisions request shape (e.g. OpenRouter's `/api/alpha/decisions`, Perplexity, Microsoft-Decision-1) are not supported.
+- Google, Bedrock, PlatformAI, Anthropic-only and System One-only custom providers and Claude deployments on Foundry answer `400 unsupported_api`. A custom OpenAI provider whose server has no `/decisions` returns that server's own error (usually 404). Upstreams that use a different decisions request shape (e.g. OpenRouter's `/api/alpha/decisions`, Perplexity) are not supported; TypeSafe-shaped **System One** upstreams, including Azure Foundry's Microsoft-Decision-1, are served on their own port instead (see [7. TypeSafe System One API](#7-typesafe-system-one-api)).
 
 When a prefix-less model name such as `gpt-6-luna` is served by several providers, requests rotate across all of them, including ones that cannot serve decisions. Use the full model id (e.g. `openai:primary/gpt-6-luna`), or add a model mapping that pins the name to a decisions-capable provider.
+
+### 7. TypeSafe System One API
+
+The proxy serves the [TypeSafe System One API](https://docs.typesafe.ai/api/system-one.md) — typed answers (`noul`, `choice`, `score`, `box`) to named questions about a `state` — on its own **TypeSafe port (11366)**, which behaves like `api.typesafe.ai` so the official TypeSafe SDKs work unchanged. It is a native passthrough: the request body is forwarded as sent, with `model` mapped to the upstream id, and the upstream `{model, answers, usage}` object is relayed unchanged except that `model` echoes the name you sent. The call is non-streaming (`stream` gets a 400), counts as one request toward rate limits, and is not retried by the proxy (the SDK retries 408/429/5xx itself).
+
+**Set up an upstream.** Add a **Custom** provider and fill in its **System One base URL**, which **includes `/v1`** — the proxy posts to `{System One base URL}/systemone` and lists models from `{System One base URL}/models`. Leave the **OpenAI base URL** blank for System One-only hosts, so their models are offered only on the TypeSafe port. For gateways that serve both APIs, one entry can carry both URLs: each discovered model is offered on the API whose listing named it (models neither listing names, e.g. ones you call by full id, are offered on both).
+
+| Upstream | System One base URL |
+|---|---|
+| TypeSafe | `https://api.typesafe.ai/v1` |
+| OpenRouter | `https://openrouter.ai/api/v1` |
+| Fireworks | `https://api.fireworks.ai/inference/v1` |
+| LLM Gateway, DigitalOcean, Requesty | their `/v1` base URL |
+| Self-hosted vLLM, SGLang, Ollama, Strands | `http://host:port/v1` |
+
+**Microsoft-Decision-1 on Azure Foundry.** Add the deployment to an **Azure** provider with the **Foundry** backend and select **/systemone (Microsoft-Decision-1)** in its deployment row. Ticking it on a new row unticks the default `/chat/completions` and `/responses`; keep the row to `/systemone` alone so the deployment is offered only on the TypeSafe port. Deployments that are discovered or in legacy rows are never offered there. The proxy posts to `{resource endpoint}/providers/microsoft/v1/systemone` (no `api-version`; a project-scoped `/api/projects/<p>` suffix is trimmed, other path prefixes are kept) with the provider's key in the `api-key` header. Call it with your **deployment name** as `model` (e.g. `Decision-1`), not the model name `microsoft-decision-1`; Foundry reports the underlying model in responses, and the proxy replaces it with the name you sent. Decision-1 answers `noul`, `choice` and `score` questions on text or JSON `state`.
+
+Through the API, set `systemone_base_url` and include `"systemone"` in `supported_apis` (rows that list `"systemone"` without a `systemone_base_url` use `base_url`). Models are discovered from `{System One base URL}/models` in either the TypeSafe (`{"models": [...]}`) or the OpenAI (`{"data": [...]}`) shape; a provider with an OpenAI or Anthropic URL as well lists those models too. A provider created through the API without `supported_apis` gets them from its filled URLs. Hosts that list no System One models can still be called by full model id, e.g. `custom:openrouter/typesafe/jev-1.14`.
+
+**Use the TypeSafe SDK** with the proxy as its `base_url` (**without** `/v1` — the SDK appends `/v1/systemone` and `/v1/models`) and your proxy API key:
+
+```python
+from typesafe_sdk import Choice, Noul, TypeSafeClient  # pip install "typesafe-sdk[zstd]"
+
+with TypeSafeClient(
+    base_url="http://localhost:11366",   # or http://localhost:8765/typesafe
+    api_key="your-user-token",
+    timeout=60,                          # the SDK default is 10 s
+) as client:
+    print([m.name for m in client.models.list().models])
+    result = client.system_one(
+        model="custom:typesafe/jev-latest",   # or a bare name such as "jev-latest"
+        state="I was charged twice. Please help.",
+        questions={
+            "billing": Noul(instructions="Is this about billing?"),
+            "tone": Choice(instructions="What is the tone?", criteria={"calm": None, "angry": None}),
+        },
+    )
+    print(result.nouls["billing"].noul, result.choices["tone"].choice)
+```
+
+The environment variables work too: `TYPESAFE_BASE_URL=http://localhost:11366` and `TYPESAFE_API_KEY=your-user-token`. Raise the SDK's 10 s default timeout: each retry of a timed-out call is billed again upstream.
+
+```bash
+curl http://localhost:11366/v1/systemone \
+  -H "Authorization: Bearer your-user-token" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "jev-latest",
+       "state": "My screen arrived cracked.",
+       "questions": {"damaged": {"type": "noul", "instructions": "Is the item damaged?"}}}'
+```
+
+#### TypeSafe API Endpoints
+
+| Endpoint | Port | Description |
+|---|---|---|
+| `POST /v1/systemone` | 11366 (TypeSafe) | System One request |
+| `GET /v1/models` | 11366 (TypeSafe) | System One models you may use, as `{"models": [{"name", "description", "release_date"}]}` |
+| `/typesafe/v1/systemone`, `/typesafe/v1/models` | 8765 (Management) | The same endpoints through the management port |
+
+System One is **not** served on the OpenAI (11440) or Azure OpenAI (11439) ports.
+
+**Behaviour:**
+- **Supported backends:** custom providers with a System One base URL, and Azure deployments whose row selects `/systemone` (Microsoft-Decision-1). Other Azure deployments, Google, Bedrock, PlatformAI and custom providers without a System One URL answer `400` when named by full id; a bare name that no System One provider serves is a `404`. Bare names rotate only over System One providers. On the other ports, models of a System One-only provider are not listed and a bare name only such a provider serves is a `404`.
+- **Headers:** only `TypeSafe-Danger-Zone-Images` and `TypeSafe-Danger-Zone-Long-Context` are forwarded upstream. `x-typesafe-request-id`, `retry-after`, `retry-after-ms`, `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-reset` and `x-ratelimit-{limit,remaining,reset}-{requests,tokens}` are relayed back. Every `/v1/systemone` and `/v1/models` response, and every error, carries an `x-typesafe-request-id` (the upstream's when it sent one).
+- **Errors** use TypeSafe's shape, `{"detail": {"error_type": "...", "message": "..."}}` (`detail[]` for 422 validation errors): `authentication_error` (403 without a key, 401 for an invalid one), `permission_error` (403), `not_found_error` (404), `invalid_request_error` (400), `rate_limit_error` (429), `request_too_large` (413), `api_usage_error` (415, 405, and 400 for an undecodable compressed body), `overloaded_error` (503, 529), `timeout_error` (504), `api_error` (other 5xx). Only `authentication_error` and `api_usage_error` are confirmed against api.typesafe.ai. Upstream TypeSafe errors are relayed verbatim; other upstream error shapes are converted.
+- **Compressed bodies:** `Content-Encoding` `gzip`, `x-gzip` or `zstd` (one layer, as the SDKs send) is accepted on this port only, up to 32 MiB compressed and 32 MiB decoded, with a zstd window of at most 8 MiB; the key is checked before a compressed body is read. `br` and stacked codings get `415`, corrupt data `400`, oversized compressed bodies `413`. Uncompressed bodies are handled as on the other ports.
+- **Quota:** a request is charged once it passes validation; `stream`, a model not served over System One, and NaN/Infinity or unpaired surrogates in the body get a `400` without being charged.
+- **Not supported yet:** image uploads through the SDK, which always sends them as `multipart/form-data` (`415`); raw-HTTP callers can send `assets` inline as JSON with `data_base64`.
+- **Model mappings** apply on the TypeSafe port only when the mapping has **TypeSafe** ticked in its APIs (off by default).
 
 ### Model Naming Format
 
@@ -477,6 +553,7 @@ Each server exposes interactive Swagger UI documentation:
 | OpenAI API | `http://localhost:11440/docs` | `http://localhost:11440/openapi.json` |
 | Anthropic API | `http://localhost:2027/docs` | `http://localhost:2027/openapi.json` |
 | Azure OpenAI API | `http://localhost:11439/docs` | `http://localhost:11439/openapi.json` |
+| TypeSafe API | `http://localhost:11366/docs` | `http://localhost:11366/openapi.json` |
 | Management | `http://localhost:8765/docs` | `http://localhost:8765/openapi.json` |
 
 ## Authentication
@@ -620,6 +697,7 @@ Each server exposes a `/health` endpoint:
 curl http://localhost:11440/health  # OpenAI API
 curl http://localhost:2027/health   # Anthropic API
 curl http://localhost:11439/health  # Azure OpenAI API
+curl http://localhost:11366/health  # TypeSafe API
 curl http://localhost:8765/health   # Management
 ```
 

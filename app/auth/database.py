@@ -1692,7 +1692,8 @@ async def update_provider_credentials(
 # PlatformAI, whose form clears it to switch the provider to OAuth; other
 # forms never send an empty api_key.
 _CLEARABLE_PROVIDER_FIELDS = frozenset({
-    "anthropic_base_url", "anthropic_auth_style", "oauth_accounts_url", "pai_token_id", "api_key",
+    "anthropic_base_url", "anthropic_auth_style", "systemone_base_url", "oauth_accounts_url", "pai_token_id",
+    "api_key",
 })
 
 
@@ -1780,6 +1781,7 @@ async def _rename_provider_with_models(
             supported_apis=fields.get('supported_apis', old_credentials.supported_apis),
             anthropic_base_url=fields.get('anthropic_base_url', old_credentials.anthropic_base_url),
             anthropic_auth_style=fields.get('anthropic_auth_style', old_credentials.anthropic_auth_style),
+            systemone_base_url=fields.get('systemone_base_url', old_credentials.systemone_base_url),
             oauth_client_id=fields.get('oauth_client_id', old_credentials.oauth_client_id),
             oauth_client_secret=fields.get('oauth_client_secret', old_credentials.oauth_client_secret),
             oauth_refresh_token=fields.get('oauth_refresh_token', old_credentials.oauth_refresh_token),
@@ -3652,11 +3654,12 @@ async def _run_auto_migrations():
         except Exception as e:
             logger.warning(f"Auto-migration: Could not add supported_apis column: {e}")
 
-        # Native-Anthropic overrides for custom providers, and PlatformAI's
-        # Zoho OAuth credentials / BYOK token id.
+        # Native-Anthropic overrides and the System One base URL for custom
+        # providers, and PlatformAI's Zoho OAuth credentials / BYOK token id.
         for column_name, column_type in (
             ("anthropic_base_url", "VARCHAR(500)"),
             ("anthropic_auth_style", "VARCHAR(20)"),
+            ("systemone_base_url", "VARCHAR(500)"),
             ("oauth_client_id", "VARCHAR(200)"),
             ("oauth_client_secret", "VARCHAR(500)"),
             ("oauth_refresh_token", "VARCHAR(1000)"),

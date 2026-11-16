@@ -12,6 +12,7 @@ reads as not found (404), exactly like one that does not exist. Prefixed
 """
 
 import asyncio
+import json
 import logging
 import time
 import urllib.parse
@@ -39,7 +40,7 @@ from app.providers.auto_sync import sync_byok_provider
 from app.providers.provider_manager import provider_manager
 from app.providers.provider_service import (
     check_platformai_create, credentials_response_fields, infer_azure_supported_apis,
-    platformai_update_deployments, provider_update_data,
+    infer_custom_supported_apis, platformai_update_deployments, provider_update_data,
 )
 from app.providers.url_guard import URL_FIELDS, UnsafeUpstreamURL, validate_credential_urls
 
@@ -130,12 +131,40 @@ def _check_required_credentials(provider_type: str, data: dict) -> None:
     elif provider_type == "bedrock":
         missing = [n for n in ("access_key_id", "secret_access_key") if not given(n)]
     elif provider_type == "custom":
-        if not (given("base_url") or given("anthropic_base_url")):
+        apis = data.get("supported_apis")
+        wants_systemone = isinstance(apis, list) and "systemone" in apis
+        if not (given("base_url") or given("anthropic_base_url") or given("systemone_base_url")):
             missing = ["base_url"]
+        elif wants_systemone and not (given("systemone_base_url") or given("base_url")):
+            # System One is served from {systemone_base_url}/systemone (or the
+            # base URL for rows without one); never from the Anthropic URL.
+            missing = ["systemone_base_url"]
     if missing:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Missing required field(s): {', '.join(missing)}",
+        )
+
+
+def _check_systemone_base_url(body, cred, update_data: dict) -> None:
+    """An update must not leave a custom instance with System One but no URL to
+    serve it from (the stored row and the update merged, as the provider will be
+    built: systemone_base_url, else base_url). 422."""
+    apis = body.supported_apis
+    if apis is None:
+        try:
+            apis = json.loads(cred.supported_apis) if cred.supported_apis else []
+        except (TypeError, ValueError):
+            apis = []
+
+    def given(name):
+        value = update_data.get(name, getattr(cred, name, None))
+        return isinstance(value, str) and bool(value.strip())
+
+    if isinstance(apis, list) and "systemone" in apis and not (given("systemone_base_url") or given("base_url")):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Missing required field(s): systemone_base_url",
         )
 
 
@@ -200,8 +229,9 @@ async def create_my_provider(
         check_platformai_create(body)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
-    if body.provider_type == "custom" and not body.supported_apis:
-        body.supported_apis = ["openai"]
+    # A custom instance without supported_apis serves the APIs whose URLs are
+    # filled (as the form derives them), the OpenAI API when none is.
+    infer_custom_supported_apis(body)
 
     raw = body.model_dump(exclude_unset=False)
     _check_required_credentials(body.provider_type, raw)
@@ -227,7 +257,7 @@ async def create_my_provider(
                 "endpoint", "api_key", "discovery_api_version", "azure_backend", "region",
                 "access_key_id", "secret_access_key", "base_url", "deployments",
                 "openai_deployments", "anthropic_deployments", "deployment_groups",
-                "dynamic_discovery", "anthropic_base_url", "anthropic_auth_style",
+                "dynamic_discovery", "anthropic_base_url", "anthropic_auth_style", "systemone_base_url",
                 "oauth_client_id", "oauth_client_secret", "oauth_refresh_token",
                 "oauth_accounts_url", "pai_token_id",
             )
@@ -282,6 +312,8 @@ async def update_my_provider(
 
     merged = {name: getattr(cred, name, None) for name in URL_FIELDS}
     merged.update({k: v for k, v in update_data.items() if k in URL_FIELDS})
+    if cred.provider_type == "custom":
+        _check_systemone_base_url(body, cred, update_data)
     await _check_urls(merged)
 
     update_data = secret_box.encrypt_fields(update_data)

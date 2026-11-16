@@ -5,8 +5,8 @@ import json
 import logging
 from collections import OrderedDict
 from contextvars import ContextVar
-from typing import List, Dict, Any, AsyncGenerator, Optional
-from openai import AsyncAzureOpenAI, AsyncOpenAI
+from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
+from openai import AsyncAzureOpenAI, AsyncOpenAI, Omit
 
 # Per-request selection of the upstream call style for AzureProvider inference methods.
 #   "v1"         → AsyncOpenAI at {endpoint}/openai/v1/  (no api-version required)
@@ -51,7 +51,7 @@ from app.model_capabilities import (
     scrub as scrub_unsupported_params,
     warn_if_version_unparseable,
 )
-from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
+from app.providers.base import SYSTEMONE_API, AnthropicRequestMetadata, ProviderHTTPError
 from app.conversion.anthropic_openai import _is_codex_model
 from app.providers.azure_deployments import (
     API_ANTHROPIC,
@@ -62,6 +62,7 @@ from app.providers.azure_deployments import (
     API_IMAGES,
     API_RESPONSES,
     API_SPEECH,
+    API_SYSTEMONE,
     API_TRANSCRIPTION,
     CONVERSATIONAL_APIS,
     merge_azure_deployments,
@@ -388,7 +389,13 @@ class AzureProvider(OpenAICompatibleProvider):
                 include_anthropic=True,
             )
         if self.openai_deployments:
-            return list(self.openai_deployments)
+            # /systemone is Foundry-only: a row that selects nothing else (or only
+            # /messages, which is Foundry-only too) is not listed here.
+            return [
+                name for name in self.openai_deployments
+                if (apis := self.deployment_apis.get(name)) is None
+                or set(apis) - {API_ANTHROPIC, API_SYSTEMONE}
+            ]
         return list(self.deployments)
 
     def _strip_cache_control_scope(self, blocks: Optional[List[Any]]) -> bool:
@@ -606,16 +613,20 @@ class AzureProvider(OpenAICompatibleProvider):
         Non-Foundry defers to base behavior.
 
         A deployment listed in the admin form's rows follows them exactly: it is
-        offered on the OpenAI surfaces when any OpenAI path is selected, and on
-        the Anthropic surface when /messages, /chat/completions or /responses is
-        (natively or through the adapter)."""
+        offered on the OpenAI surfaces when any OpenAI path is selected, on the
+        Anthropic surface when /messages, /chat/completions or /responses is
+        (natively or through the adapter), and on the TypeSafe port when
+        /systemone is (Microsoft-Decision-1, Foundry backend only). Unlisted
+        deployments never serve System One."""
         apis = self.deployment_apis.get(self.get_model_id(model_name))
         if apis is not None:
             supported = []
-            if set(apis) - {API_ANTHROPIC}:
+            if set(apis) - {API_ANTHROPIC, API_SYSTEMONE}:
                 supported.extend(["openai", "azure_openai"])
             if CONVERSATIONAL_APIS.intersection(apis):
                 supported.append("anthropic")
+            if API_SYSTEMONE in apis and self._is_foundry_backend():  # Decision-1 is a Foundry model
+                supported.append(SYSTEMONE_API)
             return supported
         if not self._is_foundry_backend():
             return super().get_supported_apis_for_model(model_name)
@@ -657,6 +668,9 @@ class AzureProvider(OpenAICompatibleProvider):
         # Decisions is also served off the v1 client (gpt-6-luna deployments).
         endpoints.append("/openai/v1/decisions")
         endpoints.append("/v1/decisions")
+        # System One (Microsoft-Decision-1), on the TypeSafe port, for rows that select it.
+        if self._is_foundry_backend() and any(API_SYSTEMONE in apis for apis in self.deployment_apis.values()):
+            endpoints.append("/v1/systemone")
         return endpoints
 
     def _is_chat_capable_model(self, model_name: str) -> bool:
@@ -714,6 +728,7 @@ class AzureProvider(OpenAICompatibleProvider):
         API_TRANSCRIPTION: "/audio/transcriptions",
         API_ANTHROPIC: "/messages",
         API_DECISIONS: "/decisions",
+        API_SYSTEMONE: "/systemone",
     }
 
     def _deployment_api_error(self, model_name: str, api: str) -> Optional[ProviderHTTPError]:
@@ -818,6 +833,36 @@ class AzureProvider(OpenAICompatibleProvider):
                 "upstream, so the Decisions API is unavailable for it"
             )
         return await super().decisions_create(request)
+
+    # ==================== System One API (Microsoft-Decision-1) ====================
+
+    def _systemone_url(self) -> str:
+        """Foundry serves Microsoft-Decision-1 at the resource endpoint, not under
+        /openai/v1: {endpoint}/providers/microsoft/v1/systemone, no api-version.
+        A project-scoped suffix (/api/projects/<p>) is trimmed; any other path
+        prefix (e.g. an API Management gateway) is kept, as for every other call."""
+        base = re.sub(r"/api/projects/[^/]+$", "", self.endpoint.rstrip("/"))
+        return f"{base}/providers/microsoft/v1/systemone"
+
+    async def systemone_create(
+        self, request: Any, headers: Optional[Dict[str, str]] = None
+    ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """Relay POST /v1/systemone to a deployment whose row selects /systemone.
+
+        The request ``model`` is the deployment name (Foundry rejects the
+        underlying model name), and the resource key goes in the ``api-key``
+        header -- Foundry documents that or an Entra token for this path, not a
+        key as Bearer. The v1 client is reused for its BYOK-guarded transport;
+        the absolute URL bypasses its /openai/v1 base."""
+        if SYSTEMONE_API not in self.get_supported_apis_for_model(request.model):
+            raise NotImplementedError(
+                f"Deployment '{self.get_model_id(request.model)}' is not configured for /systemone; "
+                "select /systemone (Microsoft-Decision-1) in its deployment row"
+            )
+        return await self._relay_systemone(
+            self._v1_client, self._systemone_url(), request, headers,
+            auth_headers={"api-key": self.api_key, "Authorization": Omit()},
+        )
 
     # ==================== Anthropic Messages API ====================
 

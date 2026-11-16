@@ -16,14 +16,15 @@ const AZURE_DEPLOYMENT_APIS = [
     { value: 'speech', label: '/audio/speech', short: '/audio/speech' },
     { value: 'transcription', label: '/audio/transcriptions, /translations', short: '/audio/transcriptions' },
     { value: 'decisions', label: '/decisions', short: '/decisions' },
+    { value: 'systemone', label: '/systemone', short: '/systemone', foundryOnly: true },
 ];
 const AZURE_DEFAULT_APIS = ['chat', 'responses'];
 // Rows carried over from configs saved before deployment groups: they
 // classify deployments without restricting their APIs, until APIs are picked.
 const AZURE_LEGACY_MODE_LABELS = {
-    openai: 'Legacy: OpenAI (all APIs)',
-    responses: 'Legacy: OpenAI via /responses (all APIs)',
-    anthropic: 'Legacy: Anthropic (all APIs)',
+    openai: 'Legacy: OpenAI (all APIs except /systemone)',
+    responses: 'Legacy: OpenAI via /responses (all APIs except /systemone)',
+    anthropic: 'Legacy: Anthropic (all APIs except /systemone)',
 };
 
 function azureEscape(text) {
@@ -78,7 +79,19 @@ class AzureManager {
 
         if (isLegacy) row.dataset.legacyMode = legacyMode;
 
-        row.querySelector('.deployment-api-menu').addEventListener('change', () => {
+        row.querySelector('.deployment-api-menu').addEventListener('change', (event) => {
+            // Ticking /systemone on a row still at the defaults (/chat/completions
+            // + /responses) unticks them: Microsoft-Decision-1 serves neither, and
+            // left ticked they would offer the deployment on the chat ports too.
+            const target = event.target;
+            if (target && target.value === 'systemone' && target.checked) {
+                const others = this._selectedApis(row).filter(api => api !== 'systemone').sort();
+                if (others.join(',') === [...AZURE_DEFAULT_APIS].sort().join(',')) {
+                    row.querySelectorAll('.deployment-api-option input').forEach(cb => {
+                        if (AZURE_DEFAULT_APIS.includes(cb.value)) cb.checked = false;
+                    });
+                }
+            }
             // Picking APIs turns a legacy row into an explicit one.
             if (this._selectedApis(row).length) delete row.dataset.legacyMode;
             this._applyBackendToRow(row);

@@ -23,7 +23,8 @@ from typing import Callable, Iterable, Optional
 
 from app.auth.database import AsyncSessionLocal, get_all_model_aliases
 from app.auth.models import (
-    DEFAULT_PROFILE_ID, MODEL_ALIAS_API_SURFACES, MODEL_ALIAS_KINDS, validate_alias_pattern,
+    DEFAULT_PROFILE_ID, MODEL_ALIAS_API_SURFACES, MODEL_ALIAS_DEFAULT_SURFACES, MODEL_ALIAS_KINDS,
+    validate_alias_pattern,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,11 @@ def reset_alias_context() -> None:
     alias_seen_names.set(frozenset())
     current_profile_id.set(None)
 
-_ALL_SURFACES = frozenset(MODEL_ALIAS_API_SURFACES)
+# The surfaces a rule covers when its row names none (NULL/legacy, empty or
+# malformed): every surface except the opt-in "systemone" (TypeSafe app).
+_ALL_SURFACES = frozenset(MODEL_ALIAS_DEFAULT_SURFACES)
+# Every surface a row may name.
+_KNOWN_SURFACES = frozenset(MODEL_ALIAS_API_SURFACES)
 
 # Names longer than this skip contains/regex rules: client-controlled input must
 # not be able to drive arbitrarily expensive regex scans. Aliases are at most
@@ -86,7 +91,7 @@ _MAX_PATTERN_NAME_LEN = 256
 
 
 def _parse_apis(raw) -> frozenset[str]:
-    """Decode the stored JSON array; NULL/empty/malformed ⇒ every surface."""
+    """Decode the stored JSON array; NULL/empty/malformed ⇒ the default surfaces."""
     if not raw:
         return _ALL_SURFACES
     try:
@@ -95,7 +100,7 @@ def _parse_apis(raw) -> frozenset[str]:
         return _ALL_SURFACES
     if not isinstance(decoded, list):
         return _ALL_SURFACES
-    surfaces = frozenset(decoded) & _ALL_SURFACES
+    surfaces = frozenset(decoded) & _KNOWN_SURFACES
     return surfaces or _ALL_SURFACES
 
 

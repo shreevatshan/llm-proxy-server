@@ -741,10 +741,12 @@ class DefaultGroupChargeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_every_model_route_is_marked(self):
         from fastapi.routing import APIRoute
-        from app.main import create_anthropic_app, create_azure_openai_app, create_openai_app
+        from app.main import (
+            create_anthropic_app, create_azure_openai_app, create_openai_app, create_typesafe_app,
+        )
 
         unmarked = []
-        for make in (create_openai_app, create_anthropic_app, create_azure_openai_app):
+        for make in (create_openai_app, create_anthropic_app, create_azure_openai_app, create_typesafe_app):
             for route in make().routes:
                 if not isinstance(route, APIRoute) or "POST" not in route.methods:
                     continue

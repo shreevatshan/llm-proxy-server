@@ -91,6 +91,8 @@ from app.providers.provider_service import (
     parse_azure_deployment_fields as _parse_azure_deployment_fields,
     build_credentials_response as _build_credentials_response,
     infer_azure_supported_apis as _infer_azure_supported_apis,
+    infer_custom_supported_apis as _infer_custom_supported_apis,
+    custom_supported_apis_from_urls as _custom_supported_apis_from_urls,
     check_platformai_create as _check_platformai_create,
 )
 from app.byok import byok_registry, is_byok_instance_name
@@ -2987,8 +2989,10 @@ async def create_provider_credential(
             # Create provider credentials
             logging.info(f"💾 Creating new provider credentials in database...")
 
-            # Auto-infer supported_apis for Azure providers
+            # Auto-infer supported_apis for Azure providers, and for custom
+            # providers from which base URLs are filled (as the form does).
             _infer_azure_supported_apis(provider_data)
+            _infer_custom_supported_apis(provider_data)
 
             # Required only here: an upsert of an existing provider keeps the stored values.
             try:
@@ -3023,6 +3027,7 @@ async def create_provider_credential(
                 supported_apis=supported_apis_json,
                 anthropic_base_url=provider_data.anthropic_base_url,
                 anthropic_auth_style=provider_data.anthropic_auth_style,
+                systemone_base_url=provider_data.systemone_base_url,
                 oauth_client_id=provider_data.oauth_client_id,
                 oauth_client_secret=provider_data.oauth_client_secret,
                 oauth_refresh_token=provider_data.oauth_refresh_token,
@@ -3176,7 +3181,7 @@ async def delete_provider_credential(
 def _byok_row_response(cred, username: Optional[str], model_count: int) -> "AdminByokProviderResponse":
     from app.auth.models import AdminByokProviderResponse
     host = None
-    for field in ("endpoint", "base_url", "anthropic_base_url"):
+    for field in ("endpoint", "base_url", "anthropic_base_url", "systemone_base_url"):
         value = getattr(cred, field, None)
         if value:
             host = urllib.parse.urlparse(value).hostname
@@ -3315,6 +3320,7 @@ async def export_provider_config(
                 "supported_apis": supported_apis,
                 "anthropic_base_url": cred.anthropic_base_url,
                 "anthropic_auth_style": cred.anthropic_auth_style,
+                "systemone_base_url": cred.systemone_base_url,
                 "oauth_client_id": cred.oauth_client_id,
                 "oauth_client_secret": cred.oauth_client_secret if include_secrets else None,
                 "oauth_refresh_token": cred.oauth_refresh_token if include_secrets else None,
@@ -3460,6 +3466,8 @@ async def import_provider_config(
                         and provider_data.get("anthropic_deployments")
                     ):
                         supported_apis_val.append("anthropic")
+                if provider_data.get("provider_type") == "custom" and not supported_apis_val:
+                    supported_apis_val = _custom_supported_apis_from_urls(provider_data)
                 supported_apis_json = json.dumps(supported_apis_val) if supported_apis_val else None
 
                 # Shared field set for both create and update-in-place.
@@ -3484,6 +3492,7 @@ async def import_provider_config(
                     supported_apis=supported_apis_json,
                     anthropic_base_url=provider_data.get("anthropic_base_url"),
                     anthropic_auth_style=provider_data.get("anthropic_auth_style"),
+                    systemone_base_url=provider_data.get("systemone_base_url"),
                     oauth_client_id=provider_data.get("oauth_client_id"),
                     oauth_client_secret=provider_data.get("oauth_client_secret"),
                     oauth_refresh_token=provider_data.get("oauth_refresh_token"),

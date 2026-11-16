@@ -2,7 +2,8 @@ from abc import ABC, abstractmethod
 from contextvars import ContextVar
 import json
 import logging
-from typing import List, Dict, Any, AsyncGenerator
+from typing import List, Dict, Any, AsyncGenerator, Optional, Tuple
+import httpx
 from openai import AsyncOpenAI
 from app.providers.base import BaseProvider, ProviderHTTPError
 from app.model_alias import echo_model_name
@@ -56,13 +57,65 @@ logger = logging.getLogger(__name__)
 _DEFAULT_API_KEY = "not-required"
 
 
-def _translate_openai_sdk_error(e: Exception, provider_name: str) -> ProviderHTTPError:
+def _json_object_body(e: Exception) -> Optional[Dict[str, Any]]:
+    """The upstream error body exactly as sent, if it is a JSON object.
+
+    ``e.body`` is not enough on its own: the SDK unwraps ``body.get("error",
+    body)``, so Ollama's ``{"error": "..."}`` arrives there as a bare string.
+    """
+    try:
+        data = json.loads(e.response.content)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _upstream_error_message(body: Any) -> Optional[str]:
+    """The message in an upstream error body (for logs), whatever its shape."""
+    if not isinstance(body, dict):
+        return None
+    for key in ("error", "detail", "message"):
+        value = body.get(key)
+        if isinstance(value, dict):
+            value = value.get("message")
+        if isinstance(value, str):
+            return value[:300]
+    return None
+
+
+def encode_passthrough_body(body: Dict[str, Any], *, surrogate_message: bool = False) -> bytes:
+    """Strict-JSON UTF-8 bytes of a relayed request body, or ValueError.
+
+    NaN/Infinity (accepted by the request parser, forbidden by JSON) and lone
+    surrogates (unencodable in UTF-8) are client errors. With
+    ``surrogate_message`` a lone surrogate gets its own message; without it
+    (the Decisions relay, unchanged) both share the NaN message.
+    """
+    try:
+        return json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except UnicodeEncodeError as e:  # a ValueError subclass, so it must come first
+        if surrogate_message:
+            raise ValueError(
+                "Request body contains an unpaired Unicode surrogate, which UTF-8 cannot encode"
+            ) from e
+        raise ValueError("Request body contains NaN or Infinity, which JSON does not allow") from e
+    except ValueError as e:
+        raise ValueError("Request body contains NaN or Infinity, which JSON does not allow") from e
+
+
+def _translate_openai_sdk_error(
+    e: Exception, provider_name: str, *, relay_upstream_body: bool = False
+) -> ProviderHTTPError:
     """Convert an OpenAI SDK exception into a ProviderHTTPError.
 
     Preserves the real upstream HTTP status (401/429/4xx/5xx) instead of
     collapsing everything to 500, and returns a sanitized error body rather
     than ``str(e)`` — which for httpx/OpenAI SDK errors embeds internal upstream
     base URLs and raw response bodies (internal-topology disclosure).
+
+    With ``relay_upstream_body`` (System One), any JSON-object error body is
+    kept exactly as the upstream sent it, e.g. TypeSafe's ``{"detail": ...}``,
+    which the default path below would replace with a generic envelope.
     """
     try:
         import openai as _openai
@@ -81,6 +134,18 @@ def _translate_openai_sdk_error(e: Exception, provider_name: str) -> ProviderHTT
         # Forward the upstream's own JSON error body when available (it is the
         # provider's error message, not internal topology); otherwise synthesize
         # a generic envelope. Never embed str(e) (leaks the request URL).
+        relayed = _json_object_body(e) if relay_upstream_body else None
+        if relayed is not None:
+            logger.warning(
+                "Upstream provider '%s' returned status %s: %s",
+                provider_name, status, _upstream_error_message(relayed),
+            )
+            return ProviderHTTPError(
+                status_code=status,
+                message=f"Upstream provider '{provider_name}' returned status {status}",
+                body=relayed,
+                headers=headers,
+            )
         body = getattr(e, "body", None)
         if isinstance(body, list) and len(body) == 1:
             # Gemini's OpenAI layer wraps its error envelope in a one-item list.
@@ -103,7 +168,7 @@ def _translate_openai_sdk_error(e: Exception, provider_name: str) -> ProviderHTT
             }
         logger.warning(
             "Upstream provider '%s' returned status %s: %s",
-            provider_name, status, body.get("error", {}).get("message"),
+            provider_name, status, _upstream_error_message(body),
         )
         return ProviderHTTPError(
             status_code=status,
@@ -879,6 +944,69 @@ class OpenAICompatibleProvider(BaseProvider):
 
     # ==================== DECISIONS API ====================
 
+    def _passthrough_payload(self, request: Any, *, surrogate_message: bool = False) -> bytes:
+        """The client's body as sent, with ``model`` mapped to the upstream id.
+
+        Shared by the Decisions and System One relays. ``exclude_unset`` keeps
+        the client's explicit nulls and extra fields. Serialized here, not by
+        the SDK: the request parser accepts NaN and Infinity, which JSON forbids,
+        and the SDK's own allow_nan=False failure would surface as a 502
+        "upstream" error for a call never made.
+        """
+        body = request.model_dump(exclude_unset=True)
+        body["model"] = self.get_model_id(request.model)
+        return encode_passthrough_body(body, surrogate_message=surrogate_message)
+
+    # ==================== SYSTEM ONE API (shared relay) ====================
+
+    async def _relay_systemone(
+        self,
+        client: AsyncOpenAI,
+        url: str,
+        request: Any,
+        headers: Optional[Dict[str, str]] = None,
+        auth_headers: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """POST a System One request through *client* to *url* (a path under the
+        client's base URL, or an absolute URL).
+
+        Shared by the providers that serve System One (custom providers, and
+        Azure Foundry's Microsoft-Decision-1). The body is exactly what the client
+        sent, with ``model`` mapped to the upstream id. Only *headers* (the
+        route's Danger-Zone allow-list) and *auth_headers* are added; the
+        ``extra_request_headers`` ContextVar is not read, so no ``aoai-*`` header
+        travels. No proxy retries: the TypeSafe SDK retries and honours
+        retry-after itself. Returns (upstream body, upstream response headers),
+        with ``model`` echoing the client's name.
+        """
+        payload = self._passthrough_payload(request, surrogate_message=True)  # before any I/O
+        options: Dict[str, Any] = {"max_retries": 0}
+        request_headers = {**(headers or {}), **(auth_headers or {})}
+        if request_headers:
+            options["headers"] = request_headers
+        try:
+            response = await client.post(url, cast_to=httpx.Response, content=payload, options=options)
+        except ProviderHTTPError:
+            raise
+        except Exception as e:  # status errors, timeouts, connection errors, BYOK URL guard
+            raise _translate_openai_sdk_error(e, self.provider_type, relay_upstream_body=True) from e
+
+        try:
+            data = json.loads(response.content)
+        except ValueError:
+            data = None
+        if not isinstance(data, dict) or not isinstance(data.get("answers"), dict):
+            message = f"Upstream provider '{self.provider_type}' returned a malformed System One response"
+            logger.warning("%s (%s)", message, type(data).__name__)
+            raise ProviderHTTPError(
+                status_code=502,
+                message=message,
+                body={"detail": {"error_type": "api_error", "message": message}},
+                headers=dict(response.headers),
+            )
+        data["model"] = echo_model_name(request)  # the TypeSafe SDK requires `model`
+        return data, dict(response.headers)
+
     async def decisions_create(self, request: DecisionCreateRequest) -> Dict[str, Any]:
         """Relay POST /v1/decisions to ``{base_url}/decisions``.
 
@@ -898,15 +1026,7 @@ class OpenAICompatibleProvider(BaseProvider):
             raise NotImplementedError(
                 "The Decisions API needs an OpenAI-compatible upstream; this provider has none"
             )
-        body = request.model_dump(exclude_unset=True)
-        body["model"] = self.get_model_id(request.model)
-        # Serialized here, not by the SDK: the request parser accepts NaN and
-        # Infinity, which JSON forbids, and the SDK's own allow_nan=False failure
-        # would surface below as a 502 "upstream" error for a call never made.
-        try:
-            payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        except ValueError as e:
-            raise ValueError("Request body contains NaN or Infinity, which JSON does not allow") from e
+        payload = self._passthrough_payload(request)
         headers = dict(extra_request_headers.get({}))
 
         try:

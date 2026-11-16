@@ -180,7 +180,11 @@ class ModelConfiguration(Base):
 
 # API surfaces a model alias can be scoped to. These mirror the server_name
 # strings passed to _add_request_tracking in app/main.py.
-MODEL_ALIAS_API_SURFACES = ("openai", "anthropic", "azure_openai")
+# The surfaces a rule covers when none are chosen (new rules, legacy NULL rows).
+MODEL_ALIAS_DEFAULT_SURFACES = ("openai", "anthropic", "azure_openai")
+# "systemone" (the TypeSafe app) is opt-in: a rule applies there only when an
+# admin ticks it, so existing chat aliases never reroute System One requests.
+MODEL_ALIAS_API_SURFACES = MODEL_ALIAS_DEFAULT_SURFACES + ("systemone",)
 
 # How a model alias's `alias` text is compared with the requested model name.
 # exact is case-sensitive; contains and regex (re.search) are case-insensitive.
@@ -310,7 +314,8 @@ class ModelAlias(Base):
     target_model_id = Column(String(200), nullable=False)
     enabled = Column(Boolean, default=True, nullable=False)
     # JSON array of API surfaces this alias applies to. NULL (legacy rows) means
-    # "all surfaces". Mirrors ProviderCredentials.supported_apis.
+    # the default surfaces (MODEL_ALIAS_DEFAULT_SURFACES); "systemone" applies
+    # only when listed explicitly. Mirrors ProviderCredentials.supported_apis.
     apis = Column(Text, nullable=True, default='["openai", "anthropic", "azure_openai"]')
     # One of MODEL_ALIAS_MATCH_TYPES.
     match_type = Column(String(16), nullable=False, default="exact", server_default="exact")
@@ -827,6 +832,10 @@ class ProviderCredentials(Base):
     # auth header style ("x-api-key" default, or "bearer").
     anthropic_base_url = Column(String(500), nullable=True)
     anthropic_auth_style = Column(String(20), nullable=True)
+    # Custom providers with the TypeSafe System One API: its base URL, including
+    # /v1 (requests go to {systemone_base_url}/systemone). Rows that list
+    # "systemone" without it fall back to base_url.
+    systemone_base_url = Column(String(500), nullable=True)
 
     # PlatformAI: Zoho OAuth credentials (the alternative to api_key) and the
     # optional BYOK credential id sent as Z-Token-Id. Not named
@@ -1914,7 +1923,7 @@ class ModelAliasUpsert(BaseModel):
     alias: str
     target_model_id: str
     enabled: bool = True
-    apis: List[str] = Field(default_factory=lambda: list(MODEL_ALIAS_API_SURFACES))
+    apis: List[str] = Field(default_factory=lambda: list(MODEL_ALIAS_DEFAULT_SURFACES))
     # None keeps an existing row's type ("exact" for a new row). The endpoint
     # re-validates against that effective type, since it is unknown here.
     match_type: Optional[Literal[MODEL_ALIAS_MATCH_TYPES]] = None
@@ -1969,18 +1978,19 @@ class ModelAliasResponse(BaseModel):
     @classmethod
     def _decode_apis(cls, value):
         # from_attributes hands through the raw Text column (a JSON string) or
-        # None; NULL/empty/malformed all mean "all surfaces".
+        # None; NULL/empty/malformed all mean the default surfaces (every
+        # surface except the opt-in "systemone").
         if isinstance(value, list):
             return value
         if not value:
-            return list(MODEL_ALIAS_API_SURFACES)
+            return list(MODEL_ALIAS_DEFAULT_SURFACES)
         try:
             decoded = json.loads(value)
         except (ValueError, TypeError):
-            return list(MODEL_ALIAS_API_SURFACES)
+            return list(MODEL_ALIAS_DEFAULT_SURFACES)
         if not isinstance(decoded, list) or not decoded:
-            return list(MODEL_ALIAS_API_SURFACES)
-        return [a for a in MODEL_ALIAS_API_SURFACES if a in set(decoded)] or list(MODEL_ALIAS_API_SURFACES)
+            return list(MODEL_ALIAS_DEFAULT_SURFACES)
+        return [a for a in MODEL_ALIAS_API_SURFACES if a in set(decoded)] or list(MODEL_ALIAS_DEFAULT_SURFACES)
 
 
 class ModelAliasReorder(BaseModel):
@@ -2245,6 +2255,7 @@ class ProviderCredentialsCreate(BaseModel):
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
     anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
     anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
+    systemone_base_url: Optional[str] = None  # custom providers: TypeSafe System One base URL (with /v1)
 
     # PlatformAI (API key in api_key, or Zoho OAuth refresh-token credentials)
     oauth_client_id: Optional[str] = None
@@ -2273,6 +2284,18 @@ class ProviderCredentialsCreate(BaseModel):
         parsed = urlparse(v)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("anthropic_base_url must be an http(s) URL with a host")
+        return v
+
+    @field_validator('systemone_base_url')
+    @classmethod
+    def validate_systemone_base_url(cls, v):
+        if v in (None, ""):
+            return v
+        from urllib.parse import urlparse
+        v = v.strip()
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("systemone_base_url must be an http(s) URL with a host")
         return v
 
     @field_validator('azure_backend')
@@ -2353,6 +2376,7 @@ class ProviderCredentialsUpdate(BaseModel):
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
     anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
     anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
+    systemone_base_url: Optional[str] = None  # custom providers: TypeSafe System One base URL (with /v1)
 
     # PlatformAI (API key in api_key, or Zoho OAuth refresh-token credentials)
     oauth_client_id: Optional[str] = None
@@ -2381,6 +2405,18 @@ class ProviderCredentialsUpdate(BaseModel):
         parsed = urlparse(v)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("anthropic_base_url must be an http(s) URL with a host")
+        return v
+
+    @field_validator('systemone_base_url')
+    @classmethod
+    def validate_systemone_base_url(cls, v):
+        if v in (None, ""):
+            return v
+        from urllib.parse import urlparse
+        v = v.strip()
+        parsed = urlparse(v)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("systemone_base_url must be an http(s) URL with a host")
         return v
 
     @field_validator('azure_backend')
@@ -2463,6 +2499,7 @@ class ProviderCredentialsResponse(BaseModel):
     supported_apis: Optional[List[str]] = None  # e.g., ["openai", "anthropic"]
     anthropic_base_url: Optional[str] = None  # custom providers: native Anthropic base URL override
     anthropic_auth_style: Optional[str] = None  # "x-api-key" (default) or "bearer"
+    systemone_base_url: Optional[str] = None  # custom providers: TypeSafe System One base URL (with /v1)
 
     # PlatformAI (API key in api_key, or Zoho OAuth refresh-token credentials)
     oauth_client_id: Optional[str] = None

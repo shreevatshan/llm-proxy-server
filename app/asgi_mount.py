@@ -1,7 +1,7 @@
 """ASGI helpers for serving the provider apps under the management port.
 
-``create_management_app`` mounts the three provider apps (``/openai``,
-``/anthropic``, ``/azure-openai``) so every API is reachable through the single
+``create_management_app`` mounts the four provider apps (``/openai``,
+``/anthropic``, ``/azure-openai``, ``/typesafe``) so every API is reachable through the single
 management port as well as its own dedicated port. Two things have to be fixed
 up for a mounted request to behave *identically* to the same request on the
 dedicated port; this module holds both.
@@ -25,8 +25,8 @@ from urllib.parse import urlsplit, urlunsplit
 from starlette.datastructures import MutableHeaders
 
 # Path prefixes the provider apps are mounted under on the management port.
-# Order matches (openai_app, anthropic_app, azure_openai_app).
-MOUNTED_API_PREFIXES = ("/openai", "/anthropic", "/azure-openai")
+# Order matches (openai_app, anthropic_app, azure_openai_app, typesafe_app).
+MOUNTED_API_PREFIXES = ("/openai", "/anthropic", "/azure-openai", "/typesafe")
 
 
 def _under(path: str, prefix: str) -> bool:

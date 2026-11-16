@@ -52,10 +52,13 @@ API_IMAGES = "images"
 API_SPEECH = "speech"
 API_TRANSCRIPTION = "transcription"
 API_DECISIONS = "decisions"
+# TypeSafe System One (Foundry's Microsoft-Decision-1), served on the TypeSafe
+# port from {resource}/providers/microsoft/v1/systemone.
+API_SYSTEMONE = "systemone"
 DEPLOYMENT_APIS = (
     API_CHAT, API_RESPONSES, API_ANTHROPIC, API_COMPLETIONS,
     API_EMBEDDINGS, API_IMAGES, API_SPEECH, API_TRANSCRIPTION,
-    API_DECISIONS,
+    API_DECISIONS, API_SYSTEMONE,
 )
 # APIs that make a deployment a conversational model (offered on /v1/messages).
 CONVERSATIONAL_APIS = frozenset({API_CHAT, API_RESPONSES, API_ANTHROPIC})
@@ -155,6 +158,8 @@ def _lists_from_groups(rows: List[Dict[str, Any]]) -> AzureDeploymentGroups:
                 modes_by_name[name].add(row["legacy_mode"])
 
     def is_openai(n: str) -> bool:
+        # Every non-Anthropic deployment is served off the endpoint (a
+        # /systemone-only one too); its row decides the APIs it is offered on.
         return bool(apis_by_name[n] - {API_ANTHROPIC}) or bool(modes_by_name[n] & {LEGACY_OPENAI, LEGACY_RESPONSES})
 
     def is_responses_only(n: str) -> bool:
