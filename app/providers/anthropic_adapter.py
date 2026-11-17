@@ -119,12 +119,22 @@ _RETRYABLE_PARAMS_RESPONSES = (
     "temperature",
     "user",
 )
+# Optional Anthropic Messages parameters a native /v1/messages upstream (a
+# custom provider's own Anthropic endpoint) may reject; retried the same way.
+RETRYABLE_PARAMS_ANTHROPIC = (
+    "stop_sequences",
+    "temperature",
+    "top_p",
+    "top_k",
+    "thinking",
+)
 # Parameter names that are also ordinary words in error text ("roles must
 # alternate user/assistant", "stop sequence"); these only count when the
 # message clearly names them as a parameter.
-_AMBIGUOUS_PARAMS = {"user", "stop", "temperature", "reasoning"}
+_AMBIGUOUS_PARAMS = {"user", "stop", "temperature", "reasoning", "thinking"}
 _PARAM_CONTEXT = r"(?:param(?:eter)?|argument|field|property|key|kwarg)s?"
 _MAX_PARAM_RETRIES = 3
+MAX_PARAM_RETRIES = _MAX_PARAM_RETRIES
 # Structured upstream error codes meaning "this parameter is not accepted".
 _UNSUPPORTED_PARAM_CODES = {"unsupported_parameter", "unknown_parameter", "unrecognized_parameter", "extra_forbidden"}
 # Structured codes for a bad value, schema or combination: never a reason to
@@ -292,9 +302,16 @@ def _remember_rejected(provider: Any, model_id: str, transport: str, param: str)
     except TypeError:  # not weak-referenceable; the retry still happens
         return
     logger.info(
-        "Upstream %s rejected '%s' for model %s over %s; dropping it for future Anthropic adapter requests",
+        "Upstream %s rejected '%s' for model %s over %s; dropping it for future requests",
         getattr(provider, "full_provider_name", type(provider).__name__), param, model_id, transport,
     )
+
+
+def remember_rejected_param(provider: Any, model_id: str, transport: str, param: str) -> None:
+    """Record that ``model_id`` on ``provider`` rejects ``param`` over ``transport``
+    (any key naming the wire format, e.g. "converse" or "anthropic"), so later
+    requests skip it; read back with :func:`known_rejected_params`."""
+    _remember_rejected(provider, model_id, transport, param)
 
 
 def _request_params(request_dict: Dict[str, Any]) -> Set[str]:
@@ -323,6 +340,9 @@ def _names_param(lowered: str, param: str) -> bool:
     return bool(
         re.search(rf"[\'\"`]{name}[\'\"`]", lowered)
         or re.search(rf"{_PARAM_CONTEXT}(?:\s+supplied)?\W{{0,5}}{name}(?![\w-])", lowered)
+        # "the temperature field" (Bedrock: "This model doesn't support the
+        # temperature field")
+        or re.search(rf"\bthe\s+{name}\s+{_PARAM_CONTEXT}\b", lowered)
         or re.search(rf"(?<![\w.-]){name}\W{{0,5}}(?:is|are)?\s*(?:not supported|unsupported|not permitted|not allowed|unrecognized)", lowered)
     )
 
@@ -397,6 +417,35 @@ def _retryable_param(
         if param in present and _rejects_param(lowered, param):
             return param, True
     return None
+
+
+def unsupported_param(
+    status: Any,
+    message: str,
+    request_dict: Dict[str, Any],
+    candidates: Tuple[str, ...],
+    *,
+    error_param: Any = None,
+    error_code: Any = None,
+) -> Optional[str]:
+    """The parameter in ``candidates`` that ``request_dict`` sent and the
+    upstream's 400/422 rejected as unsupported by the model, else None.
+
+    Matching is case-sensitive against the lower-cased message, so pass
+    lower-case candidate names. A bad value, schema or combination ("must be
+    between 0 and 1", "cannot be used with top_p") is not a rejection.
+    """
+    rejection = _retryable_param(
+        status, message, request_dict, candidates, error_param=error_param, error_code=error_code,
+    )
+    if rejection is None or not rejection[1]:
+        return None
+    return rejection[0]
+
+
+def provider_error_message(error: ProviderHTTPError) -> str:
+    """The upstream's own error text from an Anthropic- or OpenAI-shaped body."""
+    return _provider_error_message(error)
 
 
 def _strip_params(adapted: Any, params: Iterable[str]) -> Any:

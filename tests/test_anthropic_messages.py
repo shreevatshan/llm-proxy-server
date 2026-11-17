@@ -318,24 +318,26 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
         body = asyncio.run(self._collect_response_body(response))
         return response, body, request_obj
 
-    def test_omitted_stream_uses_streaming_for_custom_provider(self):
+    def test_omitted_stream_stays_non_streaming_for_custom_provider(self):
+        # Claude Code's auto-mode classifier omits ``stream`` and reads
+        # ``usage`` from a JSON body; an SSE reply made every check fail.
         provider = FakeCustomProvider()
         span_attrs = []
         response, body, _ = self._invoke_create_message(
             self._payload(),
             provider,
-            anthropic_beta="beta-stream",
+            anthropic_beta="beta-json",
             span_attrs=span_attrs,
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.media_type.startswith("text/event-stream"))
-        self.assertIn("event: message_start", body)
-        self.assertEqual(len(provider.stream_calls), 1)
-        self.assertEqual(provider.stream_calls[0]["beta"], "beta-stream")
-        self.assertEqual(provider.nonstream_calls, [])
-        self.assertTrue(self._active_request()["is_streaming"])
-        self.assertTrue(any(attrs.get("anthropic.stream") is True for attrs in span_attrs))
+        self.assertTrue(response.media_type.startswith("application/json"))
+        self.assertEqual(json.loads(body)["usage"], {"input_tokens": 1, "output_tokens": 1})
+        self.assertEqual(len(provider.nonstream_calls), 1)
+        self.assertEqual(provider.nonstream_calls[0]["beta"], "beta-json")
+        self.assertEqual(provider.stream_calls, [])
+        self.assertFalse(self._active_request()["is_streaming"])
+        self.assertTrue(any(attrs.get("anthropic.stream") is False for attrs in span_attrs))
 
     def test_explicit_false_stays_non_streaming_for_custom_provider(self):
         provider = FakeCustomProvider()
@@ -558,7 +560,7 @@ class AnthropicMessagesRouteTests(unittest.TestCase):
         stream_context = FakeAsyncAnthropicStreamContext(event_stream)
         provider = FakeSdkBackedCustomProvider(FakeAnthropicSdkClient(stream_context))
         response, body, request_obj = self._invoke_create_message(
-            self._payload(),
+            self._payload(stream=True),
             provider,
         )
 
@@ -1045,6 +1047,53 @@ class PreflightAndSdkErrorTests(unittest.TestCase):
 
         self.assertIsInstance(result, ProviderHTTPError)
         self.assertEqual(result.status_code, 504)
+
+    def test_request_without_stream_field_gets_json_with_usage(self):
+        """Auto-mode classifier shape (no ``stream``, ``stop_sequences``) on a
+        real native custom provider and the real Anthropic SDK: one JSON body
+        carrying ``usage``, from a non-streaming upstream call."""
+        import anthropic as anthropic_sdk
+        import httpx
+        from app.providers.custom_providers import create_custom_provider
+
+        upstream_bodies = []
+
+        def upstream(http_request):
+            upstream_bodies.append(json.loads(http_request.content))
+            return httpx.Response(200, json={
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "test-model",
+                "content": [{"type": "text", "text": "<block>no"}],
+                "stop_reason": "stop_sequence", "stop_sequence": "</block>",
+                "usage": {"input_tokens": 41, "output_tokens": 3},
+            })
+
+        provider = create_custom_provider({
+            "provider_type": "custom",
+            "provider_name": "lmstudio",
+            "name": "msi-ai-test-01",
+            "base_url": "http://upstream.test/v1",
+            "api_key": "k",
+            "supported_apis": ["openai", "anthropic"],
+        })
+        provider._anthropic_client = anthropic_sdk.AsyncAnthropic(
+            api_key="k",
+            base_url="http://upstream.test",
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
+        )
+        payload = self._payload(stop_sequences=["</block>"])
+        del payload["stream"]
+
+        response, body = self._invoke(payload, provider)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.media_type.startswith("application/json"))
+        data = json.loads(body)
+        self.assertEqual(data["usage"]["input_tokens"], 41)
+        self.assertEqual(data["content"][0]["text"], "<block>no")
+        self.assertEqual(len(upstream_bodies), 1)
+        self.assertNotIn("stream", upstream_bodies[0])
+        self.assertEqual(upstream_bodies[0]["stop_sequences"], ["</block>"])
 
     def test_nonstream_api_response_validation_error_surfaces_as_502(self):
         import anthropic as anthropic_sdk

@@ -83,10 +83,17 @@ class ModelGroupManager {
         const map = {
             missing: ['bg-danger', 'missing'],
             provider_disabled: ['bg-warning text-dark', 'provider off'],
-            model_disabled: ['bg-secondary', 'model off'],
+            model_disabled: ['bg-secondary', 'inactive'],
         };
         const hit = map[status];
         return hit ? ` <span class="badge ${hit[0]}">${count === null ? '' : `${count} `}${hit[1]}</span>` : '';
+    }
+
+    /** The Status cell of a member/model row: an Active or Inactive chip, else the issue badge. */
+    _statusCell(status) {
+        if (!status || status === 'ok') return '<span class="status-badge status-active">Active</span>';
+        if (status === 'model_disabled') return '<span class="status-badge status-inactive">Inactive</span>';
+        return this._statusBadge(status);
     }
 
     _plural(n, word) {
@@ -217,7 +224,6 @@ class ModelGroupManager {
         const rows = g.members.map(m => {
             const isInstance = m.kind === 'instance';
             const drill = isInstance && m.covers.length;
-            const ok = !m.status || m.status === 'ok';
             const note = m.overrides_group
                 ? ` <span class="text-muted small" title="Carved out of the instance in '${esc(m.overrides_group)}'">overrides ${esc(m.overrides_group)}</span>`
                 : '';
@@ -231,7 +237,7 @@ class ModelGroupManager {
                 <td class="text-break"><i class="fas ${isInstance ? 'fa-server' : 'fa-cube'} me-2 text-muted"></i>${esc(m.key)}</td>
                 <td>${isInstance ? 'Instance' : 'Model'}</td>
                 <td class="text-nowrap">${isInstance ? this._plural(m.covers.length, 'model') : '<span class="text-muted">—</span>'}</td>
-                <td class="text-nowrap">${ok ? '<span class="status-badge status-active">Active</span>' : this._statusBadge(m.status)}${note}</td>
+                <td class="text-nowrap">${this._statusCell(m.status)}${note}</td>
             </tr>`;
         }).join('');
         return `
@@ -253,9 +259,7 @@ class ModelGroupManager {
             const instance = cut < 0 ? '' : mid.slice(0, cut);
             const name = cut < 0 ? mid : mid.slice(cut + 1);
             const known = catalogue.get(mid);
-            const status = known && !known.enabled
-                ? this._statusBadge('model_disabled')
-                : '<span class="status-badge status-active">Active</span>';
+            const status = this._statusCell(known && !known.enabled ? 'model_disabled' : 'ok');
             return `
             <tr>
                 <td class="text-break"><i class="fas fa-cube me-2 text-muted"></i>${esc(name)}</td>

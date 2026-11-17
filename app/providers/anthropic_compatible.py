@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import time
-from typing import List, Any, AsyncGenerator, Dict, Optional
+from typing import List, Any, AsyncGenerator, Dict, Optional, Tuple
 
 from app.anthropic_models import (
     AnthropicMessagesRequest,
@@ -16,12 +16,33 @@ from app.anthropic_models import (
     is_anthropic_terminal_stream_event,
 )
 from app.openai_models import ModelInfo
+from app.providers.anthropic_adapter import (
+    MAX_PARAM_RETRIES,
+    RETRYABLE_PARAMS_ANTHROPIC,
+    known_rejected_params,
+    provider_error_message,
+    remember_rejected_param,
+    unsupported_param,
+)
 from app.providers.base import BaseProvider, ProviderHTTPError
 from app.model_alias import echo_model_name
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_API_KEY = "not-required"
+# Key for remembered parameter rejections on the native /v1/messages path.
+_NATIVE_TRANSPORT = "anthropic"
+
+
+def _sdk_error(e: Exception, provider_name: str) -> Optional[ProviderHTTPError]:
+    """The ProviderHTTPError for an Anthropic SDK exception, None for anything else."""
+    try:
+        import anthropic as _anthropic
+    except ImportError:
+        return None
+    if isinstance(e, _anthropic.AnthropicError):
+        return _translate_anthropic_sdk_error(e, provider_name)
+    return None
 
 
 def _translate_anthropic_sdk_error(e: Exception, provider_name: str) -> ProviderHTTPError:
@@ -306,22 +327,20 @@ class AnthropicCompatibleProvider(BaseProvider):
         if not getattr(self, "_anthropic_client", None):
             raise NotImplementedError(f"Anthropic API not available for {self.custom_provider_name}")
 
-        kwargs = build_anthropic_sdk_kwargs(request, self.get_model_id(request.model))
-        if anthropic_beta:
-            kwargs["extra_headers"] = {
-                **kwargs.get("extra_headers", {}),
-                "anthropic-beta": anthropic_beta,
-            }
-        try:
-            response = await self._anthropic_client.messages.create(**kwargs)
-        except Exception as e:
+        model_id, kwargs = self._native_anthropic_kwargs(request, anthropic_beta)
+        retries = 0
+        while True:
             try:
-                import anthropic as _anthropic
-                if isinstance(e, _anthropic.AnthropicError):
-                    raise _translate_anthropic_sdk_error(e, self.custom_provider_name) from e
-            except ImportError:
-                pass
-            raise
+                response = await self._anthropic_client.messages.create(**kwargs)
+                break
+            except Exception as e:
+                error = _sdk_error(e, self.custom_provider_name)
+                if error is None:
+                    raise
+                if retries < MAX_PARAM_RETRIES and self._drop_rejected_param(error, kwargs, model_id):
+                    retries += 1
+                    continue
+                raise error from e
         return json.loads(response.model_dump_json(warnings="none"))
 
     async def anthropic_messages_stream(
@@ -333,26 +352,77 @@ class AnthropicCompatibleProvider(BaseProvider):
         if not getattr(self, "_anthropic_client", None):
             raise NotImplementedError(f"Anthropic streaming not available for {self.custom_provider_name}")
 
-        kwargs = build_anthropic_sdk_kwargs(request, self.get_model_id(request.model))
+        model_id, kwargs = self._native_anthropic_kwargs(request, anthropic_beta)
+        retries = 0
+        while True:
+            started = False
+            try:
+                async with self._anthropic_client.messages.stream(**kwargs) as stream:
+                    async for sse in stream_anthropic_sdk_events(
+                        stream,
+                        provider_label=getattr(self, "full_provider_name", self.custom_provider_name),
+                        model=echo_model_name(request),
+                    ):
+                        started = True
+                        yield sse
+                return
+            except Exception as e:
+                error = _sdk_error(e, self.custom_provider_name)
+                if error is None:
+                    raise
+                # Retry only while nothing has reached the client.
+                if (
+                    not started
+                    and retries < MAX_PARAM_RETRIES
+                    and self._drop_rejected_param(error, kwargs, model_id)
+                ):
+                    retries += 1
+                    continue
+                raise error from e
+
+    def _native_anthropic_kwargs(
+        self,
+        request: AnthropicMessagesRequest,
+        anthropic_beta: str | None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """SDK kwargs for the native call, minus params this model already rejected."""
+        model_id = self.get_model_id(request.model)
+        kwargs = build_anthropic_sdk_kwargs(request, model_id)
+        for param in known_rejected_params(self, model_id, _NATIVE_TRANSPORT):
+            kwargs.pop(param, None)
         if anthropic_beta:
             kwargs["extra_headers"] = {
                 **kwargs.get("extra_headers", {}),
                 "anthropic-beta": anthropic_beta,
             }
+        return model_id, kwargs
 
-        try:
-            async with self._anthropic_client.messages.stream(**kwargs) as stream:
-                async for sse in stream_anthropic_sdk_events(
-                    stream,
-                    provider_label=getattr(self, "full_provider_name", self.custom_provider_name),
-                    model=echo_model_name(request),
-                ):
-                    yield sse
-        except Exception as e:
-            try:
-                import anthropic as _anthropic
-                if isinstance(e, _anthropic.AnthropicError):
-                    raise _translate_anthropic_sdk_error(e, self.custom_provider_name) from e
-            except ImportError:
-                pass
-            raise
+    def _drop_rejected_param(
+        self,
+        error: ProviderHTTPError,
+        kwargs: Dict[str, Any],
+        model_id: str,
+    ) -> bool:
+        """Drop the optional param ``error`` says the model does not support.
+
+        Local Anthropic-compatible servers (and gateways in front of other
+        vendors) accept the Messages shape but not always every optional
+        field, e.g. ``stop_sequences``, which Claude Code's auto-mode
+        classifier always sends. Returns True when a param was dropped (and
+        remembered for this model) so the caller can retry.
+        """
+        body = error.body if isinstance(error.body, dict) else {}
+        inner = body.get("error") if isinstance(body.get("error"), dict) else {}
+        param = unsupported_param(
+            error.status_code,
+            provider_error_message(error),
+            kwargs,
+            RETRYABLE_PARAMS_ANTHROPIC,
+            error_param=inner.get("param"),
+            error_code=inner.get("code"),
+        )
+        if param is None:
+            return False
+        kwargs.pop(param, None)
+        remember_rejected_param(self, model_id, _NATIVE_TRANSPORT, param)
+        return True

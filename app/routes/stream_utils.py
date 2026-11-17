@@ -53,7 +53,7 @@ STREAM_EARLY_DISCONNECT_CHECK_CHUNKS = int(
     os.getenv("STREAM_EARLY_DISCONNECT_CHECK_CHUNKS", "5")
 )
 # Keepalive cadence during upstream silence. The Anthropic SDK swallows upstream
-# `ping` keepalive events (see note above _async_iterate / build_events), so a
+# `ping` keepalive events (see the STREAM_CHUNK_TIMEOUT_SECONDS note), so a
 # long thinking pause or slow time-to-first-token sends the client zero bytes
 # and trips its own read timeout. We emit our own SSE keepalive every N seconds
 # while waiting for the next chunk. This does NOT extend the per-chunk timeout

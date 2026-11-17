@@ -13,19 +13,23 @@ This provider implements AWS Bedrock integration with support for:
 
 import asyncio
 import base64
+import concurrent.futures
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import uuid
-from typing import List, Dict, Any, AsyncGenerator, Literal, Optional
+from typing import List, Dict, Any, AsyncGenerator, Callable, Literal, Optional, Tuple
 from collections import defaultdict
+from urllib.parse import urlparse
 import boto3
 import numpy as np
-import requests
+import urllib3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from starlette.concurrency import run_in_threadpool
@@ -37,10 +41,24 @@ from app.model_alias import echo_model_name
 #  Module-level concurrency primitive for the Converse path.
 #  The Claude (native) path now runs on the AsyncAnthropicBedrock SDK, which
 #  owns its own transport/concurrency; only the Converse / converse_stream
-#  path (OpenAI chat + non-Claude Anthropic) still needs a bound, since it
-#  runs on Starlette's default threadpool and is otherwise ungoverned.
+#  path (OpenAI chat + non-Claude Anthropic) still needs a bound, since its
+#  blocking boto3 calls run on threads and are otherwise ungoverned. A stream
+#  holds its permit until its reader thread exits (see _ConverseStreamReader).
 # ---------------------------------------------------------------------------
 _CONVERSE_SEMAPHORE_LIMIT = 15
+
+# boto3.client() builds on the shared default session, whose client
+# construction is not thread-safe, and Bedrock providers are built on worker
+# threads (ProviderManager.build_provider). Build one client at a time.
+_BOTO_CLIENT_LOCK = threading.Lock()
+
+# Converse stream reader tuning: undelivered events buffered per stream before
+# the reader stops reading (backpressure), how often a reader blocked on that
+# buffer re-checks for a stop request, and how long close() waits for the
+# reader thread to exit once its socket has been shut down.
+_STREAM_BUFFER_EVENTS = 64
+_STREAM_STOP_POLL_SECONDS = 0.25
+_STREAM_CLOSE_WAIT_SECONDS = 2.0
 
 
 def _get_positive_int_env(name: str, default: int) -> int:
@@ -79,6 +97,19 @@ def _is_access_denied(error: Exception) -> bool:
     return error.response.get("Error", {}).get("Code") in ("AccessDeniedException", "AccessDenied")
 
 
+# Optional inferenceConfig fields a Converse model may refuse with a
+# ValidationException ("This model doesn't support the stopSequences field.
+# Remove stopSequences and try again."), keyed by the lower-cased name the
+# message is matched on. maxTokens is required and never dropped.
+_CONVERSE_OPTIONAL_FIELDS = {
+    "stopsequences": "stopSequences",
+    "temperature": "temperature",
+    "topp": "topP",
+}
+# Key for remembered Converse field rejections (see known_rejected_params).
+_CONVERSE_TRANSPORT = "converse"
+
+
 def _map_bedrock_error(error_code: str, error_message: str) -> Dict[str, Any]:
     """Map a Bedrock ClientError to an Anthropic-format error dict + HTTP status.
 
@@ -112,7 +143,7 @@ def _map_bedrock_error(error_code: str, error_message: str) -> Dict[str, Any]:
     }
 
 
-from app.providers.base import AnthropicRequestMetadata, BaseProvider
+from app.providers.base import AnthropicRequestMetadata, BaseProvider, ProviderHTTPError
 from app.anthropic_models import (
     ANTHROPIC_SDK_TIMEOUT_SECONDS,
     _extract_system_messages_from_messages,
@@ -133,6 +164,12 @@ from app.providers.anthropic_compatible import (
     # Bedrock native Anthropic streams share the same bounded post-terminal
     # drain policy and event serialization as the other Anthropic-SDK paths.
     stream_anthropic_sdk_events,
+)
+from app.providers.anthropic_adapter import (
+    MAX_PARAM_RETRIES,
+    known_rejected_params,
+    remember_rejected_param,
+    unsupported_param,
 )
 from app.openai_models import (
     ModelInfo,
@@ -187,6 +224,244 @@ def _sanitize_for_json(obj: Any) -> Any:
         return [_sanitize_for_json(item) for item in obj]
     else:
         return obj
+
+
+def _event_stream_socket(stream: Any) -> Optional[socket.socket]:
+    """The socket under a botocore EventStream, or None if it can't be found.
+
+    botocore wraps the urllib3 response as ``EventStream._raw_stream``; urllib3
+    keeps the connection (and its socket) on the response while the body is
+    being streamed.
+    """
+    raw = getattr(stream, "_raw_stream", None)
+    if raw is None:
+        return None
+    for path in (("_connection", "sock"), ("_fp", "fp", "raw", "_sock")):
+        obj = raw
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if isinstance(obj, socket.socket):
+            return obj
+    return None
+
+
+def _interrupt_event_stream(stream: Any) -> None:
+    """Make a read blocked on ``stream``'s socket return now.
+
+    ``shutdown()`` (unlike ``close()``) wakes a thread blocked in ``recv`` on
+    the same socket. The base-class method is called directly so an SSL
+    socket's state is left for its owning thread to tear down.
+    """
+    sock = _event_stream_socket(stream)
+    if sock is None:
+        return
+    try:
+        socket.socket.shutdown(sock, socket.SHUT_RDWR)
+    except OSError:
+        pass  # already closed or never connected
+
+
+class _ConverseStreamReader:
+    """Open and read one Bedrock ``converse_stream`` on a dedicated thread.
+
+    The blocking boto3 reads never touch the shared AnyIO threadpool, and a
+    cancelled consumer can actually stop them: ``close()`` shuts the socket
+    down, which makes a blocked read return at once, and the reader thread then
+    closes the stream itself, so no other thread ever closes it mid-read.
+
+    ``on_exit`` runs on the event loop once the thread has exited. Callers pass
+    the Converse semaphore's ``release`` there, so the concurrency bound covers
+    the whole stream (open, every read and cleanup), not just opening it.
+
+    Delivered-but-unconsumed events are capped at ``max_buffered``; past that
+    the reader stops reading until the consumer catches up.
+    """
+
+    _OPENED = "opened"
+    _EVENT = "event"
+    _DONE = "done"
+    _ERROR = "error"
+
+    def __init__(
+        self,
+        open_stream: Callable[[], Any],
+        *,
+        on_exit: Optional[Callable[[], None]] = None,
+        max_buffered: int = _STREAM_BUFFER_EVENTS,
+    ):
+        self._open_stream = open_stream
+        self._on_exit = on_exit
+        self._loop = asyncio.get_running_loop()
+        self._items: asyncio.Queue = asyncio.Queue()
+        self._slots = threading.Semaphore(max_buffered)
+        self._stop = threading.Event()
+        self._stream: Any = None
+        self._stream_lock = threading.Lock()
+        self._exited = self._loop.create_future()
+        self._finished = False
+        self._started = False
+        self._thread = threading.Thread(
+            target=self._run, name="bedrock-converse-stream", daemon=True
+        )
+
+    # --- reader thread ---------------------------------------------------
+
+    def _post(self, kind: str, payload: Any = None) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._items.put_nowait, (kind, payload))
+        except RuntimeError:
+            pass  # loop already closed (shutdown); nobody is listening
+
+    def _wait_for_slot(self) -> bool:
+        while not self._slots.acquire(timeout=_STREAM_STOP_POLL_SECONDS):
+            if self._stop.is_set():
+                return False
+        return not self._stop.is_set()
+
+    def _run(self) -> None:
+        stream = None
+        try:
+            try:
+                stream = self._open_stream()
+            except BaseException as exc:
+                self._post(self._ERROR, exc)
+                return
+            with self._stream_lock:
+                self._stream = stream
+            if self._stop.is_set():  # cancelled while the stream was opening
+                return
+            self._post(self._OPENED)
+            for event in stream:
+                if not self._wait_for_slot():
+                    return
+                self._post(self._EVENT, event)
+            self._post(self._DONE)
+        except BaseException as exc:
+            # After a stop request this is the read our own shutdown() broke.
+            if not self._stop.is_set():
+                self._post(self._ERROR, exc)
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    logger.debug("[BEDROCK STREAM] Error closing event stream: %s", exc)
+            try:
+                self._loop.call_soon_threadsafe(self._finish)
+            except RuntimeError:
+                pass
+
+    # --- event loop ------------------------------------------------------
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if not self._exited.done():
+            self._exited.set_result(None)
+        if self._on_exit is not None:
+            self._on_exit()
+
+    def start(self) -> None:
+        self._thread.start()
+        self._started = True
+
+    async def wait_opened(self) -> None:
+        """Wait until the stream is open; raises the error that opening raised."""
+        kind, payload = await self._items.get()
+        if kind == self._OPENED:
+            return
+        if kind == self._ERROR:
+            raise payload
+        raise RuntimeError(f"Unexpected stream state while opening: {kind}")
+
+    async def next_event(self) -> Optional[Dict[str, Any]]:
+        """The next event, or None at the end; raises a mid-stream read error."""
+        while True:
+            kind, payload = await self._items.get()
+            if kind == self._EVENT:
+                self._slots.release()
+                return payload
+            if kind == self._DONE:
+                return None
+            if kind == self._ERROR:
+                raise payload
+            # _OPENED when the caller skipped wait_opened(): nothing to deliver.
+
+    async def close(self) -> None:
+        """Stop the reader: interrupt any blocked read, then wait for the thread.
+
+        Safe to call more than once. The wait is bounded; a reader that has
+        not exited by then still releases its permit when it does.
+        """
+        if not self._started:
+            self._finish()
+            return
+        self._stop.set()
+        self._slots.release()  # wake a reader waiting for buffer space
+        with self._stream_lock:
+            stream = self._stream
+        if stream is not None:
+            _interrupt_event_stream(stream)
+        if self._exited.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._exited), _STREAM_CLOSE_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[BEDROCK STREAM] Reader thread still running %ss after close; "
+                "it exits (and releases its Converse permit) when its read returns",
+                _STREAM_CLOSE_WAIT_SECONDS,
+            )
+
+
+_SUPPORTED_IMAGE_FORMATS = {
+    "png": "png",
+    "jpeg": "jpeg",
+    "jpg": "jpeg",
+    "pjpeg": "jpeg",
+    "gif": "gif",
+    "webp": "webp",
+}
+
+
+def _sniff_image_format(data: bytes) -> Optional[str]:
+    """The Converse image format of ``data`` from its magic bytes, if recognised."""
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+def _converse_image_format(data: bytes, declared_type: Optional[str]) -> str:
+    """Pick the Converse ``image.format`` for ``data``.
+
+    The bytes decide when they're recognisable: a declared type can be wrong
+    (a ``.png`` URL served as ``image/jpeg``) and Bedrock rejects a format that
+    doesn't match the data. Otherwise the declared media type is normalised
+    (parameters dropped, ``jpg`` -> ``jpeg``). Anything else is rejected rather
+    than sent as a format Converse doesn't accept.
+    """
+    sniffed = _sniff_image_format(data)
+    if sniffed:
+        return sniffed
+    subtype = (declared_type or "").split(";", 1)[0].strip().lower()
+    if subtype.startswith("image/"):
+        subtype = subtype[len("image/"):]
+    fmt = _SUPPORTED_IMAGE_FORMATS.get(subtype)
+    if fmt is None:
+        raise ValueError(
+            f"Unsupported image format {declared_type!r}; Bedrock accepts png, jpeg, gif and webp"
+        )
+    return fmt
 
 
 class BedrockProvider(BaseProvider):
@@ -256,12 +531,34 @@ class BedrockProvider(BaseProvider):
         self.default_model = config.get('default_model', 'anthropic.claude-3-sonnet-20240229-v1:0')
         self.debug = config.get('debug', False)
         
-        # Configure boto3 client with custom config
+        # Data-plane (bedrock-runtime) budgets. The read timeout stays long:
+        # a non-streaming Converse call only returns once generation finishes.
+        # Connect timeout and attempt count are tighter (previously 60s and 9
+        # attempts), since every attempt can wait out the full read timeout.
+        # 3 attempts in total (first try included) matches the native Claude
+        # path (AsyncAnthropicBedrock max_retries=2). Streams are additionally
+        # torn down by the route's TTFT/per-chunk budgets via
+        # _ConverseStreamReader.close().
         boto_config = Config(
-            connect_timeout=60,
-            read_timeout=900,
-            retries={'max_attempts': 8, 'mode': 'adaptive'},
+            connect_timeout=_get_positive_int_env("BEDROCK_CONNECT_TIMEOUT_SECONDS", 10),
+            read_timeout=_get_positive_int_env("BEDROCK_READ_TIMEOUT_SECONDS", 900),
+            retries={
+                'total_max_attempts': _get_positive_int_env("BEDROCK_MAX_ATTEMPTS", 3),
+                'mode': 'adaptive',
+            },
             max_pool_connections=50
+        )
+        # Control-plane (model listing) budgets: these are small, fast calls,
+        # and an Anthropic cache-miss preflight can wait on them, so they get
+        # short timeouts instead of the runtime's generation-sized ones.
+        control_config = Config(
+            connect_timeout=_get_positive_int_env("BEDROCK_CONTROL_CONNECT_TIMEOUT_SECONDS", 5),
+            read_timeout=_get_positive_int_env("BEDROCK_CONTROL_READ_TIMEOUT_SECONDS", 30),
+            retries={
+                'total_max_attempts': _get_positive_int_env("BEDROCK_CONTROL_MAX_ATTEMPTS", 3),
+                'mode': 'standard',
+            },
+            max_pool_connections=10,
         )
 
         # Initialize boto3 clients
@@ -275,25 +572,35 @@ class BedrockProvider(BaseProvider):
             client_kwargs['aws_access_key_id'] = self.aws_access_key
             client_kwargs['aws_secret_access_key'] = self.aws_secret_key
 
-        self.bedrock_runtime = boto3.client(**client_kwargs)
-
         # Client for listing models
         control_client_kwargs = {
             'service_name': 'bedrock',
             'region_name': self.aws_region,
-            'config': boto_config
+            'config': control_config
         }
-        
+
         if self.aws_access_key and self.aws_secret_key:
             control_client_kwargs['aws_access_key_id'] = self.aws_access_key
             control_client_kwargs['aws_secret_access_key'] = self.aws_secret_key
-        
-        self.bedrock_client = boto3.client(**control_client_kwargs)
+
+        # Client creation loads service models and, without explicit keys,
+        # resolves the credential chain (possibly over the network), so the
+        # provider is constructed off the event loop (see
+        # ProviderManager.build_provider). Serialized: see _BOTO_CLIENT_LOCK.
+        with _BOTO_CLIENT_LOCK:
+            self.bedrock_runtime = boto3.client(**client_kwargs)
+            self.bedrock_client = boto3.client(**control_client_kwargs)
         
         # Cache for model list
         self.bedrock_model_list = {}
 
         self._anthropic_client = None
+        # Set when the native client was built without explicit keys: the
+        # credentials then come from the default chain and are resolved (and
+        # refreshed) off the event loop by _ensure_anthropic_client().
+        self._anthropic_uses_default_chain = False
+        self._chain_credentials = None
+        self._chain_credentials_lock: Optional[asyncio.Lock] = None
 
         # Per-instance Converse concurrency bound, created lazily on the running
         # event loop (a module-level Semaphore would be shared across accounts/
@@ -328,9 +635,11 @@ class BedrockProvider(BaseProvider):
     def _get_converse_semaphore(self) -> asyncio.Semaphore:
         """Get or create this instance's Converse / converse_stream bound.
 
-        The OpenAI chat path and the non-Claude Anthropic path call
-        converse/converse_stream on Starlette's default threadpool with no
-        Bedrock-side concurrency bound. The Semaphore is created lazily so it
+        The OpenAI chat path and the non-Claude Anthropic path make blocking
+        converse/converse_stream calls on threads with no Bedrock-side
+        concurrency bound. A non-streaming call holds a permit for the whole
+        call; a stream holds one until its reader thread has exited. The
+        Semaphore is created lazily so it
         binds to the running event loop, and is per-instance so one busy AWS
         account/region can't starve another. Limit is configurable via
         BEDROCK_CONVERSE_SEMAPHORE_LIMIT.
@@ -401,51 +710,20 @@ class BedrockProvider(BaseProvider):
         """
         try:
             model_list = {}
-            profile_list = []
-            app_profiles_by_model = defaultdict(set)
-            
-            # Get cross-region inference profiles
-            if self.enable_cross_region:
-                try:
-                    paginator = self.bedrock_client.get_paginator('list_inference_profiles')
-                    for page in paginator.paginate(maxResults=1000, typeEquals="SYSTEM_DEFINED"):
-                        profile_list.extend([p["inferenceProfileId"] for p in page["inferenceProfileSummaries"]])
-                except Exception as e:
-                    # A missing IAM permission is a stable config choice and yields the
-                    # same list every time. Anything else (e.g. endpoint unreachable)
-                    # would silently drop every cross-region model, so fail the refresh.
-                    if not _is_access_denied(e):
-                        raise
-                    logger.warning(f"Not permitted to list cross-region inference profiles: {e}")
-            
-            # Get application inference profiles
-            if self.enable_app_profiles:
-                try:
-                    paginator = self.bedrock_client.get_paginator('list_inference_profiles')
-                    for page in paginator.paginate(maxResults=1000, typeEquals="APPLICATION"):
-                        for profile in page["inferenceProfileSummaries"]:
-                            try:
-                                profile_arn = profile.get("inferenceProfileArn")
-                                if not profile_arn:
-                                    continue
-                                
-                                models = profile.get("models", [])
-                                for model in models:
-                                    model_arn = model.get("modelArn", "")
-                                    if model_arn:
-                                        model_id = model_arn.split('/')[-1] if '/' in model_arn else model_arn
-                                        if model_id:
-                                            app_profiles_by_model[model_id].add(profile_arn)
-                            except Exception as e:
-                                logger.warning(f"Error processing application profile: {e}")
-                except Exception as e:
-                    if not _is_access_denied(e):
-                        raise
-                    logger.warning(f"Not permitted to list application inference profiles: {e}")
-            
-            # List foundation models - removed byOutputModality filter
-            #response = self.bedrock_client.list_foundation_models(byOutputModality="TEXT")
-            response = self.bedrock_client.list_foundation_models()
+
+            # The three listings are independent, so run them concurrently: a
+            # cold refresh then costs the slowest call, not the sum of all three.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=3, thread_name_prefix="bedrock-model-list"
+            ) as pool:
+                system_profiles_future = pool.submit(self._list_system_inference_profiles)
+                app_profiles_future = pool.submit(self._list_application_inference_profiles)
+                # List foundation models - removed byOutputModality filter
+                foundation_future = pool.submit(self.bedrock_client.list_foundation_models)
+                response = foundation_future.result()
+                profile_list = system_profiles_future.result()
+                app_profiles_by_model = app_profiles_future.result()
+
             cr_inference_prefix = self._get_inference_region_prefix()
             
             for model in response["modelSummaries"]:
@@ -473,11 +751,15 @@ class BedrockProvider(BaseProvider):
                 if global_profile_id in profile_list:
                     model_list[global_profile_id] = {"modalities": input_modalities}
                 
-                # Add application inference profiles
+                # Add application inference profiles. An ARN says nothing about
+                # the model behind it, so record that for capability checks.
                 if model_id in app_profiles_by_model:
                     for profile_arn in app_profiles_by_model[model_id]:
-                        model_list[profile_arn] = {"modalities": input_modalities}
-            
+                        model_list[profile_arn] = {
+                            "modalities": input_modalities,
+                            "base_model_id": model_id,
+                        }
+
             if not model_list:
                 # Raise rather than return []: an empty fetch tells auto-sync to
                 # clear this provider's saved models.
@@ -495,6 +777,101 @@ class BedrockProvider(BaseProvider):
             # is left in place for the request-path helpers, and
             # _model_list_fetched_at is not bumped, so the next call retries.
             raise
+
+    def _list_system_inference_profiles(self) -> List[str]:
+        """Cross-region (system-defined) inference profile ids."""
+        profile_list: List[str] = []
+        if not self.enable_cross_region:
+            return profile_list
+        try:
+            paginator = self.bedrock_client.get_paginator('list_inference_profiles')
+            for page in paginator.paginate(maxResults=1000, typeEquals="SYSTEM_DEFINED"):
+                profile_list.extend([p["inferenceProfileId"] for p in page["inferenceProfileSummaries"]])
+        except Exception as e:
+            # A missing IAM permission is a stable config choice and yields the
+            # same list every time. Anything else (e.g. endpoint unreachable)
+            # would silently drop every cross-region model, so fail the refresh.
+            if not _is_access_denied(e):
+                raise
+            logger.warning(f"Not permitted to list cross-region inference profiles: {e}")
+        return profile_list
+
+    def _list_application_inference_profiles(self) -> Dict[str, set]:
+        """Application inference profile ARNs keyed by the foundation model they serve."""
+        app_profiles_by_model: Dict[str, set] = defaultdict(set)
+        if not self.enable_app_profiles:
+            return app_profiles_by_model
+        try:
+            paginator = self.bedrock_client.get_paginator('list_inference_profiles')
+            for page in paginator.paginate(maxResults=1000, typeEquals="APPLICATION"):
+                for profile in page["inferenceProfileSummaries"]:
+                    try:
+                        profile_arn = profile.get("inferenceProfileArn")
+                        if not profile_arn:
+                            continue
+
+                        models = profile.get("models", [])
+                        for model in models:
+                            model_arn = model.get("modelArn", "")
+                            if model_arn:
+                                model_id = model_arn.split('/')[-1] if '/' in model_arn else model_arn
+                                if model_id:
+                                    app_profiles_by_model[model_id].add(profile_arn)
+                    except Exception as e:
+                        logger.warning(f"Error processing application profile: {e}")
+        except Exception as e:
+            if not _is_access_denied(e):
+                raise
+            logger.warning(f"Not permitted to list application inference profiles: {e}")
+        return app_profiles_by_model
+
+    def _discovery_signature(self) -> tuple:
+        """What determines this instance's model list (account, region, listing flags)."""
+        return (
+            getattr(self, "aws_region", None),
+            getattr(self, "aws_access_key", None),
+            getattr(self, "aws_secret_key", None),
+            getattr(self, "enable_cross_region", None),
+            getattr(self, "enable_app_profiles", None),
+        )
+
+    def adopt_model_discovery(self, other: Any) -> bool:
+        """Take over ``other``'s already-fetched model list when it is equivalent.
+
+        A provider save rebuilds every live instance (empty model list) and runs
+        discovery on a separate throwaway instance, so without this the live
+        instances start cold: image-modality checks fail and the next request
+        that needs the list pays for a full control-plane sweep. Only adopted
+        from an instance configured for the same account, region and listing
+        flags. Returns True if the list was adopted.
+        """
+        if other is self or not isinstance(other, BedrockProvider):
+            return False
+        model_list = getattr(other, "bedrock_model_list", None)
+        fetched_at = getattr(other, "_model_list_fetched_at", None)
+        if not model_list or fetched_at is None:
+            return False
+        if other._discovery_signature() != self._discovery_signature():
+            return False
+        own_fetched_at = getattr(self, "_model_list_fetched_at", None)
+        if own_fetched_at is not None and own_fetched_at >= fetched_at:
+            return False
+        # Same single-reference swap as a refresh (readers never see a mix).
+        self.bedrock_model_list = model_list
+        self._model_list_fetched_at = fetched_at
+        return True
+
+    def _capability_model_id(self, model_id: str) -> str:
+        """The foundation model id to judge ``model_id``'s capabilities by.
+
+        Application inference profile ARNs don't name their model, so they
+        resolve through the base model recorded at discovery; any other id is
+        its own answer.
+        """
+        entry = self.bedrock_model_list.get(model_id) if getattr(self, "bedrock_model_list", None) else None
+        if isinstance(entry, dict) and entry.get("base_model_id"):
+            return entry["base_model_id"]
+        return model_id
 
     async def get_available_models(self) -> List[ModelInfo]:
         """Get list of available models from Bedrock."""
@@ -585,73 +962,128 @@ class BedrockProvider(BaseProvider):
     _IMAGE_DOWNLOAD_TIMEOUT = 10  # seconds
     _IMAGE_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB
 
-    def _assert_safe_image_url(self, image_url: str) -> None:
-        """Reject URLs that could be used for SSRF before fetching them.
+    _DATA_URL_RE = re.compile(r"^data:(?P<type>[^;,]*)(?P<params>[^,]*?);base64,", re.IGNORECASE)
 
-        Blocks non-http(s) schemes and hosts that resolve to private,
-        loopback, link-local, or otherwise non-global IP ranges (e.g. cloud
-        metadata endpoints at 169.254.169.254).
+    @staticmethod
+    def _resolve_safe_image_address(host: str, port: int) -> str:
+        """Resolve ``host`` once; return an address to connect to, or raise.
+
+        Every address the name resolves to must be public: private, loopback,
+        link-local, reserved and multicast ranges (e.g. the cloud metadata
+        endpoint 169.254.169.254) are refused. The caller connects to the
+        returned address itself, so a second lookup can't hand back a
+        different (internal) one (DNS rebinding).
         """
-        import ipaddress
-        import socket as _socket
-        from urllib.parse import urlparse
+        try:
+            addrinfos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except socket.gaierror as e:
+            raise ValueError(f"Could not resolve image host: {host}") from e
 
+        addresses = []
+        for info in addrinfos:
+            ip = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+            if (
+                not ip.is_global or ip.is_loopback or ip.is_private or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast
+            ):
+                raise ValueError(f"Image URL resolves to a disallowed address: {ip}")
+            addresses.append(str(ip))
+        if not addresses:
+            raise ValueError(f"Could not resolve image host: {host}")
+        return addresses[0]
+
+    def _decode_base64_image(self, data: str) -> bytes:
+        """Decode base64 image data, enforcing the same size cap as downloads."""
+        # Base64 is 4 chars per 3 bytes; check before decoding so an oversized
+        # payload is refused without materialising it a second time.
+        if len(data) * 3 // 4 > self._IMAGE_MAX_BYTES + 3:
+            raise ValueError(f"Image exceeds maximum size of {self._IMAGE_MAX_BYTES} bytes")
+        image_bytes = base64.b64decode(data)
+        if len(image_bytes) > self._IMAGE_MAX_BYTES:
+            raise ValueError(f"Image exceeds maximum size of {self._IMAGE_MAX_BYTES} bytes")
+        return image_bytes
+
+    def _fetch_image_url(self, image_url: str) -> tuple:
+        """Download an image over http(s) with SSRF and size guards (blocking)."""
         parsed = urlparse(image_url)
         if parsed.scheme not in ("http", "https"):
             raise ValueError(f"Unsupported image URL scheme: {parsed.scheme!r}")
         host = parsed.hostname
         if not host:
             raise ValueError("Image URL has no host")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+        # Connect to the address that was validated, never re-resolving the
+        # name. TLS still verifies the certificate against the hostname (SNI +
+        # hostname check), and Host carries the name the server expects.
+        address = self._resolve_safe_image_address(host, port)
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        headers = {
+            "Host": parsed.netloc.rsplit("@", 1)[-1],
+            "Accept": "image/*",
+            "User-Agent": "llm-proxy-image-fetch",
+        }
+        timeout = urllib3.Timeout(
+            connect=self._IMAGE_DOWNLOAD_TIMEOUT, read=self._IMAGE_DOWNLOAD_TIMEOUT
+        )
+        if parsed.scheme == "https":
+            try:
+                import certifi  # the trust store requests used for this fetch
+                ca_certs = certifi.where()
+            except ImportError:
+                ca_certs = None  # urllib3 falls back to the system store
+            pool = urllib3.HTTPSConnectionPool(
+                address, port, timeout=timeout, retries=False, maxsize=1,
+                cert_reqs="CERT_REQUIRED", ca_certs=ca_certs, server_hostname=host,
+            )
+        else:
+            pool = urllib3.HTTPConnectionPool(address, port, timeout=timeout, retries=False, maxsize=1)
 
         try:
-            addrinfos = _socket.getaddrinfo(host, None)
-        except _socket.gaierror as e:
-            raise ValueError(f"Could not resolve image host: {host}") from e
+            # redirect=False: a vetted public URL must not 3xx to an internal
+            # address and bypass the guard above.
+            response = pool.urlopen(
+                "GET", target, headers=headers, redirect=False, retries=False,
+                preload_content=False, assert_same_host=False,
+            )
+            try:
+                if response.status != 200:
+                    raise ValueError(f"Unable to access image URL: {image_url}")
+                declared_length = response.headers.get("Content-Length")
+                if declared_length and declared_length.isdigit() and int(declared_length) > self._IMAGE_MAX_BYTES:
+                    raise ValueError(f"Image exceeds maximum size of {self._IMAGE_MAX_BYTES} bytes")
 
-        for info in addrinfos:
-            ip = ipaddress.ip_address(info[4][0])
-            if not ip.is_global or ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved:
-                raise ValueError(f"Image URL resolves to a disallowed address: {ip}")
+                # Size cap so a large/slow image can't pin a worker or exhaust memory.
+                chunks = []
+                total = 0
+                for chunk in response.stream(65536):
+                    total += len(chunk)
+                    if total > self._IMAGE_MAX_BYTES:
+                        raise ValueError(f"Image exceeds maximum size of {self._IMAGE_MAX_BYTES} bytes")
+                    chunks.append(chunk)
+                return b"".join(chunks), response.headers.get("Content-Type")
+            finally:
+                response.release_conn()
+        except urllib3.exceptions.HTTPError as e:
+            raise ValueError(f"Unable to access image URL: {image_url} ({e})") from e
+        finally:
+            pool.close()
 
     def _parse_image_sync(self, image_url: str) -> tuple:
-        """Parse image from URL or base64 data (synchronous - for use in threadpool)."""
-        pattern = r"^data:(image/[a-z]*);base64,\s*"
-        content_type = re.search(pattern, image_url)
+        """Parse an image from a URL or base64 data URL (blocking; use a threadpool).
 
-        # Check if already base64 encoded
-        if content_type:
-            image_data = re.sub(pattern, "", image_url)
-            return base64.b64decode(image_data), content_type.group(1)
+        Returns ``(bytes, format)`` where ``format`` is a Converse image format
+        (png, jpeg, gif or webp).
+        """
+        data_url = self._DATA_URL_RE.match(image_url)
+        if data_url:
+            image_bytes = self._decode_base64_image(image_url[data_url.end():].strip())
+            return image_bytes, _converse_image_format(image_bytes, data_url.group("type"))
 
-        # SSRF guard before any network access.
-        self._assert_safe_image_url(image_url)
-
-        # Download from URL (blocking - must be called from threadpool), with a
-        # size cap so a large/slow image can't pin a worker or exhaust memory.
-        # allow_redirects=False so a vetted public URL cannot 3xx-redirect to an
-        # internal address (e.g. 169.254.169.254), bypassing the SSRF guard; the
-        # `with` block guarantees the pooled connection is always released.
-        with requests.get(
-            image_url,
-            timeout=self._IMAGE_DOWNLOAD_TIMEOUT,
-            stream=True,
-            allow_redirects=False,
-        ) as response:
-            if response.status_code != 200:
-                raise ValueError(f"Unable to access image URL: {image_url}")
-
-            chunks = []
-            total = 0
-            for chunk in response.iter_content(chunk_size=65536):
-                total += len(chunk)
-                if total > self._IMAGE_MAX_BYTES:
-                    raise ValueError(f"Image exceeds maximum size of {self._IMAGE_MAX_BYTES} bytes")
-                chunks.append(chunk)
-
-            content_type = response.headers.get("Content-Type", "image/jpeg")
-            if not content_type.startswith("image"):
-                content_type = "image/jpeg"
-            return b"".join(chunks), content_type
+        image_bytes, content_type = self._fetch_image_url(image_url)
+        return image_bytes, _converse_image_format(image_bytes, content_type)
 
     def _parse_content_parts(self, message: ChatMessage, model_id: str) -> List[Dict]:
         """Parse message content into Bedrock format."""
@@ -671,10 +1103,10 @@ class BedrockProvider(BaseProvider):
                 if not self._is_supported_modality(model_id, "IMAGE"):
                     raise ValueError(f"Model {model_id} does not support images")
                 
-                image_data, content_type = self._parse_image_sync(part.image_url.url)
+                image_data, image_format = self._parse_image_sync(part.image_url.url)
                 content_parts.append({
                     "image": {
-                        "format": content_type.replace("image/", ""),
+                        "format": image_format,
                         "source": {"bytes": image_data}
                     }
                 })
@@ -834,88 +1266,105 @@ class BedrockProvider(BaseProvider):
         """
         Validate and repair tool_use/tool_result pairing in messages.
 
-        AWS Bedrock (Converse) requires that every toolUse block has a matching
-        toolResult block and vice-versa. The real Anthropic Messages API is more
-        lenient about where they sit, so a toolUse and its toolResult can legally
-        end up non-adjacent after reframing (e.g. assistant text + toolUse split,
-        or tool results answered across several user turns).
+        Converse (like the Anthropic API behind it) requires each toolResult to
+        sit in the user message immediately after the assistant message whose
+        toolUse it answers. History doesn't always arrive that way (a result
+        answered a turn late, a user message interjected between a call and its
+        result), and a pair that merely exists somewhere in the list is still
+        rejected. So:
 
-        This method pairs toolUse<->toolResult by toolUseId across the WHOLE
-        message list (not just immediately-adjacent messages), and only drops a
-        block when its partner is missing ANYWHERE. This preserves the orphan
-        cleanup Converse needs without deleting valid tool calls.
+        * each assistant message's toolUse blocks claim the first unclaimed
+          toolResult with the same id found later in the conversation; the
+          claimed results are moved into a user message placed directly after
+          that assistant message, in call order;
+        * a toolUse with no later result, and a toolResult no earlier toolUse
+          claimed, are dropped as orphans;
+        * a message left with no content is dropped.
+
+        Already-valid histories come out unchanged.
         """
         if not messages:
             return messages
 
-        # First pass: collect every toolUse id and every toolResult id across
-        # all messages. A tool id is valid (kept) iff it appears on BOTH sides.
-        all_tool_use_ids = set()
-        all_tool_result_ids = set()
+        def _tool_id(item: Any, key: str) -> Optional[str]:
+            block = item.get(key) if isinstance(item, dict) else None
+            return block.get("toolUseId") if isinstance(block, dict) else None
 
-        for msg in messages:
-            content = msg.get("content", [])
-            if not isinstance(content, list):
+        def _is_block(item: Any, key: str) -> bool:
+            return isinstance(item, dict) and key in item
+
+        # Every toolResult in conversation order, as [message index, block].
+        unclaimed = [
+            [j, item]
+            for j, msg in enumerate(messages)
+            if isinstance(msg.get("content"), list)
+            for item in msg["content"]
+            if _is_block(item, "toolResult")
+        ]
+
+        # Pair each toolUse with the first unclaimed result for its id that
+        # comes after it. paired_after[i] holds (origin index, block) for the
+        # results that must directly follow assistant message i.
+        paired_after: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+        kept_ids: set = set()  # id() of every toolUse/toolResult block kept
+        for i, msg in enumerate(messages):
+            content = msg.get("content")
+            if msg.get("role") != "assistant" or not isinstance(content, list):
                 continue
             for item in content:
-                if isinstance(item, dict):
-                    if "toolUse" in item:
-                        tid = item["toolUse"].get("toolUseId")
-                        if tid:
-                            all_tool_use_ids.add(tid)
-                    elif "toolResult" in item:
-                        tid = item["toolResult"].get("toolUseId")
-                        if tid:
-                            all_tool_result_ids.add(tid)
+                use_id = _tool_id(item, "toolUse") if _is_block(item, "toolUse") else None
+                if not use_id:
+                    continue
+                for pos, (j, result) in enumerate(unclaimed):
+                    if j > i and _tool_id(result, "toolResult") == use_id:
+                        del unclaimed[pos]
+                        kept_ids.update((id(item), id(result)))
+                        paired_after.setdefault(i, []).append((j, result))
+                        break
 
-        valid_tool_ids = all_tool_use_ids & all_tool_result_ids
-
-        if self.debug:
-            logger.info(f"[BEDROCK] Valid tool IDs (paired across all messages): {valid_tool_ids}")
-        
-        # Second pass: filter messages to only keep valid tool_use and tool_result blocks
         validated_messages = []
-        
         for i, message in enumerate(messages):
             role = message.get("role")
             content = message.get("content", [])
-            
+
             if isinstance(content, list):
                 filtered_content = []
                 removed_items = []
-                
                 for item in content:
-                    if isinstance(item, dict):
-                        if "toolUse" in item:
-                            tool_use_id = item["toolUse"].get("toolUseId")
-                            if tool_use_id not in valid_tool_ids:
-                                removed_items.append(f"toolUse:{tool_use_id}")
-                                continue  # Skip orphaned toolUse
-                        elif "toolResult" in item:
-                            tool_result_id = item["toolResult"].get("toolUseId")
-                            if tool_result_id not in valid_tool_ids:
-                                removed_items.append(f"toolResult:{tool_result_id}")
-                                continue  # Skip orphaned toolResult
-                    filtered_content.append(item)
-                
+                    key = next((k for k in ("toolUse", "toolResult") if _is_block(item, k)), None)
+                    if key is None:
+                        filtered_content.append(item)
+                    elif id(item) not in kept_ids:
+                        removed_items.append(f"{key}:{_tool_id(item, key)}")
+                    elif key == "toolUse":
+                        filtered_content.append(item)
+                    # A kept toolResult is re-emitted right after its call below.
+
                 if removed_items:
                     logger.warning(
                         f"[BEDROCK] Removed orphaned items at message index {i} ({role}): {removed_items}"
                     )
-                
-                # Only add message if there's remaining content
+
                 if filtered_content:
                     validated_messages.append({
                         "role": role,
                         "content": filtered_content
                     })
-                else:
+                elif removed_items:
                     logger.warning(
                         f"[BEDROCK] Skipping {role} message at index {i} as all content was orphaned"
                     )
             else:
                 validated_messages.append(message)
-        
+
+            paired = paired_after.get(i)
+            if paired:
+                if any(j != i + 1 for j, _ in paired):
+                    logger.warning(
+                        f"[BEDROCK] Moved tool result(s) to directly follow their call at message index {i}"
+                    )
+                validated_messages.append({"role": "user", "content": [result for _, result in paired]})
+
         return validated_messages
 
     def _parse_messages(self, request: ChatCompletionRequest, tool_name_mapping: Optional[Dict[str, str]] = None) -> List[Dict]:
@@ -1068,9 +1517,12 @@ class BedrockProvider(BaseProvider):
         messages = self._parse_messages(request, tool_name_mapping=tool_name_mapping)
         system_prompts = self._parse_system_prompts(request.messages)
         
-        # Base inference parameters
+        # Base inference parameters. max_completion_tokens is OpenAI's current
+        # name for the output cap (max_tokens is the deprecated alias), so it
+        # wins when both are sent.
+        max_tokens = request.max_completion_tokens or request.max_tokens or 2048
         inference_config = {
-            "maxTokens": request.max_tokens or 2048,
+            "maxTokens": max_tokens,
         }
         
         # Only include optional parameters when specified
@@ -1113,11 +1565,11 @@ class BedrockProvider(BaseProvider):
             "inferenceConfig": inference_config
         }
         
-        # Handle reasoning effort
+        # Handle reasoning effort. Judged by the foundation model, so an
+        # application inference profile ARN gets its model's capabilities.
+        capability_model = self._capability_model_id(request.model)
         if request.reasoning_effort:
-            max_tokens = request.max_completion_tokens or request.max_tokens or 2048
-            inference_config["maxTokens"] = max_tokens
-            if self._is_grok_model(request.model):
+            if self._is_grok_model(capability_model):
                 # Grok wants an effort string, not a token budget;
                 # _apply_grok_constraints validates/normalizes it below.
                 args.setdefault("additionalModelRequestFields", {})["reasoning_effort"] = request.reasoning_effort
@@ -1128,11 +1580,22 @@ class BedrockProvider(BaseProvider):
             # Warn rather than swallow it silently; on Converse the only
             # candidate carrier is additionalModelRequestFields["output_config"],
             # which is unverified against Bedrock (see note in the module docs).
-            elif thinking_style(request.model) == THINKING_ADAPTIVE:
+            elif thinking_style(capability_model) == THINKING_ADAPTIVE:
                 logger.warning(
                     "[BEDROCK] reasoning_effort=%r cannot be forwarded for %s on the "
                     "Converse path (adaptive thinking rejects budget_tokens); the "
                     "request will run at the model's default effort",
+                    request.reasoning_effort,
+                    request.model,
+                )
+            # reasoning_config is Claude's extended-thinking switch (Claude 3.7
+            # and later). Other models (older Claude, Llama, Nova, Mistral, ...)
+            # either reject the unknown field or have no budget-style reasoning,
+            # so it is not sent to them.
+            elif not self._supports_budget_thinking(capability_model):
+                logger.warning(
+                    "[BEDROCK] reasoning_effort=%r is not supported for %s on the "
+                    "Converse path; ignoring it",
                     request.reasoning_effort,
                     request.model,
                 )
@@ -1157,13 +1620,22 @@ class BedrockProvider(BaseProvider):
         # Check if messages contain tool usage (toolUse or toolResult blocks)
         # AWS Bedrock requires toolConfig to be present when any message contains these blocks
         messages_have_tools = self._messages_contain_tool_usage(messages)
-        
+
+        # tool_choice "none" means the model must not call a tool. Converse has
+        # no "none" choice, so the declared tools are withheld instead (only
+        # the placeholder remains when history forces a toolConfig).
+        tool_choice = request.tool_choice
+        tools_disabled = tool_choice == "none" or (
+            isinstance(tool_choice, dict) and tool_choice.get("type") == "none"
+        )
+        declared_tools = request.tools if request.tools and not tools_disabled else None
+
         # Handle tools
-        if request.tools or messages_have_tools:
+        if declared_tools or messages_have_tools:
             # Build tool config from current request tools, or use empty tools list if none provided
             # but message history contains tool usage
             tool_config = {
-                "tools": [self._convert_tool_spec(t.function, tool_name_mapping=tool_name_mapping) for t in request.tools] if request.tools else []
+                "tools": [self._convert_tool_spec(t.function, tool_name_mapping=tool_name_mapping) for t in declared_tools] if declared_tools else []
             }
 
             # Converse requires >= 1 tool when toolConfig is present; if history
@@ -1171,22 +1643,26 @@ class BedrockProvider(BaseProvider):
             if not tool_config["tools"]:
                 tool_config["tools"] = [self._PLACEHOLDER_TOOL_SPEC]
 
-            if request.tool_choice and request.tools and not request.model.startswith("meta.llama3-1-"):
-                if isinstance(request.tool_choice, str):
-                    if request.tool_choice == "required":
+            if tool_choice and declared_tools and not request.model.startswith("meta.llama3-1-"):
+                if isinstance(tool_choice, str):
+                    if tool_choice == "required":
                         tool_config["toolChoice"] = {"any": {}}
                     else:
                         tool_config["toolChoice"] = {"auto": {}}
                 else:
                     # Specific tool to use
-                    if isinstance(request.tool_choice, dict) and "function" in request.tool_choice:
+                    if isinstance(tool_choice, dict) and "function" in tool_choice:
+                        # Named the way the toolSpec was (truncated past 64 chars).
                         tool_config["toolChoice"] = {
-                            "tool": {"name": request.tool_choice["function"].get("name", "")}
+                            "tool": {"name": self._truncate_tool_name(
+                                (tool_choice.get("function") or {}).get("name", ""),
+                                tool_name_mapping=tool_name_mapping,
+                            )}
                         }
-            
+
             args["toolConfig"] = tool_config
-            
-            if self.debug and messages_have_tools and not request.tools:
+
+            if self.debug and messages_have_tools and not declared_tools:
                 logger.info(f"Added empty toolConfig for {request.model} due to tool usage in message history")
         
         # add Additional fields to enable extend thinking
@@ -1343,11 +1819,11 @@ class BedrockProvider(BaseProvider):
         logger.warning(f"[BEDROCK] Unknown finish reason '{finish_reason}', defaulting to 'stop'")
         return "stop"
 
-    async def _invoke_bedrock(self, request: ChatCompletionRequest, stream: bool = False):
-        """Invoke Bedrock model.
-        
+    async def _prepare_converse_args(self, request: ChatCompletionRequest) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """Build the Converse args for an OpenAI chat request.
+
         Returns:
-            tuple: (response, tool_name_mapping) where tool_name_mapping is a
+            tuple: (args, tool_name_mapping) where tool_name_mapping is a
                    request-scoped dict mapping truncated tool names to originals.
         """
         # Request-scoped tool name mapping to avoid race conditions between concurrent requests
@@ -1394,41 +1870,143 @@ class BedrockProvider(BaseProvider):
                 logger.info(f"Bedrock args: {safe_args}")
             except Exception as e:
                 logger.warning(f"Failed to serialize args for logging: {e}")
-        
-        # Bound Converse concurrency. For converse_stream this covers opening
-        # the stream (boto3 returns the EventStream once headers arrive, not
-        # when the body is drained), so the permit is released before the
-        # client reads the body — a slow consumer never holds a Converse permit.
-        converse_semaphore = self._get_converse_semaphore()
+
+        return args, tool_name_mapping
+
+    @staticmethod
+    def _http_exception_for_client_error(e: ClientError):
+        """Map a Bedrock ClientError to an HTTPException with the right status.
+
+        Throttling/quota/validation/permission errors keep their real HTTP
+        status (429/400/403/...) instead of collapsing to a generic 500.
+        """
+        err = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
+        code = err.get("Code", "ClientError")
+        msg = err.get("Message", str(e))
+        logger.error(f"Bedrock invocation failed: {code}: {msg}")
+        mapped = _map_bedrock_error(code, msg)
+        from fastapi import HTTPException
+        return HTTPException(status_code=mapped["status"], detail=mapped["body"])
+
+    async def _open_converse_stream(self, args: Dict[str, Any]) -> _ConverseStreamReader:
+        """Open ``converse_stream`` on a dedicated reader thread.
+
+        Takes a Converse permit first and hands it to the reader, which
+        releases it when its thread exits, so active streams (not just
+        stream opens) count against the bound. Raises whatever opening raised
+        (e.g. a ClientError) before any event is read.
+        """
+        semaphore = self._get_converse_semaphore()
+        await semaphore.acquire()
         try:
-            async with converse_semaphore:
-                if stream:
-                    response = await run_in_threadpool(
-                        self.bedrock_runtime.converse_stream, **args
-                    )
-                else:
-                    response = await run_in_threadpool(
-                        self.bedrock_runtime.converse, **args
-                    )
+            reader = _ConverseStreamReader(
+                lambda: self.bedrock_runtime.converse_stream(**args).get("stream"),
+                on_exit=semaphore.release,
+            )
+            reader.start()
+        except BaseException:
+            semaphore.release()
+            raise
+        try:
+            await reader.wait_opened()
+        except BaseException:
+            await reader.close()
+            raise
+        return reader
+
+    async def _converse_once(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """One blocking ``converse`` call, holding a Converse permit throughout."""
+        async with self._get_converse_semaphore():
+            return await run_in_threadpool(self.bedrock_runtime.converse, **args)
+
+    def _drop_rejected_converse_field(self, error: ClientError, args: Dict[str, Any]) -> bool:
+        """Drop the optional inferenceConfig field a ValidationException refuses.
+
+        Bedrock's static capability rules only know some models (Grok); any
+        other model that refuses an optional field ("This model doesn't
+        support the stopSequences field") would otherwise fail every request
+        that carries it, e.g. each Claude Code auto-mode classifier call.
+        Returns True when a field was dropped (and remembered for the model)
+        so the caller can retry.
+        """
+        err = (getattr(error, "response", None) or {}).get("Error", {})
+        if err.get("Code") != "ValidationException":
+            return False
+        inference_config = args.get("inferenceConfig")
+        if not isinstance(inference_config, dict):
+            return False
+        present = {
+            name: inference_config[field]
+            for name, field in _CONVERSE_OPTIONAL_FIELDS.items()
+            if inference_config.get(field) is not None
+        }
+        name = unsupported_param(400, err.get("Message") or "", present, tuple(_CONVERSE_OPTIONAL_FIELDS))
+        if name is None:
+            return False
+        field = _CONVERSE_OPTIONAL_FIELDS[name]
+        inference_config.pop(field, None)
+        remember_rejected_param(self, args.get("modelId"), _CONVERSE_TRANSPORT, field)
+        return True
+
+    async def _call_converse(self, args: Dict[str, Any], call):
+        """Run ``call(args)`` (a converse call or stream open), dropping and
+        retrying optional fields the model refuses.
+
+        Fields this model refused before are dropped up front. Only the
+        opening is retried: a stream is returned once it has opened, before
+        any event has been read.
+        """
+        inference_config = args.get("inferenceConfig")
+        if isinstance(inference_config, dict):
+            for field in known_rejected_params(self, args.get("modelId"), _CONVERSE_TRANSPORT):
+                inference_config.pop(field, None)
+        retries = 0
+        while True:
+            try:
+                return await call(args)
+            except ClientError as e:
+                if retries >= MAX_PARAM_RETRIES or not self._drop_rejected_converse_field(e, args):
+                    raise
+                retries += 1
+
+    async def _invoke_bedrock(self, request: ChatCompletionRequest):
+        """Invoke Bedrock Converse (non-streaming).
+
+        Returns:
+            tuple: (response, tool_name_mapping) where tool_name_mapping is a
+                   request-scoped dict mapping truncated tool names to originals.
+        """
+        args, tool_name_mapping = await self._prepare_converse_args(request)
+
+        try:
+            # Bound Converse concurrency for the whole (blocking) call.
+            response = await self._call_converse(args, self._converse_once)
             return response, tool_name_mapping
         except ClientError as e:
-            # Map Bedrock errors to correct HTTP status codes (429/400/403/...)
-            # instead of letting them propagate to a generic 500. SDK-based
-            # providers get this for free from typed exceptions.
-            err = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
-            code = err.get("Code", "ClientError")
-            msg = err.get("Message", str(e))
-            logger.error(f"Bedrock invocation failed: {code}: {msg}")
-            mapped = _map_bedrock_error(code, msg)
-            from fastapi import HTTPException
-            raise HTTPException(status_code=mapped["status"], detail=mapped["body"])
+            raise self._http_exception_for_client_error(e)
         except Exception as e:
             logger.error(f"Bedrock invocation failed: {e}")
             raise
 
+    async def _open_bedrock_stream(self, request: ChatCompletionRequest) -> Tuple[_ConverseStreamReader, Dict[str, str]]:
+        """Open a Converse stream for an OpenAI chat request.
+
+        Returns:
+            tuple: (reader, tool_name_mapping). The caller must ``close()`` the reader.
+        """
+        args, tool_name_mapping = await self._prepare_converse_args(request)
+        try:
+            reader = await self._call_converse(args, self._open_converse_stream)
+        except ClientError as e:
+            raise self._http_exception_for_client_error(e)
+        except Exception as e:
+            logger.error(f"Bedrock invocation failed: {e}")
+            raise
+        return reader, tool_name_mapping
+
     async def chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         """Handle chat completion request."""
-        response, tool_name_mapping = await self._invoke_bedrock(request, stream=False)
+        response, tool_name_mapping = await self._invoke_bedrock(request)
         
         output_message = response["output"]["message"]
         usage_raw = response["usage"]
@@ -1455,6 +2033,7 @@ class BedrockProvider(BaseProvider):
         # blocks, and multiple text blocks must be concatenated (not overwritten).
         message = ChatMessage(role="assistant", content="")
         content = ""
+        reasoning_parts: List[str] = []
         tool_calls = []
         for part in output_message["content"]:
             if "toolUse" in part:
@@ -1482,14 +2061,18 @@ class BedrockProvider(BaseProvider):
                 # content as the visible text only (no <think> injection).
                 # Encrypted reasoning (Grok returns redactedContent only) has no
                 # client-visible text, so skip it rather than KeyError.
+                # Interleaved thinking yields several reasoning blocks; keep
+                # them all, in order.
                 reasoning_text = part["reasoningContent"].get("reasoningText")
-                if isinstance(reasoning_text, dict):
-                    message.reasoning_content = reasoning_text.get("text", "")
+                if isinstance(reasoning_text, dict) and reasoning_text.get("text"):
+                    reasoning_parts.append(reasoning_text["text"])
             elif "text" in part:
                 content += part["text"]
 
         if tool_calls:
             message.tool_calls = tool_calls
+        if reasoning_parts:
+            message.reasoning_content = "\n\n".join(reasoning_parts)
         message.content = content
         
         chat_response = ChatCompletionResponse(
@@ -1542,127 +2125,32 @@ class BedrockProvider(BaseProvider):
             usage=chat_response.usage
         )
 
-    async def _async_iterate(self, stream):
-        """Convert sync iterator to async iterator by running iteration in threadpool.
-        
-        This implementation ensures both iter() and next() calls happen in the threadpool
-        to avoid blocking the event loop when dealing with blocking generators.
-        """
-        async def _close_stream(state):
-            stream_obj = state.get('stream')
-            close_stream = getattr(stream_obj, 'close', None)
-            if not callable(close_stream):
-                return
-            try:
-                await run_in_threadpool(close_stream)
-            except Exception as exc:
-                logger.warning(
-                    "[BEDROCK STREAM CONVERSE] Failed to close stream: %s",
-                    exc,
-                    exc_info=True,
-                )
-        
-        def _get_next(state):
-            """Get next item from iterator in threadpool.
-            
-            Uses a state dict to lazily initialize the iterator inside the threadpool,
-            ensuring iter(stream) doesn't block the event loop.
-            """
-            if state.get('iterator') is None:
-                state['iterator'] = iter(state['stream'])
-            try:
-                return next(state['iterator']), False
-            except StopIteration:
-                return None, True
-        
-        # Store stream in state dict so iter() happens in threadpool
-        state = {'stream': stream, 'iterator': None}
-        try:
-            while True:
-                chunk, done = await run_in_threadpool(_get_next, state)
-                if done:
-                    break
-                yield chunk
-                # Yield control to allow other tasks to run
-                await asyncio.sleep(0)
-        finally:
-            await _close_stream(state)
-            state.clear()
-
-    async def _async_iterate_catching(self, stream):
-        """Like _async_iterate but converts mid-stream exceptions into a sentinel chunk.
-
-        When the Bedrock event stream raises an error during iteration (e.g.
-        EventStreamError "Response ended prematurely"), the error is surfaced as a
-        synthetic ``{"_bedrock_stream_error": <exc>}`` chunk instead of propagating
-        as an exception.  This lets the caller emit proper SSE terminal events before
-        reporting the error to the client.
-        """
-        async def _close_stream(state):
-            stream_obj = state.get('stream')
-            close_stream = getattr(stream_obj, 'close', None)
-            if not callable(close_stream):
-                return
-            try:
-                await run_in_threadpool(close_stream)
-            except Exception as exc:
-                logger.warning(
-                    "[BEDROCK STREAM CONVERSE] Failed to close error-handling stream: %s",
-                    exc,
-                    exc_info=True,
-                )
-
-        def _get_next(state):
-            if state.get('iterator') is None:
-                state['iterator'] = iter(state['stream'])
-            try:
-                chunk = next(state['iterator'])
-                state['chunk_count'] = state.get('chunk_count', 0) + 1
-                return chunk, False, None
-            except StopIteration:
-                return None, True, None
-            except Exception as exc:
-                logger.warning(
-                    "[BEDROCK STREAM CONVERSE] Mid-stream error after %d chunks: %s",
-                    state.get('chunk_count', 0),
-                    exc,
-                    exc_info=True,
-                )
-                return None, True, exc  # surface as sentinel
-
-        state = {'stream': stream, 'iterator': None, 'chunk_count': 0}
-        try:
-            while True:
-                chunk, done, exc = await run_in_threadpool(_get_next, state)
-                if exc is not None:
-                    yield {"_bedrock_stream_error": exc}
-                    return
-                if done:
-                    break
-                yield chunk
-                await asyncio.sleep(0)
-        finally:
-            await _close_stream(state)
-            state.clear()
-
     async def chat_completion_stream(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """Handle streaming chat completion request."""
+        reader: Optional[_ConverseStreamReader] = None
         try:
-            response, tool_name_mapping = await self._invoke_bedrock(request, stream=True)
+            reader, tool_name_mapping = await self._open_bedrock_stream(request)
             message_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
-            stream = response.get("stream")
 
             # Per-stream parser state (local to this stream to avoid cross-request races):
             #   tool_call_index   — last OpenAI tool-call ordinal assigned
             #   block_index_map   — Bedrock contentBlockIndex -> OpenAI tool-call ordinal
-            stream_state = {"tool_call_index": -1, "block_index_map": {}}
+            #   created           — one timestamp for every chunk of the stream
+            stream_state = {
+                "tool_call_index": -1,
+                "block_index_map": {},
+                "created": int(time.time()),
+            }
 
             # Default include_usage to True if not specified
             include_usage = True
             if request.stream_options is not None:
                 include_usage = request.stream_options.include_usage if request.stream_options.include_usage is not None else True
 
-            async for chunk in self._async_iterate(stream):
+            while True:
+                chunk = await reader.next_event()
+                if chunk is None:
+                    break
                 # Thread parser state through each chunk
                 stream_response, stream_state = self._parse_stream_chunk(chunk, message_id, echo_model_name(request), stream_state, tool_name_mapping)
                 
@@ -1720,6 +2208,11 @@ class BedrockProvider(BaseProvider):
                         "type": "server_error",
                     }
                 })
+        finally:
+            # Runs on completion, error, cancellation and client disconnect
+            # (aclose): stops the reader thread and frees its Converse permit.
+            if reader is not None:
+                await reader.close()
 
     def _parse_stream_chunk(self, chunk: Dict, message_id: str, model_id: str, stream_state: Dict, tool_name_mapping: Optional[Dict[str, str]] = None) -> tuple:
         """Parse Bedrock stream chunk into OpenAI format.
@@ -1831,7 +2324,7 @@ class BedrockProvider(BaseProvider):
                 return ({
                     "id": message_id,
                     "object": "chat.completion.chunk",
-                    "created": int(time.time()),
+                    "created": stream_state.get("created") or int(time.time()),
                     "model": model_id,
                     "choices": [],
                     "usage": usage.model_dump()
@@ -1841,7 +2334,7 @@ class BedrockProvider(BaseProvider):
             return ({
                 "id": message_id,
                 "object": "chat.completion.chunk",
-                "created": int(time.time()),
+                "created": stream_state.get("created") or int(time.time()),
                 "model": model_id,
                 "choices": [{
                     "index": 0,
@@ -1926,14 +2419,34 @@ class BedrockProvider(BaseProvider):
             raise ValueError(f"Unsupported embedding model: {model_id}")
         
         model_name = self.SUPPORTED_EMBEDDING_MODELS[model_id]
-        
-        # Prepare input
-        texts = []
+
+        # Prepare input. The OpenAI schema also allows token-ID arrays, but
+        # Cohere and Titan on Bedrock only embed text, so those are refused
+        # here instead of being sent upstream (or tokenized with str.split).
         if isinstance(request.input, str):
             texts = [request.input]
-        elif isinstance(request.input, list):
-            texts = request.input
-        
+        elif (
+            isinstance(request.input, list)
+            and request.input
+            and all(isinstance(item, str) for item in request.input)
+        ):
+            texts = list(request.input)
+        else:
+            message = (
+                "Bedrock embeddings accept a string or a non-empty list of strings; "
+                "token-ID arrays are not supported"
+            )
+            raise ProviderHTTPError(
+                400,
+                message,
+                body={"error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "param": "input",
+                    "code": None,
+                }},
+            )
+
         # Handle Cohere models
         if "Cohere" in model_name:
             # Honor a client-supplied input_type (search_query vs search_document
@@ -2068,11 +2581,79 @@ class BedrockProvider(BaseProvider):
             if isinstance(input_schema, dict) and input_schema.get("type") == "custom":
                 dropped_fields.append("tools.input_schema.type")
 
+        if mode == "adapter":
+            model_id = self._resolve_bedrock_anthropic_model_id(request.model)
+            dropped_fields.extend(self._adapter_dropped_fields(request, model_id))
+
         return AnthropicRequestMetadata(
             mode=mode,
             transport="messages" if mode == "native" else "chat",
             dropped_fields=sorted(set(dropped_fields)),
         )
+
+    # ---- Converse adapter (non-Claude /v1/messages) request semantics ----
+
+    _ADAPTER_TOOL_CHOICE_TYPES = frozenset({"auto", "any", "tool", "none"})
+
+    @staticmethod
+    def _dump_optional(value: Any) -> Optional[Dict[str, Any]]:
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            return value.model_dump(exclude_none=True)
+        return value if isinstance(value, dict) else None
+
+    def _adapter_reasoning_family(self, model_id: str) -> Optional[str]:
+        """How the Converse adapter carries a thinking config for ``model_id``.
+
+        None when the model has no known reasoning control on Converse, in
+        which case an Anthropic ``thinking`` block is not forwarded (Bedrock
+        rejects unknown additionalModelRequestFields for those models).
+        """
+        capability_model = self._capability_model_id(model_id)
+        if self._is_nova2_model(capability_model):
+            return "nova2"
+        if self._is_kimi_model(capability_model):
+            return "kimi"
+        if self._is_grok_model(capability_model):
+            return "grok"
+        if self._is_claude_model(capability_model):
+            return "claude"
+        return None
+
+    def _adapter_thinking(self, request, model_id: str) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+        """The thinking config the adapter honours, and the fields it cannot.
+
+        Returns ``(thinking_data, dropped)``. ``thinking_data`` is None when the
+        request asked for no thinking (or only ``disabled``) or the model has no
+        reasoning control on Converse; for Claude it has been through the same
+        normalize_thinking as the native path (adaptive models reject a budget).
+        """
+        thinking_data = self._dump_optional(getattr(request, "thinking", None))
+        if not thinking_data or thinking_data.get("type") == "disabled":
+            return None, []
+        family = self._adapter_reasoning_family(model_id)
+        if family is None:
+            return None, ["thinking"]
+        if family == "claude":
+            normalized, dropped = normalize_thinking(thinking_data, self._capability_model_id(model_id))
+            return normalized, list(dropped)
+        return thinking_data, []
+
+    def _adapter_dropped_fields(self, request, model_id: str) -> List[str]:
+        """Request fields the Converse adapter cannot honour for ``model_id``."""
+        dropped: List[str] = []
+        metadata = self._dump_optional(getattr(request, "metadata", None))
+        if metadata:
+            # Converse has no counterpart to Anthropic's metadata.user_id.
+            dropped.append("metadata")
+        tool_choice = self._dump_optional(getattr(request, "tool_choice", None))
+        if tool_choice and tool_choice.get("disable_parallel_tool_use"):
+            # Converse's toolChoice has no parallel-tool-use switch.
+            dropped.append("tool_choice.disable_parallel_tool_use")
+        _, thinking_dropped = self._adapter_thinking(request, model_id)
+        dropped.extend(thinking_dropped)
+        return dropped
 
     def _get_anthropic_model_id(self, model_name: str) -> str:
         """Extract a clean model ID for the Anthropic SDK from a provider-prefixed name.
@@ -2187,6 +2768,15 @@ class BedrockProvider(BaseProvider):
     @staticmethod
     def _supports_output_config_effort(model_id: str) -> bool:
         return BedrockProvider._is_claude_at_least(model_id, 4, 6)
+
+    @staticmethod
+    def _supports_budget_thinking(model_id: str) -> bool:
+        """Claude models with extended thinking (3.7 and later).
+
+        Adaptive-thinking models (see thinking_style) are a subset that rejects
+        an explicit budget; callers check for those first.
+        """
+        return BedrockProvider._is_claude_at_least(model_id, 3, 7)
 
     def _parse_anthropic_beta_values(self, anthropic_beta: Optional[str]) -> List[str]:
         if not anthropic_beta:
@@ -2546,19 +3136,73 @@ class BedrockProvider(BaseProvider):
             "timeout": ANTHROPIC_SDK_TIMEOUT_SECONDS,
             "max_retries": 2,
         }
-        if self.aws_access_key and self.aws_secret_key:
+        uses_default_chain = not (self.aws_access_key and self.aws_secret_key)
+        if not uses_default_chain:
             kwargs["aws_access_key"] = self.aws_access_key
             kwargs["aws_secret_key"] = self.aws_secret_key
-        # else: omit creds → SDK uses the default boto3 credential chain, matching
-        # how self.bedrock_runtime is built without explicit creds.
+        # else: omit creds → the default boto3 credential chain, matching how
+        # self.bedrock_runtime is built without explicit creds. The SDK would
+        # resolve (and refresh) that chain synchronously inside its async
+        # request preparation, i.e. on the event loop, so
+        # _ensure_anthropic_client() resolves it off-loop and hands the SDK
+        # static credentials instead.
         try:
             self._anthropic_client = AsyncAnthropicBedrock(**kwargs)
+            self._anthropic_uses_default_chain = uses_default_chain
             logger.info(
                 "[BEDROCK] AsyncAnthropicBedrock client initialized for region=%s",
                 self.aws_region,
             )
         except Exception as e:
             logger.warning("[BEDROCK] Failed to init AsyncAnthropicBedrock client: %s", e)
+
+    async def _ensure_anthropic_client(self) -> None:
+        """Build the native client and make sure its credentials are current.
+
+        With explicit keys the SDK signs with static credentials and never
+        blocks. With the default chain, credentials are resolved on a worker
+        thread (instance metadata, SSO, credential_process, ... can each block
+        on I/O) and refreshed there before they expire; the SDK client gets the
+        resulting static key/secret/token, so signing on the loop stays cheap.
+        """
+        self._init_bedrock_anthropic_client()
+        client = self._anthropic_client
+        if client is None or not getattr(self, "_anthropic_uses_default_chain", False):
+            return
+        if not self._chain_credentials_stale():
+            return
+        if getattr(self, "_chain_credentials_lock", None) is None:
+            self._chain_credentials_lock = asyncio.Lock()
+        async with self._chain_credentials_lock:
+            if not self._chain_credentials_stale():
+                return  # another request refreshed them while we waited
+            credentials, frozen = await asyncio.to_thread(
+                self._resolve_chain_credentials, self._chain_credentials
+            )
+            # Plain attribute swap on the loop thread: no request can observe
+            # a half-updated key/secret/token triple.
+            client.aws_access_key = frozen.access_key
+            client.aws_secret_key = frozen.secret_key
+            client.aws_session_token = frozen.token
+            self._chain_credentials = credentials
+
+    def _chain_credentials_stale(self) -> bool:
+        credentials = getattr(self, "_chain_credentials", None)
+        if credentials is None:
+            return True
+        refresh_needed = getattr(credentials, "refresh_needed", None)
+        # Static credentials (e.g. from env vars) never need a refresh;
+        # refreshable ones report it ahead of expiry (botocore's advisory window).
+        return bool(callable(refresh_needed) and refresh_needed())
+
+    def _resolve_chain_credentials(self, credentials: Any) -> tuple:
+        """Resolve/refresh default-chain credentials (blocking; run off-loop)."""
+        if credentials is None:
+            credentials = boto3.session.Session(region_name=self.aws_region).get_credentials()
+            if credentials is None:
+                raise RuntimeError("could not resolve AWS credentials for Bedrock")
+        # Refreshes in place when expired or about to expire.
+        return credentials, credentials.get_frozen_credentials()
 
     def _build_native_sdk_kwargs(
         self, request, model_id: str, anthropic_beta: Optional[str]
@@ -2658,6 +3302,22 @@ class BedrockProvider(BaseProvider):
         }
         return bedrock_tool
 
+    def _convert_anthropic_image_block(self, block: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Convert an Anthropic image block to a Converse image block.
+
+        Used for message content and tool_result content alike. Returns None
+        for a source type Converse can't take (e.g. a Files API reference).
+        """
+        source = block.get("source") or {}
+        if source.get("type") == "base64" and source.get("data"):
+            image_bytes = self._decode_base64_image(source["data"])
+            image_format = _converse_image_format(image_bytes, source.get("media_type"))
+        elif source.get("type") == "url" and source.get("url"):
+            image_bytes, image_format = self._parse_image_sync(source["url"])
+        else:
+            return None
+        return {"image": {"format": image_format, "source": {"bytes": image_bytes}}}
+
     def _convert_anthropic_content_to_bedrock(self, content: Any, supports_caching: bool = True) -> List[Dict[str, Any]]:
         if isinstance(content, str):
             return [{"text": content}]
@@ -2679,24 +3339,9 @@ class BedrockProvider(BaseProvider):
                 if text:
                     converted.append({"text": text})
             elif block_type == "image":
-                source = block.get("source") or {}
-                media_type = source.get("media_type", "image/jpeg")
-                image_format = media_type.replace("image/", "") if isinstance(media_type, str) else "jpeg"
-                image_bytes = None
-
-                if source.get("type") == "base64" and source.get("data"):
-                    image_bytes = base64.b64decode(source["data"])
-                elif source.get("type") == "url" and source.get("url"):
-                    image_bytes, parsed_media_type = self._parse_image_sync(source["url"])
-                    image_format = parsed_media_type.replace("image/", "")
-
-                if image_bytes is not None:
-                    converted.append({
-                        "image": {
-                            "format": image_format,
-                            "source": {"bytes": image_bytes}
-                        }
-                    })
+                image_block = self._convert_anthropic_image_block(block)
+                if image_block is not None:
+                    converted.append(image_block)
             elif block_type == "tool_use":
                 tool_input = block.get("input")
                 if not isinstance(tool_input, dict):
@@ -2719,8 +3364,16 @@ class BedrockProvider(BaseProvider):
                         if hasattr(result_block, 'model_dump'):
                             result_block = result_block.model_dump(exclude_none=True)
                         if isinstance(result_block, dict):
-                            if result_block.get("type") == "text":
+                            result_type = result_block.get("type")
+                            image_block = (
+                                self._convert_anthropic_image_block(result_block)
+                                if result_type == "image" else None
+                            )
+                            if result_type == "text":
                                 converted_tool_result_content.append({"text": result_block.get("text", "")})
+                            elif image_block is not None:
+                                # Converse tool results carry images natively.
+                                converted_tool_result_content.append(image_block)
                             else:
                                 converted_tool_result_content.append({"text": json.dumps(result_block, ensure_ascii=False)})
                         else:
@@ -2815,11 +3468,33 @@ class BedrockProvider(BaseProvider):
                             if cache_point_block:
                                 system_blocks.append(cache_point_block)
 
+        # role="system" entries inside messages[] are instructions, not user
+        # turns: lift them into the system prompt after request.system, exactly
+        # as the native path does (same helper), instead of sending them as
+        # user messages. Unknown roles are coerced to "user" by the helper.
+        raw_messages = []
         for message in request.messages:
-            role = "assistant" if message.role == "assistant" else "user"
+            content = message.content
+            if isinstance(content, list):
+                content = [
+                    block.model_dump(exclude_none=True) if hasattr(block, "model_dump") else block
+                    for block in content
+                ]
+            raw_messages.append({"role": message.role, "content": content})
+        raw_messages, extracted_system = _extract_system_messages_from_messages(raw_messages)
+        for block in extracted_system:
+            if block.get("text"):
+                system_blocks.append({"text": block["text"]})
+                if self._is_claude_model(model_id):
+                    cache_point_block = self._cache_control_to_cache_point_block(block.get("cache_control"))
+                    if cache_point_block:
+                        system_blocks.append(cache_point_block)
+
+        for message in raw_messages:
+            role = "assistant" if message["role"] == "assistant" else "user"
             messages.append({
                 "role": role,
-                "content": self._convert_anthropic_content_to_bedrock(message.content, supports_caching=self._is_claude_model(model_id)),
+                "content": self._convert_anthropic_content_to_bedrock(message["content"], supports_caching=self._is_claude_model(model_id)),
             })
 
         inference_config: Dict[str, Any] = {"maxTokens": request.max_tokens}
@@ -2842,29 +3517,32 @@ class BedrockProvider(BaseProvider):
         additional_fields: Dict[str, Any] = {}
         if request.top_k is not None:
             additional_fields["top_k"] = request.top_k
-        if request.thinking is not None:
-            if self._is_nova2_model(model_id):
-                # Nova 2 uses reasoningConfig with effort level; temperature and
-                # maxTokens must be removed from inferenceConfig when reasoning is on.
-                thinking_data = request.thinking.model_dump(exclude_none=True)
-                effort = self._budget_to_effort(thinking_data.get("budget_tokens", 0))
-                additional_fields["reasoningConfig"] = {"type": "enabled", "maxReasoningEffort": effort}
-                inference_config.pop("temperature", None)
-                inference_config.pop("maxTokens", None)
-            elif self._is_kimi_model(model_id):
-                # Kimi only supports reasoning_effort="high"
-                additional_fields["reasoning_effort"] = "high"
-            elif self._is_grok_model(model_id):
-                # Grok takes an effort string instead of a thinking block;
-                # a disabled block leaves the model on its own default.
-                thinking_data = request.thinking.model_dump(exclude_none=True)
-                if thinking_data.get("type") != "disabled":
-                    additional_fields["reasoning_effort"] = self._budget_to_effort(
-                        thinking_data.get("budget_tokens", 0)
-                    )
-            else:
-                # Claude and others: pass thinking config directly
-                additional_fields["thinking"] = request.thinking.model_dump(exclude_none=True)
+
+        # Thinking goes out in the model family's own spelling, or not at all
+        # for a model with no reasoning control on Converse (reported through
+        # get_anthropic_request_metadata). A disabled block enables nothing.
+        thinking_data, thinking_dropped = self._adapter_thinking(request, model_id)
+        if thinking_dropped and self.debug:
+            logger.info(f"Not forwarding {', '.join(thinking_dropped)} for {model_id} (Converse adapter)")
+        reasoning_family = self._adapter_reasoning_family(model_id) if thinking_data else None
+        if reasoning_family == "nova2":
+            # Nova 2 uses reasoningConfig with effort level; temperature and
+            # maxTokens must be removed from inferenceConfig when reasoning is on.
+            effort = self._budget_to_effort(thinking_data.get("budget_tokens", 0))
+            additional_fields["reasoningConfig"] = {"type": "enabled", "maxReasoningEffort": effort}
+            inference_config.pop("temperature", None)
+            inference_config.pop("maxTokens", None)
+        elif reasoning_family == "kimi":
+            # Kimi only supports reasoning_effort="high"
+            additional_fields["reasoning_effort"] = "high"
+        elif reasoning_family == "grok":
+            # Grok takes an effort string instead of a thinking block.
+            additional_fields["reasoning_effort"] = self._budget_to_effort(
+                thinking_data.get("budget_tokens", 0)
+            )
+        elif reasoning_family == "claude":
+            # Already normalized (adaptive models reject budget_tokens).
+            additional_fields["thinking"] = thinking_data
 
         # Beta headers are only meaningful for Claude/Anthropic models on Bedrock
         if self._is_claude_model(model_id):
@@ -2875,12 +3553,27 @@ class BedrockProvider(BaseProvider):
         if additional_fields:
             args["additionalModelRequestFields"] = additional_fields
 
+        # tool_choice: auto/any/tool map onto Converse; "none" (no tool calls)
+        # has no Converse choice, so the declared tools are withheld instead.
+        # Anything else is refused rather than silently run as "auto".
+        tool_choice_data = self._dump_optional(request.tool_choice)
+        tool_choice_type = tool_choice_data.get("type") if tool_choice_data else None
+        if tool_choice_data is not None:
+            if tool_choice_type not in self._ADAPTER_TOOL_CHOICE_TYPES:
+                raise ValueError(
+                    f"Unsupported tool_choice type {tool_choice_type!r}; "
+                    "expected one of auto, any, tool, none"
+                )
+            if tool_choice_type == "tool" and not tool_choice_data.get("name"):
+                raise ValueError("tool_choice of type 'tool' requires a name")
+        declared_tools = request.tools if request.tools and tool_choice_type != "none" else None
+
         messages_have_tools = self._messages_contain_tool_usage(messages)
-        if request.tools or messages_have_tools:
+        if declared_tools or messages_have_tools:
             bedrock_tools = []
             special_tools: List[Dict[str, Any]] = []
-            if request.tools:
-                for index, tool in enumerate(request.tools):
+            if declared_tools:
+                for index, tool in enumerate(declared_tools):
                     tool_data = tool.model_dump(exclude_none=True) if hasattr(tool, 'model_dump') else tool
                     if isinstance(tool_data, dict) and not tool_data.get("name") and tool_data.get("type") not in self._SPECIAL_TOOL_TYPES:
                         tool_data = {**tool_data, "name": f"tool_{index + 1}"}
@@ -2923,27 +3616,20 @@ class BedrockProvider(BaseProvider):
                 "tools": bedrock_tools,
             }
 
-            if request.tool_choice is not None:
-                tool_choice_data = (
-                    request.tool_choice.model_dump(exclude_none=True)
-                    if hasattr(request.tool_choice, 'model_dump')
-                    else request.tool_choice
-                )
-                if isinstance(tool_choice_data, dict):
-                    tool_choice_type = tool_choice_data.get("type")
-                    if placeholder_only and tool_choice_type in ("any", "tool"):
-                        # The only tool in toolConfig is the injected
-                        # placeholder; a forced choice would make the model
-                        # call the fake noop tool (or fail validation for a
-                        # named tool that isn't in toolConfig). Downgrade to
-                        # auto instead.
-                        tool_config["toolChoice"] = {"auto": {}}
-                    elif tool_choice_type == "auto":
-                        tool_config["toolChoice"] = {"auto": {}}
-                    elif tool_choice_type == "any":
-                        tool_config["toolChoice"] = {"any": {}}
-                    elif tool_choice_type == "tool" and tool_choice_data.get("name"):
-                        tool_config["toolChoice"] = {"tool": {"name": tool_choice_data["name"]}}
+            if tool_choice_type in ("any", "tool") and placeholder_only:
+                # The only tool in toolConfig is the injected placeholder; a
+                # forced choice would make the model call the fake noop tool
+                # (or fail validation for a named tool that isn't in
+                # toolConfig). Downgrade to auto instead.
+                tool_config["toolChoice"] = {"auto": {}}
+            elif tool_choice_type == "auto":
+                tool_config["toolChoice"] = {"auto": {}}
+            elif tool_choice_type == "any":
+                tool_config["toolChoice"] = {"any": {}}
+            elif tool_choice_type == "tool":
+                tool_config["toolChoice"] = {"tool": {"name": tool_choice_data["name"]}}
+            # "none": no real tools were declared above; history-only toolConfig
+            # keeps just the placeholder with Converse's default choice.
 
             args["toolConfig"] = tool_config
 
@@ -3040,6 +3726,33 @@ class BedrockProvider(BaseProvider):
     def _format_anthropic_sse_event(self, event_type: str, data: Dict[str, Any]) -> str:
         return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
+    def _anthropic_stop_events(self, stop_reason: Optional[str], stop_sequence: Optional[str]) -> List[str]:
+        """message_delta + message_stop for a complete message whose usage is unknown."""
+        return [
+            self._format_anthropic_sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": stop_reason,
+                    "stop_sequence": stop_sequence,
+                },
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            }),
+            self._format_anthropic_sse_event("message_stop", {"type": "message_stop"}),
+        ]
+
+    def _anthropic_stream_error_event(self, exc: BaseException) -> str:
+        """An Anthropic ``error`` SSE event for a failed Converse stream.
+
+        A Bedrock error (EventStreamError is a ClientError) keeps its mapped
+        type, e.g. throttling -> rate_limit_error; anything else is api_error.
+        """
+        if isinstance(exc, ClientError):
+            err = (exc.response or {}).get("Error", {})
+            body = _map_bedrock_error(err.get("Code") or "ClientError", err.get("Message") or str(exc))["body"]
+        else:
+            body = {"type": "error", "error": {"type": "api_error", "message": str(exc)}}
+        return self._format_anthropic_sse_event("error", body)
+
     async def anthropic_messages(self, request, anthropic_beta: Optional[str] = None) -> Any:
         """Handle Anthropic Messages API request.
 
@@ -3050,7 +3763,7 @@ class BedrockProvider(BaseProvider):
 
         # ── Native path for Claude models (AsyncAnthropicBedrock SDK) ──────
         if self._is_claude_model(model_id):
-            self._init_bedrock_anthropic_client()
+            await self._ensure_anthropic_client()
             if self._anthropic_client is None:
                 raise NotImplementedError(
                     "anthropic SDK not available for Bedrock native path"
@@ -3084,8 +3797,7 @@ class BedrockProvider(BaseProvider):
         # ── Converse path for non-Claude models ────────────────────────────
         args = await run_in_threadpool(self._build_bedrock_anthropic_args, request, anthropic_beta)
         try:
-            async with self._get_converse_semaphore():
-                response = await run_in_threadpool(self.bedrock_runtime.converse, **args)
+            response = await self._call_converse(args, self._converse_once)
         except ClientError as e:
             error = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
             code = error.get("Code")
@@ -3144,7 +3856,7 @@ class BedrockProvider(BaseProvider):
 
         # ── Native streaming for Claude models (AsyncAnthropicBedrock SDK) ──
         if self._is_claude_model(model_id):
-            self._init_bedrock_anthropic_client()
+            await self._ensure_anthropic_client()
             if self._anthropic_client is None:
                 raise NotImplementedError(
                     "anthropic SDK not available for Bedrock native streaming path"
@@ -3190,10 +3902,9 @@ class BedrockProvider(BaseProvider):
         # ── Converse Stream path for non-Claude models ─────────────────────
         args = await run_in_threadpool(self._build_bedrock_anthropic_args, request, anthropic_beta)
         try:
-            # Hold the Converse permit only while opening the stream (boto3
-            # returns once headers arrive), not while the client drains it.
-            async with self._get_converse_semaphore():
-                response = await run_in_threadpool(self.bedrock_runtime.converse_stream, **args)
+            # The reader holds a Converse permit until its thread exits, so an
+            # active stream counts against the bound, not just its opening.
+            reader = await self._call_converse(args, self._open_converse_stream)
         except ClientError as e:
             error = (e.response or {}).get("Error", {}) if hasattr(e, "response") else {}
             code = error.get("Code")
@@ -3204,217 +3915,219 @@ class BedrockProvider(BaseProvider):
             mapped = _map_bedrock_error(code or "ClientError", error.get("Message", str(e)))
             from fastapi import HTTPException
             raise HTTPException(status_code=mapped["status"], detail=mapped["body"]) from e
-        stream = response.get("stream")
 
-        message_id = f"msg_{uuid.uuid4().hex}"
-        content_block_started = set()
-        content_block_stopped = set()
-        # Bedrock event order: ... contentBlockStop → messageStop → metadata
-        # We must buffer the messageStop payload and only emit message_delta
-        # once we have real token counts from the trailing metadata event.
-        buffered_stop_reason: Optional[str] = None
-        buffered_stop_sequence: Optional[str] = None
-        message_stop_seen = False
-        message_stop_emitted = False
+        try:
+            message_id = f"msg_{uuid.uuid4().hex}"
+            content_block_started = set()
+            # Bedrock event order: ... contentBlockStop → messageStop → metadata
+            # We must buffer the messageStop payload and only emit message_delta
+            # once we have real token counts from the trailing metadata event.
+            buffered_stop_reason: Optional[str] = None
+            buffered_stop_sequence: Optional[str] = None
+            message_stop_seen = False
+            message_stop_emitted = False
 
-        async for chunk in self._async_iterate_catching(stream):
-            if "messageStart" in chunk:
-                message_start = {
-                    "type": "message_start",
-                    "message": {
-                        "id": message_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": echo_model_name(request),
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
-                    },
-                }
-                yield self._format_anthropic_sse_event("message_start", message_start)
-            elif "contentBlockStart" in chunk:
-                start = chunk["contentBlockStart"]
-                index = start.get("contentBlockIndex", 0)
-                start_body = start.get("start", {})
-                if "toolUse" in start_body:
-                    tool_use = start_body["toolUse"]
-                    block = {
-                        "type": "tool_use",
-                        "id": tool_use.get("toolUseId", ""),
-                        "name": tool_use.get("name", ""),
-                        # Anthropic spec: content_block_start always has empty input;
-                        # actual input arrives via input_json_delta events.
-                        "input": {},
+            while True:
+                try:
+                    chunk = await reader.next_event()
+                except Exception as exc:
+                    # A read failed mid-stream (e.g. EventStreamError "Response
+                    # ended prematurely"); handled by the branch below.
+                    chunk = {"_bedrock_stream_error": exc}
+                if chunk is None:
+                    break
+                if "messageStart" in chunk:
+                    message_start = {
+                        "type": "message_start",
+                        "message": {
+                            "id": message_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": echo_model_name(request),
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        },
                     }
-                elif "reasoningContent" in start_body:
-                    reasoning_content = start_body["reasoningContent"]
-                    if "redactedContent" in reasoning_content:
-                        block = {"type": "redacted_thinking", "data": ""}
+                    yield self._format_anthropic_sse_event("message_start", message_start)
+                elif "contentBlockStart" in chunk:
+                    start = chunk["contentBlockStart"]
+                    index = start.get("contentBlockIndex", 0)
+                    start_body = start.get("start", {})
+                    if "toolUse" in start_body:
+                        tool_use = start_body["toolUse"]
+                        block = {
+                            "type": "tool_use",
+                            "id": tool_use.get("toolUseId", ""),
+                            "name": tool_use.get("name", ""),
+                            # Anthropic spec: content_block_start always has empty input;
+                            # actual input arrives via input_json_delta events.
+                            "input": {},
+                        }
+                    elif "reasoningContent" in start_body:
+                        reasoning_content = start_body["reasoningContent"]
+                        if "redactedContent" in reasoning_content:
+                            block = {"type": "redacted_thinking", "data": ""}
+                        else:
+                            block = {"type": "thinking", "thinking": ""}
                     else:
-                        block = {"type": "thinking", "thinking": ""}
-                else:
-                    block = {"type": "text", "text": ""}
-                content_block_started.add(index)
-                yield self._format_anthropic_sse_event("content_block_start", {
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": block,
-                })
-            elif "contentBlockDelta" in chunk:
-                delta_data = chunk["contentBlockDelta"]
-                index = delta_data.get("contentBlockIndex", 0)
-                delta = delta_data.get("delta", {})
-
-                if index not in content_block_started:
+                        block = {"type": "text", "text": ""}
                     content_block_started.add(index)
-                    # Detect block type from the delta content
-                    if "reasoningContent" in delta:
-                        synth_block = {"type": "thinking", "thinking": ""}
-                    else:
-                        synth_block = {"type": "text", "text": ""}
                     yield self._format_anthropic_sse_event("content_block_start", {
                         "type": "content_block_start",
                         "index": index,
-                        "content_block": synth_block,
+                        "content_block": block,
                     })
+                elif "contentBlockDelta" in chunk:
+                    delta_data = chunk["contentBlockDelta"]
+                    index = delta_data.get("contentBlockIndex", 0)
+                    delta = delta_data.get("delta", {})
 
-                if "text" in delta:
-                    yield self._format_anthropic_sse_event("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {
-                            "type": "text_delta",
-                            "text": delta.get("text", ""),
-                        },
-                    })
-                elif "toolUse" in delta:
-                    # Bedrock sends tool input as a JSON string fragment (already
-                    # serialized), but occasionally delivers it as a dict.  The
-                    # Anthropic SSE format requires ``partial_json`` to be a
-                    # *string*, so we json.dumps dicts to keep downstream
-                    # clients (Claude Code, Cline, etc.) from seeing an empty
-                    # tool input.
-                    tool_input = delta["toolUse"].get("input", "")
-                    if isinstance(tool_input, dict):
-                        tool_input = json.dumps(tool_input, ensure_ascii=False)
-                    elif tool_input is None:
-                        tool_input = ""
-                    yield self._format_anthropic_sse_event("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": tool_input,
-                        },
-                    })
-                elif "reasoningContent" in delta:
-                    reasoning_delta = delta["reasoningContent"]
-                    if "text" in reasoning_delta:
+                    if index not in content_block_started:
+                        content_block_started.add(index)
+                        # Detect block type from the delta content
+                        if "reasoningContent" in delta:
+                            synth_block = {"type": "thinking", "thinking": ""}
+                        else:
+                            synth_block = {"type": "text", "text": ""}
+                        yield self._format_anthropic_sse_event("content_block_start", {
+                            "type": "content_block_start",
+                            "index": index,
+                            "content_block": synth_block,
+                        })
+
+                    if "text" in delta:
                         yield self._format_anthropic_sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": index,
                             "delta": {
-                                "type": "thinking_delta",
-                                "thinking": reasoning_delta.get("text", ""),
+                                "type": "text_delta",
+                                "text": delta.get("text", ""),
                             },
                         })
-                    elif "signature" in reasoning_delta:
+                    elif "toolUse" in delta:
+                        # Bedrock sends tool input as a JSON string fragment (already
+                        # serialized), but occasionally delivers it as a dict.  The
+                        # Anthropic SSE format requires ``partial_json`` to be a
+                        # *string*, so we json.dumps dicts to keep downstream
+                        # clients (Claude Code, Cline, etc.) from seeing an empty
+                        # tool input.
+                        tool_input = delta["toolUse"].get("input", "")
+                        if isinstance(tool_input, dict):
+                            tool_input = json.dumps(tool_input, ensure_ascii=False)
+                        elif tool_input is None:
+                            tool_input = ""
                         yield self._format_anthropic_sse_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": index,
                             "delta": {
-                                "type": "signature_delta",
-                                "signature": reasoning_delta.get("signature", ""),
+                                "type": "input_json_delta",
+                                "partial_json": tool_input,
                             },
                         })
-            elif "contentBlockStop" in chunk:
-                stop = chunk["contentBlockStop"]
-                blk_idx = stop.get("contentBlockIndex", 0)
-                content_block_stopped.add(blk_idx)
-                yield self._format_anthropic_sse_event("content_block_stop", {
-                    "type": "content_block_stop",
-                    "index": blk_idx,
-                })
-            elif "metadata" in chunk and "usage" in chunk["metadata"]:
-                usage = chunk["metadata"]["usage"]
-                # metadata is the last event — emit message_delta now with real
-                # token counts merged with the buffered stop_reason.
-                usage_data: Dict[str, Any] = {
-                    "input_tokens": usage.get("inputTokens", 0),
-                    "output_tokens": usage.get("outputTokens", 0),
-                }
-                if usage.get("cacheWriteInputTokens") is not None:
-                    usage_data["cache_creation_input_tokens"] = usage.get("cacheWriteInputTokens")
-                if usage.get("cacheReadInputTokens") is not None:
-                    usage_data["cache_read_input_tokens"] = usage.get("cacheReadInputTokens")
-                yield self._format_anthropic_sse_event("message_delta", {
-                    "type": "message_delta",
-                    "delta": {
-                        "stop_reason": buffered_stop_reason,
-                        "stop_sequence": buffered_stop_sequence,
-                    },
-                    "usage": usage_data,
-                })
-                yield self._format_anthropic_sse_event("message_stop", {"type": "message_stop"})
-                message_stop_emitted = True
-            elif "_bedrock_stream_error" in chunk:
-                # Bedrock raised an error mid-stream (e.g. EventStreamError
-                # "Response ended prematurely").  Close any content blocks that
-                # Bedrock never closed, emit the terminal Anthropic SSE events,
-                # and then surface the error — so clients receive a well-formed
-                # stream instead of a truncated one.
-                terminal_already_seen = message_stop_seen or message_stop_emitted
-                for open_idx in sorted(content_block_started - content_block_stopped):
+                    elif "reasoningContent" in delta:
+                        reasoning_delta = delta["reasoningContent"]
+                        if "text" in reasoning_delta:
+                            yield self._format_anthropic_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "thinking_delta",
+                                    "thinking": reasoning_delta.get("text", ""),
+                                },
+                            })
+                        elif "signature" in reasoning_delta:
+                            yield self._format_anthropic_sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "signature_delta",
+                                    "signature": reasoning_delta.get("signature", ""),
+                                },
+                            })
+                elif "contentBlockStop" in chunk:
+                    stop = chunk["contentBlockStop"]
+                    blk_idx = stop.get("contentBlockIndex", 0)
                     yield self._format_anthropic_sse_event("content_block_stop", {
                         "type": "content_block_stop",
-                        "index": open_idx,
+                        "index": blk_idx,
                     })
-                if not message_stop_emitted:
+                elif "metadata" in chunk and "usage" in chunk["metadata"]:
+                    usage = chunk["metadata"]["usage"]
+                    # metadata is the last event — emit message_delta now with real
+                    # token counts merged with the buffered stop_reason.
+                    usage_data: Dict[str, Any] = {
+                        "input_tokens": usage.get("inputTokens", 0),
+                        "output_tokens": usage.get("outputTokens", 0),
+                    }
+                    if usage.get("cacheWriteInputTokens") is not None:
+                        usage_data["cache_creation_input_tokens"] = usage.get("cacheWriteInputTokens")
+                    if usage.get("cacheReadInputTokens") is not None:
+                        usage_data["cache_read_input_tokens"] = usage.get("cacheReadInputTokens")
                     yield self._format_anthropic_sse_event("message_delta", {
                         "type": "message_delta",
                         "delta": {
-                            "stop_reason": buffered_stop_reason or "end_turn",
+                            "stop_reason": buffered_stop_reason,
                             "stop_sequence": buffered_stop_sequence,
                         },
-                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                        "usage": usage_data,
                     })
                     yield self._format_anthropic_sse_event("message_stop", {"type": "message_stop"})
                     message_stop_emitted = True
-                stream_exc = chunk["_bedrock_stream_error"]
-                if terminal_already_seen:
-                    logger.info(
-                        "Bedrock converse stream ended after terminal messageStop; suppressing late transport error: %s",
-                        stream_exc,
-                    )
-                    return
-                logger.warning(f"Bedrock stream error mid-response: {stream_exc}")
-                yield self._format_anthropic_sse_event("error", {
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": str(stream_exc),
-                    },
-                })
-                return  # stream fully terminated; no post-loop fallback needed
-            elif "messageStop" in chunk:
-                message_stop_seen = True
-                stop_reason = chunk["messageStop"].get("stopReason")
-                # Buffer stop info — will be emitted once the trailing metadata arrives.
-                buffered_stop_reason = self._convert_bedrock_stop_reason(stop_reason)
-                buffered_stop_sequence = chunk["messageStop"].get("stopSequence")
+                elif "_bedrock_stream_error" in chunk:
+                    stream_exc = chunk["_bedrock_stream_error"]
+                    if message_stop_emitted:
+                        logger.info(
+                            "Bedrock converse stream errored after message_stop; "
+                            "ignoring late transport error: %s",
+                            stream_exc,
+                        )
+                        return
+                    if message_stop_seen:
+                        # Bedrock's messageStop arrived, so the response itself
+                        # is complete; only the trailing usage metadata was
+                        # lost. Finish the message normally (usage unknown).
+                        logger.warning(
+                            "Bedrock converse stream failed after messageStop; "
+                            "usage metadata unavailable: %s",
+                            stream_exc,
+                        )
+                        for sse in self._anthropic_stop_events(buffered_stop_reason, buffered_stop_sequence):
+                            yield sse
+                        message_stop_emitted = True
+                        return
+                    # The upstream response is incomplete. Report the failure
+                    # instead of closing the message with end_turn/message_stop,
+                    # which clients (and request tracking) read as a complete,
+                    # successful response.
+                    logger.warning(f"Bedrock stream error mid-response: {stream_exc}")
+                    yield self._anthropic_stream_error_event(stream_exc)
+                    return  # stream fully terminated; no post-loop fallback needed
+                elif "messageStop" in chunk:
+                    message_stop_seen = True
+                    stop_reason = chunk["messageStop"].get("stopReason")
+                    # Buffer stop info — will be emitted once the trailing metadata arrives.
+                    buffered_stop_reason = self._convert_bedrock_stop_reason(stop_reason)
+                    buffered_stop_sequence = chunk["messageStop"].get("stopSequence")
 
-        # Guard: if Bedrock ended the stream without sending a metadata event
-        # (or without any messageStop/metadata at all), emit the terminal events
-        # now so the client gets a well-formed Anthropic SSE stream and does not
-        # report "Response ended prematurely".
-        if not message_stop_emitted:
-            yield self._format_anthropic_sse_event("message_delta", {
-                "type": "message_delta",
-                "delta": {
-                    "stop_reason": buffered_stop_reason or "end_turn",
-                    "stop_sequence": buffered_stop_sequence,
-                },
-                "usage": {"input_tokens": 0, "output_tokens": 0},
-            })
-            yield self._format_anthropic_sse_event("message_stop", {"type": "message_stop"})
+            if not message_stop_emitted:
+                if message_stop_seen:
+                    # Complete response whose trailing metadata event never
+                    # came: finish it normally (usage unknown).
+                    logger.warning(
+                        "Bedrock converse stream ended without usage metadata after messageStop"
+                    )
+                    for sse in self._anthropic_stop_events(buffered_stop_reason, buffered_stop_sequence):
+                        yield sse
+                else:
+                    # Ended before messageStop: the response is truncated, so
+                    # don't fabricate a normal end_turn for it.
+                    logger.warning("Bedrock converse stream ended before messageStop")
+                    yield self._anthropic_stream_error_event(
+                        RuntimeError("Bedrock stream ended before the response was complete")
+                    )
+        finally:
+            # Completion, error, cancellation or client disconnect: stop the
+            # reader thread (interrupting a blocked read) and free its permit.
+            await reader.close()

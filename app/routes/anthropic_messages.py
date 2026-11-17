@@ -24,7 +24,6 @@ from app.anthropic_models import (
 )
 from app.byok import byok_registry
 from app.providers.provider_manager import provider_manager
-from app.providers.custom_providers import CustomProvider
 from app.providers.base import AnthropicRequestMetadata, ProviderHTTPError
 from app.conversion.token_estimate import estimate_anthropic_input_tokens
 from app.auth.middleware import authenticate_anthropic_request, get_owner_user_id
@@ -176,24 +175,6 @@ def _parse_sse_chunk(chunk: str) -> tuple[Optional[str], Optional[dict]]:
     return event_type, payload
 
 
-def _is_custom_anthropic_provider(provider: object) -> bool:
-    """Return True for custom providers serving the Anthropic-compatible API."""
-    return (
-        isinstance(provider, CustomProvider)
-        and "anthropic" in getattr(provider, "_supported_apis", [])
-    )
-
-
-def _get_effective_stream(
-    request: AnthropicMessagesRequest,
-    provider: object,
-) -> bool:
-    """Default omitted ``stream`` to True for custom Anthropic providers only."""
-    if "stream" not in getattr(request, "model_fields_set", set()) and _is_custom_anthropic_provider(provider):
-        return True
-    return bool(request.stream)
-
-
 async def _sync_request_tracking_streaming_mode(
     request_obj: Request,
     is_streaming: bool,
@@ -300,7 +281,10 @@ async def create_message(
             if websearch_loop is not None:
                 anthropic_headers[WEBSEARCH_HEADER] = "enabled"
 
-            effective_stream = _get_effective_stream(request, provider)
+            # An omitted ``stream`` means one JSON body (the Anthropic default),
+            # for every provider. Claude Code's auto-mode classifier omits it and
+            # reads ``usage`` from the body; answering with SSE broke the check.
+            effective_stream = bool(request.stream)
             await _sync_request_tracking_streaming_mode(request_obj, effective_stream)
             add_span_attributes(span, {
                 "anthropic.stream": effective_stream,

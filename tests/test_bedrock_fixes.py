@@ -70,8 +70,26 @@ class ToolPairingTests(unittest.TestCase):
     def setUp(self):
         self.p = _provider()
 
+    @staticmethod
+    def _shape(messages):
+        """[(role, [block kind:id ...]), ...] for compact assertions."""
+        out = []
+        for m in messages:
+            blocks = []
+            for item in m["content"]:
+                if "toolUse" in item:
+                    blocks.append(f"use:{item['toolUse']['toolUseId']}")
+                elif "toolResult" in item:
+                    blocks.append(f"result:{item['toolResult']['toolUseId']}")
+                else:
+                    blocks.append(f"text:{item.get('text')}")
+            out.append((m["role"], blocks))
+        return out
+
     def test_cross_turn_pairing_preserved(self):
-        # A6: toolUse and its toolResult are NOT adjacent — must be kept.
+        # A6: toolUse and its toolResult are NOT adjacent — the pair is kept,
+        # and the result is moved to directly follow its call (Converse
+        # rejects a result that isn't in the very next user message).
         messages = [
             {"role": "assistant", "content": [
                 {"text": "let me check"},
@@ -83,12 +101,89 @@ class ToolPairingTests(unittest.TestCase):
             ]},
         ]
         out = self.p._validate_tool_use_result_pairing(messages)
-        ids = [
-            item["toolUse"]["toolUseId"]
-            for m in out for item in m["content"]
-            if isinstance(item, dict) and "toolUse" in item
+        self.assertEqual(self._shape(out), [
+            ("assistant", ["text:let me check", "use:t1"]),
+            ("user", ["result:t1"]),
+            ("assistant", ["text:still working"]),
+        ])
+
+    def test_valid_history_unchanged(self):
+        messages = [
+            {"role": "user", "content": [{"text": "q"}]},
+            {"role": "assistant", "content": [
+                {"toolUse": {"toolUseId": "a", "name": "f", "input": {}}},
+                {"toolUse": {"toolUseId": "b", "name": "g", "input": {}}},
+            ]},
+            {"role": "user", "content": [
+                {"toolResult": {"toolUseId": "a", "content": [{"text": "1"}]}},
+                {"toolResult": {"toolUseId": "b", "content": [{"text": "2"}]}},
+            ]},
+            {"role": "assistant", "content": [{"text": "done"}]},
         ]
-        self.assertIn("t1", ids)
+        out = self.p._validate_tool_use_result_pairing(messages)
+        self.assertEqual(out, messages)
+
+    def test_result_after_interjected_user_turn_moves_up(self):
+        messages = [
+            {"role": "assistant", "content": [{"toolUse": {"toolUseId": "t1", "name": "f", "input": {}}}]},
+            {"role": "user", "content": [{"text": "hurry up"}]},
+            {"role": "user", "content": [{"toolResult": {"toolUseId": "t1", "content": [{"text": "ok"}]}}]},
+        ]
+        out = self.p._validate_tool_use_result_pairing(messages)
+        self.assertEqual(self._shape(out), [
+            ("assistant", ["use:t1"]),
+            ("user", ["result:t1"]),
+            ("user", ["text:hurry up"]),
+        ])
+
+    def test_results_split_across_turns_are_grouped_after_their_call(self):
+        messages = [
+            {"role": "assistant", "content": [
+                {"toolUse": {"toolUseId": "a", "name": "f", "input": {}}},
+                {"toolUse": {"toolUseId": "b", "name": "f", "input": {}}},
+            ]},
+            {"role": "user", "content": [{"toolResult": {"toolUseId": "a", "content": [{"text": "1"}]}}]},
+            {"role": "assistant", "content": [{"text": "waiting on b"}]},
+            {"role": "user", "content": [{"toolResult": {"toolUseId": "b", "content": [{"text": "2"}]}}]},
+        ]
+        out = self.p._validate_tool_use_result_pairing(messages)
+        self.assertEqual(self._shape(out), [
+            ("assistant", ["use:a", "use:b"]),
+            ("user", ["result:a", "result:b"]),
+            ("assistant", ["text:waiting on b"]),
+        ])
+
+    def test_result_before_its_call_is_an_orphan(self):
+        messages = [
+            {"role": "user", "content": [{"toolResult": {"toolUseId": "t1", "content": [{"text": "early"}]}}]},
+            {"role": "assistant", "content": [
+                {"text": "calling"},
+                {"toolUse": {"toolUseId": "t1", "name": "f", "input": {}}},
+            ]},
+        ]
+        out = self.p._validate_tool_use_result_pairing(messages)
+        self.assertEqual(self._shape(out), [("assistant", ["text:calling"])])
+
+    def test_openai_parallel_calls_form_one_group(self):
+        # Two tool_calls on one assistant message + their tool messages become
+        # one assistant toolUse group followed by one user toolResult group.
+        from app.openai_models import ChatCompletionRequest
+        request = ChatCompletionRequest(model="amazon.nova-pro-v1:0", messages=[
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "calling", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "g", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "a", "content": "1"},
+            {"role": "tool", "tool_call_id": "b", "content": "2"},
+        ])
+        self.p.bedrock_model_list = {}
+        out = self.p._parse_messages(request)
+        self.assertEqual(self._shape(out), [
+            ("user", ["text:go"]),
+            ("assistant", ["text:calling", "use:a", "use:b"]),
+            ("user", ["result:a", "result:b"]),
+        ])
 
     def test_orphan_tooluse_dropped(self):
         messages = [
@@ -825,6 +920,577 @@ class ModelListRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.paginator.paginate.return_value = [{"inferenceProfileSummaries": []}]
         with self.assertRaises(RuntimeError):
             await self.p.get_available_models()
+
+    async def test_application_profile_records_its_base_model(self):
+        self.p.enable_app_profiles = True
+        arn = "arn:aws:bedrock:us-west-2:123:application-inference-profile/abc"
+
+        def _paginate(**kwargs):
+            if kwargs.get("typeEquals") == "APPLICATION":
+                return [{"inferenceProfileSummaries": [{
+                    "inferenceProfileArn": arn,
+                    "models": [{"modelArn": "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-x"}],
+                }]}]
+            return [{"inferenceProfileSummaries": []}]
+
+        self.paginator.paginate.side_effect = _paginate
+        await self.p.get_available_models()
+        self.assertEqual(self.p.bedrock_model_list[arn]["base_model_id"], "anthropic.claude-x")
+        self.assertEqual(self.p._capability_model_id(arn), "anthropic.claude-x")
+        # The routed name keeps the whole ARN (only the provider prefix is cut).
+        self.assertEqual(self.p.get_model_id(f"bedrock:primary/{arn}"), arn)
+
+
+class ClientConfigTests(unittest.TestCase):
+    """Data-plane vs control-plane boto3 budgets."""
+
+    def test_runtime_and_control_plane_budgets(self):
+        p = BedrockProvider({"region": "us-east-1", "access_key_id": "AKIAX", "secret_access_key": "s"})
+        runtime, control = p.bedrock_runtime.meta.config, p.bedrock_client.meta.config
+        self.assertEqual(runtime.read_timeout, 900)
+        self.assertEqual(runtime.connect_timeout, 10)
+        self.assertEqual(runtime.retries, {"mode": "adaptive", "total_max_attempts": 3})
+        self.assertEqual(control.read_timeout, 30)
+        self.assertEqual(control.connect_timeout, 5)
+        self.assertEqual(control.retries, {"mode": "standard", "total_max_attempts": 3})
+
+    def test_budgets_follow_env(self):
+        env = {"BEDROCK_READ_TIMEOUT_SECONDS": "120", "BEDROCK_MAX_ATTEMPTS": "5"}
+        with mock.patch.dict("os.environ", env):
+            p = BedrockProvider({"region": "us-east-1", "access_key_id": "AKIAX", "secret_access_key": "s"})
+        self.assertEqual(p.bedrock_runtime.meta.config.read_timeout, 120)
+        self.assertEqual(p.bedrock_runtime.meta.config.retries["total_max_attempts"], 5)
+
+
+class ModelDiscoverySharingTests(unittest.TestCase):
+    def _bedrock(self, region="us-east-1", key="AKIAX"):
+        return BedrockProvider({"region": region, "access_key_id": key, "secret_access_key": "s"})
+
+    def test_adopts_list_from_identically_configured_instance(self):
+        live, discovery = self._bedrock(), self._bedrock()
+        discovery.bedrock_model_list = {"m": {"modalities": ["TEXT", "IMAGE"]}}
+        discovery._model_list_fetched_at = 123.0
+        self.assertTrue(live.adopt_model_discovery(discovery))
+        self.assertTrue(live._is_supported_modality("m", "IMAGE"))
+        self.assertEqual(live._model_list_fetched_at, 123.0)
+
+    def test_does_not_adopt_from_other_account_or_region(self):
+        discovery = self._bedrock(region="eu-west-1")
+        discovery.bedrock_model_list = {"m": {"modalities": ["TEXT"]}}
+        discovery._model_list_fetched_at = 1.0
+        live = self._bedrock()
+        self.assertFalse(live.adopt_model_discovery(discovery))
+        self.assertEqual(live.bedrock_model_list, {})
+        other_key = self._bedrock(key="AKIAOTHER")
+        self.assertFalse(other_key.adopt_model_discovery(self._with_list(self._bedrock())))
+
+    def test_does_not_replace_a_newer_list(self):
+        live = self._with_list(self._bedrock(), fetched_at=50.0)
+        older = self._with_list(self._bedrock(), fetched_at=10.0, models={"old": {}})
+        self.assertFalse(live.adopt_model_discovery(older))
+        self.assertIn("m", live.bedrock_model_list)
+
+    @staticmethod
+    def _with_list(p, fetched_at=1.0, models=None):
+        p.bedrock_model_list = models or {"m": {"modalities": ["TEXT"]}}
+        p._model_list_fetched_at = fetched_at
+        return p
+
+    def test_registry_refresh_carries_lists_over(self):
+        from app.providers.provider_manager import ProviderManager
+        old = self._with_list(self._bedrock())
+        new = self._bedrock()
+        ProviderManager._carry_over_model_discovery({"bedrock:a": old}, {"bedrock:a": new, "x": object()})
+        self.assertEqual(new.bedrock_model_list, old.bedrock_model_list)
+
+    def test_sync_shares_discovery_with_live_instance(self):
+        from app.providers import auto_sync
+        live = self._bedrock()
+        discovery = self._with_list(self._bedrock())
+        with mock.patch.object(auto_sync.provider_manager, "providers", {"bedrock:a": live}):
+            auto_sync._share_discovery_with_live_instance("bedrock:a", discovery)
+        self.assertEqual(live.bedrock_model_list, discovery.bedrock_model_list)
+
+
+class ReasoningGatingTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _provider()
+        self.p.bedrock_model_list = {}
+
+    def _args(self, model, **kwargs):
+        kwargs.setdefault("max_tokens", 4000)
+        return self.p._parse_bedrock_request(ChatCompletionRequest(
+            model=model, messages=[ChatMessage(role="user", content="hi")], **kwargs,
+        ))
+
+    def test_budget_reasoning_for_claude_3_7_and_later(self):
+        for model in ("anthropic.claude-3-7-sonnet-20250219-v1:0", "us.anthropic.claude-sonnet-4-20250514-v1:0"):
+            amrf = self._args(model, reasoning_effort="high").get("additionalModelRequestFields", {})
+            self.assertEqual(amrf.get("reasoning_config", {}).get("type"), "enabled", model)
+
+    def test_no_reasoning_config_for_models_without_extended_thinking(self):
+        for model in (
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "meta.llama3-70b-instruct-v1:0",
+            "amazon.nova-pro-v1:0",
+            "mistral.mistral-large-2407-v1:0",
+        ):
+            with self.assertLogs("app.providers.bedrock_provider", level="WARNING"):
+                args = self._args(model, reasoning_effort="high", temperature=0.5)
+            self.assertNotIn("reasoning_config", args.get("additionalModelRequestFields", {}), model)
+            # Nothing was enabled, so the sampling params are left alone.
+            self.assertEqual(args["inferenceConfig"].get("temperature"), 0.5, model)
+
+    def test_application_profile_uses_its_base_model(self):
+        arn = "arn:aws:bedrock:us-east-1:123:application-inference-profile/abc"
+        self.p.bedrock_model_list = {arn: {"modalities": ["TEXT"], "base_model_id": "anthropic.claude-sonnet-4-20250514-v1:0"}}
+        amrf = self._args(arn, reasoning_effort="medium").get("additionalModelRequestFields", {})
+        self.assertIn("reasoning_config", amrf)
+
+
+class MaxTokensMappingTests(unittest.TestCase):
+    """OpenAI's max_completion_tokens must reach Converse's maxTokens even
+    without reasoning_effort (it used to silently fall back to 2048)."""
+
+    MODEL = "us.openai.gpt-oss-120b-1:0"
+
+    def setUp(self):
+        self.p = _provider()
+        self.p.bedrock_model_list = {}
+
+    def _max_tokens(self, **kwargs):
+        args = self.p._parse_bedrock_request(ChatCompletionRequest(
+            model=self.MODEL, messages=[ChatMessage(role="user", content="hi")], **kwargs,
+        ))
+        return args["inferenceConfig"]["maxTokens"]
+
+    def test_max_completion_tokens_alone(self):
+        self.assertEqual(self._max_tokens(max_completion_tokens=128000), 128000)
+
+    def test_max_completion_tokens_wins_over_max_tokens(self):
+        self.assertEqual(self._max_tokens(max_completion_tokens=5000, max_tokens=100), 5000)
+
+    def test_max_tokens_alone(self):
+        self.assertEqual(self._max_tokens(max_tokens=777), 777)
+
+    def test_default_when_neither_sent(self):
+        self.assertEqual(self._max_tokens(), 2048)
+
+
+class OpenAIToolChoiceTests(unittest.TestCase):
+    TOOL = {"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}
+
+    def setUp(self):
+        self.p = _provider()
+        self.p.bedrock_model_list = {}
+
+    def _args(self, messages=None, **kwargs):
+        return self.p._parse_bedrock_request(ChatCompletionRequest(
+            model="amazon.nova-pro-v1:0",
+            messages=messages or [{"role": "user", "content": "hi"}],
+            **kwargs,
+        ), {})
+
+    def test_none_withholds_tools(self):
+        args = self._args(tools=[self.TOOL], tool_choice="none")
+        self.assertNotIn("toolConfig", args)
+
+    def test_none_with_tool_history_keeps_only_placeholder(self):
+        history = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "42"},
+        ]
+        args = self._args(messages=history, tools=[self.TOOL], tool_choice="none")
+        self.assertEqual(args["toolConfig"]["tools"], [BedrockProvider._PLACEHOLDER_TOOL_SPEC])
+        self.assertNotIn("toolChoice", args["toolConfig"])
+
+    def test_auto_and_required(self):
+        self.assertEqual(self._args(tools=[self.TOOL], tool_choice="auto")["toolConfig"]["toolChoice"], {"auto": {}})
+        self.assertEqual(self._args(tools=[self.TOOL], tool_choice="required")["toolConfig"]["toolChoice"], {"any": {}})
+
+    def test_named_tool_uses_truncated_name(self):
+        long_name = "x" * 80
+        tool = {"type": "function", "function": {"name": long_name, "parameters": {"type": "object"}}}
+        args = self._args(tools=[tool], tool_choice={"type": "function", "function": {"name": long_name}})
+        spec_name = args["toolConfig"]["tools"][0]["toolSpec"]["name"]
+        self.assertEqual(args["toolConfig"]["toolChoice"], {"tool": {"name": spec_name}})
+        self.assertLessEqual(len(spec_name), 64)
+
+
+class NonStreamReasoningTests(unittest.TestCase):
+    def test_multiple_reasoning_blocks_are_all_kept(self):
+        p = _provider()
+        response = {
+            "output": {"message": {"role": "assistant", "content": [
+                {"reasoningContent": {"reasoningText": {"text": "first", "signature": "s1"}}},
+                {"text": "Hello"},
+                {"reasoningContent": {"reasoningText": {"text": "second", "signature": "s2"}}},
+                {"text": " world"},
+            ]}},
+            "usage": {"inputTokens": 1, "outputTokens": 2, "totalTokens": 3},
+            "stopReason": "end_turn",
+        }
+        request = ChatCompletionRequest(model="m", messages=[ChatMessage(role="user", content="hi")])
+        with mock.patch.object(BedrockProvider, "_invoke_bedrock", new=mock.AsyncMock(return_value=(response, {}))):
+            result = asyncio.run(p.chat_completion(request))
+        self.assertEqual(result.choices[0].message.reasoning_content, "first\n\nsecond")
+        self.assertEqual(result.choices[0].message.content, "Hello world")
+
+
+class AnthropicAdapterTests(unittest.TestCase):
+    """Converse adapter (/v1/messages for non-Claude models)."""
+
+    PNG = base64_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
+    def setUp(self):
+        self.p = _provider()
+        self.p.bedrock_model_list = {}
+        self.p.full_provider_name = "bedrock:test"
+
+    def _request(self, **kwargs):
+        kwargs.setdefault("model", "bedrock:test/amazon.nova-pro-v1:0")
+        kwargs.setdefault("max_tokens", 64)
+        kwargs.setdefault("messages", [{"role": "user", "content": "hi"}])
+        return AnthropicMessagesRequest.model_validate(kwargs)
+
+    def test_system_role_messages_become_system_prompt(self):
+        args = self.p._build_bedrock_anthropic_args(self._request(
+            system="top",
+            messages=[{"role": "system", "content": "be terse"}, {"role": "user", "content": "hi"}],
+        ))
+        self.assertEqual(args["system"], [{"text": "top"}, {"text": "be terse"}])
+        self.assertEqual([m["role"] for m in args["messages"]], ["user"])
+
+    def test_tool_result_image_stays_an_image(self):
+        args = self.p._build_bedrock_anthropic_args(self._request(messages=[
+            {"role": "user", "content": "look"},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t", "name": "shot", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": [
+                {"type": "text", "text": "screenshot:"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": self.PNG}},
+            ]}]},
+        ]))
+        result = args["messages"][2]["content"][0]["toolResult"]["content"]
+        self.assertEqual(result[0], {"text": "screenshot:"})
+        self.assertEqual(result[1]["image"]["format"], "png")  # bytes win over the declared type
+        self.assertTrue(result[1]["image"]["source"]["bytes"].startswith(b"\x89PNG"))
+
+    def test_tool_choice_none_withholds_tools(self):
+        tool = {"name": "f", "description": "d", "input_schema": {"type": "object"}}
+        args = self.p._build_bedrock_anthropic_args(self._request(tools=[tool], tool_choice={"type": "none"}))
+        self.assertNotIn("toolConfig", args)
+
+    def test_unknown_tool_choice_is_rejected(self):
+        tool = {"name": "f", "description": "d", "input_schema": {"type": "object"}}
+        with self.assertRaises(ValueError):
+            self.p._build_bedrock_anthropic_args(self._request(tools=[tool], tool_choice={"type": "sometimes"}))
+        with self.assertRaises(ValueError):
+            self.p._build_bedrock_anthropic_args(self._request(tools=[tool], tool_choice={"type": "tool"}))
+
+    def test_thinking_not_forwarded_to_model_without_reasoning_and_reported(self):
+        request = self._request(
+            model="bedrock:test/meta.llama3-70b-instruct-v1:0",
+            thinking={"type": "enabled", "budget_tokens": 2000},
+            metadata={"user_id": "u1"},
+            tool_choice={"type": "auto", "disable_parallel_tool_use": True},
+            tools=[{"name": "f", "description": "d", "input_schema": {"type": "object"}}],
+        )
+        args = self.p._build_bedrock_anthropic_args(request)
+        self.assertNotIn("thinking", args.get("additionalModelRequestFields", {}))
+        metadata = self.p.get_anthropic_request_metadata(request)
+        self.assertEqual(metadata.mode, "adapter")
+        for field in ("thinking", "metadata", "tool_choice.disable_parallel_tool_use"):
+            self.assertIn(field, metadata.dropped_fields)
+
+    def test_disabled_thinking_enables_nothing(self):
+        args = self.p._build_bedrock_anthropic_args(self._request(
+            model="bedrock:test/us.amazon.nova-2-lite-v1:0",
+            thinking={"type": "disabled"},
+        ))
+        self.assertNotIn("reasoningConfig", args.get("additionalModelRequestFields", {}))
+
+    def test_claude_application_profile_thinking_is_normalized(self):
+        arn = "arn:aws:bedrock:us-east-1:123:application-inference-profile/abc"
+        self.p.bedrock_model_list = {arn: {"modalities": ["TEXT"], "base_model_id": "anthropic.claude-opus-4-8-v1:0"}}
+        request = self._request(model=f"bedrock:test/{arn}", thinking={"type": "enabled", "budget_tokens": 2000})
+        args = self.p._build_bedrock_anthropic_args(request)
+        self.assertEqual(args["additionalModelRequestFields"]["thinking"], {"type": "adaptive"})
+        self.assertIn("thinking.budget_tokens", self.p.get_anthropic_request_metadata(request).dropped_fields)
+
+
+class _FakeEventStream:
+    """Stands in for a botocore EventStream: yields events, then ends or raises."""
+
+    def __init__(self, events, error=None):
+        self.events, self.error, self.closed = events, error, False
+
+    def __iter__(self):
+        yield from self.events
+        if self.error is not None:
+            raise self.error
+
+    def close(self):
+        self.closed = True
+
+
+class AnthropicConverseStreamTerminalTests(unittest.IsolatedAsyncioTestCase):
+    """A truncated upstream response must not be reported as a complete message."""
+
+    START = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "Hel"}}},
+    ]
+    STOP = [
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+    METADATA = [{"metadata": {"usage": {"inputTokens": 3, "outputTokens": 2}}}]
+
+    def setUp(self):
+        self.p = _provider()
+        self.p.bedrock_model_list = {}
+        self.p.full_provider_name = "bedrock:test"
+        self.p._converse_semaphore = None
+        self.p.bedrock_runtime = mock.Mock()
+        self.request = AnthropicMessagesRequest.model_validate({
+            "model": "bedrock:test/amazon.nova-pro-v1:0", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}], "stream": True,
+        })
+
+    async def _events(self, stream):
+        self.p.bedrock_runtime.converse_stream.return_value = {"stream": stream}
+        out = []
+        async for sse in self.p.anthropic_messages_stream(self.request):
+            event = sse.split("\n", 1)[0].removeprefix("event: ")
+            payload = json.loads(sse.split("data: ", 1)[1])
+            out.append((event, payload))
+        return out
+
+    async def test_complete_stream(self):
+        events = await self._events(_FakeEventStream(self.START + self.STOP + self.METADATA))
+        self.assertEqual([e for e, _ in events][-2:], ["message_delta", "message_stop"])
+        self.assertEqual(events[-2][1]["usage"]["output_tokens"], 2)
+
+    async def test_error_before_message_stop_is_an_error_not_end_turn(self):
+        from botocore.exceptions import EventStreamError
+        err = EventStreamError(
+            {"Error": {"Code": "ThrottlingException", "Message": "slow down"}}, "ConverseStream"
+        )
+        stream = _FakeEventStream(self.START, error=err)
+        events = await self._events(stream)
+        names = [e for e, _ in events]
+        self.assertNotIn("message_stop", names)
+        self.assertNotIn("message_delta", names)
+        self.assertEqual(names[-1], "error")
+        self.assertEqual(events[-1][1]["error"]["type"], "rate_limit_error")
+        self.assertTrue(stream.closed)
+
+    async def test_stream_ending_before_message_stop_is_an_error(self):
+        events = await self._events(_FakeEventStream(self.START))
+        names = [e for e, _ in events]
+        self.assertNotIn("message_stop", names)
+        self.assertEqual(names[-1], "error")
+
+    async def test_error_after_message_stop_still_completes(self):
+        # messageStop arrived, so the content is complete; only usage was lost.
+        events = await self._events(_FakeEventStream(self.START + self.STOP, error=RuntimeError("reset")))
+        names = [e for e, _ in events]
+        self.assertEqual(names[-2:], ["message_delta", "message_stop"])
+        self.assertNotIn("error", names)
+        self.assertEqual(events[-2][1]["delta"]["stop_reason"], "end_turn")
+
+    async def test_open_error_maps_to_http_status(self):
+        from botocore.exceptions import ClientError
+        from fastapi import HTTPException
+        self.p.bedrock_runtime.converse_stream.side_effect = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no"}}, "ConverseStream"
+        )
+        with self.assertRaises(HTTPException) as ctx:
+            async for _ in self.p.anthropic_messages_stream(self.request):
+                pass
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(self.p._get_converse_semaphore()._value, 15)
+
+
+class ConverseStreamReaderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_permit_is_held_until_the_reader_thread_exits(self):
+        import threading
+        release_read = threading.Event()
+
+        class _BlockingStream:
+            closed = False
+
+            def __iter__(self):
+                yield {"messageStart": {"role": "assistant"}}
+                release_read.wait(5)  # a read the socket shutdown can't reach
+                yield {"messageStop": {"stopReason": "end_turn"}}
+
+            def close(self):
+                self.closed = True
+
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        stream = _BlockingStream()
+        from app.providers.bedrock_provider import _ConverseStreamReader
+        reader = _ConverseStreamReader(lambda: stream, on_exit=semaphore.release)
+        reader.start()
+        await reader.wait_opened()
+        self.assertEqual(await reader.next_event(), {"messageStart": {"role": "assistant"}})
+
+        with mock.patch("app.providers.bedrock_provider._STREAM_CLOSE_WAIT_SECONDS", 0.1):
+            await reader.close()
+        # The thread is still in its read: the permit must still be held.
+        self.assertTrue(semaphore.locked())
+        release_read.set()
+        await asyncio.wait_for(semaphore.acquire(), 2)
+        self.assertTrue(stream.closed)  # closed by the reader thread itself
+
+    async def test_backpressure_stops_reading_ahead(self):
+        reads = []
+
+        def _events():
+            for i in range(100):
+                reads.append(i)
+                yield {"contentBlockDelta": {"delta": {"text": str(i)}}}
+
+        from app.providers.bedrock_provider import _ConverseStreamReader
+        reader = _ConverseStreamReader(lambda: _events(), max_buffered=4)
+        reader.start()
+        await reader.wait_opened()
+        await asyncio.sleep(0.3)
+        self.assertLessEqual(len(reads), 6)  # 4 buffered + the read waiting for a slot
+        await reader.close()
+
+
+class EmbeddingInputTests(unittest.TestCase):
+    def test_token_id_arrays_are_rejected(self):
+        from app.openai_models import EmbeddingRequest
+        p = _provider()
+        p.bedrock_runtime = mock.Mock()
+        for bad in ([1, 2, 3], [[1, 2], [3]], []):
+            with self.assertRaises(ProviderHTTPError) as ctx:
+                asyncio.run(p.embeddings(EmbeddingRequest(model="bedrock:x/cohere.embed-english-v3", input=bad)))
+            self.assertEqual(ctx.exception.status_code, 400)
+        p.bedrock_runtime.invoke_model.assert_not_called()
+
+
+class ImageInputTests(unittest.TestCase):
+    def setUp(self):
+        self.p = _provider()
+
+    def test_base64_images_share_the_download_size_cap(self):
+        oversized = "data:image/png;base64," + "A" * (BedrockProvider._IMAGE_MAX_BYTES * 4 // 3 + 16)
+        with self.assertRaises(ValueError):
+            self.p._parse_image_sync(oversized)
+        with self.assertRaises(ValueError):
+            self.p._convert_anthropic_image_block(
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": oversized[22:]}}
+            )
+
+    def test_formats_are_normalized_or_rejected(self):
+        from app.providers.bedrock_provider import _converse_image_format
+        self.assertEqual(_converse_image_format(b"", "image/jpg"), "jpeg")
+        self.assertEqual(_converse_image_format(b"", "image/PNG; charset=binary"), "png")
+        self.assertEqual(_converse_image_format(b"\xff\xd8\xff\xe0", "image/png"), "jpeg")
+        for bad in ("image/svg+xml", "application/octet-stream", None):
+            with self.assertRaises(ValueError):
+                _converse_image_format(b"<svg/>", bad)
+
+    def test_private_addresses_are_refused(self):
+        for url in ("http://169.254.169.254/latest", "http://127.0.0.1/x.png", "http://[::1]/x.png"):
+            with self.assertRaises(ValueError):
+                self.p._parse_image_sync(url)
+
+    def test_fetch_connects_to_the_validated_address(self):
+        # One DNS lookup; the connection goes to the address that was checked,
+        # so a rebinding resolver can't swap in an internal one afterwards.
+        import socket
+        lookups = []
+
+        def _getaddrinfo(host, *a, **k):
+            lookups.append(host)
+            ip = "93.184.215.14" if len(lookups) == 1 else "169.254.169.254"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 80))]
+
+        pools = []
+
+        class _Pool:
+            def __init__(self, host, port, **kwargs):
+                pools.append((host, port))
+
+            def urlopen(self, *a, **k):
+                raise ValueError("stop")
+
+            def close(self):
+                pass
+
+        with mock.patch("socket.getaddrinfo", _getaddrinfo), \
+             mock.patch("urllib3.HTTPConnectionPool", _Pool):
+            with self.assertRaises(ValueError):
+                self.p._parse_image_sync("http://rebind.example/a.png")
+        self.assertEqual(lookups, ["rebind.example"])
+        self.assertEqual(pools, [("93.184.215.14", 80)])
+
+
+class ChainCredentialTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_chain_credentials_resolved_off_loop_and_refreshed(self):
+        import threading
+        p = _provider()
+        p.aws_region = "us-east-1"
+        p._anthropic_client = SimpleNamespace(aws_access_key=None, aws_secret_key=None, aws_session_token=None)
+        p._anthropic_uses_default_chain = True
+        p._chain_credentials = None
+        p._chain_credentials_lock = None
+
+        loop_thread = threading.get_ident()
+        state = {"refresh": False, "threads": []}
+
+        class _Creds:
+            def refresh_needed(self):
+                return state["refresh"]
+
+            def get_frozen_credentials(self):
+                state["threads"].append(threading.get_ident())
+                n = len(state["threads"])
+                return SimpleNamespace(access_key=f"AK{n}", secret_key=f"SK{n}", token=f"T{n}")
+
+        session = mock.Mock()
+        session.get_credentials.return_value = _Creds()
+        with mock.patch("boto3.session.Session", return_value=session):
+            await p._ensure_anthropic_client()
+            self.assertEqual(p._anthropic_client.aws_access_key, "AK1")
+            await p._ensure_anthropic_client()  # fresh: no second resolution
+            self.assertEqual(len(state["threads"]), 1)
+            state["refresh"] = True
+            await p._ensure_anthropic_client()
+        self.assertEqual(p._anthropic_client.aws_session_token, "T2")
+        self.assertNotIn(loop_thread, state["threads"])
+
+    async def test_explicit_keys_untouched(self):
+        p = _provider()
+        p._anthropic_client = SimpleNamespace(aws_access_key="AK", aws_secret_key="SK", aws_session_token=None)
+        p._anthropic_uses_default_chain = False
+        with mock.patch("boto3.session.Session") as session:
+            await p._ensure_anthropic_client()
+        session.assert_not_called()
+
+
+class ProviderBuildOffLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bedrock_provider_is_built_on_a_worker_thread(self):
+        import threading
+        from app.providers.provider_manager import ProviderManager
+        threads = []
+        manager = ProviderManager.__new__(ProviderManager)
+        manager._build_provider = lambda cred, check_urls=True: threads.append(threading.get_ident()) or "built"
+        cred = SimpleNamespace(provider_type="bedrock", user_id=None, owner_user_id=None)
+        with mock.patch("app.providers.provider_manager._row_owner", return_value=None):
+            self.assertEqual(await manager.build_provider(cred), "built")
+            cred.provider_type = "custom"
+            await manager.build_provider(cred)
+        self.assertNotEqual(threads[0], threading.get_ident())
+        self.assertEqual(threads[1], threading.get_ident())
 
 
 if __name__ == "__main__":

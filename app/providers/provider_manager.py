@@ -223,6 +223,9 @@ class ProviderManager:
         'platformai': PlatformAIProvider,
     }
 
+    # Provider types whose constructor does blocking work (see build_provider).
+    _BLOCKING_CONSTRUCTOR_TYPES = frozenset({'bedrock'})
+
     def _build_provider(self, cred, check_urls: bool = True) -> BaseProvider:
         """Instantiate the provider object for one credentials row (may raise).
 
@@ -241,12 +244,22 @@ class ProviderManager:
         A BYOK row's upstream URLs are checked in a worker thread first: the check
         resolves DNS, and a slow resolver for a user-chosen host must not stall
         the event loop.
+
+        Providers whose constructor blocks are built on a worker thread too:
+        a Bedrock provider builds boto3 clients, which loads service models
+        and, without explicit keys, resolves the AWS credential chain
+        (instance metadata, SSO, ...). Every registry refresh rebuilds every
+        provider, so doing that on the loop stalls all servers in the process.
         """
-        if _row_owner(cred) is None:
-            return self._build_provider(cred)
-        from app.providers.url_guard import validate_cred_row
-        await asyncio.to_thread(validate_cred_row, cred)
-        return self._build_provider(cred, check_urls=False)
+        if _row_owner(cred) is not None:
+            from app.providers.url_guard import validate_cred_row
+            await asyncio.to_thread(validate_cred_row, cred)
+            check_urls = False
+        else:
+            check_urls = True
+        if getattr(cred, "provider_type", None) in self._BLOCKING_CONSTRUCTOR_TYPES:
+            return await asyncio.to_thread(self._build_provider, cred, check_urls)
+        return self._build_provider(cred, check_urls=check_urls)
 
     @staticmethod
     def _should_load(cred) -> bool:
@@ -1014,6 +1027,26 @@ class ProviderManager:
             async with self._byok_edit_lock():
                 await self._refresh_providers_from_database_locked()
 
+    @staticmethod
+    def _carry_over_model_discovery(
+        old_providers: Dict[str, BaseProvider], new_providers: Dict[str, BaseProvider]
+    ) -> None:
+        """Let rebuilt instances keep their predecessor's discovered model list.
+
+        A refresh rebuilds every provider, so without this each one starts with
+        an empty provider-side model list (see BedrockProvider.adopt_model_discovery,
+        which only adopts from an identically configured instance).
+        """
+        for key, new_provider in new_providers.items():
+            old_provider = (old_providers or {}).get(key)
+            adopt = getattr(new_provider, "adopt_model_discovery", None)
+            if old_provider is None or not callable(adopt):
+                continue
+            try:
+                adopt(old_provider)
+            except Exception as e:
+                print(f"Warning: could not carry over model list for {key}: {e}")
+
     async def _refresh_providers_from_database_locked(self) -> None:
         try:
             old_providers = self.providers
@@ -1026,6 +1059,7 @@ class ProviderManager:
             new_owners: Dict[str, int] = {}
             self._pending_byok_load_errors = {}
             await self._load_providers_from_database(target=new_providers, owners_target=new_owners)
+            self._carry_over_model_discovery(old_providers, new_providers)
             # Owner map first: a BYOK key briefly in the registry without its owner
             # reads as UNKNOWN_OWNER and is denied (fail closed), never as global.
             byok_registry.replace(new_owners)

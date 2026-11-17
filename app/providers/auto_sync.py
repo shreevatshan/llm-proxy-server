@@ -315,6 +315,11 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds, keep_o
             finally:
                 await _close_provider_instance(provider_instance)
 
+            # Discovery ran on a throwaway instance; hand its result to the live
+            # one (a provider save has just rebuilt it with an empty list), so it
+            # doesn't start cold and repeat the same discovery on a request.
+            _share_discovery_with_live_instance(provider_key, provider_instance)
+
             if keep_on_empty and not models:
                 error_msg = "No models returned by the provider; saved models were kept"
                 set_span_error(span, error_msg)
@@ -390,6 +395,23 @@ async def _sync_dynamic_provider_models(db: AsyncSession, provider_creds, keep_o
             error_msg = f"Failed to sync dynamic provider models: {str(e)}"
             set_span_error(span, e)
             return {"error": error_msg}
+
+
+def _share_discovery_with_live_instance(provider_key: str, discovery_instance) -> None:
+    """Give the live registry instance the model list a discovery instance fetched.
+
+    Only providers that keep their own model list implement
+    ``adopt_model_discovery`` (Bedrock); it checks the two instances are
+    configured alike before adopting.
+    """
+    live = provider_manager.providers.get(provider_key)
+    adopt = getattr(live, "adopt_model_discovery", None)
+    if live is None or live is discovery_instance or not callable(adopt):
+        return
+    try:
+        adopt(discovery_instance)
+    except Exception as e:
+        print(f"Warning: could not share discovered models with live {provider_key}: {e}")
 
 
 async def _create_provider_instance(provider_creds):
